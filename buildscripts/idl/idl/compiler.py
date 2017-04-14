@@ -75,7 +75,7 @@ def compile_idl(args):
         header_file_name = args.output_header
 
     # Compile the IDL through the 3 passes
-    with io.open(args.input_file) as file_stream:
+    with io.open(args.input_file, encoding='utf-8') as file_stream:
         parsed_doc = parser.parse(file_stream, error_file_name=error_file_name)
 
         if not parsed_doc.errors:
