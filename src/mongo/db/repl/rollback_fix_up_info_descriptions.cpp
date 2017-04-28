@@ -32,6 +32,7 @@
 
 #include "mongo/db/repl/rollback_fix_up_info_descriptions.h"
 
+#include "mongo/bson/util/bson_extract.h"
 #include "mongo/db/jsobj.h"
 
 namespace mongo {
@@ -40,7 +41,7 @@ namespace repl {
 namespace {
 
 /**
- * Appends op type to builder as string element under the field name "op".
+ * Appends single document op type to builder as string element under the field name "op".
  */
 void appendOpTypeToBuilder(RollbackFixUpInfo::SingleDocumentOpType opType,
                            BSONObjBuilder* builder) {
@@ -58,13 +59,38 @@ void appendOpTypeToBuilder(RollbackFixUpInfo::SingleDocumentOpType opType,
     }
 }
 
+/**
+ * Returns string representation of RollbackFixUpInfo::IndexOpType.
+ */
+std::string toString(RollbackFixUpInfo::IndexOpType opType) {
+    switch (opType) {
+        case RollbackFixUpInfo::IndexOpType::kCreate:
+            return "create";
+        case RollbackFixUpInfo::IndexOpType::kDrop:
+            return "drop";
+        case RollbackFixUpInfo::IndexOpType::kUpdateTTL:
+            return "updateTTL";
+    }
+    MONGO_UNREACHABLE;
+}
+/**
+ * Appends index op type to builder as string element under the field name "op".
+ */
+void appendOpTypeToBuilder(RollbackFixUpInfo::IndexOpType opType, BSONObjBuilder* builder) {
+    builder->append("operationType", toString(opType));
+}
+
 }  // namespace
 
 RollbackFixUpInfo::SingleDocumentOperationDescription::SingleDocumentOperationDescription(
     const UUID& collectionUuid,
     const BSONElement& docId,
-    RollbackFixUpInfo::SingleDocumentOpType opType)
-    : _collectionUuid(collectionUuid), _wrappedDocId(docId.wrap("documentId")), _opType(opType) {}
+    RollbackFixUpInfo::SingleDocumentOpType opType,
+    const std::string& dbName)
+    : _collectionUuid(collectionUuid),
+      _wrappedDocId(docId.wrap("documentId")),
+      _opType(opType),
+      _dbName(dbName) {}
 
 BSONObj RollbackFixUpInfo::SingleDocumentOperationDescription::toBSON() const {
     // For non-insert operations, we will use the collection UUID and document id to query the sync
@@ -82,6 +108,10 @@ BSONObj RollbackFixUpInfo::SingleDocumentOperationDescription::toBSON() const {
     // This matches the "op" field in the oplog entry.
     appendOpTypeToBuilder(_opType, &bob);
 
+    // The database name is used in the find command request when fetching the document from the
+    // sync source.
+    bob.append("db", _dbName);
+
     // This will be replaced by the most recent copy of the affected document from the sync
     // source. If the document is not found on the sync source, this will remain null.
     bob.appendNull("documentToRestore");
@@ -89,5 +119,99 @@ BSONObj RollbackFixUpInfo::SingleDocumentOperationDescription::toBSON() const {
     return bob.obj();
 }
 
+RollbackFixUpInfo::CollectionUuidDescription::CollectionUuidDescription(const UUID& collectionUuid,
+                                                                        const NamespaceString& nss)
+    : _collectionUuid(collectionUuid), _nss(nss) {}
+
+BSONObj RollbackFixUpInfo::CollectionUuidDescription::toBSON() const {
+    BSONObjBuilder bob;
+    _collectionUuid.appendToBuilder(&bob, "_id");
+    bob.append("ns", _nss.ns());
+    return bob.obj();
+}
+
+RollbackFixUpInfo::CollectionOptionsDescription::CollectionOptionsDescription(
+    const UUID& collectionUuid, const BSONObj& optionsObj)
+    : _collectionUuid(collectionUuid), _optionsObj(optionsObj) {}
+
+BSONObj RollbackFixUpInfo::CollectionOptionsDescription::toBSON() const {
+    BSONObjBuilder bob;
+    _collectionUuid.appendToBuilder(&bob, "_id");
+    bob.append("options", _optionsObj);
+    return bob.obj();
+}
+
+RollbackFixUpInfo::IndexDescription::IndexDescription(const UUID& collectionUuid,
+                                                      const std::string& indexName,
+                                                      RollbackFixUpInfo::IndexOpType opType,
+                                                      const BSONObj& infoObj)
+    : _collectionUuid(collectionUuid), _indexName(indexName), _opType(opType), _infoObj(infoObj) {
+    invariant(RollbackFixUpInfo::IndexOpType::kUpdateTTL != _opType);
+}
+
+RollbackFixUpInfo::IndexDescription::IndexDescription(const UUID& collectionUuid,
+                                                      const std::string& indexName,
+                                                      Seconds expireAfterSeconds)
+    : _collectionUuid(collectionUuid),
+      _indexName(indexName),
+      _opType(RollbackFixUpInfo::IndexOpType::kUpdateTTL),
+      _expireAfterSeconds(expireAfterSeconds) {
+    BSONObjBuilder bob;
+    bob.append("expireAfterSeconds", durationCount<Seconds>(*_expireAfterSeconds));
+    _infoObj = bob.obj();
+}
+
+RollbackFixUpInfo::IndexOpType RollbackFixUpInfo::IndexDescription::getOpType() const {
+    return _opType;
+}
+
+std::string RollbackFixUpInfo::IndexDescription::getOpTypeAsString() const {
+    return toString(_opType);
+}
+
+boost::optional<Seconds> RollbackFixUpInfo::IndexDescription::getExpireAfterSeconds() const {
+    return _expireAfterSeconds;
+}
+
+// static
+StatusWith<RollbackFixUpInfo::IndexOpType> RollbackFixUpInfo::IndexDescription::parseOpType(
+    const BSONObj& doc) {
+    std::string opTypeStr;
+    auto status = bsonExtractStringField(doc, "operationType"_sd, &opTypeStr);
+    if (!status.isOK()) {
+        return status;
+    }
+    if ("create" == opTypeStr) {
+        return RollbackFixUpInfo::IndexOpType::kCreate;
+    } else if ("drop" == opTypeStr) {
+        return RollbackFixUpInfo::IndexOpType::kDrop;
+    } else if ("updateTTL" == opTypeStr) {
+        return RollbackFixUpInfo::IndexOpType::kUpdateTTL;
+    }
+    return Status(ErrorCodes::FailedToParse,
+                  str::stream() << "Unrecognized RollbackFixUpInfo::IndexOpType: " << opTypeStr);
+}
+
+BSONObj RollbackFixUpInfo::IndexDescription::toBSON() const {
+    BSONObjBuilder bob;
+    bob.append("_id", makeIdKey());
+    appendOpTypeToBuilder(_opType, &bob);
+    bob.append("infoObj", _infoObj);
+
+    return bob.obj();
+}
+
+BSONObj RollbackFixUpInfo::IndexDescription::makeIdKey() const {
+    BSONObjBuilder idBob;
+    _collectionUuid.appendToBuilder(&idBob, "collectionUuid");
+    idBob.append("indexName", _indexName);
+    return idBob.obj();
+}
+
 }  // namespace repl
+
+std::ostream& operator<<(std::ostream& os, const repl::RollbackFixUpInfo::IndexOpType& opType) {
+    return os << repl::toString(opType);
+}
+
 }  // namespace mongo

@@ -727,6 +727,17 @@ functions:
         content_type: ${content_type|application/x-gzip}
         display_name: Generated Tests - Execution ${execution}
 
+  "run idl tests" :
+    - command: shell.exec
+      type: test
+      params:
+        working_dir: src
+        script: |
+          set -o verbose
+          set -o errexit
+
+          ${python|/opt/mongodbtoolchain/v2/bin/python2} buildscripts/idl/run_tests.py
+
   "do multiversion setup" :
     command: shell.exec
     params:
@@ -1970,14 +1981,6 @@ tasks:
       run_multiple_jobs: true
 
 - <<: *task_template
-  name: httpinterface
-  commands:
-  - func: "do setup"
-  - func: "run tests"
-    vars:
-      resmoke_args: --suites=httpinterface
-
-- <<: *task_template
   name: integration_tests_standalone
   commands:
   - func: "do setup"
@@ -2976,6 +2979,13 @@ tasks:
       resmoke_args: --suites=read_only_sharded --storageEngine=wiredTiger
       run_multiple_jobs: true
 
+- name: idl_tests
+  depends_on:
+  - name: compile
+  commands:
+  - func: "do setup"
+  - func: "run idl tests"
+
 - name: package
   depends_on:
   - name: compile
@@ -3523,7 +3533,6 @@ buildvariants:
   - name: gle_auth_basics_passthrough_WT
   - name: gle_auth_basics_passthrough_write_cmd
   - name: gle_auth_basics_passthrough_write_cmd_WT
-  - name: httpinterface
   - name: integration_tests_standalone
   - name: integration_tests_replset
   - name: integration_tests_sharded
@@ -4589,7 +4598,6 @@ buildvariants:
   - name: gle_auth_basics_passthrough_WT
   - name: gle_auth_basics_passthrough_write_cmd_WT
   - name: gle_auth_write_cmd_WT
-  - name: httpinterface
   - name: integration_tests_replset
   - name: integration_tests_sharded
   - name: integration_tests_standalone
@@ -4900,7 +4908,6 @@ buildvariants:
   - name: disk_WT
   - name: durability
   - name: failpoints
-  - name: httpinterface
   - name: integration_tests_standalone
   - name: integration_tests_replset
   - name: integration_tests_sharded
@@ -5350,7 +5357,6 @@ buildvariants:
   - name: gle_auth_basics_passthrough_write_cmd_WT
   - name: gle_auth_write_cmd
   - name: gle_auth_write_cmd_WT
-  - name: httpinterface
   - name: jsCore
   - name: jsCore_WT
   - name: jsCore_compatibility
@@ -5586,7 +5592,7 @@ buildvariants:
   - name: gle_auth_basics_passthrough_write_cmd_WT
   - name: gle_auth_write_cmd
   - name: gle_auth_write_cmd_WT
-  - name: httpinterface
+  - name: idl_tests
   - name: integration_tests_replset
   - name: integration_tests_sharded
   - name: integration_tests_standalone
@@ -5833,7 +5839,6 @@ buildvariants:
   - name: gle_auth_basics_passthrough_write_cmd_WT
   - name: gle_auth_write_cmd
   - name: gle_auth_write_cmd_WT
-  - name: httpinterface
   - name: integration_tests_replset
   - name: integration_tests_sharded
   - name: integration_tests_standalone
@@ -6373,7 +6378,6 @@ buildvariants:
   - name: gle_auth_basics_passthrough_write_cmd_WT
   # - name: gle_auth_write_cmd
   - name: gle_auth_write_cmd_WT
-  - name: httpinterface
   - name: integration_tests_replset
   - name: integration_tests_sharded
   - name: integration_tests_standalone
@@ -6513,7 +6517,6 @@ buildvariants:
   - name: gle_auth_basics_passthrough_write_cmd_WT
   # - name: gle_auth_write_cmd
   - name: gle_auth_write_cmd_WT
-  - name: httpinterface
   - name: integration_tests_replset
   - name: integration_tests_sharded
   - name: integration_tests_standalone
@@ -6653,7 +6656,6 @@ buildvariants:
   - name: gle_auth_basics_passthrough_write_cmd_WT
   # - name: gle_auth_write_cmd
   - name: gle_auth_write_cmd_WT
-  - name: httpinterface
   - name: integration_tests_replset
   - name: integration_tests_standalone
   # - name: jsCore
@@ -7075,7 +7077,6 @@ buildvariants:
   - name: gle_auth_basics_passthrough_WT
   - name: gle_auth_basics_passthrough_write_cmd_WT
   - name: gle_auth_write_cmd_WT
-  - name: httpinterface
   - name: integration_tests_replset
   - name: integration_tests_sharded
   - name: integration_tests_standalone
@@ -7352,7 +7353,6 @@ buildvariants:
   - name: gle_auth_basics_passthrough_WT
   - name: gle_auth_basics_passthrough_write_cmd_WT
   - name: gle_auth_write_cmd_WT
-  - name: httpinterface
   - name: integration_tests_replset
   - name: integration_tests_sharded
   - name: integration_tests_standalone
@@ -7562,7 +7562,6 @@ buildvariants:
   - name: disk_WT
   - name: durability
   - name: failpoints
-  - name: httpinterface
   - name: jsCore
   - name: jsCore_compatibility
   - name: jsCore_compatibility_WT
@@ -8128,7 +8127,6 @@ buildvariants:
   - name: gle_auth_write_cmd
   - name: gle_auth_basics_passthrough
   - name: gle_auth_basics_passthrough_write_cmd
-  - name: httpinterface
   - name: integration_tests_standalone
   - name: integration_tests_replset
   - name: integration_tests_sharded
@@ -8479,7 +8477,6 @@ buildvariants:
   - name: gle_auth_basics_passthrough_write_cmd_WT
   - name: gle_auth_write_cmd
   - name: gle_auth_write_cmd_WT
-  - name: httpinterface
   - name: integration_tests_replset
   - name: integration_tests_sharded
   - name: integration_tests_standalone
@@ -8662,7 +8659,6 @@ buildvariants:
   - name: gle_auth_basics_passthrough_write_cmd_WT
   - name: gle_auth_write_cmd
   - name: gle_auth_write_cmd_WT
-  - name: httpinterface
   - name: integration_tests_replset
   - name: integration_tests_sharded
   - name: integration_tests_standalone

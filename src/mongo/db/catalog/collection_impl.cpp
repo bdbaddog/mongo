@@ -55,7 +55,6 @@
 #include "mongo/db/matcher/extensions_callback_disallow_extensions.h"
 #include "mongo/db/op_observer.h"
 #include "mongo/db/operation_context.h"
-#include "mongo/db/ops/update_driver.h"
 #include "mongo/db/ops/update_request.h"
 #include "mongo/db/query/collation/collator_factory_interface.h"
 #include "mongo/db/repl/replication_coordinator_global.h"
@@ -66,6 +65,7 @@
 #include "mongo/db/storage/record_fetcher.h"
 #include "mongo/db/storage/record_store.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_record_store.h"
+#include "mongo/db/update/update_driver.h"
 
 #include "mongo/db/auth/user_document_parser.h"  // XXX-ANDY
 #include "mongo/rpc/object_check.h"
@@ -443,7 +443,8 @@ Status CollectionImpl::insertDocuments(OperationContext* opCtx,
         return status;
     invariant(sid == opCtx->recoveryUnit()->getSnapshotId());
 
-    getGlobalServiceContext()->getOpObserver()->onInserts(opCtx, ns(), begin, end, fromMigrate);
+    getGlobalServiceContext()->getOpObserver()->onInserts(
+        opCtx, ns(), uuid(opCtx), begin, end, fromMigrate);
 
     opCtx->recoveryUnit()->onCommit([this]() { notifyCappedWaitersIfNeeded(); });
 
@@ -506,7 +507,7 @@ Status CollectionImpl::insertDocument(OperationContext* opCtx,
     docs.push_back(doc);
 
     getGlobalServiceContext()->getOpObserver()->onInserts(
-        opCtx, ns(), docs.begin(), docs.end(), false);
+        opCtx, ns(), uuid(opCtx), docs.begin(), docs.end(), false);
 
     opCtx->recoveryUnit()->onCommit([this]() { notifyCappedWaitersIfNeeded(); });
 
@@ -621,7 +622,7 @@ void CollectionImpl::deleteDocument(
     _recordStore->deleteRecord(opCtx, loc);
 
     getGlobalServiceContext()->getOpObserver()->onDelete(
-        opCtx, ns(), std::move(deleteState), fromMigrate);
+        opCtx, ns(), uuid(opCtx), std::move(deleteState), fromMigrate);
 }
 
 Counter64 moveCounter;
@@ -924,7 +925,7 @@ Status CollectionImpl::truncate(OperationContext* opCtx) {
     Status status = _indexCatalog.dropAllIndexes(opCtx, true);
     if (!status.isOK())
         return status;
-    _cursorManager.invalidateAll(false, "collection truncated");
+    _cursorManager.invalidateAll(opCtx, false, "collection truncated");
 
     // 3) truncate record store
     status = _recordStore->truncate(opCtx);
@@ -942,12 +943,12 @@ Status CollectionImpl::truncate(OperationContext* opCtx) {
 }
 
 void CollectionImpl::cappedTruncateAfter(OperationContext* opCtx, RecordId end, bool inclusive) {
-    dassert(opCtx->lockState()->isCollectionLockedForMode(ns().toString(), MODE_IX));
+    dassert(opCtx->lockState()->isCollectionLockedForMode(ns().toString(), MODE_X));
     invariant(isCapped());
     BackgroundOperation::assertNoBgOpInProgForNs(ns());
     invariant(_indexCatalog.numIndexesInProgress(opCtx) == 0);
 
-    _cursorManager.invalidateAll(false, "capped collection truncated");
+    _cursorManager.invalidateAll(opCtx, false, "capped collection truncated");
     _recordStore->cappedTruncateAfter(opCtx, end, inclusive);
 }
 

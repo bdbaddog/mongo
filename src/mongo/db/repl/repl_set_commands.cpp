@@ -54,7 +54,6 @@
 #include "mongo/db/repl/replication_coordinator_external_state_impl.h"
 #include "mongo/db/repl/replication_coordinator_global.h"
 #include "mongo/db/repl/replication_coordinator_global.h"
-#include "mongo/db/repl/replication_executor.h"
 #include "mongo/db/repl/storage_interface.h"
 #include "mongo/db/repl/update_position_args.h"
 #include "mongo/db/service_context.h"
@@ -170,8 +169,13 @@ public:
         if (!status.isOK())
             return appendCommandStatus(result, status);
 
-        status = getGlobalReplicationCoordinator()->processReplSetGetRBID(&result);
-        return appendCommandStatus(result, status);
+        auto rbid = StorageInterface::get(opCtx)->getRollbackID(opCtx);
+
+        // We should always have a Rollback ID since it is created at startup.
+        fassertStatusOK(40426, rbid.getStatus());
+
+        result.append("rbid", rbid.getValue());
+        return appendCommandStatus(result, Status::OK());
     }
 } cmdReplSetRBID;
 
@@ -869,7 +873,7 @@ public:
         status = getGlobalReplicationCoordinator()->stepUpIfEligible();
 
         if (!status.isOK()) {
-            log() << "replSetStepUp request failed " << causedBy(status);
+            log() << "replSetStepUp request failed" << causedBy(status);
         }
 
         return appendCommandStatus(result, status);
@@ -880,6 +884,39 @@ private:
         return ActionSet{ActionType::replSetStateChange};
     }
 } cmdReplSetStepUp;
+
+class CmdReplSetAbortPrimaryCatchUp : public ReplSetCommand {
+public:
+    virtual void help(stringstream& help) const {
+        help << "{ CmdReplSetAbortPrimaryCatchUp : 1 }\n";
+        help << "Abort primary catch-up mode; immediately finish the transition to primary "
+                "without fetching any further unreplicated writes from any other online nodes";
+    }
+
+    CmdReplSetAbortPrimaryCatchUp() : ReplSetCommand("replSetAbortPrimaryCatchUp") {}
+
+    virtual bool run(OperationContext* opCtx,
+                     const string&,
+                     BSONObj& cmdObj,
+                     string& errmsg,
+                     BSONObjBuilder& result) override {
+        Status status = getGlobalReplicationCoordinator()->checkReplEnabledForCommand(&result);
+        if (!status.isOK())
+            return appendCommandStatus(result, status);
+        log() << "Received replSetAbortPrimaryCatchUp request";
+
+        status = getGlobalReplicationCoordinator()->abortCatchupIfNeeded();
+        if (!status.isOK()) {
+            log() << "replSetAbortPrimaryCatchUp request failed" << causedBy(status);
+        }
+        return appendCommandStatus(result, status);
+    }
+
+private:
+    ActionSet getAuthActionSet() const override {
+        return ActionSet{ActionType::replSetStateChange};
+    }
+} cmdReplSetAbortPrimaryCatchUp;
 
 }  // namespace repl
 }  // namespace mongo

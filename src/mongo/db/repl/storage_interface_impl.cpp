@@ -60,13 +60,16 @@
 #include "mongo/db/jsobj.h"
 #include "mongo/db/keypattern.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/db/ops/delete_request.h"
 #include "mongo/db/ops/parsed_update.h"
 #include "mongo/db/ops/update_request.h"
+#include "mongo/db/query/get_executor.h"
 #include "mongo/db/query/internal_plans.h"
 #include "mongo/db/repl/collection_bulk_loader_impl.h"
 #include "mongo/db/repl/oplog.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/repl/replication_coordinator_global.h"
+#include "mongo/db/repl/rollback_gen.h"
 #include "mongo/db/repl/task_runner.h"
 #include "mongo/db/service_context.h"
 #include "mongo/util/assert_util.h"
@@ -81,18 +84,25 @@ const char StorageInterfaceImpl::kDefaultMinValidNamespace[] = "local.replset.mi
 const char StorageInterfaceImpl::kInitialSyncFlagFieldName[] = "doingInitialSync";
 const char StorageInterfaceImpl::kBeginFieldName[] = "begin";
 const char StorageInterfaceImpl::kOplogDeleteFromPointFieldName[] = "oplogDeleteFromPoint";
+const char StorageInterfaceImpl::kDefaultRollbackIdNamespace[] = "local.system.rollback.id";
+const char StorageInterfaceImpl::kRollbackIdFieldName[] = "rollbackId";
+const char StorageInterfaceImpl::kRollbackIdDocumentId[] = "rollbackId";
 
 namespace {
 using UniqueLock = stdx::unique_lock<stdx::mutex>;
 
 const BSONObj kInitialSyncFlag(BSON(StorageInterfaceImpl::kInitialSyncFlagFieldName << true));
+
+const auto kIdIndexName = "_id_"_sd;
+
 }  // namespace
 
 StorageInterfaceImpl::StorageInterfaceImpl()
     : StorageInterfaceImpl(NamespaceString(StorageInterfaceImpl::kDefaultMinValidNamespace)) {}
 
 StorageInterfaceImpl::StorageInterfaceImpl(const NamespaceString& minValidNss)
-    : _minValidNss(minValidNss) {}
+    : _minValidNss(minValidNss),
+      _rollbackIdNss(StorageInterfaceImpl::kDefaultRollbackIdNamespace) {}
 
 NamespaceString StorageInterfaceImpl::getMinValidNss() const {
     return _minValidNss;
@@ -122,6 +132,73 @@ void StorageInterfaceImpl::updateMinValidDocument(OperationContext* opCtx,
     }
     MONGO_WRITE_CONFLICT_RETRY_LOOP_END(
         opCtx, "StorageInterfaceImpl::updateMinValidDocument", _minValidNss.ns());
+}
+
+StatusWith<int> StorageInterfaceImpl::getRollbackID(OperationContext* opCtx) {
+    BSONObjBuilder bob;
+    bob.append("_id", kRollbackIdDocumentId);
+    auto id = bob.obj();
+
+    try {
+        auto rbidDoc = findById(opCtx, _rollbackIdNss, id["_id"]);
+        if (!rbidDoc.isOK()) {
+            return rbidDoc.getStatus();
+        }
+
+        auto rbid = RollbackID::parse(IDLParserErrorContext("RollbackID"), rbidDoc.getValue());
+        invariant(rbid.get_id() == kRollbackIdDocumentId);
+        return rbid.getRollbackId();
+    } catch (...) {
+        return exceptionToStatus();
+    }
+
+    MONGO_UNREACHABLE;
+}
+
+Status StorageInterfaceImpl::initializeRollbackID(OperationContext* opCtx) {
+    auto status = createCollection(opCtx, _rollbackIdNss, CollectionOptions());
+    if (!status.isOK()) {
+        return status;
+    }
+
+    RollbackID rbid;
+    rbid.set_id(kRollbackIdDocumentId);
+    rbid.setRollbackId(0);
+
+    BSONObjBuilder bob;
+    rbid.serialize(&bob);
+    return insertDocument(opCtx, _rollbackIdNss, bob.done());
+}
+
+Status StorageInterfaceImpl::incrementRollbackID(OperationContext* opCtx) {
+    // This is safe because this is only called during rollback, and you can not have two
+    // rollbacks at once.
+    auto rbid = getRollbackID(opCtx);
+    if (!rbid.isOK()) {
+        return rbid.getStatus();
+    }
+
+    // If we would go over the integer limit, reset the Rollback ID to 0.
+    BSONObjBuilder updateBob;
+    if (rbid.getValue() == std::numeric_limits<int>::max()) {
+        BSONObjBuilder setBob(updateBob.subobjStart("$set"));
+        setBob.append(kRollbackIdFieldName, 0);
+    } else {
+        BSONObjBuilder incBob(updateBob.subobjStart("$inc"));
+        incBob.append(kRollbackIdFieldName, 1);
+    }
+
+    // Since the Rollback ID is in a singleton collection, we can fix the _id field.
+    BSONObjBuilder bob;
+    bob.append("_id", kRollbackIdDocumentId);
+    auto id = bob.obj();
+    Status status = upsertById(opCtx, _rollbackIdNss, id["_id"], updateBob.obj());
+
+    // We wait until durable so that we are sure the Rollback ID is updated before rollback ends.
+    if (status.isOK()) {
+        opCtx->recoveryUnit()->waitUntilDurable();
+    }
+    return status;
 }
 
 bool StorageInterfaceImpl::getInitialSyncFlag(OperationContext* opCtx) const {
@@ -467,7 +544,8 @@ DeleteStageParams makeDeleteStageParamsForDeleteDocuments() {
 }
 
 /**
- * Shared implementation between findDocuments and deleteDocuments.
+ * Shared implementation between findDocuments, deleteDocuments, and _findOrDeleteById.
+ * _findOrDeleteById is used by findById, and deleteById.
  */
 enum class FindDeleteMode { kFind, kDelete };
 StatusWith<std::vector<BSONObj>> _findOrDeleteDocuments(
@@ -476,11 +554,12 @@ StatusWith<std::vector<BSONObj>> _findOrDeleteDocuments(
     boost::optional<StringData> indexName,
     StorageInterface::ScanDirection scanDirection,
     const BSONObj& startKey,
+    const BSONObj& endKey,
     BoundInclusion boundInclusion,
     std::size_t limit,
     FindDeleteMode mode) {
     auto isFind = mode == FindDeleteMode::kFind;
-    auto opStr = isFind ? "StorageInterfaceImpl::findOne" : "StorageInterfaceImpl::deleteOne";
+    auto opStr = isFind ? "StorageInterfaceImpl::find" : "StorageInterfaceImpl::delete";
 
     MONGO_WRITE_CONFLICT_RETRY_LOOP_BEGIN {
         auto collectionAccessMode = isFind ? MODE_IS : MODE_IX;
@@ -495,7 +574,7 @@ StatusWith<std::vector<BSONObj>> _findOrDeleteDocuments(
         auto isForward = scanDirection == StorageInterface::ScanDirection::kForward;
         auto direction = isForward ? InternalPlanner::FORWARD : InternalPlanner::BACKWARD;
 
-        std::unique_ptr<PlanExecutor> planExecutor;
+        std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> planExecutor;
         if (!indexName) {
             if (!startKey.isEmpty()) {
                 return {ErrorCodes::NoSuchKey,
@@ -509,12 +588,12 @@ StatusWith<std::vector<BSONObj>> _findOrDeleteDocuments(
             // Use collection scan.
             planExecutor = isFind
                 ? InternalPlanner::collectionScan(
-                      opCtx, nss.ns(), collection, PlanExecutor::YIELD_MANUAL, direction)
+                      opCtx, nss.ns(), collection, PlanExecutor::NO_YIELD, direction)
                 : InternalPlanner::deleteWithCollectionScan(
                       opCtx,
                       collection,
                       makeDeleteStageParamsForDeleteDocuments(),
-                      PlanExecutor::YIELD_MANUAL,
+                      PlanExecutor::NO_YIELD,
                       direction);
         } else {
             // Use index scan.
@@ -544,6 +623,9 @@ StatusWith<std::vector<BSONObj>> _findOrDeleteDocuments(
             if (!startKey.isEmpty()) {
                 bounds.first = startKey;
             }
+            if (!endKey.isEmpty()) {
+                bounds.second = endKey;
+            }
             planExecutor = isFind
                 ? InternalPlanner::indexScan(opCtx,
                                              collection,
@@ -551,7 +633,7 @@ StatusWith<std::vector<BSONObj>> _findOrDeleteDocuments(
                                              bounds.first,
                                              bounds.second,
                                              boundInclusion,
-                                             PlanExecutor::YIELD_MANUAL,
+                                             PlanExecutor::NO_YIELD,
                                              direction,
                                              InternalPlanner::IXSCAN_FETCH)
                 : InternalPlanner::deleteWithIndexScan(opCtx,
@@ -561,7 +643,7 @@ StatusWith<std::vector<BSONObj>> _findOrDeleteDocuments(
                                                        bounds.first,
                                                        bounds.second,
                                                        boundInclusion,
-                                                       PlanExecutor::YIELD_MANUAL,
+                                                       PlanExecutor::NO_YIELD,
                                                        direction);
         }
 
@@ -582,6 +664,31 @@ StatusWith<std::vector<BSONObj>> _findOrDeleteDocuments(
     MONGO_UNREACHABLE;
 }
 
+StatusWith<BSONObj> _findOrDeleteById(OperationContext* opCtx,
+                                      const NamespaceString& nss,
+                                      const BSONElement& idKey,
+                                      FindDeleteMode mode) {
+    auto wrappedIdKey = idKey.wrap("");
+    auto result = _findOrDeleteDocuments(opCtx,
+                                         nss,
+                                         kIdIndexName,
+                                         StorageInterface::ScanDirection::kForward,
+                                         wrappedIdKey,
+                                         wrappedIdKey,
+                                         BoundInclusion::kIncludeBothStartAndEndKeys,
+                                         1U,
+                                         mode);
+    if (!result.isOK()) {
+        return result.getStatus();
+    }
+    const auto& docs = result.getValue();
+    if (docs.empty()) {
+        return {ErrorCodes::NoSuchKey, str::stream() << "No document found with _id: " << idKey};
+    }
+
+    return docs.front();
+}
+
 }  // namespace
 
 StatusWith<std::vector<BSONObj>> StorageInterfaceImpl::findDocuments(
@@ -597,6 +704,7 @@ StatusWith<std::vector<BSONObj>> StorageInterfaceImpl::findDocuments(
                                   indexName,
                                   scanDirection,
                                   startKey,
+                                  {},
                                   boundInclusion,
                                   limit,
                                   FindDeleteMode::kFind);
@@ -615,9 +723,22 @@ StatusWith<std::vector<BSONObj>> StorageInterfaceImpl::deleteDocuments(
                                   indexName,
                                   scanDirection,
                                   startKey,
+                                  {},
                                   boundInclusion,
                                   limit,
                                   FindDeleteMode::kDelete);
+}
+
+StatusWith<BSONObj> StorageInterfaceImpl::findById(OperationContext* opCtx,
+                                                   const NamespaceString& nss,
+                                                   const BSONElement& idKey) {
+    return _findOrDeleteById(opCtx, nss, idKey, FindDeleteMode::kFind);
+}
+
+StatusWith<BSONObj> StorageInterfaceImpl::deleteById(OperationContext* opCtx,
+                                                     const NamespaceString& nss,
+                                                     const BSONElement& idKey) {
+    return _findOrDeleteById(opCtx, nss, idKey, FindDeleteMode::kDelete);
 }
 
 namespace {
@@ -659,7 +780,7 @@ Status StorageInterfaceImpl::upsertById(OperationContext* opCtx,
     request.setUpsert(true);
     invariant(!request.isMulti());  // This follows from using an exact _id query.
     invariant(!request.shouldReturnAnyDocs());
-    invariant(PlanExecutor::YIELD_MANUAL == request.getYieldPolicy());
+    invariant(PlanExecutor::NO_YIELD == request.getYieldPolicy());
 
     MONGO_WRITE_CONFLICT_RETRY_LOOP_BEGIN {
         // ParsedUpdate needs to be inside the write conflict retry loop because it contains
@@ -697,6 +818,53 @@ Status StorageInterfaceImpl::upsertById(OperationContext* opCtx,
         return planExecutor->executePlan();
     }
     MONGO_WRITE_CONFLICT_RETRY_LOOP_END(opCtx, "StorageInterfaceImpl::upsertById", nss.ns());
+
+    MONGO_UNREACHABLE;
+}
+
+Status StorageInterfaceImpl::deleteByFilter(OperationContext* opCtx,
+                                            const NamespaceString& nss,
+                                            const BSONObj& filter) {
+    DeleteRequest request(nss);
+    request.setQuery(filter);
+    request.setMulti(true);
+    request.setYieldPolicy(PlanExecutor::NO_YIELD);
+
+    // This disables the legalClientSystemNS() check in getExecutorDelete() which is used to
+    // disallow client deletes from unrecognized system collections.
+    request.setGod();
+
+    MONGO_WRITE_CONFLICT_RETRY_LOOP_BEGIN {
+        // ParsedDelete needs to be inside the write conflict retry loop because it may create a
+        // CanonicalQuery whose ownership will be transferred to the plan executor in
+        // getExecutorDelete().
+        ParsedDelete parsedDelete(opCtx, &request);
+        auto parsedDeleteStatus = parsedDelete.parseRequest();
+        if (!parsedDeleteStatus.isOK()) {
+            return parsedDeleteStatus;
+        }
+
+        AutoGetCollection autoColl(opCtx, nss, MODE_IX);
+        auto collectionResult = getCollection(
+            autoColl,
+            nss,
+            str::stream() << "Unable to delete documents in " << nss.ns() << " using filter "
+                          << filter);
+        if (!collectionResult.isOK()) {
+            return collectionResult.getStatus();
+        }
+        auto collection = collectionResult.getValue();
+
+        auto planExecutorResult =
+            mongo::getExecutorDelete(opCtx, nullptr, collection, &parsedDelete);
+        if (!planExecutorResult.isOK()) {
+            return planExecutorResult.getStatus();
+        }
+        auto planExecutor = std::move(planExecutorResult.getValue());
+
+        return planExecutor->executePlan();
+    }
+    MONGO_WRITE_CONFLICT_RETRY_LOOP_END(opCtx, "StorageInterfaceImpl::deleteByFilter", nss.ns());
 
     MONGO_UNREACHABLE;
 }

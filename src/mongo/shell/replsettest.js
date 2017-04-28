@@ -681,7 +681,8 @@ var ReplSetTest = function(opts) {
             return config;
         }
 
-        if (_isRunningWithoutJournaling(replNode)) {
+        // Check journaling by sending commands through the bridge if it's used.
+        if (_isRunningWithoutJournaling(this.nodes[0])) {
             config[wcMajorityJournalField] = false;
         }
 
@@ -873,19 +874,15 @@ var ReplSetTest = function(opts) {
     };
 
     this.reInitiate = function() {
-        var config = this.getReplSetConfig();
-        var newVersion = this.getReplSetConfigFromNode().version + 1;
-        config.version = newVersion;
+        var config = this.getReplSetConfigFromNode();
+        var newConfig = this.getReplSetConfig();
+        // Only reset members.
+        config.members = newConfig.members;
+        config.version += 1;
 
         this._setDefaultConfigOptions(config);
 
-        try {
-            assert.commandWorked(this.getPrimary().adminCommand({replSetReconfig: config}));
-        } catch (e) {
-            if (!isNetworkError(e)) {
-                throw e;
-            }
-        }
+        assert.adminCommandWorkedAllowingNetworkError(this.getPrimary(), {replSetReconfig: config});
     };
 
     /**
@@ -1448,8 +1445,10 @@ var ReplSetTest = function(opts) {
             this.query = function(ts) {
                 var coll = this.getOplogColl();
                 var query = {ts: {$gte: ts ? ts : new Timestamp()}};
-                // Set the cursor to read backwards, from last to first.
-                this.cursor = coll.find(query).sort({$natural: -1});
+                // Set the cursor to read backwards, from last to first. We also set the cursor not
+                // to time out since it may take a while to process each batch and a test may have
+                // changed "cursorTimeoutMillis" to a short time period.
+                this.cursor = coll.find(query).sort({$natural: -1}).noCursorTimeout();
             };
 
             this.getFirstDoc = function() {

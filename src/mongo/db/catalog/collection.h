@@ -199,6 +199,7 @@ public:
         virtual const CollectionInfoCache* infoCache() const = 0;
 
         virtual const NamespaceString& ns() const = 0;
+        virtual OptionalCollectionUUID uuid(OperationContext* opCtx) const = 0;
 
         virtual const IndexCatalog* getIndexCatalog() const = 0;
         virtual IndexCatalog* getIndexCatalog() = 0;
@@ -318,30 +319,6 @@ public:
     };
 
 private:
-    std::unique_ptr<Impl> _pimpl;
-
-    // This structure exists to give us a customization point to decide how to force users of this
-    // class to depend upon the corresponding `index_catalog_entry.cpp` Translation Unit (TU).  All
-    // public forwarding functions call `_impl(), and `_impl` creates an instance of this structure.
-    struct TUHook {
-        static void hook() noexcept;
-
-        explicit inline TUHook() noexcept {
-            if (kDebugBuild)
-                this->hook();
-        }
-    };
-
-    inline const Impl& _impl() const {
-        TUHook{};
-        return *this->_pimpl;
-    }
-
-    inline Impl& _impl() {
-        TUHook{};
-        return *this->_pimpl;
-    }
-
     static std::unique_ptr<Impl> makeImpl(Collection* _this,
                                           OperationContext* opCtx,
                                           StringData fullNS,
@@ -362,6 +339,9 @@ public:
         : _pimpl(makeImpl(this, opCtx, fullNS, details, recordStore, dbce)) {
         this->_impl().init(opCtx);
     }
+
+    // Use this constructor only for testing/mocks
+    explicit inline Collection(std::unique_ptr<Impl> mock) : _pimpl(std::move(mock)) {}
 
     inline ~Collection() = default;
 
@@ -387,6 +367,10 @@ public:
 
     inline const NamespaceString& ns() const {
         return this->_impl().ns();
+    }
+
+    inline OptionalCollectionUUID uuid(OperationContext* opCtx) const {
+        return this->_impl().uuid(opCtx);
     }
 
     inline const IndexCatalog* getIndexCatalog() const {
@@ -734,7 +718,31 @@ private:
         return this->_impl().recordStoreGoingToUpdateInPlace(opCtx, loc);
     }
 
+    // This structure exists to give us a customization point to decide how to force users of this
+    // class to depend upon the corresponding `collection.cpp` Translation Unit (TU).  All public
+    // forwarding functions call `_impl(), and `_impl` creates an instance of this structure.
+    struct TUHook {
+        static void hook() noexcept;
+
+        explicit inline TUHook() noexcept {
+            if (kDebugBuild)
+                this->hook();
+        }
+    };
+
+    inline const Impl& _impl() const {
+        TUHook{};
+        return *this->_pimpl;
+    }
+
+    inline Impl& _impl() {
+        TUHook{};
+        return *this->_pimpl;
+    }
+
+    std::unique_ptr<Impl> _pimpl;
+
     friend class DatabaseImpl;
-    friend class IndexCatalog;
+    friend class IndexCatalogImpl;
 };
 }  // namespace mongo

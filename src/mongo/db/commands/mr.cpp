@@ -58,7 +58,6 @@
 #include "mongo/db/query/get_executor.h"
 #include "mongo/db/query/plan_summary_stats.h"
 #include "mongo/db/query/query_planner.h"
-#include "mongo/db/range_preserver.h"
 #include "mongo/db/repl/replication_coordinator_global.h"
 #include "mongo/db/s/collection_metadata.h"
 #include "mongo/db/s/collection_sharding_state.h"
@@ -426,6 +425,9 @@ void State::prepTempCollection() {
             CollectionOptions options;
             options.setNoIdIndex();
             options.temp = true;
+            if (enableCollectionUUIDs) {
+                options.uuid.emplace(UUID::gen());
+            }
             incColl = incCtx.db()->createCollection(_opCtx, _config.incLong.ns(), options);
             invariant(incColl);
 
@@ -497,6 +499,9 @@ void State::prepTempCollection() {
 
         CollectionOptions options = finalOptions;
         options.temp = true;
+        if (enableCollectionUUIDs) {
+            options.uuid.emplace(UUID::gen());
+        }
         tempColl = tempCtx.db()->createCollection(_opCtx, _config.tempNamespace.ns(), options);
 
         for (vector<BSONObj>::iterator it = indexesToInsert.begin(); it != indexesToInsert.end();
@@ -510,8 +515,9 @@ void State::prepTempCollection() {
                 uassertStatusOK(status);
             }
             // Log the createIndex operation.
-            NamespaceString logNs{_config.tempNamespace.db(), "system.indexes"};
-            getGlobalServiceContext()->getOpObserver()->onCreateIndex(_opCtx, logNs, *it, false);
+            auto uuid = tempColl->uuid(_opCtx);
+            getGlobalServiceContext()->getOpObserver()->onCreateIndex(
+                _opCtx, _config.tempNamespace, uuid, *it, false);
         }
         wuow.commit();
     }
@@ -1114,7 +1120,15 @@ void State::finalReduce(OperationContext* opCtx, CurOp* curOp, ProgressMeterHold
         _opCtx, coll, std::move(cq), PlanExecutor::YIELD_AUTO, QueryPlannerParams::NO_TABLE_SCAN);
     verify(statusWithPlanExecutor.isOK());
 
-    unique_ptr<PlanExecutor> exec = std::move(statusWithPlanExecutor.getValue());
+    auto exec = std::move(statusWithPlanExecutor.getValue());
+
+    // Make sure the PlanExecutor is destroyed while holding a collection lock.
+    ON_BLOCK_EXIT([&exec, &ctx, opCtx, this] {
+        if (!ctx) {
+            AutoGetCollection autoColl(opCtx, _config.incLong, MODE_IS);
+            exec.reset();
+        }
+    });
 
     // iterate over all sorted objects
     BSONObj o;
@@ -1397,34 +1411,16 @@ public:
         uassert(16149, "cannot run map reduce without the js engine", getGlobalScriptEngine());
 
         // Prevent sharding state from changing during the MR.
-        unique_ptr<RangePreserver> rangePreserver;
         ScopedCollectionMetadata collMetadata;
         {
-            AutoGetCollectionForReadCommand ctx(opCtx, config.nss);
-
-            Collection* collection = ctx.getCollection();
+            // Get metadata before we check our version, to make sure it doesn't increment in the
+            // meantime.
+            AutoGetCollectionForReadCommand autoColl(opCtx, config.nss);
+            auto collection = autoColl.getCollection();
             if (collection) {
-                rangePreserver.reset(new RangePreserver(collection));
-            }
-
-            // Get metadata before we check our version, to make sure it doesn't increment
-            // in the meantime.  Need to do this in the same lock scope as the block.
-            if (ShardingState::get(opCtx)->needCollectionMetadata(opCtx, config.nss.ns())) {
                 collMetadata = CollectionShardingState::get(opCtx, config.nss)->getMetadata();
             }
         }
-
-        // Ensure that the RangePreserver is freed under the lock. This is necessary since the
-        // RangePreserver's destructor unpins a ClientCursor, and access to the CursorManager must
-        // be done under the lock.
-        ON_BLOCK_EXIT([opCtx, &config, &rangePreserver] {
-            if (rangePreserver) {
-                // Be sure not to use AutoGetCollectionForReadCommand here, since that has
-                // side-effects other than lock acquisition.
-                AutoGetCollection ctx(opCtx, config.nss, MODE_IS);
-                rangePreserver.reset();
-            }
-        });
 
         bool shouldHaveData = false;
 
@@ -1502,7 +1498,7 @@ public:
                 }
                 std::unique_ptr<CanonicalQuery> cq = std::move(statusWithCQ.getValue());
 
-                unique_ptr<PlanExecutor> exec;
+                unique_ptr<PlanExecutor, PlanExecutor::Deleter> exec;
                 {
                     Database* db = scopedAutoDb->getDb();
                     Collection* coll = State::getCollectionOrUassert(opCtx, db, config.nss);

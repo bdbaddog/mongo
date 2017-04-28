@@ -185,10 +185,6 @@ public:
                                           const BSONObj& configObj,
                                           BSONObjBuilder* resultObj);
 
-    virtual Status processReplSetGetRBID(BSONObjBuilder* resultObj);
-
-    virtual void incrementRollbackID();
-
     virtual Status processReplSetFresh(const ReplSetFreshArgs& args, BSONObjBuilder* resultObj);
 
     virtual Status processReplSetElect(const ReplSetElectArgs& args, BSONObjBuilder* resultObj);
@@ -226,7 +222,8 @@ public:
                                               const ReplSetRequestVotesArgs& args,
                                               ReplSetRequestVotesResponse* response);
 
-    void prepareReplMetadata(const BSONObj& metadataRequestObj,
+    void prepareReplMetadata(OperationContext* opCtx,
+                             const BSONObj& metadataRequestObj,
                              const OpTime& lastOpTimeFromClient,
                              BSONObjBuilder* builder) const override;
 
@@ -283,6 +280,8 @@ public:
     virtual ServiceContext* getServiceContext() override {
         return _service;
     }
+
+    virtual Status abortCatchupIfNeeded() override;
 
 private:
     AtomicUInt64 _snapshotNameGenerator;

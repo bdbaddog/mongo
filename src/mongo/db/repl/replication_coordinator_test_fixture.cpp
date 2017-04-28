@@ -42,7 +42,6 @@
 #include "mongo/db/repl/replication_coordinator_impl.h"
 #include "mongo/db/repl/storage_interface_mock.h"
 #include "mongo/db/repl/topology_coordinator_impl.h"
-#include "mongo/db/time_proof_service.h"
 #include "mongo/executor/network_interface_mock.h"
 #include "mongo/stdx/functional.h"
 #include "mongo/stdx/memory.h"
@@ -124,8 +123,7 @@ void ReplCoordTest::init() {
     // PRNG seed for tests.
     const int64_t seed = 0;
 
-    auto timeProofService = stdx::make_unique<TimeProofService>();
-    auto logicalClock = stdx::make_unique<LogicalClock>(service, std::move(timeProofService));
+    auto logicalClock = stdx::make_unique<LogicalClock>(service);
     LogicalClock::set(service, std::move(logicalClock));
 
     TopologyCoordinatorImpl::Options settings;
@@ -197,16 +195,17 @@ void ReplCoordTest::assertStartSuccess(const BSONObj& configDoc, const HostAndPo
     ASSERT_NE(MemberState::RS_STARTUP, getReplCoord()->getMemberState().s);
 }
 
-ResponseStatus ReplCoordTest::makeResponseStatus(const BSONObj& doc, Milliseconds millis) {
+executor::RemoteCommandResponse ReplCoordTest::makeResponseStatus(const BSONObj& doc,
+                                                                  Milliseconds millis) {
     return makeResponseStatus(doc, BSONObj(), millis);
 }
 
-ResponseStatus ReplCoordTest::makeResponseStatus(const BSONObj& doc,
-                                                 const BSONObj& metadata,
-                                                 Milliseconds millis) {
+executor::RemoteCommandResponse ReplCoordTest::makeResponseStatus(const BSONObj& doc,
+                                                                  const BSONObj& metadata,
+                                                                  Milliseconds millis) {
     log() << "Responding with " << doc << " (metadata: " << metadata << "; elapsed: " << millis
           << ")";
-    return ResponseStatus(RemoteCommandResponse(doc, metadata, millis));
+    return RemoteCommandResponse(doc, metadata, millis);
 }
 
 void ReplCoordTest::simulateEnoughHeartbeatsForAllNodesUp() {
@@ -324,6 +323,10 @@ void ReplCoordTest::simulateSuccessfulV1ElectionAt(Date_t electionTime) {
             ReplSetHeartbeatResponse hbResp;
             hbResp.setSetName(rsConfig.getReplSetName());
             hbResp.setState(MemberState::RS_SECONDARY);
+            // The smallest valid optime in PV1.
+            OpTime opTime(Timestamp(), 0);
+            hbResp.setAppliedOpTime(opTime);
+            hbResp.setDurableOpTime(opTime);
             hbResp.setConfigVersion(rsConfig.getConfigVersion());
             net->scheduleResponse(noi, net->now(), makeResponseStatus(hbResp.toBSON(true)));
         } else if (request.cmdObj.firstElement().fieldNameStringData() == "replSetRequestVotes") {
@@ -335,10 +338,6 @@ void ReplCoordTest::simulateSuccessfulV1ElectionAt(Date_t electionTime) {
                                                                << request.cmdObj["term"].Long()
                                                                << "voteGranted"
                                                                << true)));
-        } else if (request.cmdObj.firstElement().fieldNameStringData() == "replSetGetStatus") {
-            // OpTime part of replSetGetStatus for use by FreshnessScanner during catch-up period.
-            BSONObj response = BSON("optimes" << BSON("appliedOpTime" << OpTime().toBSON()));
-            net->scheduleResponse(noi, net->now(), makeResponseStatus(response));
         } else {
             error() << "Black holing unexpected request to " << request.target << ": "
                     << request.cmdObj;
@@ -489,32 +488,30 @@ void ReplCoordTest::disableSnapshots() {
     _externalState->setAreSnapshotsEnabled(false);
 }
 
-void ReplCoordTest::simulateCatchUpTimeout() {
+void ReplCoordTest::simulateCatchUpAbort() {
     NetworkInterfaceMock* net = getNet();
-    auto catchUpTimeoutWhen = net->now() + getReplCoord()->getConfig().getCatchUpTimeoutPeriod();
+    auto heartbeatTimeoutWhen =
+        net->now() + getReplCoord()->getConfig().getHeartbeatTimeoutPeriodMillis();
     bool hasRequest = false;
     net->enterNetwork();
-    if (net->now() < catchUpTimeoutWhen) {
-        net->runUntil(catchUpTimeoutWhen);
+    if (net->now() < heartbeatTimeoutWhen) {
+        net->runUntil(heartbeatTimeoutWhen);
     }
     hasRequest = net->hasReadyRequests();
-    net->exitNetwork();
-
     while (hasRequest) {
-        net->enterNetwork();
         auto noi = net->getNextReadyRequest();
         auto request = noi->getRequest();
         // Black hole heartbeat requests caused by time advance.
         log() << "Black holing request to " << request.target.toString() << " : " << request.cmdObj;
         net->blackHole(noi);
-        if (net->now() < catchUpTimeoutWhen) {
-            net->runUntil(catchUpTimeoutWhen);
+        if (net->now() < heartbeatTimeoutWhen) {
+            net->runUntil(heartbeatTimeoutWhen);
         } else {
             net->runReadyNetworkOperations();
         }
         hasRequest = net->hasReadyRequests();
-        net->exitNetwork();
     }
+    net->exitNetwork();
 }
 
 }  // namespace repl

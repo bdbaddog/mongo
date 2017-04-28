@@ -102,7 +102,8 @@ Status emptyCapped(OperationContext* opCtx, const NamespaceString& collectionNam
         return status;
     }
 
-    getGlobalServiceContext()->getOpObserver()->onEmptyCapped(opCtx, collection->ns());
+    getGlobalServiceContext()->getOpObserver()->onEmptyCapped(
+        opCtx, collection->ns(), collection->uuid(opCtx));
 
     wuow.commit();
 
@@ -164,10 +165,11 @@ Status cloneCollectionAsCapped(OperationContext* opCtx,
 
     long long excessSize = fromCollection->dataSize(opCtx) - allocatedSpaceGuess;
 
-    std::unique_ptr<PlanExecutor> exec(InternalPlanner::collectionScan(
-        opCtx, fromNss.ns(), fromCollection, PlanExecutor::YIELD_MANUAL, InternalPlanner::FORWARD));
-
-    exec->setYieldPolicy(PlanExecutor::WRITE_CONFLICT_RETRY_ONLY, fromCollection);
+    auto exec = InternalPlanner::collectionScan(opCtx,
+                                                fromNss.ns(),
+                                                fromCollection,
+                                                PlanExecutor::WRITE_CONFLICT_RETRY_ONLY,
+                                                InternalPlanner::FORWARD);
 
     Snapshotted<BSONObj> objToClone;
     RecordId loc;
@@ -270,7 +272,6 @@ Status convertToCapped(OperationContext* opCtx,
             return status;
     }
 
-
     {
         repl::UnreplicatedWritesBlock uwb(opCtx);
         Status status =
@@ -279,9 +280,9 @@ Status convertToCapped(OperationContext* opCtx,
         if (!status.isOK()) {
             return status;
         }
-
-        verify(db->getCollection(opCtx, longTmpName));
     }
+
+    OptionalCollectionUUID uuid = db->getCollection(opCtx, longTmpName)->uuid(opCtx);
 
     {
         WriteUnitOfWork wunit(opCtx);
@@ -297,7 +298,7 @@ Status convertToCapped(OperationContext* opCtx,
             return status;
 
         getGlobalServiceContext()->getOpObserver()->onConvertToCapped(
-            opCtx, NamespaceString(collectionName), size);
+            opCtx, collectionName, uuid, size);
 
         wunit.commit();
     }

@@ -66,6 +66,7 @@
 #include "mongo/util/assert_util.h"
 #include "mongo/util/log.h"
 #include "mongo/util/namespace_uuid_cache.h"
+#include "mongo/util/uuid_catalog.h"
 
 namespace mongo {
 namespace {
@@ -151,7 +152,7 @@ DatabaseImpl::~DatabaseImpl() {
         delete i->second;
 }
 
-void DatabaseImpl::close(OperationContext* opCtx) {
+void DatabaseImpl::close(OperationContext* opCtx, const std::string& reason) {
     // XXX? - Do we need to close database under global lock or just DB-lock is sufficient ?
     invariant(opCtx->lockState()->isW());
 
@@ -160,6 +161,11 @@ void DatabaseImpl::close(OperationContext* opCtx) {
 
     if (BackgroundOperation::inProgForDb(_name)) {
         log() << "warning: bg op in prog during close db? " << _name;
+    }
+
+    for (auto&& pair : _collections) {
+        auto* coll = pair.second;
+        coll->getCursorManager()->invalidateAll(opCtx, true, reason);
     }
 }
 
@@ -417,6 +423,7 @@ Status DatabaseImpl::dropCollectionEvenIfSystem(OperationContext* opCtx,
 
     audit::logDropCollection(&cc(), fullns.toString());
 
+    collection->getCursorManager()->invalidateAll(opCtx, true, "collection dropped");
     Status s = collection->getIndexCatalog()->dropAllIndexes(opCtx, true);
 
     if (!s.isOK()) {
@@ -432,6 +439,7 @@ Status DatabaseImpl::dropCollectionEvenIfSystem(OperationContext* opCtx,
 
     // We want to destroy the Collection object before telling the StorageEngine to destroy the
     // RecordStore.
+    auto uuid = collection->uuid(opCtx);
     _clearCollectionCache(opCtx, fullns.toString(), "collection dropped");
 
     s = _dbEntry->dropCollection(opCtx, fullns.toString());
@@ -453,13 +461,8 @@ Status DatabaseImpl::dropCollectionEvenIfSystem(OperationContext* opCtx,
         }
     }
 
-    getGlobalServiceContext()->getOpObserver()->onDropCollection(opCtx, fullns);
+    getGlobalServiceContext()->getOpObserver()->onDropCollection(opCtx, fullns, uuid);
 
-    // Evict namespace entry from the namespace/uuid cache.
-    if (enableCollectionUUIDs) {
-        NamespaceUUIDCache& cache = NamespaceUUIDCache::get(opCtx);
-        cache.evictNamespace(fullns);
-    }
     return Status::OK();
 }
 
@@ -475,7 +478,7 @@ void DatabaseImpl::_clearCollectionCache(OperationContext* opCtx,
     // Takes ownership of the collection
     opCtx->recoveryUnit()->registerChange(new RemoveCollectionChange(this, it->second));
 
-    it->second->getCursorManager()->invalidateAll(false, reason);
+    it->second->getCursorManager()->invalidateAll(opCtx, false, reason);
     _collections.erase(it);
 }
 
@@ -541,11 +544,6 @@ Status DatabaseImpl::renameCollection(OperationContext* opCtx,
     Status s = _dbEntry->renameCollection(opCtx, fromNS, toNS, stayTemp);
     _collections[toNS] = _getOrCreateCollectionInstance(opCtx, toNSS);
 
-    // Evict namespace entry from the namespace/uuid cache.
-    if (enableCollectionUUIDs) {
-        NamespaceUUIDCache& cache = NamespaceUUIDCache::get(opCtx);
-        cache.evictNamespace(fromNSS);
-    }
     return s;
 }
 
@@ -641,7 +639,7 @@ Collection* DatabaseImpl::createCollection(OperationContext* opCtx,
     }
 
     getGlobalServiceContext()->getOpObserver()->onCreateCollection(
-        opCtx, nss, options, fullIdIndexSpec);
+        opCtx, collection, nss, options, fullIdIndexSpec);
 
     return collection;
 }
@@ -667,7 +665,7 @@ void DatabaseImpl::dropDatabase(OperationContext* opCtx, Database* db) {
         Top::get(opCtx->getClient()->getServiceContext()).collectionDropped(coll->ns().ns(), true);
     }
 
-    dbHolder().close(opCtx, name);
+    dbHolder().close(opCtx, name, "database dropped");
     db = NULL;  // d is now deleted
 
     MONGO_WRITE_CONFLICT_RETRY_LOOP_BEGIN {

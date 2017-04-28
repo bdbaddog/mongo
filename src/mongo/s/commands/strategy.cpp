@@ -60,6 +60,7 @@
 #include "mongo/s/client/parallel.h"
 #include "mongo/s/client/shard_connection.h"
 #include "mongo/s/client/shard_registry.h"
+#include "mongo/s/commands/cluster_commands_common.h"
 #include "mongo/s/commands/cluster_explain.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/query/cluster_cursor_manager.h"
@@ -194,7 +195,7 @@ MONGO_INITIALIZER(InitializeRegisterErrorHandler)(InitializerContext* const) {
 
 }  // namespace
 
-void Strategy::queryOp(OperationContext* opCtx, const NamespaceString& nss, DbMessage* dbm) {
+DbResponse Strategy::queryOp(OperationContext* opCtx, const NamespaceString& nss, DbMessage* dbm) {
     globalOpCounters.gotQuery();
 
     const QueryMessage q(*dbm);
@@ -253,15 +254,7 @@ void Strategy::queryOp(OperationContext* opCtx, const NamespaceString& nss, DbMe
             opCtx, findCommand, queryRequest, verbosity, metadata, &explainBuilder));
 
         BSONObj explainObj = explainBuilder.done();
-        replyToQuery(0,  // query result flags
-                     client->session(),
-                     dbm->msg(),
-                     static_cast<const void*>(explainObj.objdata()),
-                     explainObj.objsize(),
-                     1,  // numResults
-                     0,  // startingFrom
-                     CursorId(0));
-        return;
+        return replyToQuery(explainObj);
     }
 
     // Do the work to generate the first batch of results. This blocks waiting to get responses from
@@ -292,20 +285,16 @@ void Strategy::queryOp(OperationContext* opCtx, const NamespaceString& nss, DbMe
         numResults++;
     }
 
-    reply.send(client->session(),
-               0,  // query result flags
-               dbm->msg(),
-               numResults,
-               0,  // startingFrom
-               cursorId.getValue());
+    return DbResponse{reply.toQueryReply(0,  // query result flags
+                                         numResults,
+                                         0,  // startingFrom
+                                         cursorId.getValue())};
 }
 
-void Strategy::clientCommandOp(OperationContext* opCtx,
-                               const NamespaceString& nss,
-                               DbMessage* dbm) {
+DbResponse Strategy::clientCommandOp(OperationContext* opCtx,
+                                     const NamespaceString& nss,
+                                     DbMessage* dbm) {
     const QueryMessage q(*dbm);
-
-    Client* const client = opCtx->getClient();
 
     LOG(3) << "command: " << q.ns << " " << redact(q.query) << " ntoreturn: " << q.ntoreturn
            << " options: " << q.queryOptions;
@@ -335,22 +324,17 @@ void Strategy::clientCommandOp(OperationContext* opCtx,
             const NamespaceString interposedNss("admin", "$cmd");
             BSONObjBuilder reply;
             runAgainstRegistered(opCtx, interposedNss, interposedCmd, reply, q.queryOptions);
-            replyToQuery(0, client->session(), dbm->msg(), reply.done());
+            return replyToQuery(reply.done());
         };
 
         if (nss.coll() == "$cmd.sys.inprog") {
-            upgradeToRealCommand("currentOp");
-            return;
+            return upgradeToRealCommand("currentOp");
         } else if (nss.coll() == "$cmd.sys.killop") {
-            upgradeToRealCommand("killOp");
-            return;
+            return upgradeToRealCommand("killOp");
         } else if (nss.coll() == "$cmd.sys.unlock") {
-            replyToQuery(0,
-                         client->session(),
-                         dbm->msg(),
-                         BSON("err"
-                              << "can't do unlock through mongos"));
-            return;
+            return replyToQuery(BSON("$err"
+                                     << "can't do unlock through mongos"),
+                                ResultFlag_ErrSet);
         }
 
         // No pseudo-command found, fall through to execute as a regular query
@@ -417,8 +401,7 @@ void Strategy::clientCommandOp(OperationContext* opCtx,
                 BSONObjBuilder builder(reply.bufBuilderForResults());
                 runAgainstRegistered(opCtx, NamespaceString(q.ns), cmdObj, builder, q.queryOptions);
             }
-            reply.sendCommandReply(client->session(), dbm->msg());
-            return;
+            return DbResponse{reply.toCommandReply()};
         } catch (const StaleConfigException& e) {
             if (loops <= 0)
                 throw e;
@@ -432,9 +415,9 @@ void Strategy::clientCommandOp(OperationContext* opCtx,
 
             ShardConnection::checkMyConnectionVersions(opCtx, staleNS);
             if (loops < 4) {
-                const NamespaceString nss(staleNS);
-                if (nss.isValid()) {
-                    Grid::get(opCtx)->catalogCache()->invalidateShardedCollection(nss);
+                const NamespaceString staleNSS(staleNS);
+                if (staleNSS.isValid()) {
+                    Grid::get(opCtx)->catalogCache()->invalidateShardedCollection(staleNSS);
                 }
             }
         } catch (const DBException& e) {
@@ -443,8 +426,7 @@ void Strategy::clientCommandOp(OperationContext* opCtx,
                 BSONObjBuilder builder(reply.bufBuilderForResults());
                 Command::appendCommandStatus(builder, e.toStatus());
             }
-            reply.sendCommandReply(client->session(), dbm->msg());
-            return;
+            return DbResponse{reply.toCommandReply()};
         }
     }
 }
@@ -478,7 +460,7 @@ void Strategy::commandOp(OperationContext* opCtx,
     }
 }
 
-void Strategy::getMore(OperationContext* opCtx, const NamespaceString& nss, DbMessage* dbm) {
+DbResponse Strategy::getMore(OperationContext* opCtx, const NamespaceString& nss, DbMessage* dbm) {
     const int ntoreturn = dbm->pullInt();
     uassert(
         34424, str::stream() << "Invalid ntoreturn for OP_GET_MORE: " << ntoreturn, ntoreturn >= 0);
@@ -486,15 +468,12 @@ void Strategy::getMore(OperationContext* opCtx, const NamespaceString& nss, DbMe
 
     globalOpCounters.gotGetMore();
 
-    Client* const client = opCtx->getClient();
-
     // TODO: Handle stale config exceptions here from coll being dropped or sharded during op for
     // now has same semantics as legacy request.
 
     auto statusGetDb = Grid::get(opCtx)->catalogCache()->getDatabase(opCtx, nss.db());
     if (statusGetDb == ErrorCodes::NamespaceNotFound) {
-        replyToQuery(ResultFlag_CursorNotFound, client->session(), dbm->msg(), 0, 0, 0);
-        return;
+        return replyToQuery(ResultFlag_CursorNotFound, nullptr, 0, 0);
     }
     uassertStatusOK(statusGetDb);
 
@@ -507,8 +486,7 @@ void Strategy::getMore(OperationContext* opCtx, const NamespaceString& nss, DbMe
 
     auto cursorResponse = ClusterFind::runGetMore(opCtx, getMoreRequest);
     if (cursorResponse == ErrorCodes::CursorNotFound) {
-        replyToQuery(ResultFlag_CursorNotFound, client->session(), dbm->msg(), 0, 0, 0);
-        return;
+        return replyToQuery(ResultFlag_CursorNotFound, nullptr, 0, 0);
     }
     uassertStatusOK(cursorResponse.getStatus());
 
@@ -521,14 +499,12 @@ void Strategy::getMore(OperationContext* opCtx, const NamespaceString& nss, DbMe
         ++numResults;
     }
 
-    replyToQuery(0,
-                 client->session(),
-                 dbm->msg(),
-                 buffer.buf(),
-                 buffer.len(),
-                 numResults,
-                 cursorResponse.getValue().getNumReturnedSoFar().value_or(0),
-                 cursorResponse.getValue().getCursorId());
+    return replyToQuery(0,
+                        buffer.buf(),
+                        buffer.len(),
+                        numResults,
+                        cursorResponse.getValue().getNumReturnedSoFar().value_or(0),
+                        cursorResponse.getValue().getCursorId());
 }
 
 void Strategy::killCursors(OperationContext* opCtx, DbMessage* dbm) {
@@ -636,37 +612,47 @@ Status Strategy::explainFind(OperationContext* opCtx,
                              const BSONObj& findCommand,
                              const QueryRequest& qr,
                              ExplainOptions::Verbosity verbosity,
-                             const rpc::ServerSelectionMetadata& serverSelectionMetadata,
+                             const rpc::ServerSelectionMetadata& ssm,
                              BSONObjBuilder* out) {
     BSONObjBuilder explainCmdBob;
-    int options = 0;
-    ClusterExplain::wrapAsExplain(
-        findCommand, verbosity, serverSelectionMetadata, &explainCmdBob, &options);
+    ClusterExplain::wrapAsExplain(findCommand, verbosity, &explainCmdBob);
 
     // We will time how long it takes to run the commands on the shards.
     Timer timer;
 
-    std::vector<Strategy::CommandResult> shardResults;
-    Strategy::commandOp(opCtx,
-                        qr.nss().db().toString(),
-                        explainCmdBob.obj(),
-                        qr.nss().toString(),
-                        qr.getFilter(),
-                        qr.getCollation(),
-                        &shardResults);
+    BSONObj viewDefinition;
+    auto swShardResponses = scatterGatherForNamespace(opCtx,
+                                                      qr.nss(),
+                                                      explainCmdBob.obj(),
+                                                      getReadPref(ssm),
+                                                      qr.getFilter(),
+                                                      qr.getCollation(),
+                                                      true,  // do shard versioning
+                                                      &viewDefinition);
 
     long long millisElapsed = timer.millis();
 
-    if (shardResults.size() == 1 &&
-        ResolvedView::isResolvedViewErrorResponse(shardResults[0].result)) {
-        out->append("resolvedView", shardResults[0].result.getObjectField("resolvedView"));
-        return getStatusFromCommandResult(shardResults[0].result);
+    if (ErrorCodes::CommandOnShardedViewNotSupportedOnMongod == swShardResponses.getStatus()) {
+        uassert(ErrorCodes::InternalError,
+                str::stream() << "Missing resolved view definition, but remote returned "
+                              << ErrorCodes::errorString(swShardResponses.getStatus().code()),
+                !viewDefinition.isEmpty());
+
+        out->appendElements(viewDefinition);
+        return swShardResponses.getStatus();
     }
 
-    const char* mongosStageName = ClusterExplain::getStageNameForReadOp(shardResults, findCommand);
+    uassertStatusOK(swShardResponses.getStatus());
+    auto shardResponses = std::move(swShardResponses.getValue());
 
-    return ClusterExplain::buildExplainResult(
-        opCtx, shardResults, mongosStageName, millisElapsed, out);
+    const char* mongosStageName =
+        ClusterExplain::getStageNameForReadOp(shardResponses.size(), findCommand);
+
+    return ClusterExplain::buildExplainResult(opCtx,
+                                              ClusterExplain::downconvert(opCtx, shardResponses),
+                                              mongosStageName,
+                                              millisElapsed,
+                                              out);
 }
 
 /**

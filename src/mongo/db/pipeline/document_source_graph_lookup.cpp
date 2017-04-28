@@ -164,11 +164,10 @@ DocumentSource::GetNextResult DocumentSourceGraphLookUp::getNextUnwound() {
     }
 }
 
-void DocumentSourceGraphLookUp::dispose() {
+void DocumentSourceGraphLookUp::doDispose() {
     _cache.clear();
     _frontier.clear();
     _visited.clear();
-    pSource->dispose();
 }
 
 void DocumentSourceGraphLookUp::doBreadthFirstSearch() {
@@ -352,7 +351,7 @@ DocumentSource::GetModPathsReturn DocumentSourceGraphLookUp::getModifiedPaths() 
         modifiedPaths.insert(pathsModifiedByUnwind.paths.begin(),
                              pathsModifiedByUnwind.paths.end());
     }
-    return {GetModPathsReturn::Type::kFiniteSet, std::move(modifiedPaths)};
+    return {GetModPathsReturn::Type::kFiniteSet, std::move(modifiedPaths), {}};
 }
 
 Pipeline::SourceContainer::iterator DocumentSourceGraphLookUp::doOptimizeAt(

@@ -41,12 +41,9 @@
 namespace mongo {
 namespace {
 
-/**
- * Implements the aggregation (pipeline command for sharding).
- */
-class PipelineCommand : public Command {
+class ClusterPipelineCommand : public Command {
 public:
-    PipelineCommand() : Command(AggregationRequest::kCommandName, false) {}
+    ClusterPipelineCommand() : Command("aggregate", false) {}
 
     virtual bool slaveOk() const {
         return true;
@@ -78,7 +75,7 @@ public:
                      BSONObj& cmdObj,
                      std::string& errmsg,
                      BSONObjBuilder& result) {
-        const NamespaceString nss(parseNsCollectionRequired(dbname, cmdObj));
+        NamespaceString nss(parseNsCollectionRequired(dbname, cmdObj));
 
         auto request = AggregationRequest::parseFromBSON(nss, cmdObj);
         if (!request.isOK()) {
@@ -100,29 +97,31 @@ public:
                    ExplainOptions::Verbosity verbosity,
                    const rpc::ServerSelectionMetadata& serverSelectionMetadata,
                    BSONObjBuilder* out) const override {
-        const NamespaceString nss(parseNsCollectionRequired(dbName, cmdObj));
-
-        auto request = AggregationRequest::parseFromBSON(nss, cmdObj, verbosity);
-        if (!request.isOK()) {
-            return request.getStatus();
-        }
 
         // Add the server selection metadata to the aggregate command in the "unwrapped" format that
         // runAggregate() expects: {aggregate: ..., $queryOptions: {$readPreference: ...}}.
         BSONObjBuilder aggCmdBuilder;
         aggCmdBuilder.appendElements(cmdObj);
         if (auto readPref = serverSelectionMetadata.getReadPreference()) {
-            auto readPrefObj = readPref->toBSON();
             aggCmdBuilder.append(QueryRequest::kUnwrappedReadPrefField,
-                                 BSON("$readPreference" << readPrefObj));
+                                 BSON("$readPreference" << readPref->toBSON()));
+        }
+        BSONObj aggCmd = aggCmdBuilder.obj();
+
+        NamespaceString nss(parseNsCollectionRequired(dbName, aggCmd));
+
+        auto request = AggregationRequest::parseFromBSON(nss, aggCmd, verbosity);
+        if (!request.isOK()) {
+            return request.getStatus();
         }
 
         ClusterAggregate::Namespaces nsStruct;
         nsStruct.requestedNss = nss;
         nsStruct.executionNss = std::move(nss);
 
-        return ClusterAggregate::runAggregate(opCtx, nsStruct, request.getValue(), cmdObj, out);
+        return ClusterAggregate::runAggregate(opCtx, nsStruct, request.getValue(), aggCmd, out);
     }
+
 } clusterPipelineCmd;
 
 }  // namespace

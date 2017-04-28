@@ -52,17 +52,32 @@ public:
     /**
      * This function adds the pair nss.ns(), uuid to the namespace uuid cache
      * if it does not yet exist. If nss.ns() already exists in the cache with
-     * a different uuid, a UserException is thrown.
+     * a different uuid, a UserException is thrown, so we can guarantee that
+     * an operation will always resolve the same name to the same collection,
+     * even in presence of drops and renames.
      */
     void ensureNamespaceInCache(const NamespaceString& nss, CollectionUUID uuid);
 
     /**
      * This function removes the entry for nss.ns() from the namespace uuid
-     * cache. Does nothing if the entry doesn't exist.
+     * cache. Does nothing if the entry doesn't exist. It is called via the
+     * op observer when a collection is dropped.
      */
-    void evictNamespace(const NamespaceString& nss);
+    void onDropCollection(const NamespaceString& nss);
+
+    /**
+     * This function removes the entry for nss.ns() from the namespace uuid
+     * cache. Does nothing if the entry doesn't exist. It is called via the
+     * op observer when a collection is renamed.
+     */
+    void onRenameCollection(const NamespaceString& nss);
 
 private:
+    /**
+     * This function removes the entry for nss.ns() from the namespace uuid
+     * cache. Does nothing if the entry doesn't exist.
+     */
+    void _evictNamespace(const NamespaceString& nss);
     using CollectionUUIDMap = StringMap<CollectionUUID>;
     CollectionUUIDMap _cache;
 };

@@ -28,15 +28,20 @@
 
 #pragma once
 
+#include <boost/optional.hpp>
+#include <utility>
+
 #include "mongo/base/disallow_copying.h"
 #include "mongo/base/status.h"
+#include "mongo/base/status_with.h"
 #include "mongo/db/namespace_string.h"
+#include "mongo/util/duration.h"
+#include "mongo/util/uuid.h"
 
 namespace mongo {
 
 class BSONElement;
 class OperationContext;
-class UUID;
 
 namespace repl {
 
@@ -64,6 +69,28 @@ public:
     static const NamespaceString kRollbackDocsNamespace;
 
     /**
+     * Contains mappings of collection UUID -> namespace.
+     * This collection is used to roll back create, drop and rename operations.
+     * For drops and renames, the namespace in the mapping will be the full namespace to restore
+     * in the database catalog.
+     * For collection creation, the namespace will be set to empty to indicate that the collection
+     * should be dropped.
+     */
+    static const NamespaceString kRollbackCollectionUuidNamespace;
+
+    /**
+     * Contains mappings of collection UUID -> collection options.
+     * This collection is used to roll back non-TTL collMod changes to collections.
+     */
+    static const NamespaceString kRollbackCollectionOptionsNamespace;
+
+    /**
+     * Contains mappings of (collection UUID, index name) -> index info.
+     * This collection is used to roll back create, drop and TTL changes to indexes.
+     */
+    static const NamespaceString kRollbackIndexNamespace;
+
+    /**
      * Creates an instance of RollbackFixUpInfo.
      */
     explicit RollbackFixUpInfo(StorageInterface* storageInterface);
@@ -77,6 +104,9 @@ public:
      *
      * "docId" is the _id field of the modified document.
      *
+     * "dbName" is required for the find command request used to fetch the document from the sync
+     * source.
+     *
      * For index creation operations, which are represented in the oplog as insert operations in
      * "*.system.indexes", use processCreateIndexOplogEntry() instead.
      */
@@ -85,9 +115,111 @@ public:
     Status processSingleDocumentOplogEntry(OperationContext* opCtx,
                                            const UUID& collectionUuid,
                                            const BSONElement& docId,
-                                           SingleDocumentOpType opType);
+                                           SingleDocumentOpType opType,
+                                           const std::string& dbName);
+
+    /**
+     * Processes an oplog entry representing a create collection command. Stores information about
+     * this operation into "kRollbackCollectionUuidNamespace" to allow us to roll back this
+     * operation later by dropping the collection from the catalog by UUID.
+     *
+     * The mapping in the "kRollbackCollectionUuidNamespace" collection will contain the
+     * empty namespace.
+     */
+    class CollectionUuidDescription;
+    Status processCreateCollectionOplogEntry(OperationContext* opCtx, const UUID& collectionUuid);
+
+    /**
+     * Processes an oplog entry representing a drop collection command. Stores information about
+     * this operation into "kRollbackCollectionUuidNamespace" to allow us to roll back this
+     * operation later by restoring the UUID mapping in the catalog.
+     */
+    Status processDropCollectionOplogEntry(OperationContext* opCtx,
+                                           const UUID& collectionUuid,
+                                           const NamespaceString& nss);
+
+    /**
+     * Processes an oplog entry representing a rename collection command. Stores information about
+     * this operation into "kRollbackCollectionUuidNamespace" to allow us to roll back this
+     * operation later by restoring the UUID mapping(s) in the catalog.
+     *
+     * "targetCollectionUuidAndNss" is derived from the "dropTarget" and "to" fields of the
+     * renameCollection oplogEntry.
+     *
+     * If the target collection did not exist when the rename operation was applied
+     * (targetCollectionUuidAndNss is valid), this function will insert one document into
+     * "kRollbackCollectionUuidNamespace":
+     *     source UUID -> namespace mapping.
+     *
+     * If the target collection was dropped when the rename operation was applied
+     * (targetCollectionUuidAndNss is valid), this function will insert two documents into
+     * "kRollbackCollectionUuidNamespace":
+     *     source UUID -> namespace mapping; and
+     *     dropped target UUID -> namespace mapping
+     */
+    using CollectionUuidAndNss = std::pair<UUID, NamespaceString>;
+    Status processRenameCollectionOplogEntry(
+        OperationContext* opCtx,
+        const UUID& sourceCollectionUuid,
+        const NamespaceString& sourceNss,
+        boost::optional<CollectionUuidAndNss> targetCollectionUuidAndNss);
+
+    /**
+     * Processes an oplog entry representing a non-TTL collMod command. Stores information about
+     * this operation into "kRollbackCollectionOptionsNamespace" to allow us to roll back this
+     * operation later by restoring the collection options in the catalog.
+     */
+    class CollectionOptionsDescription;
+    Status processCollModOplogEntry(OperationContext* opCtx,
+                                    const UUID& collectionUuid,
+                                    const BSONObj& optionsObj);
+
+    /**
+     * Processes an oplog entry representing a createIndex command. Stores information about
+     * this operation into "kRollbackIndexNamespace" to allow us to roll back this
+     * operation later by dropping the index from the catalog by UUID/index name.
+     *
+     * The mapping in the "kRollbackCollectionUuidNamespace" collection will contain the
+     * empty namespace.
+     */
+    Status processCreateIndexOplogEntry(OperationContext* opCtx,
+                                        const UUID& collectionUuid,
+                                        const std::string& indexName);
+    enum class IndexOpType { kCreate, kDrop, kUpdateTTL };
+    class IndexDescription;
+
+    /**
+     * Processes an oplog entry representing a collMod command that updates the expiration setting
+     * on a TTL index. Stores information about this operation into "kRollbackIndexNamespace" to
+     * allow us to roll back this operation later by updating the TTL expiration to the previous
+     * value.
+     */
+    Status processUpdateIndexTTLOplogEntry(OperationContext* opCtx,
+                                           const UUID& collectionUuid,
+                                           const std::string& indexName,
+                                           Seconds expireAfterSeconds);
+
+    /**
+     * Processes an oplog entry representing a dropIndexes command with a single index. Stores
+     * information about this operation into "kRollbackIndexNamespace" to allow us to roll back this
+     * operation later by recreating the index.
+     */
+    Status processDropIndexOplogEntry(OperationContext* opCtx,
+                                      const UUID& collectionUuid,
+                                      const std::string& indexName,
+                                      const BSONObj& infoObj);
 
 private:
+    /**
+     * Upserts a single document using the _id field of the document in "update".
+     */
+    Status _upsertById(OperationContext* opCtx, const NamespaceString& nss, const BSONObj& update);
+
+    /**
+     * Upserts an IndexDescription.
+     */
+    Status _upsertIndexDescription(OperationContext* opCtx, const IndexDescription& description);
+
     StorageInterface* const _storageInterface;
 };
 

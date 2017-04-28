@@ -22,8 +22,9 @@ Common error handling code for IDL compiler.
 from __future__ import absolute_import, print_function, unicode_literals
 
 import inspect
+import os
 import sys
-# from typing import List, Union, Any
+from typing import List, Union, Any
 from yaml import nodes
 import yaml
 
@@ -55,6 +56,9 @@ ERROR_ID_FIELD_MUST_BE_EMPTY_FOR_STRUCT = "ID0019"
 ERROR_ID_CUSTOM_SCALAR_SERIALIZATION_NOT_SUPPORTED = "ID0020"
 ERROR_ID_BAD_ANY_TYPE_USE = "ID0021"
 ERROR_ID_BAD_NUMERIC_CPP_TYPE = "ID0022"
+ERROR_ID_BAD_ARRAY_TYPE_NAME = "ID0023"
+ERROR_ID_ARRAY_NO_DEFAULT = "ID0024"
+ERROR_ID_BAD_IMPORT = "ID0025"
 
 
 class IDLError(Exception):
@@ -91,8 +95,8 @@ class ParserError(common.SourceLocation):
         Example error message:
         test.idl: (17, 4): ID0008: Unknown IDL node 'cpp_namespac' for YAML entity 'global'.
         """
-        msg = "%s: (%d, %d): %s: %s" % (self.file_name, self.line, self.column, self.error_id,
-                                        self.msg)
+        msg = "%s: (%d, %d): %s: %s" % (os.path.basename(self.file_name), self.line, self.column,
+                                        self.error_id, self.msg)
         return msg  # type: ignore
 
 
@@ -387,6 +391,27 @@ class ParserContext(object):
             "The C++ numeric type '%s' is not allowed for %s '%s'. Only 'std::int32_t'," +
             " 'std::uint32_t', 'std::uint64_t', and 'std::int64_t' are supported.") %
                         (cpp_type, ast_type, ast_parent))
+
+    def add_bad_array_type_name(self, location, field_name, type_name):
+        # type: (common.SourceLocation, unicode, unicode) -> None
+        """Add an error about a field type having a malformed type name."""
+        self._add_error(location, ERROR_ID_BAD_ARRAY_TYPE_NAME,
+                        ("'%s' is not a valid array type for field '%s'. A valid array type" +
+                         " is in the form 'array<type_name>'.") % (type_name, field_name))
+
+    def add_array_no_default(self, location, field_name):
+        # type: (common.SourceLocation, unicode) -> None
+        """Add an error about an array having a type with a default value."""
+        self._add_error(
+            location, ERROR_ID_ARRAY_NO_DEFAULT,
+            "Field '%s' is not allowed to have both a default value and be an array type" %
+            (field_name))
+
+    def add_cannot_find_import(self, location, imported_file_name):
+        # type: (common.SourceLocation, unicode) -> None
+        """Add an error about not being able to find an import."""
+        self._add_error(location, ERROR_ID_BAD_IMPORT,
+                        "Could not resolve import '%s', file not found" % (imported_file_name))
 
 
 def _assert_unique_error_messages():

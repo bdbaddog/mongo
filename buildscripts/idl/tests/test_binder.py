@@ -24,7 +24,7 @@ import unittest
 if __package__ is None:
     import sys
     from os import path
-    sys.path.append(path.dirname(path.dirname(path.abspath(__file__))))
+    sys.path.append(path.dirname(path.abspath(__file__)))
     from context import idl
     import testcase
 else:
@@ -102,6 +102,7 @@ class TestBinder(testcase.IDLTestcase):
                 cpp_type: foo
                 bson_serialization_type: %s
                 default: foo
+                deserializer: BSONElement::fake
             """ % (bson_type)))
 
         # Test supported numeric types
@@ -118,6 +119,7 @@ class TestBinder(testcase.IDLTestcase):
                         description: foo
                         cpp_type: %s
                         bson_serialization_type: int
+                        deserializer: BSONElement::fake
                 """ % (cpp_type)))
 
         # Test object
@@ -157,6 +159,7 @@ class TestBinder(testcase.IDLTestcase):
                     bson_serialization_type: bindata
                     bindata_subtype: %s
                     default: foo
+                    deserializer: BSONElement::fake
                 """ % (bindata_subtype)))
 
     def test_type_negative(self):
@@ -181,6 +184,7 @@ class TestBinder(testcase.IDLTestcase):
                     description: foo
                     cpp_type: StringData
                     bson_serialization_type: string
+                    deserializer: bar
             """), idl.errors.ERROR_ID_NO_STRINGDATA)
 
         # Test unsupported serialization
@@ -230,6 +234,7 @@ class TestBinder(testcase.IDLTestcase):
                         description: foo
                         cpp_type: %s
                         bson_serialization_type: int
+                        deserializer: BSONElement::int
                     """ % (cpp_type)), idl.errors.ERROR_ID_BAD_NUMERIC_CPP_TYPE)
 
         # Test the std prefix 8 and 16-byte integers fail
@@ -241,7 +246,8 @@ class TestBinder(testcase.IDLTestcase):
                         description: foo
                         cpp_type: %s
                         bson_serialization_type: int
-                    """ % (cpp_type)), idl.errors.ERROR_ID_BAD_NUMERIC_CPP_TYPE)
+                        deserializer: BSONElement::int
+                    """ % (std_cpp_type)), idl.errors.ERROR_ID_BAD_NUMERIC_CPP_TYPE)
 
         # Test bindata_subtype missing
         self.assert_bind_fail(
@@ -251,6 +257,7 @@ class TestBinder(testcase.IDLTestcase):
                     description: foo
                     cpp_type: foo
                     bson_serialization_type: bindata
+                    deserializer: BSONElement::fake
             """), idl.errors.ERROR_ID_BAD_BSON_BINDATA_SUBTYPE_VALUE)
 
         # Test bindata_subtype wrong
@@ -262,6 +269,7 @@ class TestBinder(testcase.IDLTestcase):
                     cpp_type: foo
                     bson_serialization_type: bindata
                     bindata_subtype: foo
+                    deserializer: BSONElement::fake
             """), idl.errors.ERROR_ID_BAD_BSON_BINDATA_SUBTYPE_VALUE)
 
         # Test bindata_subtype on wrong type
@@ -273,6 +281,7 @@ class TestBinder(testcase.IDLTestcase):
                     cpp_type: foo
                     bson_serialization_type: string
                     bindata_subtype: generic
+                    deserializer: BSONElement::fake
             """), idl.errors.ERROR_ID_BAD_BSON_BINDATA_SUBTYPE_TYPE)
 
         # Test bindata in list of types
@@ -324,6 +333,7 @@ class TestBinder(testcase.IDLTestcase):
                         cpp_type: std::string
                         bson_serialization_type: %s
                         serializer: foo
+                        deserializer: BSONElement::fake
                     """ % (bson_type)),
                 idl.errors.ERROR_ID_CUSTOM_SCALAR_SERIALIZATION_NOT_SUPPORTED)
 
@@ -337,27 +347,6 @@ class TestBinder(testcase.IDLTestcase):
                         deserializer: foo
                     """ % (bson_type)),
                 idl.errors.ERROR_ID_CUSTOM_SCALAR_SERIALIZATION_NOT_SUPPORTED)
-
-        # Test object serialization needs deserializer & serializer
-        self.assert_bind_fail(
-            textwrap.dedent("""
-            types:
-                foofoo:
-                    description: foo
-                    cpp_type: foo
-                    bson_serialization_type: object
-                    serializer: foo
-            """), idl.errors.ERROR_ID_MISSING_AST_REQUIRED_FIELD)
-
-        self.assert_bind_fail(
-            textwrap.dedent("""
-            types:
-                foofoo:
-                    description: foo
-                    cpp_type: foo
-                    bson_serialization_type: object
-                    deserializer: foo
-            """), idl.errors.ERROR_ID_MISSING_AST_REQUIRED_FIELD)
 
         # Test any serialization needs deserializer
         self.assert_bind_fail(
@@ -389,6 +378,7 @@ class TestBinder(testcase.IDLTestcase):
                     description: foo
                     cpp_type: foo
                     bson_serialization_type: string
+                    deserializer: bar
             """), idl.errors.ERROR_ID_ARRAY_NOT_VALID_TYPE)
 
     def test_struct_positive(self):
@@ -455,7 +445,6 @@ class TestBinder(testcase.IDLTestcase):
                 bson_serialization_type: string
                 serializer: foo
                 deserializer: foo
-                default: foo
         """)
 
         # Short type
@@ -491,6 +480,35 @@ class TestBinder(testcase.IDLTestcase):
                         default: bar
             """))
 
+        # Test array as field type
+        self.assert_bind(test_preamble + textwrap.dedent("""
+            structs:
+                foo: 
+                    description: foo
+                    strict: true
+                    fields:
+                        foo: array<string>
+            """))
+
+        # Test array as field type
+        self.assert_bind(
+            textwrap.dedent("""
+            types:
+                 arrayfake:
+                    description: foo
+                    cpp_type: foo
+                    bson_serialization_type: string
+                    serializer: foo
+                    deserializer: foo
+
+            structs:
+                foo: 
+                    description: foo
+                    strict: true
+                    fields:
+                        arrayOfString: arrayfake
+            """))
+
     def test_field_negative(self):
         # type: () -> None
         """Negative field tests."""
@@ -516,6 +534,47 @@ class TestBinder(testcase.IDLTestcase):
                     fields:
                         array<foo>: string
             """), idl.errors.ERROR_ID_ARRAY_NOT_VALID_TYPE)
+
+        # Test recursive array as field type
+        self.assert_bind_fail(test_preamble + textwrap.dedent("""
+            structs:
+                foo: 
+                    description: foo
+                    strict: true
+                    fields:
+                        foo: array<array<string>>
+            """), idl.errors.ERROR_ID_BAD_ARRAY_TYPE_NAME)
+
+        # Test inherited default with array
+        self.assert_bind_fail(test_preamble + textwrap.dedent("""
+            structs:
+                foo: 
+                    description: foo
+                    strict: true
+                    fields:
+                        foo: array<string>
+            """), idl.errors.ERROR_ID_ARRAY_NO_DEFAULT)
+
+        # Test non-inherited default with array
+        self.assert_bind_fail(
+            textwrap.dedent("""
+            types:
+                string:
+                    description: foo
+                    cpp_type: foo
+                    bson_serialization_type: string
+                    serializer: foo
+                    deserializer: foo
+
+            structs:
+                foo: 
+                    description: foo
+                    strict: true
+                    fields:
+                        foo:
+                            type: array<string>
+                            default: 123
+            """), idl.errors.ERROR_ID_ARRAY_NO_DEFAULT)
 
     def test_ignored_field_negative(self):
         # type: () -> None

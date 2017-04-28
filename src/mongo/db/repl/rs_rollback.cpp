@@ -539,8 +539,8 @@ void syncFixUp(OperationContext* opCtx,
             Helpers::RemoveSaver removeSaver("rollback", "", *it);
 
             // perform a collection scan and write all documents in the collection to disk
-            std::unique_ptr<PlanExecutor> exec(InternalPlanner::collectionScan(
-                opCtx, *it, db->getCollection(opCtx, *it), PlanExecutor::YIELD_AUTO));
+            auto exec = InternalPlanner::collectionScan(
+                opCtx, *it, db->getCollection(opCtx, *it), PlanExecutor::YIELD_AUTO);
             BSONObj curObj;
             PlanExecutor::ExecState execState;
             while (PlanExecutor::ADVANCED == (execState = exec->getNext(&curObj, NULL))) {
@@ -720,7 +720,6 @@ void syncFixUp(OperationContext* opCtx,
                                           collection,
                                           docNss,
                                           pattern,
-                                          PlanExecutor::YIELD_MANUAL,
                                           true,   // justone
                                           true);  // god
                         }
@@ -827,7 +826,10 @@ Status _syncRollback(OperationContext* opCtx,
     log() << "rollback common point is " << how.commonPoint;
     log() << "rollback 3 fixup";
     try {
-        ON_BLOCK_EXIT([&] { replCoord->incrementRollbackID(); });
+        ON_BLOCK_EXIT([&] {
+            auto status = storageInterface->incrementRollbackID(opCtx);
+            fassertStatusOK(40425, status);
+        });
         syncFixUp(opCtx, how, rollbackSource, replCoord, storageInterface);
     } catch (const RSFatalException& e) {
         return Status(ErrorCodes::UnrecoverableRollbackError, e.what(), 18753);

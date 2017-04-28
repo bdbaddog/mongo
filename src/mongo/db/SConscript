@@ -33,6 +33,7 @@ env.SConscript(
         'sorter',
         'stats',
         'storage',
+        'update',
         'views',
     ],
     exports=[
@@ -111,6 +112,17 @@ env.CppUnitTest(
     source= 'keypattern_test.cpp',
     LIBDEPS=[
         'common'
+    ],
+)
+
+env.CppUnitTest(
+    target= 'op_observer_impl_test',
+    source= 'op_observer_impl_test.cpp',
+    LIBDEPS=[
+        'common',
+        'op_observer_d',
+        'service_context_d_test_fixture',
+        '$BUILD_DIR/mongo/db/repl/replmocks',
     ],
 )
 
@@ -369,40 +381,10 @@ env.CppUnitTest(
     ],
 )
 
-env.Library(
-    target='range_deleter',
-    source=[
-        'range_deleter.cpp',
-        'range_deleter_mock_env.cpp',
-    ],
-    LIBDEPS=[
-        '$BUILD_DIR/mongo/base',
-        '$BUILD_DIR/mongo/db/common',
-        '$BUILD_DIR/mongo/db/repl/repl_coordinator_global',
-        '$BUILD_DIR/mongo/db/service_context',
-        'range_arithmetic',
-    ],
-)
-
-env.CppUnitTest(
-    target='range_deleter_test',
-    source=[
-        'range_deleter_test.cpp',
-    ],
-    LIBDEPS=[
-        'common',
-        'range_deleter',
-        '$BUILD_DIR/mongo/db/auth/authorization_manager_mock_init',
-        '$BUILD_DIR/mongo/db/repl/replmocks',
-        '$BUILD_DIR/mongo/db/service_context_noop_init',
-    ],
-)
-
 # This library is linked into mongos and mongod only, not into the shell or any tools.
 env.Library(
     target="mongodandmongos",
     source=[
-        "dbwebserver.cpp",
         "initialize_server_global_state.cpp",
         "server_extra_log_context.cpp",
         "server_options_init.cpp",
@@ -414,32 +396,9 @@ env.Library(
         "$BUILD_DIR/mongo/rpc/command_reply",
         "$BUILD_DIR/mongo/rpc/command_request",
         "$BUILD_DIR/mongo/rpc/metadata",
-        "$BUILD_DIR/mongo/util/net/miniwebserver",
         "$BUILD_DIR/mongo/util/processinfo",
         "$BUILD_DIR/mongo/util/signal_handlers",
         "auth/authorization_manager_global",
-    ],
-)
-
-env.Library(
-    target="mongodwebserver",
-    source=[
-        "clientlistplugin.cpp",
-        "restapi.cpp",
-        "stats/snapshots_webplugins.cpp",
-        "repl/repl_set_web_handler.cpp",
-    ],
-    LIBDEPS=[
-        '$BUILD_DIR/mongo/db/background',
-        "$BUILD_DIR/mongo/db/curop",
-        '$BUILD_DIR/mongo/db/clientcursor',
-        "$BUILD_DIR/mongo/db/dbdirectclient",
-        '$BUILD_DIR/mongo/db/stats/fill_locker_info',
-        '$BUILD_DIR/mongo/db/stats/serveronly',
-        "$BUILD_DIR/mongo/util/net/miniwebserver",
-        "mongodandmongos",
-        'repl/repl_coordinator_global',
-        'repl/serveronly',
     ],
 )
 
@@ -572,11 +531,8 @@ env.Library(
         'views/views',
         '$BUILD_DIR/mongo/db/concurrency/lock_manager',
         '$BUILD_DIR/mongo/db/s/sharding',
-        #'catalog/catalog', # CYCLE
-    ],
-    LIBDEPS_TAGS=[
-        # TODO(ADAM, 2017-03-10): See `CYCLE` tags above
-        'illegal_cyclic_or_unresolved_dependencies_whitelisted',
+        '$BUILD_DIR/mongo/db/catalog/database',
+        '$BUILD_DIR/mongo/db/catalog/database_holder',
     ],
 )
 
@@ -617,11 +573,6 @@ env.Library(
         'db_raii',
         'index/index_access_methods',
         'ops/write_ops',
-        #'$BUILD_DIR/mongo/db/catalog/catalog', # CYCLE
-    ],
-    LIBDEPS_TAGS=[
-        # TODO(ADAM, 2017-03-10): See `CYCLE` tags above
-        'illegal_cyclic_or_unresolved_dependencies_whitelisted',
     ],
 )
 
@@ -651,6 +602,7 @@ env.Library(
         'commands/dcommands',
         'repl/serveronly',
         'views/views_mongod',
+        '$BUILD_DIR/mongo/util/uuid_catalog',
     ],
 )
 
@@ -687,15 +639,11 @@ env.Library(
         "cloner.cpp",
     ],
     LIBDEPS=[
-        "$BUILD_DIR/mongo/base",
-        "dbdirectclient",
-        "ops/write_ops",
-        "repl/isself",
-        #"catalog/catalog", # CYCLE
-    ],
-    LIBDEPS_TAGS=[
-        # TODO(ADAM, 2017-03-10): See `CYCLE` tags above.
-        'illegal_cyclic_or_unresolved_dependencies_whitelisted',
+        'dbdirectclient',
+        'ops/write_ops',
+        'repl/isself',
+        '$BUILD_DIR/mongo/base',
+        '$BUILD_DIR/mongo/db/catalog/index_create',
     ],
 )
 
@@ -718,13 +666,10 @@ env.Library(
         "index_rebuilder.cpp",
     ],
     LIBDEPS=[
-        "db_raii",
-        "index/index_access_methods",
-        #"catalog/catalog", # CYCLE
-    ],
-    LIBDEPS_TAGS=[
-        # TODO(ADAM, 2017-03-10): See `CYCLE` tags above.
-        'illegal_cyclic_or_unresolved_dependencies_whitelisted',
+        'db_raii',
+        'index/index_access_methods',
+        '$BUILD_DIR/mongo/db/catalog/index_catalog',
+        '$BUILD_DIR/mongo/db/catalog/index_create',
     ],
 )
 
@@ -735,47 +680,25 @@ env.Library(
     ],
     LIBDEPS=[
         "db_raii",
-        #"catalog/catalog", # CYCLE
-    ],
-    LIBDEPS_TAGS=[
-        # TODO(ADAM, 2017-03-10): See `CYCLE` tags above.
-        'illegal_cyclic_or_unresolved_dependencies_whitelisted',
     ],
 )
 
 env.Library(
-    target="prefetch",
+    target='prefetch',
     source=[
-        "prefetch.cpp",
+        'prefetch.cpp',
     ],
     LIBDEPS=[
-        "catalog/catalog",
-        "dbhelpers",
-        "index/index_access_methods",
+        'dbhelpers',
+        'index/index_access_methods',
+        '$BUILD_DIR/mongo/db/storage/mmap_v1/mmap',
     ],
 )
 
 env.Library(
-    target="range_deleter_d",
+    target="rw_concern_d",
     source=[
-        "range_deleter_db_env.cpp",
-        "range_deleter_service.cpp",
-    ],
-    LIBDEPS=[
-        "dbhelpers",
-        "db_raii",
-        "range_deleter",
-        #"catalog/catalog", # CYCLE
-    ],
-    LIBDEPS_TAGS=[
-        # TODO(ADAM, 2017-03-10): See `CYCLE` tags above.
-        'illegal_cyclic_or_unresolved_dependencies_whitelisted',
-    ],
-)
-
-env.Library(
-    target="write_concern_d",
-    source=[
+        "read_concern.cpp",
         "write_concern.cpp",
     ],
     LIBDEPS=[
@@ -786,6 +709,7 @@ env.Library(
         "repl/repl_coordinator_interface",
         "stats/timer_stats",
         "storage/storage_options",
+        "s/sharding",
     ],
 )
 
@@ -797,11 +721,9 @@ env.Library(
     LIBDEPS=[
         "background",
         "catalog/index_key_validate",
-        #"catalog/catalog", # CYCLE
-    ],
-    LIBDEPS_TAGS=[
-        # TODO(ADAM, 2017-03-10): See `CYCLE` tags above.
-        'illegal_cyclic_or_unresolved_dependencies_whitelisted',
+        '$BUILD_DIR/mongo/db/catalog/collection',
+        '$BUILD_DIR/mongo/db/catalog/database',
+        "$BUILD_DIR/mongo/db/storage/mmap_v1/storage_mmapv1",
     ],
 )
 
@@ -918,14 +840,11 @@ env.Library(
         "matcher/expressions_mongod_only",
         "op_observer_d",
         "ops/write_ops",
-        "ops/update_driver",
         "ops/write_ops_parsers",
         "pipeline/aggregation",
         "pipeline/serveronly",
         "prefetch",
         "query/query",
-        "range_deleter",
-        "range_deleter_d",
         "repair_database",
         "repl/bgsync",
         "repl/oplog_buffer_collection",
@@ -941,7 +860,7 @@ env.Library(
         "repl/sync_tail",
         "repl/topology_coordinator_impl",
         "run_commands",
-        "write_concern_d",
+        "rw_concern_d",
         "s/commands",
         "s/metadata",
         "s/sharding",
@@ -960,6 +879,7 @@ env.Library(
         "storage/storage_options",
         "storage/wiredtiger/storage_wiredtiger" if wiredtiger else [],
         "ttl_d",
+        "update/update_driver",
         "update_index_data",
         "views/views_mongod",
     ],
@@ -1035,11 +955,14 @@ env.Library(
 env.Library(
     target='keys_collection_manager',
     source=[
+        'keys_collection_manager.cpp',
         'keys_collection_cache_reader.cpp',
+        'keys_collection_cache_reader_and_updater.cpp',
     ],
     LIBDEPS=[
         'keys_collection_document',
         'logical_time',
+        '$BUILD_DIR/mongo/s/coreshard',
     ],
 )
 
@@ -1049,7 +972,6 @@ env.Library(
         'logical_clock.cpp',
     ],
     LIBDEPS=[
-        'keys_collection_manager',
         'server_parameters',
         'service_context',
         'signed_logical_time',
@@ -1133,6 +1055,39 @@ env.CppUnitTest(
     ],
     LIBDEPS=[
         'time_proof_service',
+    ],
+)
+
+env.CppUnitTest(
+    target='keys_collection_cache_reader_test',
+    source=[
+        'keys_collection_cache_reader_test.cpp',
+    ],
+    LIBDEPS=[
+        'keys_collection_manager',
+        '$BUILD_DIR/mongo/s/config_server_test_fixture',
+    ],
+)
+
+env.CppUnitTest(
+    target='keys_collection_cache_reader_and_updater_test',
+    source=[
+        'keys_collection_cache_reader_and_updater_test.cpp',
+    ],
+    LIBDEPS=[
+        'keys_collection_manager',
+        '$BUILD_DIR/mongo/s/config_server_test_fixture',
+    ],
+)
+
+env.CppUnitTest(
+    target='keys_collection_manager_test',
+    source=[
+        'keys_collection_manager_test.cpp',
+    ],
+    LIBDEPS=[
+        'keys_collection_manager',
+        '$BUILD_DIR/mongo/s/config_server_test_fixture',
     ],
 )
 

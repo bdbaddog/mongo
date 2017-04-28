@@ -113,6 +113,7 @@ bool cursorCommandPassthrough(OperationContext* opCtx,
 
     StatusWith<BSONObj> transformedResponse =
         storePossibleCursor(opCtx,
+                            shardId,
                             HostAndPort(cursor->originalHost()),
                             response,
                             nss,
@@ -189,25 +190,25 @@ protected:
     }
 };
 
+/**
+ * Base class for commands on collections that simply need to broadcast the command to shards that
+ * own data for the collection and aggregate the raw results.
+ */
 class AllShardsCollectionCommand : public Command {
 protected:
     AllShardsCollectionCommand(const char* name,
                                const char* oldname = NULL,
-                               bool implicitCreateDb = false)
-        : Command(name, false, oldname), _implicitCreateDb(implicitCreateDb) {}
+                               bool implicitCreateDb = false,
+                               bool appendShardVersion = true)
+        : Command(name, false, oldname),
+          _implicitCreateDb(implicitCreateDb),
+          _appendShardVersion(appendShardVersion) {}
 
     bool slaveOk() const override {
         return true;
     }
     bool adminOnly() const override {
         return false;
-    }
-
-    BSONObj appendShardVersion(BSONObj cmdObj, ChunkVersion version) {
-        BSONObjBuilder cmdWithVersionBob;
-        cmdWithVersionBob.appendElements(cmdObj);
-        version.appendForCommands(&cmdWithVersionBob);
-        return cmdWithVersionBob.obj();
     }
 
     bool run(OperationContext* opCtx,
@@ -222,37 +223,22 @@ protected:
             uassertStatusOK(createShardDatabase(opCtx, dbName));
         }
 
-        Status status = Status::OK();
-        int numAttempts = 0;
-        while (numAttempts < kMaxNumStaleVersionRetries) {
-            status = Status::OK();
-            output.resetToEmpty();
-
-            auto routingInfo = uassertStatusOK(
-                Grid::get(opCtx)->catalogCache()->getCollectionRoutingInfo(opCtx, nss));
-            auto requests = buildRequestsForTargetedShards(opCtx, routingInfo, cmdObj);
-
-            auto swResponses = gatherResponsesFromShards(opCtx, dbName, cmdObj, requests, &output);
-            if (ErrorCodes::isStaleShardingError(swResponses.getStatus().code())) {
-                Grid::get(opCtx)->catalogCache()->onStaleConfigError(std::move(routingInfo));
-                ++numAttempts;
-                continue;
-            }
-            status = swResponses.getStatus();
-            break;
-        }
-
-        // We don't uassertStatusOK(), because that causes 'output' to be cleared, but we want to
-        // report the raw results even if there was an error.
-        if (!status.isOK()) {
-            return appendCommandStatus(output, status);
-        }
-        return true;
+        auto shardResponses = uassertStatusOK(scatterGatherForNamespace(opCtx,
+                                                                        nss,
+                                                                        cmdObj,
+                                                                        getReadPref(cmdObj),
+                                                                        boost::none,  // filter
+                                                                        boost::none,  // collation
+                                                                        _appendShardVersion));
+        return appendRawResponses(opCtx, &errmsg, &output, std::move(shardResponses));
     }
 
 private:
     // Whether the requested database should be created implicitly
     const bool _implicitCreateDb;
+
+    // Whether the shardVersion will be included in the requests to shards.
+    const bool _appendShardVersion;
 };
 
 class NotAllowedOnShardedCollectionCmd : public PublicGridCommand {
@@ -280,7 +266,7 @@ protected:
 
 class DropIndexesCmd : public AllShardsCollectionCommand {
 public:
-    DropIndexesCmd() : AllShardsCollectionCommand("dropIndexes", "deleteIndexes") {}
+    DropIndexesCmd() : AllShardsCollectionCommand("dropIndexes", "deleteIndexes", false, false) {}
     virtual void addRequiredPrivileges(const std::string& dbname,
                                        const BSONObj& cmdObj,
                                        std::vector<Privilege>* out) {
@@ -913,7 +899,7 @@ public:
 
         {
             BSONObjBuilder explainCmdBob;
-            ClusterExplain::wrapAsExplain(
+            ClusterExplain::wrapAsExplainDeprecated(
                 cmdObj, verbosity, serverSelectionMetadata, &explainCmdBob, &options);
             command = explainCmdBob.obj();
         }
@@ -1141,7 +1127,7 @@ public:
                    const std::string& dbname,
                    const BSONObj& cmdObj,
                    ExplainOptions::Verbosity verbosity,
-                   const rpc::ServerSelectionMetadata& serverSelectionMetadata,
+                   const rpc::ServerSelectionMetadata& ssm,
                    BSONObjBuilder* out) const {
         const NamespaceString nss(parseNsCollectionRequired(dbname, cmdObj));
 
@@ -1162,33 +1148,33 @@ public:
         }
 
         // Extract the targeting collation.
-        auto targetingCollation = getCollation(cmdObj);
-        if (!targetingCollation.isOK()) {
-            return targetingCollation.getStatus();
-        }
+        auto targetingCollation = uassertStatusOK(getCollation(cmdObj));
 
         BSONObjBuilder explainCmdBob;
-        int options = 0;
-        ClusterExplain::wrapAsExplain(
-            cmdObj, verbosity, serverSelectionMetadata, &explainCmdBob, &options);
+        ClusterExplain::wrapAsExplain(cmdObj, verbosity, &explainCmdBob);
 
         // We will time how long it takes to run the commands on the shards.
         Timer timer;
 
-        vector<Strategy::CommandResult> shardResults;
-        Strategy::commandOp(opCtx,
-                            dbname,
-                            explainCmdBob.obj(),
-                            nss.ns(),
-                            targetingQuery,
-                            targetingCollation.getValue(),
-                            &shardResults);
+        BSONObj viewDefinition;
+        auto swShardResponses = scatterGatherForNamespace(opCtx,
+                                                          nss,
+                                                          explainCmdBob.obj(),
+                                                          getReadPref(ssm),
+                                                          targetingQuery,
+                                                          targetingCollation,
+                                                          true,  // do shard versioning
+                                                          &viewDefinition);
 
         long long millisElapsed = timer.millis();
 
-        if (shardResults.size() == 1 &&
-            ResolvedView::isResolvedViewErrorResponse(shardResults[0].result)) {
-            auto resolvedView = ResolvedView::fromBSON(shardResults[0].result);
+        if (ErrorCodes::CommandOnShardedViewNotSupportedOnMongod == swShardResponses.getStatus()) {
+            uassert(ErrorCodes::InternalError,
+                    str::stream() << "Missing resolved view definition, but remote returned "
+                                  << ErrorCodes::errorString(swShardResponses.getStatus().code()),
+                    !viewDefinition.isEmpty());
+
+            auto resolvedView = ResolvedView::fromBSON(viewDefinition);
             auto parsedDistinct = ParsedDistinct::parse(
                 opCtx, resolvedView.getNamespace(), cmdObj, ExtensionsCallbackNoop(), true);
             if (!parsedDistinct.isOK()) {
@@ -1218,10 +1204,18 @@ public:
                 opCtx, nsStruct, resolvedAggRequest, resolvedAggCmd, out);
         }
 
-        const char* mongosStageName = ClusterExplain::getStageNameForReadOp(shardResults, cmdObj);
+        uassertStatusOK(swShardResponses.getStatus());
+        auto shardResponses = std::move(swShardResponses.getValue());
+
+        const char* mongosStageName =
+            ClusterExplain::getStageNameForReadOp(shardResponses.size(), cmdObj);
 
         return ClusterExplain::buildExplainResult(
-            opCtx, shardResults, mongosStageName, millisElapsed, out);
+            opCtx,
+            ClusterExplain::downconvert(opCtx, shardResponses),
+            mongosStageName,
+            millisElapsed,
+            out);
     }
 
 } disinctCmd;
@@ -1425,10 +1419,10 @@ public:
         cm->getShardIdsForQuery(opCtx, query, collation.getValue(), &shardIds);
 
         // We support both "num" and "limit" options to control limit
-        int limit = 100;
+        long long limit = 100;
         const char* limitName = cmdObj["num"].isNumber() ? "num" : "limit";
         if (cmdObj[limitName].isNumber())
-            limit = cmdObj[limitName].numberInt();
+            limit = cmdObj[limitName].safeNumberLong();
 
         // Construct the requests.
         vector<AsyncRequestsSender::Request> requests;
@@ -1438,20 +1432,12 @@ public:
             shardArray.append(shardId.toString());
         }
 
-        // Extract the readPreference from the command.
-        const auto queryOptionsObj = cmdObj.getObjectField(QueryRequest::kUnwrappedReadPrefField);
-        const auto readPrefObj =
-            queryOptionsObj.getObjectField(QueryRequest::kWrappedReadPrefField);
-        const auto readPref = readPrefObj.isEmpty()
-            ? ReadPreferenceSetting(ReadPreference::PrimaryOnly, TagSet())
-            : uassertStatusOK(ReadPreferenceSetting::fromBSON(readPrefObj));
-
         // Send the requests.
         AsyncRequestsSender ars(opCtx,
                                 Grid::get(opCtx)->getExecutorPool()->getArbitraryExecutor(),
                                 dbName,
                                 requests,
-                                readPref);
+                                getReadPref(cmdObj));
 
         // Receive the responses.
         multimap<double, BSONObj> results;  // TODO: maybe use merge-sort instead
@@ -1497,7 +1483,7 @@ public:
         result.append("ns", nss.ns());
         result.append("near", nearStr);
 
-        int outCount = 0;
+        long long outCount = 0;
         double totalDistance = 0;
         double maxDistance = 0;
         {
