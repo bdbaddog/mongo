@@ -35,6 +35,7 @@
 #include "mongo/s/write_ops/batched_delete_request.h"
 #include "mongo/s/write_ops/batched_insert_request.h"
 #include "mongo/s/write_ops/batched_update_request.h"
+#include "mongo/s/write_ops/write_ops_gen.h"
 
 namespace mongo {
 
@@ -56,10 +57,6 @@ public:
 
     enum BatchType { BatchType_Insert, BatchType_Update, BatchType_Delete, BatchType_Unknown };
 
-    //
-    // construction / destruction
-    //
-
     BatchedCommandRequest(BatchType batchType);
 
     /**
@@ -80,32 +77,28 @@ public:
     BatchedCommandRequest(BatchedDeleteRequest* deleteReq)
         : _batchType(BatchType_Delete), _deleteReq(deleteReq) {}
 
-    ~BatchedCommandRequest(){};
-
-    /** Copies all the fields present in 'this' to 'other'. */
-    void cloneTo(BatchedCommandRequest* other) const;
-
     bool isValid(std::string* errMsg) const;
     BSONObj toBSON() const;
     bool parseBSON(StringData dbName, const BSONObj& source, std::string* errMsg);
-    void clear();
     std::string toString() const;
 
     //
     // Batch type accessors
     //
 
-    BatchType getBatchType() const;
+    BatchType getBatchType() const {
+        return _batchType;
+    }
+
     BatchedInsertRequest* getInsertRequest() const;
     BatchedUpdateRequest* getUpdateRequest() const;
     BatchedDeleteRequest* getDeleteRequest() const;
+
     // Index creation is also an insert, but a weird one.
     bool isInsertIndexRequest() const;
-    bool isUniqueIndexRequest() const;
     bool isValidIndexRequest(std::string* errMsg) const;
-    std::string getTargetingNS() const;
+
     const NamespaceString& getTargetingNSS() const;
-    BSONObj getIndexKeyPattern() const;
 
     //
     // individual field accessors
@@ -142,6 +135,21 @@ public:
     const ChunkVersion& getShardVersion() const {
         return _shardVersion.get();
     }
+
+    const boost::optional<std::int64_t> getTxnNum() const&;
+    void setTxnNum(boost::optional<std::int64_t> value);
+
+    const boost::optional<std::vector<std::int32_t>> getStmtIds() const&;
+    void setStmtIds(boost::optional<std::vector<std::int32_t>> value);
+
+    /**
+     * Retrieves the statement id for the write at the specified position in the write batch entries
+     * array.
+     *
+     * This method may only be called if a TxnNumber has been given for the operation, otherwise it
+     * will fassert.
+     */
+    int32_t getStmtIdForWriteAt(size_t writePos) const;
 
     void setShouldBypassValidation(bool newVal);
     bool shouldBypassValidation() const;
@@ -189,6 +197,9 @@ private:
     std::unique_ptr<BatchedInsertRequest> _insertReq;
     std::unique_ptr<BatchedUpdateRequest> _updateReq;
     std::unique_ptr<BatchedDeleteRequest> _deleteReq;
+
+    // If this write is retriable, contains information about the retriability of the write
+    WriteOpTxnInfo _txnInfo;
 };
 
 /**

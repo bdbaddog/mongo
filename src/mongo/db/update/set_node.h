@@ -28,7 +28,7 @@
 
 #pragma once
 
-#include "mongo/db/update/update_leaf_node.h"
+#include "mongo/db/update/path_creating_node.h"
 #include "mongo/stdx/memory.h"
 
 namespace mongo {
@@ -36,7 +36,7 @@ namespace mongo {
 /**
  * Represents the application of a $set to the value at the end of a path.
  */
-class SetNode : public UpdateLeafNode {
+class SetNode : public PathCreatingNode {
 public:
     Status init(BSONElement modExpr, const CollatorInterface* collator) final;
 
@@ -46,15 +46,9 @@ public:
 
     void setCollator(const CollatorInterface* collator) final {}
 
-    Status apply(mutablebson::Element element,
-                 FieldRef* pathToCreate,
-                 FieldRef* pathTaken,
-                 StringData matchedField,
-                 bool fromReplication,
-                 const UpdateIndexData* indexData,
-                 LogBuilder* logBuilder,
-                 bool* indexesAffected,
-                 bool* noop) const final;
+protected:
+    void updateExistingElement(mutablebson::Element* element, bool* noop) const final;
+    void setValueForNewElement(mutablebson::Element* element) const final;
 
 private:
     BSONElement _val;

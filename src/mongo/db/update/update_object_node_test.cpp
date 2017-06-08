@@ -53,6 +53,22 @@ TEST(UpdateObjectNodeTest, InvalidPathFailsToParse) {
     ASSERT_EQ(result.getStatus().reason(), "An empty update path is not valid.");
 }
 
+TEST(UpdateObjectNodeTest, ValidIncPathParsesSuccessfully) {
+    auto update = fromjson("{$inc: {'a.b': 5}}");
+    const CollatorInterface* collator = nullptr;
+    UpdateObjectNode root;
+    ASSERT_OK(UpdateObjectNode::parseAndMerge(
+        &root, modifiertable::ModifierType::MOD_INC, update["$inc"]["a.b"], collator));
+}
+
+TEST(UpdateObjectNodeTest, ValidMulPathParsesSuccessfully) {
+    auto update = fromjson("{$mul: {'a.b': 5}}");
+    const CollatorInterface* collator = nullptr;
+    UpdateObjectNode root;
+    ASSERT_OK(UpdateObjectNode::parseAndMerge(
+        &root, modifiertable::ModifierType::MOD_MUL, update["$mul"]["a.b"], collator));
+}
+
 TEST(UpdateObjectNodeTest, ValidSetPathParsesSuccessfully) {
     auto update = fromjson("{$set: {'a.b': 5}}");
     const CollatorInterface* collator = nullptr;
@@ -114,15 +130,15 @@ TEST(UpdateObjectNodeTest, PositionalElementFirstPositionFailsToParse) {
 }
 
 // TODO SERVER-28777: All modifier types should succeed.
-TEST(UpdateObjectNodeTest, IncFailsToParse) {
-    auto update = fromjson("{$inc: {a: 5}}");
+TEST(UpdateObjectNodeTest, PushFailsToParse) {
+    auto update = fromjson("{$push: {a: 5}}");
     const CollatorInterface* collator = nullptr;
     UpdateObjectNode root;
     auto result = UpdateObjectNode::parseAndMerge(
-        &root, modifiertable::ModifierType::MOD_INC, update["$inc"]["a"], collator);
+        &root, modifiertable::ModifierType::MOD_PUSH, update["$push"]["a"], collator);
     ASSERT_NOT_OK(result);
     ASSERT_EQ(result.getStatus().code(), ErrorCodes::FailedToParse);
-    ASSERT_EQ(result.getStatus().reason(), "Cannot construct modifier of type 3");
+    ASSERT_EQ(result.getStatus().reason(), "Cannot construct modifier of type 10");
 }
 
 TEST(UpdateObjectNodeTest, TwoModifiersOnSameFieldFailToParse) {
@@ -649,15 +665,15 @@ TEST(UpdateObjectNodeTest, ApplyCreateField) {
     LogBuilder logBuilder(logDoc.root());
     auto indexesAffected = false;
     auto noop = false;
-    ASSERT_OK(root.apply(doc.root(),
-                         &pathToCreate,
-                         &pathTaken,
-                         matchedField,
-                         fromReplication,
-                         &indexData,
-                         &logBuilder,
-                         &indexesAffected,
-                         &noop));
+    root.apply(doc.root(),
+               &pathToCreate,
+               &pathTaken,
+               matchedField,
+               fromReplication,
+               &indexData,
+               &logBuilder,
+               &indexesAffected,
+               &noop);
     ASSERT_TRUE(indexesAffected);
     ASSERT_FALSE(noop);
     ASSERT_EQUALS(fromjson("{a: 5, b: 6}"), doc);
@@ -683,15 +699,15 @@ TEST(UpdateObjectNodeTest, ApplyExistingField) {
     LogBuilder logBuilder(logDoc.root());
     auto indexesAffected = false;
     auto noop = false;
-    ASSERT_OK(root.apply(doc.root(),
-                         &pathToCreate,
-                         &pathTaken,
-                         matchedField,
-                         fromReplication,
-                         &indexData,
-                         &logBuilder,
-                         &indexesAffected,
-                         &noop));
+    root.apply(doc.root(),
+               &pathToCreate,
+               &pathTaken,
+               matchedField,
+               fromReplication,
+               &indexData,
+               &logBuilder,
+               &indexesAffected,
+               &noop);
     ASSERT_TRUE(indexesAffected);
     ASSERT_FALSE(noop);
     ASSERT_EQUALS(fromjson("{a: 6}"), doc);
@@ -723,15 +739,15 @@ TEST(UpdateObjectNodeTest, ApplyExistingAndNonexistingFields) {
     LogBuilder logBuilder(logDoc.root());
     auto indexesAffected = false;
     auto noop = false;
-    ASSERT_OK(root.apply(doc.root(),
-                         &pathToCreate,
-                         &pathTaken,
-                         matchedField,
-                         fromReplication,
-                         &indexData,
-                         &logBuilder,
-                         &indexesAffected,
-                         &noop));
+    root.apply(doc.root(),
+               &pathToCreate,
+               &pathTaken,
+               matchedField,
+               fromReplication,
+               &indexData,
+               &logBuilder,
+               &indexesAffected,
+               &noop);
     ASSERT_TRUE(indexesAffected);
     ASSERT_FALSE(noop);
     ASSERT_BSONOBJ_EQ(fromjson("{a: 5, c: 7, b: 6, d: 8}"), doc.getObject());
@@ -763,15 +779,15 @@ TEST(UpdateObjectNodeTest, ApplyExistingNestedPaths) {
     LogBuilder logBuilder(logDoc.root());
     auto indexesAffected = false;
     auto noop = false;
-    ASSERT_OK(root.apply(doc.root(),
-                         &pathToCreate,
-                         &pathTaken,
-                         matchedField,
-                         fromReplication,
-                         &indexData,
-                         &logBuilder,
-                         &indexesAffected,
-                         &noop));
+    root.apply(doc.root(),
+               &pathToCreate,
+               &pathTaken,
+               matchedField,
+               fromReplication,
+               &indexData,
+               &logBuilder,
+               &indexesAffected,
+               &noop);
     ASSERT_TRUE(indexesAffected);
     ASSERT_FALSE(noop);
     ASSERT_BSONOBJ_EQ(fromjson("{a: {b: 6, c: 7}, b: {d: 8, e: 9}}"), doc.getObject());
@@ -804,15 +820,15 @@ TEST(UpdateObjectNodeTest, ApplyCreateNestedPaths) {
     LogBuilder logBuilder(logDoc.root());
     auto indexesAffected = false;
     auto noop = false;
-    ASSERT_OK(root.apply(doc.root(),
-                         &pathToCreate,
-                         &pathTaken,
-                         matchedField,
-                         fromReplication,
-                         &indexData,
-                         &logBuilder,
-                         &indexesAffected,
-                         &noop));
+    root.apply(doc.root(),
+               &pathToCreate,
+               &pathTaken,
+               matchedField,
+               fromReplication,
+               &indexData,
+               &logBuilder,
+               &indexesAffected,
+               &noop);
     ASSERT_TRUE(indexesAffected);
     ASSERT_FALSE(noop);
     ASSERT_BSONOBJ_EQ(fromjson("{z: 0, a: {b: 6, c: 7}, b: {d: 8, e: 9}}"), doc.getObject());
@@ -843,15 +859,15 @@ TEST(UpdateObjectNodeTest, ApplyCreateDeeplyNestedPaths) {
     LogBuilder logBuilder(logDoc.root());
     auto indexesAffected = false;
     auto noop = false;
-    ASSERT_OK(root.apply(doc.root(),
-                         &pathToCreate,
-                         &pathTaken,
-                         matchedField,
-                         fromReplication,
-                         &indexData,
-                         &logBuilder,
-                         &indexesAffected,
-                         &noop));
+    root.apply(doc.root(),
+               &pathToCreate,
+               &pathTaken,
+               matchedField,
+               fromReplication,
+               &indexData,
+               &logBuilder,
+               &indexesAffected,
+               &noop);
     ASSERT_TRUE(indexesAffected);
     ASSERT_FALSE(noop);
     ASSERT_BSONOBJ_EQ(fromjson("{z: 0, a: {b: {c: {d: 6, e: 7}}, f: 8}}"), doc.getObject());
@@ -886,15 +902,15 @@ TEST(UpdateObjectNodeTest, ChildrenShouldBeAppliedInAlphabeticalOrder) {
     LogBuilder logBuilder(logDoc.root());
     auto indexesAffected = false;
     auto noop = false;
-    ASSERT_OK(root.apply(doc.root(),
-                         &pathToCreate,
-                         &pathTaken,
-                         matchedField,
-                         fromReplication,
-                         &indexData,
-                         &logBuilder,
-                         &indexesAffected,
-                         &noop));
+    root.apply(doc.root(),
+               &pathToCreate,
+               &pathTaken,
+               matchedField,
+               fromReplication,
+               &indexData,
+               &logBuilder,
+               &indexesAffected,
+               &noop);
     ASSERT_TRUE(indexesAffected);
     ASSERT_FALSE(noop);
     ASSERT_BSONOBJ_EQ(fromjson("{z: 9, a: 5, b: 8, c: 7, d: 6}"), doc.getObject());
@@ -922,15 +938,15 @@ TEST(UpdateObjectNodeTest, CollatorShouldNotAffectUpdateOrder) {
     LogBuilder logBuilder(logDoc.root());
     auto indexesAffected = false;
     auto noop = false;
-    ASSERT_OK(root.apply(doc.root(),
-                         &pathToCreate,
-                         &pathTaken,
-                         matchedField,
-                         fromReplication,
-                         &indexData,
-                         &logBuilder,
-                         &indexesAffected,
-                         &noop));
+    root.apply(doc.root(),
+               &pathToCreate,
+               &pathTaken,
+               matchedField,
+               fromReplication,
+               &indexData,
+               &logBuilder,
+               &indexesAffected,
+               &noop);
     ASSERT_TRUE(indexesAffected);
     ASSERT_FALSE(noop);
     ASSERT_BSONOBJ_EQ(fromjson("{abc: 5, cba: 6}"), doc.getObject());
@@ -962,15 +978,15 @@ TEST(UpdateObjectNodeTest, ApplyNoop) {
     LogBuilder logBuilder(logDoc.root());
     auto indexesAffected = false;
     auto noop = false;
-    ASSERT_OK(root.apply(doc.root(),
-                         &pathToCreate,
-                         &pathTaken,
-                         matchedField,
-                         fromReplication,
-                         &indexData,
-                         &logBuilder,
-                         &indexesAffected,
-                         &noop));
+    root.apply(doc.root(),
+               &pathToCreate,
+               &pathTaken,
+               matchedField,
+               fromReplication,
+               &indexData,
+               &logBuilder,
+               &indexesAffected,
+               &noop);
     ASSERT_FALSE(indexesAffected);
     ASSERT_TRUE(noop);
     ASSERT_BSONOBJ_EQ(fromjson("{a: 5, b: 6, c: 7}"), doc.getObject());
@@ -1002,15 +1018,15 @@ TEST(UpdateObjectNodeTest, ApplySomeChildrenNoops) {
     LogBuilder logBuilder(logDoc.root());
     auto indexesAffected = false;
     auto noop = false;
-    ASSERT_OK(root.apply(doc.root(),
-                         &pathToCreate,
-                         &pathTaken,
-                         matchedField,
-                         fromReplication,
-                         &indexData,
-                         &logBuilder,
-                         &indexesAffected,
-                         &noop));
+    root.apply(doc.root(),
+               &pathToCreate,
+               &pathTaken,
+               matchedField,
+               fromReplication,
+               &indexData,
+               &logBuilder,
+               &indexesAffected,
+               &noop);
     ASSERT_TRUE(indexesAffected);
     ASSERT_FALSE(noop);
     ASSERT_BSONOBJ_EQ(fromjson("{a: 5, b: 6, c: 7}"), doc.getObject());
@@ -1070,15 +1086,15 @@ TEST(UpdateObjectNodeTest, ApplyBlockingElementFromReplication) {
     LogBuilder logBuilder(logDoc.root());
     auto indexesAffected = false;
     auto noop = false;
-    ASSERT_OK(root.apply(doc.root(),
-                         &pathToCreate,
-                         &pathTaken,
-                         matchedField,
-                         fromReplication,
-                         &indexData,
-                         &logBuilder,
-                         &indexesAffected,
-                         &noop));
+    root.apply(doc.root(),
+               &pathToCreate,
+               &pathTaken,
+               matchedField,
+               fromReplication,
+               &indexData,
+               &logBuilder,
+               &indexesAffected,
+               &noop);
     ASSERT_FALSE(indexesAffected);
     ASSERT_FALSE(noop);
     ASSERT_BSONOBJ_EQ(fromjson("{a: 0, b: 6}"), doc.getObject());
@@ -1139,15 +1155,15 @@ TEST(UpdateObjectNodeTest, ApplyMergePositionalChild) {
     LogBuilder logBuilder(logDoc.root());
     auto indexesAffected = false;
     auto noop = false;
-    ASSERT_OK(root.apply(doc.root(),
-                         &pathToCreate,
-                         &pathTaken,
-                         matchedField,
-                         fromReplication,
-                         &indexData,
-                         &logBuilder,
-                         &indexesAffected,
-                         &noop));
+    root.apply(doc.root(),
+               &pathToCreate,
+               &pathTaken,
+               matchedField,
+               fromReplication,
+               &indexData,
+               &logBuilder,
+               &indexesAffected,
+               &noop);
     ASSERT_TRUE(indexesAffected);
     ASSERT_FALSE(noop);
     ASSERT_BSONOBJ_EQ(fromjson("{a: [{b: 5, c: 6}]}"), doc.getObject());
@@ -1179,15 +1195,15 @@ TEST(UpdateObjectNodeTest, ApplyOrderMergedPositionalChild) {
     LogBuilder logBuilder(logDoc.root());
     auto indexesAffected = false;
     auto noop = false;
-    ASSERT_OK(root.apply(doc.root(),
-                         &pathToCreate,
-                         &pathTaken,
-                         matchedField,
-                         fromReplication,
-                         &indexData,
-                         &logBuilder,
-                         &indexesAffected,
-                         &noop));
+    root.apply(doc.root(),
+               &pathToCreate,
+               &pathTaken,
+               matchedField,
+               fromReplication,
+               &indexData,
+               &logBuilder,
+               &indexesAffected,
+               &noop);
     ASSERT_TRUE(indexesAffected);
     ASSERT_FALSE(noop);
     ASSERT_BSONOBJ_EQ(fromjson("{a: {'0': 7, '1': {b: 6, c: 8}, '2': 5}}"), doc.getObject());
@@ -1252,15 +1268,15 @@ TEST(UpdateObjectNodeTest, ApplyDoNotMergePositionalChild) {
     LogBuilder logBuilder(logDoc.root());
     auto indexesAffected = false;
     auto noop = false;
-    ASSERT_OK(root.apply(doc.root(),
-                         &pathToCreate,
-                         &pathTaken,
-                         matchedField,
-                         fromReplication,
-                         &indexData,
-                         &logBuilder,
-                         &indexesAffected,
-                         &noop));
+    root.apply(doc.root(),
+               &pathToCreate,
+               &pathTaken,
+               matchedField,
+               fromReplication,
+               &indexData,
+               &logBuilder,
+               &indexesAffected,
+               &noop);
     ASSERT_TRUE(indexesAffected);
     ASSERT_FALSE(noop);
     ASSERT_BSONOBJ_EQ(fromjson("{a: {'0': 5, '1': 7, '2': 6}}"), doc.getObject());
@@ -1290,15 +1306,15 @@ TEST(UpdateObjectNodeTest, ApplyPositionalChildLast) {
     LogBuilder logBuilder(logDoc.root());
     auto indexesAffected = false;
     auto noop = false;
-    ASSERT_OK(root.apply(doc.root(),
-                         &pathToCreate,
-                         &pathTaken,
-                         matchedField,
-                         fromReplication,
-                         &indexData,
-                         &logBuilder,
-                         &indexesAffected,
-                         &noop));
+    root.apply(doc.root(),
+               &pathToCreate,
+               &pathTaken,
+               matchedField,
+               fromReplication,
+               &indexData,
+               &logBuilder,
+               &indexesAffected,
+               &noop);
     ASSERT_TRUE(indexesAffected);
     ASSERT_FALSE(noop);
     ASSERT_BSONOBJ_EQ(fromjson("{a: {'0': 6, '1': 7, '2': 5}}"), doc.getObject());
@@ -1326,15 +1342,15 @@ TEST(UpdateObjectNodeTest, ApplyUseStoredMergedPositional) {
     LogBuilder logBuilder(logDoc.root());
     auto indexesAffected = false;
     auto noop = false;
-    ASSERT_OK(root.apply(doc.root(),
-                         &pathToCreate,
-                         &pathTaken,
-                         matchedField,
-                         fromReplication,
-                         &indexData,
-                         &logBuilder,
-                         &indexesAffected,
-                         &noop));
+    root.apply(doc.root(),
+               &pathToCreate,
+               &pathTaken,
+               matchedField,
+               fromReplication,
+               &indexData,
+               &logBuilder,
+               &indexesAffected,
+               &noop);
     ASSERT_TRUE(indexesAffected);
     ASSERT_FALSE(noop);
     ASSERT_BSONOBJ_EQ(fromjson("{a: [{b: 5, c: 6}]}"), doc.getObject());
@@ -1344,15 +1360,15 @@ TEST(UpdateObjectNodeTest, ApplyUseStoredMergedPositional) {
     Document doc2(fromjson("{a: [{b: 0, c: 0}]}"));
     Document logDoc2;
     LogBuilder logBuilder2(logDoc2.root());
-    ASSERT_OK(root.apply(doc2.root(),
-                         &pathToCreate,
-                         &pathTaken,
-                         matchedField,
-                         fromReplication,
-                         &indexData,
-                         &logBuilder2,
-                         &indexesAffected,
-                         &noop));
+    root.apply(doc2.root(),
+               &pathToCreate,
+               &pathTaken,
+               matchedField,
+               fromReplication,
+               &indexData,
+               &logBuilder2,
+               &indexesAffected,
+               &noop);
     ASSERT_TRUE(indexesAffected);
     ASSERT_FALSE(noop);
     ASSERT_BSONOBJ_EQ(fromjson("{a: [{b: 5, c: 6}]}"), doc2.getObject());
@@ -1382,15 +1398,15 @@ TEST(UpdateObjectNodeTest, ApplyDoNotUseStoredMergedPositional) {
     LogBuilder logBuilder(logDoc.root());
     auto indexesAffected = false;
     auto noop = false;
-    ASSERT_OK(root.apply(doc.root(),
-                         &pathToCreate,
-                         &pathTaken,
-                         matchedField,
-                         fromReplication,
-                         &indexData,
-                         &logBuilder,
-                         &indexesAffected,
-                         &noop));
+    root.apply(doc.root(),
+               &pathToCreate,
+               &pathTaken,
+               matchedField,
+               fromReplication,
+               &indexData,
+               &logBuilder,
+               &indexesAffected,
+               &noop);
     ASSERT_TRUE(indexesAffected);
     ASSERT_FALSE(noop);
     ASSERT_BSONOBJ_EQ(fromjson("{a: [{b: 5, c: 6}, {c: 0, d: 7}]}"), doc.getObject());
@@ -1401,15 +1417,15 @@ TEST(UpdateObjectNodeTest, ApplyDoNotUseStoredMergedPositional) {
     StringData matchedField2 = "1";
     Document logDoc2;
     LogBuilder logBuilder2(logDoc2.root());
-    ASSERT_OK(root.apply(doc2.root(),
-                         &pathToCreate,
-                         &pathTaken,
-                         matchedField2,
-                         fromReplication,
-                         &indexData,
-                         &logBuilder2,
-                         &indexesAffected,
-                         &noop));
+    root.apply(doc2.root(),
+               &pathToCreate,
+               &pathTaken,
+               matchedField2,
+               fromReplication,
+               &indexData,
+               &logBuilder2,
+               &indexesAffected,
+               &noop);
     ASSERT_TRUE(indexesAffected);
     ASSERT_FALSE(noop);
     ASSERT_BSONOBJ_EQ(fromjson("{a: [{b: 5, c: 0}, {c: 6, d: 7}]}"), doc2.getObject());

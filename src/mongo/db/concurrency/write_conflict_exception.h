@@ -38,27 +38,27 @@
 
 // Use of this macro is deprecated.  Prefer the writeConflictRetry template, below, instead.
 
-#define MONGO_WRITE_CONFLICT_RETRY_LOOP_BEGIN \
-    do {                                      \
-        int wcr__Attempts = 0;                \
-        do {                                  \
+// clang-format off
+
+#define MONGO_WRITE_CONFLICT_RETRY_LOOP_BEGIN                           \
+    do {                                                                \
+        int WCR_attempts = 0;                                           \
+        do {                                                            \
             try
-#define MONGO_WRITE_CONFLICT_RETRY_LOOP_END(PTXN, OPSTR, NSSTR) \
-    catch (const ::mongo::WriteConflictException& wce) {        \
-        const OperationContext* ptxn = (PTXN);                  \
-        ++CurOp::get(ptxn)->debug().writeConflicts;             \
-        wce.logAndBackoff(wcr__Attempts, (OPSTR), (NSSTR));     \
-        ++wcr__Attempts;                                        \
-        ptxn->recoveryUnit()->abandonSnapshot();                \
-        continue;                                               \
-    }                                                           \
-    break;                                                      \
-    }                                                           \
-    while (true)                                                \
-        ;                                                       \
-    }                                                           \
-    while (false)                                               \
-        ;
+#define MONGO_WRITE_CONFLICT_RETRY_LOOP_END(PTXN, OPSTR, NSSTR)         \
+            catch (const ::mongo::WriteConflictException& WCR_wce) {    \
+                OperationContext const* WCR_opCtx = (PTXN);             \
+                ++CurOp::get(WCR_opCtx)->debug().writeConflicts;        \
+                WCR_wce.logAndBackoff(WCR_attempts, (OPSTR), (NSSTR));  \
+                ++WCR_attempts;                                         \
+                WCR_opCtx->recoveryUnit()->abandonSnapshot();           \
+                continue;                                               \
+            }                                                           \
+            break;                                                      \
+        } while (true);                                                 \
+    } while (false)
+
+// clang-format on
 
 namespace mongo {
 
@@ -86,13 +86,24 @@ public:
     static AtomicBool trace;
 };
 
+/**
+ * Runs the argument function f as many times as needed for f to complete or throw an exception
+ * other than WriteConflictException.  For each time f throws a WriteConflictException, logs the
+ * error, waits a spell, cleans up, and then tries f again.  Imposes no upper limit on the number
+ * of times to re-try f, so any required timeout behavior must be enforced within f.
+ *
+ * When converting from uses of the deprecated macros MONGO_WRITE_CONFLICT_RETRY_LOOP_BEGIN/_END,
+ * return-statements in the body code (ending up in f) must be converted to redirect control flow
+ * by some other means, such as throwing an exception or returning a value for the caller to check.
+ * Similarly, any value produced in f must be transported out via returned result or via a captured
+ * pointer or reference.
+ */
 template <typename F>
-void writeConflictRetry(OperationContext* opCtx, StringData opStr, StringData ns, F&& f) {
+auto writeConflictRetry(OperationContext* opCtx, StringData opStr, StringData ns, F&& f) {
     int attempts = 0;
     while (true) {
         try {
-            f();
-            break;
+            return f();
         } catch (WriteConflictException const& wce) {
             ++CurOp::get(opCtx)->debug().writeConflicts;
             wce.logAndBackoff(attempts, opStr, ns);

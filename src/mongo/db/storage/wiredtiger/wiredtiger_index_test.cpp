@@ -54,65 +54,6 @@ namespace {
 
 using std::string;
 
-class MyHarnessHelper final : public SortedDataInterfaceHarnessHelper {
-public:
-    MyHarnessHelper() : _dbpath("wt_test"), _conn(NULL) {
-        const char* config = "create,cache_size=1G,";
-        int ret = wiredtiger_open(_dbpath.path().c_str(), NULL, config, &_conn);
-        invariantWTOK(ret);
-
-        _sessionCache = new WiredTigerSessionCache(_conn);
-    }
-
-    ~MyHarnessHelper() final {
-        delete _sessionCache;
-        _conn->close(_conn, NULL);
-    }
-
-    std::unique_ptr<SortedDataInterface> newSortedDataInterface(bool unique) final {
-        std::string ns = "test.wt";
-        OperationContextNoop opCtx(newRecoveryUnit().release());
-
-        BSONObj spec = BSON("key" << BSON("a" << 1) << "name"
-                                  << "testIndex"
-                                  << "ns"
-                                  << ns);
-
-        IndexDescriptor desc(NULL, "", spec);
-
-        StatusWith<std::string> result =
-            WiredTigerIndex::generateCreateString(kWiredTigerEngineName, "", "", desc);
-        ASSERT_OK(result.getStatus());
-
-        string uri = "table:" + ns;
-        invariantWTOK(WiredTigerIndex::Create(&opCtx, uri, result.getValue()));
-
-        if (unique)
-            return stdx::make_unique<WiredTigerIndexUnique>(
-                &opCtx, uri, &desc, KVPrefix::kNotPrefixed);
-        return stdx::make_unique<WiredTigerIndexStandard>(
-            &opCtx, uri, &desc, KVPrefix::kNotPrefixed);
-    }
-
-    std::unique_ptr<RecoveryUnit> newRecoveryUnit() final {
-        return stdx::make_unique<WiredTigerRecoveryUnit>(_sessionCache);
-    }
-
-private:
-    unittest::TempDir _dbpath;
-    WT_CONNECTION* _conn;
-    WiredTigerSessionCache* _sessionCache;
-};
-
-std::unique_ptr<HarnessHelper> makeHarnessHelper() {
-    return stdx::make_unique<MyHarnessHelper>();
-}
-
-MONGO_INITIALIZER(RegisterHarnessFactory)(InitializerContext* const) {
-    mongo::registerHarnessHelperFactory(makeHarnessHelper);
-    return Status::OK();
-}
-
 TEST(WiredTigerIndexTest, GenerateCreateStringEmptyDocument) {
     BSONObj spec = fromjson("{}");
     StatusWith<std::string> result = WiredTigerIndex::parseIndexOptions(spec);
