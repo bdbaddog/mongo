@@ -597,6 +597,12 @@ class Node(object):
         Annotate(self)
 
     def disambiguate(self, must_exist=None):
+        """
+        Convert the node to it's actual type. 
+        We may create the node before we know if it's a file, directory, or other
+        :param must_exist: 
+        :return: A node converted to it's proper type.
+        """
         return self
 
     def get_suffix(self):
@@ -1125,38 +1131,19 @@ class Node(object):
             binfo.bactsig = SCons.Util.MD5signature(executor.get_contents())
 
         if self._specific_sources:
-            sources = []
-            for s in self.sources:
-                if s not in ignore_set:
-                    sources.append(s)
+            sources = [ s for s in self.sources if not s in ignore_set]
         else:
             sources = executor.get_unignored_sources(self, self.ignore)
+
         seen = set()
-        bsources = []
-        bsourcesigs = []
-        for s in sources:
-            if not s in seen:
-                seen.add(s)
-                bsources.append(s)
-                bsourcesigs.append(s.get_ninfo())
-        binfo.bsources = bsources
-        binfo.bsourcesigs = bsourcesigs
+        binfo.bsources = [s for s in sources if s not in seen and not seen.add(s)]
+        binfo.bsourcesigs = [s.get_ninfo() for s in binfo.bsources]
 
-        depends = self.depends
-        dependsigs = []
-        for d in depends:
-            if d not in ignore_set:
-                dependsigs.append(d.get_ninfo())
-        binfo.bdepends = depends
-        binfo.bdependsigs = dependsigs
+        binfo.bdepends = self.depends
+        binfo.bdependsigs = [d.get_ninfo() for d in self.depends if d not in ignore_set]
 
-        implicit = self.implicit or []
-        implicitsigs = []
-        for i in implicit:
-            if i not in ignore_set:
-                implicitsigs.append(i.get_ninfo())
-        binfo.bimplicit = implicit
-        binfo.bimplicitsigs = implicitsigs
+        binfo.bimplicit = self.implicit or []
+        binfo.bimplicitsigs = [i.get_ninfo() for i in binfo.bimplicit if i not in ignore_set]
 
         return binfo
 
