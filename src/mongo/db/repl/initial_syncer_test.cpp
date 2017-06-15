@@ -269,7 +269,7 @@ protected:
                     log() << "reusing collection during test which may cause problems, ns:" << nss;
                 }
                 (collInfo->loader = new CollectionBulkLoaderMock(&collInfo->stats))
-                    ->init(nullptr, secondaryIndexSpecs);
+                    ->init(secondaryIndexSpecs);
 
                 return StatusWith<std::unique_ptr<CollectionBulkLoader>>(
                     std::unique_ptr<CollectionBulkLoader>(collInfo->loader));
@@ -293,6 +293,7 @@ protected:
         options.initialSyncRetryWait = Milliseconds(1);
         options.getMyLastOptime = [this]() { return _myLastOpTime; };
         options.setMyLastOptime = [this](const OpTime& opTime) { _setMyLastOptime(opTime); };
+        options.resetOptimes = [this]() { _setMyLastOptime(OpTime()); };
         options.getSlaveDelay = [this]() { return Seconds(0); };
         options.syncSourceSelector = this;
 
@@ -359,8 +360,8 @@ protected:
         if (_executorThreadShutdownComplete) {
             return;
         }
-        executor::ThreadPoolExecutorTest::shutdownExecutorThread();
-        executor::ThreadPoolExecutorTest::joinExecutorThread();
+        getExecutor().shutdown();
+        getExecutor().join();
         _executorThreadShutdownComplete = true;
     }
 
@@ -371,9 +372,6 @@ protected:
         _dbWorkThreadPool.reset();
         _replicationProcess.reset();
         _storageInterface.reset();
-
-        // tearDown() destroys the task executor which was referenced by the initial syncer.
-        executor::ThreadPoolExecutorTest::tearDown();
     }
 
     /**
@@ -526,6 +524,7 @@ TEST_F(InitialSyncerTest, InvalidConstruction) {
     InitialSyncerOptions options;
     options.getMyLastOptime = []() { return OpTime(); };
     options.setMyLastOptime = [](const OpTime&) {};
+    options.resetOptimes = []() {};
     options.getSlaveDelay = []() { return Seconds(0); };
     options.syncSourceSelector = this;
     auto callback = [](const StatusWith<OpTimeWithHash>&) {};
@@ -730,6 +729,30 @@ TEST_F(InitialSyncerTest,
         << progress;
     ASSERT_EQUALS(progress.getIntField("maxFailedInitialSyncAttempts"), int(initialSyncMaxAttempts))
         << progress;
+}
+
+TEST_F(InitialSyncerTest, InitialSyncerResetsOptimesOnNewAttempt) {
+    auto initialSyncer = &getInitialSyncer();
+    auto opCtx = makeOpCtx();
+
+    _syncSourceSelector->setChooseNewSyncSourceResult_forTest(HostAndPort());
+
+    const std::uint32_t initialSyncMaxAttempts = 1U;
+    ASSERT_OK(initialSyncer->startup(opCtx.get(), initialSyncMaxAttempts));
+
+    auto net = getNet();
+    auto origOptime = OpTime(Timestamp(1000, 1), 1);
+
+    _setMyLastOptime(origOptime);
+
+    // Simulate a failed initial sync attempt
+    _simulateChooseSyncSourceFailure(net, _options.syncSourceRetryWait);
+    advanceClock(net, _options.initialSyncRetryWait);
+
+    initialSyncer->join();
+
+    // Make sure the initial sync attempt reset optimes.
+    ASSERT_EQUALS(OpTime(), _options.getMyLastOptime());
 }
 
 TEST_F(InitialSyncerTest,

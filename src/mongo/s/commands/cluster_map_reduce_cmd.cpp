@@ -47,9 +47,8 @@
 #include "mongo/s/catalog_cache.h"
 #include "mongo/s/client/shard_connection.h"
 #include "mongo/s/client/shard_registry.h"
-#include "mongo/s/commands/cluster_commands_common.h"
+#include "mongo/s/commands/cluster_commands_helpers.h"
 #include "mongo/s/commands/cluster_write.h"
-#include "mongo/s/commands/sharded_command_processing.h"
 #include "mongo/s/commands/strategy.h"
 #include "mongo/s/grid.h"
 #include "mongo/stdx/chrono.h"
@@ -282,7 +281,7 @@ public:
             ShardConnection conn(inputRoutingInfo.primary()->getConnString(), "");
 
             BSONObj res;
-            bool ok = conn->runCommand(dbname, cmdObj, res);
+            bool ok = conn->runCommand(dbname, filterCommandRequestForPassthrough(cmdObj), res);
             conn.done();
 
             if (auto wcErrorElem = res["writeConcernError"]) {
@@ -290,7 +289,7 @@ public:
                     inputRoutingInfo.primary()->getId(), wcErrorElem, result);
             }
 
-            result.appendElementsUnique(res);
+            result.appendElementsUnique(filterCommandReplyForPassthrough(res));
             return ok;
         }
 

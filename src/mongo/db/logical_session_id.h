@@ -32,6 +32,7 @@
 
 #include "mongo/base/status_with.h"
 #include "mongo/db/logical_session_id_gen.h"
+#include "mongo/stdx/unordered_set.h"
 #include "mongo/util/uuid.h"
 
 namespace mongo {
@@ -113,5 +114,10 @@ inline std::ostream& operator<<(std::ostream& s, const LogicalSessionId& lsid) {
 inline StringBuilder& operator<<(StringBuilder& s, const LogicalSessionId& lsid) {
     return (s << lsid.toString());
 }
+
+/**
+ * An alias for sets of session ids.
+ */
+using LogicalSessionIdSet = stdx::unordered_set<LogicalSessionId, LogicalSessionId::Hash>;
 
 }  // namespace mongo

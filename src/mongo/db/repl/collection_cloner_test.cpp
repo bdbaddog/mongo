@@ -66,6 +66,9 @@ protected:
     void setUp() override;
     void tearDown() override;
 
+    // 16MB max batch size / 12 byte min doc size * 10 (for good measure) = defaultBatchSize to use.
+    const int defaultBatchSize = (16 * 1024 * 1024) / 12 * 10;
+
     CollectionOptions options;
     std::unique_ptr<CollectionCloner> collectionCloner;
     CollectionMockStats collectionStats;  // Used by the _loader.
@@ -83,15 +86,15 @@ void CollectionClonerTest::setUp() {
         nss,
         options,
         stdx::bind(&CollectionClonerTest::setStatus, this, stdx::placeholders::_1),
-        storageInterface.get());
+        storageInterface.get(),
+        defaultBatchSize);
     collectionStats = CollectionMockStats();
     storageInterface->createCollectionForBulkFn =
         [this](const NamespaceString& nss,
                const CollectionOptions& options,
                const BSONObj idIndexSpec,
                const std::vector<BSONObj>& secondaryIndexSpecs) {
-            (_loader = new CollectionBulkLoaderMock(&collectionStats))
-                ->init(nullptr, secondaryIndexSpecs);
+            (_loader = new CollectionBulkLoaderMock(&collectionStats))->init(secondaryIndexSpecs);
 
             return StatusWith<std::unique_ptr<CollectionBulkLoader>>(
                 std::unique_ptr<CollectionBulkLoader>(_loader));
@@ -118,15 +121,16 @@ TEST_F(CollectionClonerTest, InvalidConstruction) {
     // Null executor -- error from Fetcher, not CollectionCloner.
     {
         StorageInterface* si = storageInterface.get();
-        ASSERT_THROWS_CODE_AND_WHAT(CollectionCloner(nullptr, pool, target, nss, options, cb, si),
-                                    UserException,
-                                    ErrorCodes::BadValue,
-                                    "task executor cannot be null");
+        ASSERT_THROWS_CODE_AND_WHAT(
+            CollectionCloner(nullptr, pool, target, nss, options, cb, si, defaultBatchSize),
+            UserException,
+            ErrorCodes::BadValue,
+            "task executor cannot be null");
     }
 
     // Null storage interface
     ASSERT_THROWS_CODE_AND_WHAT(
-        CollectionCloner(&executor, pool, target, nss, options, cb, nullptr),
+        CollectionCloner(&executor, pool, target, nss, options, cb, nullptr, defaultBatchSize),
         UserException,
         ErrorCodes::BadValue,
         "storage interface cannot be null");
@@ -136,7 +140,7 @@ TEST_F(CollectionClonerTest, InvalidConstruction) {
         NamespaceString badNss("db.");
         StorageInterface* si = storageInterface.get();
         ASSERT_THROWS_CODE_AND_WHAT(
-            CollectionCloner(&executor, pool, target, badNss, options, cb, si),
+            CollectionCloner(&executor, pool, target, badNss, options, cb, si, defaultBatchSize),
             UserException,
             ErrorCodes::BadValue,
             "invalid collection namespace: db.");
@@ -149,7 +153,8 @@ TEST_F(CollectionClonerTest, InvalidConstruction) {
                                             << "not a document");
         StorageInterface* si = storageInterface.get();
         ASSERT_THROWS_CODE_AND_WHAT(
-            CollectionCloner(&executor, pool, target, nss, invalidOptions, cb, si),
+            CollectionCloner(
+                &executor, pool, target, nss, invalidOptions, cb, si, defaultBatchSize),
             UserException,
             ErrorCodes::BadValue,
             "'storageEngine.storageEngine1' has to be an embedded document.");
@@ -160,7 +165,7 @@ TEST_F(CollectionClonerTest, InvalidConstruction) {
         CollectionCloner::CallbackFn nullCb;
         StorageInterface* si = storageInterface.get();
         ASSERT_THROWS_CODE_AND_WHAT(
-            CollectionCloner(&executor, pool, target, nss, options, nullCb, si),
+            CollectionCloner(&executor, pool, target, nss, options, nullCb, si, defaultBatchSize),
             UserException,
             ErrorCodes::BadValue,
             "callback function cannot be null");
@@ -308,7 +313,8 @@ TEST_F(CollectionClonerTest,
         nss,
         options,
         stdx::bind(&CollectionClonerTest::setStatus, this, stdx::placeholders::_1),
-        storageInterface.get());
+        storageInterface.get(),
+        defaultBatchSize);
 
     ASSERT_OK(collectionCloner->startup());
 
@@ -330,7 +336,8 @@ TEST_F(CollectionClonerTest, DoNotCreateIDIndexIfAutoIndexIdUsed) {
         nss,
         options,
         stdx::bind(&CollectionClonerTest::setStatus, this, stdx::placeholders::_1),
-        storageInterface.get()));
+        storageInterface.get(),
+        defaultBatchSize));
 
     NamespaceString collNss;
     CollectionOptions collOptions;
@@ -345,7 +352,7 @@ TEST_F(CollectionClonerTest, DoNotCreateIDIndexIfAutoIndexIdUsed) {
             collNss = theNss;
             collOptions = theOptions;
             collIndexSpecs = theIndexSpecs;
-            loader->init(nullptr, theIndexSpecs);
+            loader->init(theIndexSpecs);
             return std::unique_ptr<CollectionBulkLoader>(loader);
         };
 
@@ -1146,7 +1153,8 @@ TEST_F(CollectionClonerTest, CollectionClonerResetsOnCompletionCallbackFunctionA
                                                 log() << "setting result to " << status;
                                                 result = status;
                                             },
-                                            storageInterface.get());
+                                            storageInterface.get(),
+                                            defaultBatchSize);
 
     ASSERT_OK(collectionCloner->startup());
     ASSERT_TRUE(collectionCloner->isActive());

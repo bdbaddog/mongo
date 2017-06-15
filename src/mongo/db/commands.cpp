@@ -341,4 +341,44 @@ bool Command::enhancedRun(OperationContext* opCtx,
     return run(opCtx, request.getDatabase().toString(), request.body, errmsg, result);
 }
 
+BSONObj Command::filterCommandRequestForPassthrough(const BSONObj& cmdObj) {
+    BSONObjBuilder bob;
+    for (auto elem : cmdObj) {
+        const auto name = elem.fieldNameStringData();
+        if (name == "$readPreference") {
+            BSONObjBuilder(bob.subobjStart("$queryOptions")).append(elem);
+        } else if (!Command::isGenericArgument(name) ||  //
+                   name == "$queryOptions" ||            //
+                   name == "maxTimeMS" ||                //
+                   name == "readConcern" ||              //
+                   name == "writeConcern") {
+            // This is the whitelist of generic arguments that commands can be trusted to blindly
+            // forward to the shards.
+            bob.append(elem);
+        }
+    }
+    return bob.obj();
+}
+
+void Command::filterCommandReplyForPassthrough(const BSONObj& cmdObj, BSONObjBuilder* output) {
+    for (auto elem : cmdObj) {
+        const auto name = elem.fieldNameStringData();
+        if (name == "$configServerState" ||  //
+            name == "$gleStats" ||           //
+            name == "$logicalTime" ||        //
+            name == "$oplogQueryData" ||     //
+            name == "$replData" ||           //
+            name == "operationTime") {
+            continue;
+        }
+        output->append(elem);
+    }
+}
+
+BSONObj Command::filterCommandReplyForPassthrough(const BSONObj& cmdObj) {
+    BSONObjBuilder bob;
+    filterCommandReplyForPassthrough(cmdObj, &bob);
+    return bob.obj();
+}
+
 }  // namespace mongo

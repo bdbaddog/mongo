@@ -60,7 +60,7 @@
 #include "mongo/s/client/parallel.h"
 #include "mongo/s/client/shard_connection.h"
 #include "mongo/s/client/shard_registry.h"
-#include "mongo/s/commands/cluster_commands_common.h"
+#include "mongo/s/commands/cluster_commands_helpers.h"
 #include "mongo/s/commands/cluster_explain.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/query/cluster_cursor_manager.h"
@@ -143,56 +143,22 @@ void appendRequiredFieldsToResponse(OperationContext* opCtx, BSONObjBuilder* res
     }
 }
 
-/**
- * Rewrites cmdObj into the format expected by mongos Command::run() implementations.
- *
- * This performs 2 transformations:
- * 1) $readPreference fields are moved into a subobject called $queryOptions. This matches the
- *    "wrapped" format historically used internally by mongos. Moving off of that format will be
- *    done as SERVER-29091.
- *
- * 2) Filter out generic arguments that shouldn't be blindly passed to the shards.  This is
- *    necessary because many mongos implementations of Command::run() just pass cmdObj through
- *    directly to the shards. However, some of the generic arguments fields are automatically
- *    appended in the egress layer. Removing them here ensures that they don't get duplicated.
- *
- * Ideally this function can be deleted once mongos run() implementations are more careful about
- * what they send to the shards.
- */
-BSONObj filterCommandRequestForPassthrough(const BSONObj& cmdObj) {
-    BSONObjBuilder bob;
-    for (auto elem : cmdObj) {
-        const auto name = elem.fieldNameStringData();
-        if (name == "$readPreference") {
-            BSONObjBuilder(bob.subobjStart("$queryOptions")).append(elem);
-        } else if (!Command::isGenericArgument(name) || name == "maxTimeMS" ||
-                   name == "readConcern" || name == "writeConcern") {
-            // This is the whitelist of generic arguments that commands can be trusted to blindly
-            // forward to the shards.
-            bob.append(elem);
-        }
-    }
-    return bob.obj();
-}
-
 void execCommandClient(OperationContext* opCtx,
                        Command* c,
-                       StringData dbname,
-                       BSONObj& cmdObj,
+                       const OpMsgRequest& request,
                        BSONObjBuilder& result) {
     ON_BLOCK_EXIT([opCtx, &result] { appendRequiredFieldsToResponse(opCtx, &result); });
 
+    const auto dbname = request.getDatabase().toString();
     uassert(ErrorCodes::IllegalOperation,
             "Can't use 'local' database through mongos",
             dbname != NamespaceString::kLocalDb);
-
     uassert(ErrorCodes::InvalidNamespace,
             str::stream() << "Invalid database name: '" << dbname << "'",
             NamespaceString::validDBName(dbname, NamespaceString::DollarInDbNameBehavior::Allow));
 
-    dassert(dbname == nsToDatabase(dbname));
     StringMap<int> topLevelFields;
-    for (auto&& element : cmdObj) {
+    for (auto&& element : request.body) {
         StringData fieldName = element.fieldNameStringData();
         if (fieldName == "help" && element.type() == Bool && element.Bool()) {
             std::stringstream help;
@@ -209,7 +175,7 @@ void execCommandClient(OperationContext* opCtx,
                 topLevelFields[fieldName]++ == 0);
     }
 
-    Status status = Command::checkAuthorization(c, opCtx, dbname.toString(), cmdObj);
+    Status status = Command::checkAuthorization(c, opCtx, dbname, request.body);
     if (!status.isOK()) {
         Command::appendCommandStatus(result, status);
         return;
@@ -222,13 +188,13 @@ void execCommandClient(OperationContext* opCtx,
     }
 
     StatusWith<WriteConcernOptions> wcResult =
-        WriteConcernOptions::extractWCFromCommand(cmdObj, dbname.toString());
+        WriteConcernOptions::extractWCFromCommand(request.body, dbname);
     if (!wcResult.isOK()) {
         Command::appendCommandStatus(result, wcResult.getStatus());
         return;
     }
 
-    bool supportsWriteConcern = c->supportsWriteConcern(cmdObj);
+    bool supportsWriteConcern = c->supportsWriteConcern(request.body);
     if (!supportsWriteConcern && !wcResult.getValue().usedDefault) {
         // This command doesn't do writes so it should not be passed a writeConcern.
         // If we did not use the default writeConcern, one was provided when it shouldn't have
@@ -243,25 +209,24 @@ void execCommandClient(OperationContext* opCtx,
     trackingMetadata.initWithOperName(c->getName());
     rpc::TrackingMetadata::get(opCtx) = trackingMetadata;
 
-    auto metadataStatus = processCommandMetadata(opCtx, cmdObj);
+    auto metadataStatus = processCommandMetadata(opCtx, request.body);
     if (!metadataStatus.isOK()) {
         Command::appendCommandStatus(result, metadataStatus);
         return;
     }
 
-    auto filteredCmdObj = filterCommandRequestForPassthrough(cmdObj);
     std::string errmsg;
     bool ok = false;
     try {
         if (!supportsWriteConcern) {
-            ok = c->run(opCtx, dbname.toString(), filteredCmdObj, errmsg, result);
+            ok = c->enhancedRun(opCtx, request, errmsg, result);
         } else {
             // Change the write concern while running the command.
             const auto oldWC = opCtx->getWriteConcern();
             ON_BLOCK_EXIT([&] { opCtx->setWriteConcern(oldWC); });
             opCtx->setWriteConcern(wcResult.getValue());
 
-            ok = c->run(opCtx, dbname.toString(), filteredCmdObj, errmsg, result);
+            ok = c->enhancedRun(opCtx, request, errmsg, result);
         }
     } catch (const DBException& e) {
         result.resetToEmpty();
@@ -284,31 +249,29 @@ void execCommandClient(OperationContext* opCtx,
 }
 
 void runAgainstRegistered(OperationContext* opCtx,
-                          StringData db,
-                          BSONObj& jsobj,
+                          const OpMsgRequest& request,
                           BSONObjBuilder& anObjBuilder) {
-    BSONElement e = jsobj.firstElement();
-    const auto commandName = e.fieldNameStringData();
-    Command* c = e.type() ? Command::findCommand(commandName) : NULL;
+    const auto commandName = request.getCommandName();
+    Command* c = Command::findCommand(commandName);
     if (!c) {
         Command::appendCommandStatus(
-            anObjBuilder, false, str::stream() << "no such cmd: " << commandName);
-        anObjBuilder.append("code", ErrorCodes::CommandNotFound);
+            anObjBuilder,
+            {ErrorCodes::CommandNotFound, str::stream() << "no such cmd: " << commandName});
         Command::unknownCommands.increment();
         return;
     }
 
-    execCommandClient(opCtx, c, db, jsobj, anObjBuilder);
+    execCommandClient(opCtx, c, request, anObjBuilder);
 }
 
-void runCommand(OperationContext* opCtx, StringData db, BSONObj cmdObj, BSONObjBuilder&& builder) {
+void runCommand(OperationContext* opCtx, const OpMsgRequest& request, BSONObjBuilder&& builder) {
     // Handle command option maxTimeMS.
     uassert(ErrorCodes::InvalidOptions,
             "no such command option $maxTimeMs; use maxTimeMS instead",
-            cmdObj[QueryRequest::queryOptionMaxTimeMS].eoo());
+            request.body[QueryRequest::queryOptionMaxTimeMS].eoo());
 
-    const int maxTimeMS =
-        uassertStatusOK(QueryRequest::parseMaxTimeMS(cmdObj[QueryRequest::cmdOptionMaxTimeMS]));
+    const int maxTimeMS = uassertStatusOK(
+        QueryRequest::parseMaxTimeMS(request.body[QueryRequest::cmdOptionMaxTimeMS]));
     if (maxTimeMS > 0) {
         opCtx->setDeadlineAfterNowBy(Milliseconds{maxTimeMS});
     }
@@ -318,13 +281,13 @@ void runCommand(OperationContext* opCtx, StringData db, BSONObj cmdObj, BSONObjB
     while (true) {
         builder.resetToEmpty();
         try {
-            runAgainstRegistered(opCtx, db, cmdObj, builder);
+            runAgainstRegistered(opCtx, request, builder);
             return;
         } catch (const StaleConfigException& e) {
             if (e.getns().empty()) {
                 // This should be impossible but older versions tried incorrectly to handle it here.
                 log() << "Received a stale config error with an empty namespace while executing "
-                      << redact(cmdObj) << " : " << redact(e);
+                      << redact(request.body) << " : " << redact(e);
                 throw;
             }
 
@@ -332,7 +295,7 @@ void runCommand(OperationContext* opCtx, StringData db, BSONObj cmdObj, BSONObjB
                 throw e;
 
             loops--;
-            log() << "Retrying command " << redact(cmdObj) << causedBy(e);
+            log() << "Retrying command " << redact(request.body) << causedBy(e);
 
             ShardConnection::checkMyConnectionVersions(opCtx, e.getns());
             if (loops < 4) {
@@ -379,7 +342,7 @@ DbResponse Strategy::queryOp(OperationContext* opCtx, const NamespaceString& nss
     const auto defaultReadPref = q.queryOptions & QueryOption_SlaveOk
         ? ReadPreference::SecondaryPreferred
         : ReadPreference::PrimaryOnly;
-    const auto readPreference =
+    ReadPreferenceSetting::get(opCtx) =
         uassertStatusOK(ReadPreferenceSetting::fromContainingBSON(q.query, defaultReadPref));
 
     auto canonicalQuery =
@@ -395,8 +358,12 @@ DbResponse Strategy::queryOp(OperationContext* opCtx, const NamespaceString& nss
         const auto verbosity = ExplainOptions::Verbosity::kExecAllPlans;
 
         BSONObjBuilder explainBuilder;
-        uassertStatusOK(Strategy::explainFind(
-            opCtx, findCommand, queryRequest, verbosity, readPreference, &explainBuilder));
+        uassertStatusOK(Strategy::explainFind(opCtx,
+                                              findCommand,
+                                              queryRequest,
+                                              verbosity,
+                                              ReadPreferenceSetting::get(opCtx),
+                                              &explainBuilder));
 
         BSONObj explainObj = explainBuilder.done();
         return replyToQuery(explainObj);
@@ -411,7 +378,7 @@ DbResponse Strategy::queryOp(OperationContext* opCtx, const NamespaceString& nss
     auto cursorId =
         ClusterFind::runQuery(opCtx,
                               *canonicalQuery,
-                              readPreference,
+                              ReadPreferenceSetting::get(opCtx),
                               &batch,
                               nullptr /*Argument is for views which OP_QUERY doesn't support*/);
 
@@ -513,28 +480,32 @@ DbResponse Strategy::clientOpQueryCommand(OperationContext* opCtx,
         }
     }
 
+    auto request = OpMsgRequest::fromDBAndBody(nss.db(), cmdObj);
     OpQueryReplyBuilder reply;
-    runCommand(opCtx, nss.db(), cmdObj, BSONObjBuilder(reply.bufBuilderForResults()));
+    runCommand(opCtx, request, BSONObjBuilder(reply.bufBuilderForResults()));
     return DbResponse{reply.toCommandReply()};
 }
 
 DbResponse Strategy::clientOpMsgCommand(OperationContext* opCtx, const Message& m) {
-    auto request = OpMsg::parse(m);
+    // TODO SERVER-28964 If this parsing the request fails we reply to an invalid request which
+    // isn't always safe. Unfortunately tests currently rely on this. Figure out what to do
+    // (probably throw a special exception type like ConnectionFatalMessageParseError).
+    bool canReply = true;
+    boost::optional<OpMsgRequest> request;
     OpMsgBuilder reply;
     try {
-        std::string db = "admin";
-        if (auto elem = request.body["$db"])
-            db = elem.String();
-
-        runCommand(opCtx, db, request.body, reply.beginBody());
+        request.emplace(OpMsgRequest::parse(m));  // Request is validated here.
+        canReply = !request->isFlagSet(OpMsg::kMoreToCome);
+        runCommand(opCtx, *request, reply.beginBody());
     } catch (const DBException& ex) {
         reply.reset();
         auto bob = reply.beginBody();
         Command::appendCommandStatus(bob, ex.toStatus());
     }
 
-    if (request.isFlagSet(OpMsg::kMoreToCome))
+    if (!canReply)
         return {};
+
     return DbResponse{reply.finish()};
 }
 
@@ -694,7 +665,8 @@ void Strategy::writeOp(OperationContext* opCtx, DbMessage* dbm) {
             BSONObj commandBSON = commandRequest->toBSON();
 
             BSONObjBuilder builder;
-            runAgainstRegistered(opCtx, fullNS.db(), commandBSON, builder);
+            runAgainstRegistered(
+                opCtx, OpMsgRequest::fromDBAndBody(fullNS.db(), commandBSON), builder);
 
             bool parsed = commandResponse.parseBSON(builder.done(), nullptr);
             (void)parsed;  // for compile

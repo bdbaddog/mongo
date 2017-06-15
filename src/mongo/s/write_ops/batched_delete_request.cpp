@@ -156,28 +156,6 @@ void BatchedDeleteRequest::clear() {
     _isOrderedSet = false;
 }
 
-void BatchedDeleteRequest::cloneTo(BatchedDeleteRequest* other) const {
-    other->clear();
-
-    other->_ns = _ns;
-    other->_isNSSet = _isNSSet;
-
-    for (std::vector<BatchedDeleteDocument*>::const_iterator it = _deletes.begin();
-         it != _deletes.end();
-         ++it) {
-        unique_ptr<BatchedDeleteDocument> tempBatchDeleteDocument(new BatchedDeleteDocument);
-        (*it)->cloneTo(tempBatchDeleteDocument.get());
-        other->addToDeletes(tempBatchDeleteDocument.release());
-    }
-    other->_isDeletesSet = _isDeletesSet;
-
-    other->_writeConcern = _writeConcern;
-    other->_isWriteConcernSet = _isWriteConcernSet;
-
-    other->_ordered = _ordered;
-    other->_isOrderedSet = _isOrderedSet;
-}
-
 std::string BatchedDeleteRequest::toString() const {
     return toBSON().toString();
 }

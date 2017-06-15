@@ -42,10 +42,9 @@
 #include "mongo/s/catalog_cache.h"
 #include "mongo/s/client/shard_connection.h"
 #include "mongo/s/client/shard_registry.h"
-#include "mongo/s/commands/cluster_commands_common.h"
+#include "mongo/s/commands/cluster_commands_helpers.h"
 #include "mongo/s/commands/cluster_explain.h"
 #include "mongo/s/commands/cluster_write.h"
-#include "mongo/s/commands/sharded_command_processing.h"
 #include "mongo/s/commands/strategy.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/stale_exception.h"
@@ -232,7 +231,8 @@ private:
             uassertStatusOK(Grid::get(opCtx)->shardRegistry()->getShard(opCtx, shardId));
 
         ShardConnection conn(shard->getConnString(), nss.ns(), chunkManager);
-        bool ok = conn->runCommand(nss.db().toString(), cmdObj, res);
+        bool ok =
+            conn->runCommand(nss.db().toString(), filterCommandRequestForPassthrough(cmdObj), res);
         conn.done();
 
         // ErrorCodes::RecvStaleConfig is the code for RecvStaleConfigException.
@@ -247,7 +247,7 @@ private:
             appendWriteConcernErrorToCmdResponse(shardId, wcErrorElem, result);
         }
 
-        result.appendElementsUnique(res);
+        result.appendElementsUnique(filterCommandReplyForPassthrough(res));
         return ok;
     }
 

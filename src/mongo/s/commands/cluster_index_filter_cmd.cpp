@@ -106,8 +106,13 @@ public:
         // commands are tied to query shape (data has no effect on query shape).
         vector<Strategy::CommandResult> results;
         const BSONObj query;
-        Strategy::commandOp(
-            opCtx, dbname, cmdObj, nss.ns(), query, CollationSpec::kSimpleSpec, &results);
+        Strategy::commandOp(opCtx,
+                            dbname,
+                            filterCommandRequestForPassthrough(cmdObj),
+                            nss.ns(),
+                            query,
+                            CollationSpec::kSimpleSpec,
+                            &results);
 
         // Set value of first shard result's "ok" field.
         bool clusterCmdResult = true;
@@ -120,7 +125,7 @@ public:
             // XXX: In absence of sensible aggregation strategy,
             //      promote first shard's result to top level.
             if (i == results.begin()) {
-                result.appendElements(cmdResult.result);
+                filterCommandReplyForPassthrough(cmdResult.result, &result);
                 clusterCmdResult = cmdResult.result["ok"].trueValue();
             }
 

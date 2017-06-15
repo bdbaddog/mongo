@@ -32,7 +32,7 @@
 
 #include "mongo/db/commands.h"
 #include "mongo/s/client/shard_registry.h"
-#include "mongo/s/commands/cluster_commands_common.h"
+#include "mongo/s/commands/cluster_commands_helpers.h"
 #include "mongo/s/grid.h"
 
 namespace mongo {
@@ -69,7 +69,10 @@ public:
              std::string& errmsg,
              BSONObjBuilder& output) override {
         auto shardResponses =
-            uassertStatusOK(scatterGather(opCtx, dbName, cmdObj, getReadPref(cmdObj)));
+            uassertStatusOK(scatterGather(opCtx,
+                                          dbName,
+                                          filterCommandRequestForPassthrough(cmdObj),
+                                          ReadPreferenceSetting::get(opCtx)));
         if (!appendRawResponses(opCtx, &errmsg, &output, shardResponses)) {
             return false;
         }
