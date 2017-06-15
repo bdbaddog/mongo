@@ -450,6 +450,7 @@ env.Library(
         '$BUILD_DIR/mongo/util/decorable',
         '$BUILD_DIR/mongo/util/fail_point',
         '$BUILD_DIR/mongo/util/net/hostandport',
+        '$BUILD_DIR/mongo/util/periodic_runner',
         '$BUILD_DIR/mongo/transport/transport_layer_common',
         '$BUILD_DIR/mongo/transport/transport_layer_manager',
     ],
@@ -547,7 +548,6 @@ env.Library(
         '$BUILD_DIR/mongo/client/clientdriver',
         'curop',
         'lasterror',
-        'assemble_response',
     ],
 )
 
@@ -567,13 +567,22 @@ env.Library(
     target="service_context_d",
     source=[
         "service_context_d.cpp",
+        "service_entry_point_mongod.cpp",
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/base',
+        '$BUILD_DIR/mongo/transport/service_entry_point',
+        'auth/authmongod',
+        'commands/dcommands_fsync',
         'concurrency/lock_manager',
         'curop',
-        'storage/storage_engine_lock_file',
-        'storage/storage_engine_metadata',
+        'curop_metrics',
+        'diag_log',
+        'lasterror',
+        'ops/write_ops',
+        'ops/write_ops_parsers',
+        'rw_concern_d',
+        's/sharding',
         'storage/storage_options',
     ],
 )
@@ -609,6 +618,7 @@ env.Library(
     ],
     LIBDEPS=[
         "$BUILD_DIR/mongo/base",
+        "$BUILD_DIR/mongo/db/logical_session_id",
         "$BUILD_DIR/mongo/util/background_job",
         "query/query",
         "background",
@@ -735,30 +745,6 @@ env.Library(
 )
 
 env.Library(
-    target="assemble_response",
-    source=[
-        "assemble_response.cpp",
-        "run_commands.cpp",
-    ],
-    LIBDEPS=[
-        "curop",
-        "curop_metrics",
-        "diag_log",
-        "lasterror",
-        "ops/write_ops_parsers",
-        "storage/storage_options",
-        #'introspect', # CYCLE
-        #'$BUILD_DIR/mongo/db/ops/write_ops', # CYCLE
-        #'$BUILD_DIR/mongo/db/catalog/catalog', # CYCLE
-        #'$BUILD_DIR/mongo/db/commands/dcommands_fsync', # CYCLE
-    ],
-    LIBDEPS_TAGS=[
-        # TODO(ADAM, 2017-05-16): See `CYCLE` tags above
-        'illegal_cyclic_or_unresolved_dependencies_whitelisted',
-    ],
-)
-
-env.Library(
     target="authz_manager_external_state_factory_d",
     source=[
         "authz_manager_external_state_factory_d.cpp",
@@ -791,7 +777,6 @@ env.Library(
         "$BUILD_DIR/mongo/db/storage/mmap_v1/file_allocator",
         "$BUILD_DIR/third_party/shim_snappy",
         '$BUILD_DIR/mongo/db/ttl_collection_cache',
-        "assemble_response",
         "auth/authmongod",
         "authz_manager_external_state_factory_d",
         "background",

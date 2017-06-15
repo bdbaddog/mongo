@@ -33,8 +33,9 @@
 
 #include "mongo/base/clonable_ptr.h"
 #include "mongo/bson/bsonelement.h"
+#include "mongo/db/update/array_filter.h"
 #include "mongo/db/update/modifier_table.h"
-#include "mongo/db/update/update_node.h"
+#include "mongo/db/update/update_internal_node.h"
 #include "mongo/stdx/memory.h"
 #include "mongo/stdx/unordered_map.h"
 
@@ -44,19 +45,24 @@ namespace mongo {
  * An internal node in the prefix tree of update modifier expressions, representing updates to an
  * object. See comment in class definition of UpdateNode for more details.
  */
-class UpdateObjectNode : public UpdateNode {
+class UpdateObjectNode : public UpdateInternalNode {
 
 public:
     /**
      * Parses 'modExpr' as an update modifier expression and merges with it with 'root'. Returns a
-     * non-OK status if 'modExpr' is not a valid update modifier expression, or if merging would
-     * cause a conflict. Returns true if the path of 'modExpr' contains a positional $ element, e.g.
-     * 'a.$.b'.
+     * non-OK status if 'modExpr' is not a valid update modifier expression, if merging would
+     * cause a conflict, or if there is an array filter identifier in 'modExpr' without a
+     * corresponding filter in 'arrayFilters'. Returns true if the path of 'modExpr' contains a
+     * positional $ element, e.g. 'a.$.b'. Any array filter identifiers are added to
+     * 'foundIdentifiers'.
      */
-    static StatusWith<bool> parseAndMerge(UpdateObjectNode* root,
-                                          modifiertable::ModifierType type,
-                                          BSONElement modExpr,
-                                          const CollatorInterface* collator);
+    static StatusWith<bool> parseAndMerge(
+        UpdateObjectNode* root,
+        modifiertable::ModifierType type,
+        BSONElement modExpr,
+        const CollatorInterface* collator,
+        const std::map<StringData, std::unique_ptr<ArrayFilter>>& arrayFilters,
+        std::set<std::string>& foundIdentifiers);
 
     /**
      * Creates a new UpdateObjectNode by merging two input UpdateObjectNode objects and their
@@ -70,7 +76,7 @@ public:
                                                                  const UpdateObjectNode& rightNode,
                                                                  FieldRef* pathTaken);
 
-    UpdateObjectNode() : UpdateNode(Type::Object) {}
+    UpdateObjectNode() : UpdateInternalNode(Type::Object) {}
 
     std::unique_ptr<UpdateNode> clone() const final {
         return stdx::make_unique<UpdateObjectNode>(*this);
@@ -93,16 +99,9 @@ public:
                bool* indexesAffected,
                bool* noop) const final;
 
-    /**
-     * Returns the child with field name 'field' or nullptr if there is no such child.
-     */
-    UpdateNode* getChild(const std::string& field) const;
+    UpdateNode* getChild(const std::string& field) const final;
 
-    /**
-     * Adds a child with field name 'field'. The node must not already have a child with field
-     * name 'field'.
-     */
-    void setChild(std::string field, std::unique_ptr<UpdateNode> child);
+    void setChild(std::string field, std::unique_ptr<UpdateNode> child) final;
 
 private:
     std::map<std::string, clonable_ptr<UpdateNode>> _children;

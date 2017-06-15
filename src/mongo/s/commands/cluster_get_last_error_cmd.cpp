@@ -243,7 +243,8 @@ public:
         const HostOpTimeMap hostOpTimes(ClusterLastErrorInfo::get(cc())->getPrevHostOpTimes());
 
         std::vector<LegacyWCResponse> wcResponses;
-        auto status = enforceLegacyWriteConcern(opCtx, dbname, cmdObj, hostOpTimes, &wcResponses);
+        auto status = enforceLegacyWriteConcern(
+            opCtx, dbname, filterCommandRequestForPassthrough(cmdObj), hostOpTimes, &wcResponses);
 
         // Don't forget about our last hosts, reset the client info
         ClusterLastErrorInfo::get(cc())->disableForCommand();
@@ -303,7 +304,7 @@ public:
         if (numWCErrors == 1) {
             // Return the single write concern error we found, err should be set or not
             // from gle response
-            result.appendElements(lastErrResponse->gleResponse);
+            filterCommandReplyForPassthrough(lastErrResponse->gleResponse, &result);
             return lastErrResponse->gleResponse["ok"].trueValue();
         } else {
             // Return a generic combined WC error message

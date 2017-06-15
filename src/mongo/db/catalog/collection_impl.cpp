@@ -1005,16 +1005,8 @@ public:
     virtual Status validate(const RecordId& recordId, const RecordData& record, size_t* dataSize) {
         BSONObj recordBson = record.toBson();
 
-        // Secondaries are configured to always validate using the latest enabled BSON version. But
-        // users should be able to run collection validation on a secondary in "3.2"
-        // featureCompatibilityVersion in order to be alerted to the presence of NumberDecimal.
-        auto bsonValidationVersion = (serverGlobalParams.featureCompatibility.version.load() ==
-                                      ServerGlobalParams::FeatureCompatibility::Version::k32)
-            ? BSONVersion::kV1_0
-            : Validator<BSONObj>::enabledBSONVersion();
-
-        const Status status =
-            validateBSON(recordBson.objdata(), recordBson.objsize(), bsonValidationVersion);
+        const Status status = validateBSON(
+            recordBson.objdata(), recordBson.objsize(), Validator<BSONObj>::enabledBSONVersion());
         if (status.isOK()) {
             *dataSize = recordBson.objsize();
         } else {
@@ -1265,7 +1257,18 @@ Status CollectionImpl::validate(OperationContext* opCtx,
             // `results`.
             dassert(status.isOK());
 
-            if (indexValidator->tooManyIndexEntries()) {
+
+            string msg = "One or more indexes contain invalid index entries.";
+            // when there's an index key/document mismatch, both `if` and `else if` statements
+            // will be true. But if we only check tooFewIndexEntries(), we'll be able to see
+            // which specific index is invalid.
+            if (indexValidator->tooFewIndexEntries()) {
+                // The error message can't be more specific because even though the index is
+                // invalid, we won't know if the corruption occurred on the index entry or in
+                // the document.
+                results->errors.push_back(msg);
+                results->valid = false;
+            } else if (indexValidator->tooManyIndexEntries()) {
                 for (auto& it : indexNsResultsMap) {
                     // Marking all indexes as invalid since we don't know which one failed.
                     ValidateResults& r = it.second;
@@ -1273,8 +1276,6 @@ Status CollectionImpl::validate(OperationContext* opCtx,
                 }
                 string msg = "One or more indexes contain invalid index entries.";
                 results->errors.push_back(msg);
-                results->valid = false;
-            } else if (indexValidator->tooFewIndexEntries()) {
                 results->valid = false;
             }
         }

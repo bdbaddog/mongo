@@ -38,7 +38,7 @@
 #include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/s/catalog_cache.h"
 #include "mongo/s/commands/cluster_aggregate.h"
-#include "mongo/s/commands/cluster_commands_common.h"
+#include "mongo/s/commands/cluster_commands_helpers.h"
 #include "mongo/s/commands/cluster_explain.h"
 #include "mongo/s/commands/strategy.h"
 #include "mongo/s/grid.h"
@@ -144,7 +144,7 @@ public:
         auto swShardResponses = scatterGatherForNamespace(opCtx,
                                                           nss,
                                                           countCmdObj,
-                                                          getReadPref(countCmdObj),
+                                                          ReadPreferenceSetting::get(opCtx),
                                                           filter,
                                                           collation,
                                                           true,  // do shard versioning
@@ -272,7 +272,7 @@ public:
         auto swShardResponses = scatterGatherForNamespace(opCtx,
                                                           nss,
                                                           explainCmd,
-                                                          getReadPref(explainCmd),
+                                                          ReadPreferenceSetting::get(opCtx),
                                                           targetingQuery,
                                                           targetingCollation,
                                                           true,  // do shard versioning
