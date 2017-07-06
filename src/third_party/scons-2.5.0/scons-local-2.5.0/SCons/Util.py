@@ -1148,11 +1148,7 @@ def unique(s):
     return u
 
 
-# A more efficient implementation of Alex's uniquer(), this avoids the
-# idfun() argument and function-call overhead by assuming that all
-# items in the sequence are hashable.
-
-def uniquer_hashables(seq):
+def uniquify(seq):
     """
     Faster uniquify implementation
     :param seq: container to be uniquified

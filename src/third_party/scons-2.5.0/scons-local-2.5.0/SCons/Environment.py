@@ -2255,7 +2255,7 @@ class Base(SubstitutionEnvironment):
         """
         from SCons.Tool import install
         if install._UNIQUE_INSTALLED_FILES is None:
-            install._UNIQUE_INSTALLED_FILES = SCons.Util.uniquer_hashables(install._INSTALLED_FILES)
+            install._UNIQUE_INSTALLED_FILES = SCons.Util.uniquify(install._INSTALLED_FILES)
         return install._UNIQUE_INSTALLED_FILES
 
 
