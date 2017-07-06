@@ -390,6 +390,8 @@ _separate_args = re.compile(r'(%s|\s+|[^\s\$]+|\$)' % _dollar_exps_str)
 # space characters in the string result from the scons_subst() function.
 _space_sep = re.compile(r'[\t ]+(?![^{]*})')
 
+DUMP_SUBST = False
+
 def scons_subst(strSubst, env, mode=SUBST_RAW, target=None, source=None, gvars={}, lvars={}, conv=None):
     """Expand a string or list containing construction variable
     substitutions.
@@ -403,7 +405,7 @@ def scons_subst(strSubst, env, mode=SUBST_RAW, target=None, source=None, gvars={
     if isinstance(strSubst, str) and not '$' in strSubst:
         return strSubst
 
-    # print("SUB:%s"%strSubst)
+    if DUMP_SUBST: print("SUB:%s"%strSubst)
 
     class StringSubber(object):
         """A class to construct the results of a scons_subst() call.
@@ -590,6 +592,9 @@ def scons_subst_list(strSubst, env, mode=SUBST_RAW, target=None, source=None, gv
     substitutions within strings, so see that function instead
     if that's what you're looking for.
     """
+
+    if DUMP_SUBST: print("LSUB:%s"%strSubst)
+
     class ListSubber(collections.UserList):
         """A class to construct the results of a scons_subst_list() call.
 
@@ -648,14 +653,14 @@ def scons_subst_list(strSubst, env, mode=SUBST_RAW, target=None, source=None, gv
                     self.close_strip('$)')
                 else:
                     key = s[1:]
-                    if key[0] == '{' or key.find('.') >= 0:
+                    if key[0] == '{' or '.' in key:
                         if key[0] == '{':
                             key = key[1:-1]
                         try:
                             s = eval(key, self.gvars, lvars)
                         except KeyboardInterrupt:
                             raise
-                        except Exception, e:
+                        except Exception as e:
                             if e.__class__ in AllowableExceptions:
                                 return
                             raise_exception(e, lvars['TARGETS'], s)
@@ -867,6 +872,9 @@ def scons_subst_once(strSubst, env, key):
     """
     if isinstance(strSubst, str) and not '$' in strSubst:
         return strSubst
+
+    if DUMP_SUBST: print("SUBO:%s"%strSubst)
+
 
     matchlist = ['$' + key, '${' + key + '}']
     val = env.get(key, '')
