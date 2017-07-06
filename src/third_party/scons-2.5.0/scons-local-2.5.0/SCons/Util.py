@@ -1148,41 +1148,19 @@ def unique(s):
     return u
 
 
-
-# From Alex Martelli,
-# http://aspn.activestate.com/ASPN/Cookbook/Python/Recipe/52560
-# ASPN: Python Cookbook: Remove duplicates from a sequence
-# First comment, dated 2001/10/13.
-# (Also in the printed Python Cookbook.)
-
-def uniquer(seq, idfun=None):
-    if idfun is None:
-        def idfun(x): return x
-    seen = {}
-    result = []
-    for item in seq:
-        marker = idfun(item)
-        # in old Python versions:
-        # if seen.has_key(marker)
-        # but in new ones:
-        if marker in seen: continue
-        seen[marker] = 1
-        result.append(item)
-    return result
-
 # A more efficient implementation of Alex's uniquer(), this avoids the
 # idfun() argument and function-call overhead by assuming that all
 # items in the sequence are hashable.
 
 def uniquer_hashables(seq):
-    seen = {}
-    result = []
-    for item in seq:
-        #if not item in seen:
-        if item not in seen:
-            seen[item] = 1
-            result.append(item)
-    return result
+    """
+    Faster uniquify implementation
+    :param seq: container to be uniquified
+    :return: uniquified container order maintained
+    """
+    seen = set()
+    return  [s for s in seq if s not in seen and not seen.add(s)]
+
 
 
 # Recipe 19.11 "Reading Lines with Continuation Characters",
@@ -1225,7 +1203,8 @@ class UniqueList(UserList):
         self.unique = True
     def __make_unique(self):
         if not self.unique:
-            self.data = uniquer_hashables(self.data)
+            seen = set()
+            self.data =  [s for s in self.data if s not in seen and not seen.add(s)]
             self.unique = True
     def __lt__(self, other):
         self.__make_unique()
