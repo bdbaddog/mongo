@@ -38,6 +38,7 @@
 #include "mongo/db/pipeline/expression.h"
 #include "mongo/db/pipeline/expression_context.h"
 #include "mongo/db/pipeline/value.h"
+#include "mongo/db/query/query_knobs.h"
 #include "mongo/stdx/memory.h"
 
 namespace mongo {
@@ -64,17 +65,26 @@ std::string pipelineToString(const vector<BSONObj>& pipeline) {
 }
 }  // namespace
 
+constexpr size_t DocumentSourceLookUp::kMaxSubPipelineDepth;
+
 DocumentSourceLookUp::DocumentSourceLookUp(NamespaceString fromNs,
                                            std::string as,
                                            const boost::intrusive_ptr<ExpressionContext>& pExpCtx)
-    : DocumentSourceNeedsMongod(pExpCtx),
+    : DocumentSource(pExpCtx),
       _fromNs(std::move(fromNs)),
       _as(std::move(as)),
-      _variablesParseState(_variables.useIdGenerator()) {
+      _variables(pExpCtx->variables),
+      _variablesParseState(pExpCtx->variablesParseState.copyWith(_variables.useIdGenerator())) {
     const auto& resolvedNamespace = pExpCtx->getResolvedNamespace(_fromNs);
     _resolvedNs = resolvedNamespace.ns;
     _resolvedPipeline = resolvedNamespace.pipeline;
     _fromExpCtx = pExpCtx->copyWith(_resolvedNs);
+
+    _fromExpCtx->subPipelineDepth += 1;
+    uassert(ErrorCodes::MaxSubPipelineDepthExceeded,
+            str::stream() << "Maximum number of nested $lookup sub-pipelines exceeded. Limit is "
+                          << kMaxSubPipelineDepth,
+            _fromExpCtx->subPipelineDepth <= kMaxSubPipelineDepth);
 }
 
 DocumentSourceLookUp::DocumentSourceLookUp(NamespaceString fromNs,
@@ -105,6 +115,8 @@ DocumentSourceLookUp::DocumentSourceLookUp(NamespaceString fromNs,
 
     _userPipeline = std::move(pipeline);
 
+    _cache.emplace(internalDocumentSourceLookupCacheSizeBytes.load());
+
     for (auto&& varElem : letVariables) {
         const auto varName = varElem.fieldNameStringData();
         Variables::uassertValidNameForUserWrite(varName);
@@ -114,9 +126,11 @@ DocumentSourceLookUp::DocumentSourceLookUp(NamespaceString fromNs,
             Expression::parseOperand(pExpCtx, varElem, pExpCtx->variablesParseState),
             _variablesParseState.defineVariable(varName));
     }
+
+    initializeIntrospectionPipeline();
 }
 
-std::unique_ptr<LiteParsedDocumentSourceOneForeignCollection> DocumentSourceLookUp::liteParse(
+std::unique_ptr<DocumentSourceLookUp::LiteParsed> DocumentSourceLookUp::LiteParsed::parse(
     const AggregationRequest& request, const BSONElement& spec) {
     uassert(ErrorCodes::FailedToParse,
             str::stream() << "the $lookup stage specification must be an object, but found "
@@ -133,15 +147,33 @@ std::unique_ptr<LiteParsedDocumentSourceOneForeignCollection> DocumentSourceLook
                           << typeName(specObj["from"].type()),
             fromElement.type() == BSONType::String);
 
-    NamespaceString nss(request.getNamespaceString().db(), fromElement.valueStringData());
+    NamespaceString fromNss(request.getNamespaceString().db(), fromElement.valueStringData());
     uassert(ErrorCodes::InvalidNamespace,
-            str::stream() << "invalid $lookup namespace: " << nss.ns(),
-            nss.isValid());
-    return stdx::make_unique<LiteParsedDocumentSourceOneForeignCollection>(std::move(nss));
+            str::stream() << "invalid $lookup namespace: " << fromNss.ns(),
+            fromNss.isValid());
+
+    stdx::unordered_set<NamespaceString> foreignNssSet;
+
+    // Recursively lite parse the nested pipeline, if one exists.
+    auto pipelineElem = specObj["pipeline"];
+    boost::optional<LiteParsedPipeline> liteParsedPipeline;
+    if (pipelineElem) {
+        auto pipeline = uassertStatusOK(AggregationRequest::parsePipelineFromBSON(pipelineElem));
+        AggregationRequest foreignAggReq(fromNss, std::move(pipeline));
+        liteParsedPipeline = LiteParsedPipeline(foreignAggReq);
+
+        auto pipelineInvolvedNamespaces = liteParsedPipeline->getInvolvedNamespaces();
+        foreignNssSet.insert(pipelineInvolvedNamespaces.begin(), pipelineInvolvedNamespaces.end());
+    }
+
+    foreignNssSet.insert(fromNss);
+
+    return stdx::make_unique<DocumentSourceLookUp::LiteParsed>(
+        std::move(fromNss), std::move(foreignNssSet), std::move(liteParsedPipeline));
 }
 
 REGISTER_DOCUMENT_SOURCE(lookup,
-                         DocumentSourceLookUp::liteParse,
+                         DocumentSourceLookUp::LiteParsed::parse,
                          DocumentSourceLookUp::createFromBson);
 
 const char* DocumentSourceLookUp::getSourceName() const {
@@ -184,8 +216,6 @@ DocumentSource::GetNextResult DocumentSourceLookUp::getNext() {
     }
 
     auto inputDoc = nextInput.releaseDocument();
-    copyVariablesToExpCtx(_variables, _variablesParseState, _fromExpCtx.get());
-    resolveLetVariables(inputDoc, &_fromExpCtx->variables);
 
     // If we have not absorbed a $unwind, we cannot absorb a $match. If we have absorbed a $unwind,
     // '_unwindSrc' would be non-null, and we would not have made it here.
@@ -198,7 +228,7 @@ DocumentSource::GetNextResult DocumentSourceLookUp::getNext() {
         _resolvedPipeline.back() = matchStage;
     }
 
-    auto pipeline = uassertStatusOK(_mongod->makePipeline(_resolvedPipeline, _fromExpCtx));
+    auto pipeline = buildPipeline(inputDoc);
 
     std::vector<Value> results;
     int objsize = 0;
@@ -217,6 +247,52 @@ DocumentSource::GetNextResult DocumentSourceLookUp::getNext() {
     MutableDocument output(std::move(inputDoc));
     output.setNestedField(_as, Value(std::move(results)));
     return output.freeze();
+}
+
+std::unique_ptr<Pipeline, PipelineDeleter> DocumentSourceLookUp::buildPipeline(
+    const Document& inputDoc) {
+    // Copy all 'let' variables into the foreign pipeline's expression context.
+    copyVariablesToExpCtx(_variables, _variablesParseState, _fromExpCtx.get());
+
+    // Resolve the 'let' variables to values per the given input document.
+    resolveLetVariables(inputDoc, &_fromExpCtx->variables);
+
+    // If we don't have a cache, build and return the pipeline immediately.
+    if (!_cache || _cache->isAbandoned()) {
+        return uassertStatusOK(
+            pExpCtx->mongoProcessInterface->makePipeline(_resolvedPipeline, _fromExpCtx));
+    }
+
+    // Tailor the pipeline construction for our needs. We want a non-optimized pipeline without a
+    // cursor source.
+    MongoProcessInterface::MakePipelineOptions pipelineOpts;
+    pipelineOpts.optimize = false;
+    pipelineOpts.attachCursorSource = false;
+
+    // Construct the basic pipeline without a cache stage.
+    auto pipeline = uassertStatusOK(
+        pExpCtx->mongoProcessInterface->makePipeline(_resolvedPipeline, _fromExpCtx, pipelineOpts));
+
+    // Add the cache stage at the end and optimize. During the optimization process, the cache will
+    // either move itself to the correct position in the pipeline, or will abandon itself if no
+    // suitable cache position exists.
+    pipeline->addFinalSource(
+        DocumentSourceSequentialDocumentCache::create(_fromExpCtx, _cache.get_ptr()));
+
+    pipeline->optimizePipeline();
+
+    if (!_cache->isServing()) {
+        // The cache has either been abandoned or has not yet been built. Attach a cursor.
+        uassertStatusOK(pExpCtx->mongoProcessInterface->attachCursorSourceToPipeline(
+            _fromExpCtx, pipeline.get()));
+    }
+
+    // If the cache has been abandoned, release it.
+    if (_cache->isAbandoned()) {
+        _cache.reset();
+    }
+
+    return pipeline;
 }
 
 DocumentSource::GetModPathsReturn DocumentSourceLookUp::getModifiedPaths() const {
@@ -469,9 +545,7 @@ DocumentSource::GetNextResult DocumentSourceLookUp::unwindResult() {
             _pipeline->dispose(pExpCtx->opCtx);
         }
 
-        copyVariablesToExpCtx(_variables, _variablesParseState, _fromExpCtx.get());
-        resolveLetVariables(*_input, &_fromExpCtx->variables);
-        _pipeline = uassertStatusOK(_mongod->makePipeline(_resolvedPipeline, _fromExpCtx));
+        _pipeline = buildPipeline(*_input);
 
         // The $lookup stage takes responsibility for disposing of its Pipeline, since it will
         // potentially be used by multiple OperationContexts, and the $lookup stage is part of an
@@ -523,8 +597,21 @@ void DocumentSourceLookUp::resolveLetVariables(const Document& localDoc, Variabl
 
     for (auto& letVar : _letVariables) {
         auto value = letVar.expression->evaluate(localDoc);
-        variables->setValue(letVar.id, value);
+        variables->setConstantValue(letVar.id, value);
     }
+}
+
+void DocumentSourceLookUp::initializeIntrospectionPipeline() {
+    copyVariablesToExpCtx(_variables, _variablesParseState, _fromExpCtx.get());
+    _parsedIntrospectionPipeline = uassertStatusOK(Pipeline::parse(_resolvedPipeline, _fromExpCtx));
+
+    auto& sources = _parsedIntrospectionPipeline->getSources();
+
+    // Ensure that the pipeline does not contain a $changeStream stage. This check will be
+    // performed recursively on all sub-pipelines.
+    uassert(ErrorCodes::IllegalOperation,
+            "$changeStream is not allowed within a $lookup foreign pipeline",
+            sources.empty() || !sources.front()->constraints().isChangeStreamStage());
 }
 
 void DocumentSourceLookUp::serializeToArray(
@@ -537,11 +624,16 @@ void DocumentSourceLookUp::serializeToArray(
                               letVar.expression->serialize(static_cast<bool>(explain)));
         }
 
+        auto pipeline = _userPipeline;
+        if (_additionalFilter) {
+            pipeline.push_back(BSON("$match" << *_additionalFilter));
+        }
+
         doc = Document{{getSourceName(),
-                        Document{{"from", _resolvedNs.coll()},
+                        Document{{"from", _fromNs.coll()},
                                  {"as", _as.fullPath()},
                                  {"let", exprList.freeze()},
-                                 {"pipeline", _resolvedPipeline}}}};
+                                 {"pipeline", pipeline}}}};
     } else {
         doc = Document{{getSourceName(),
                         {Document{{"from", _fromNs.coll()},
@@ -589,16 +681,35 @@ void DocumentSourceLookUp::serializeToArray(
 
 DocumentSource::GetDepsReturn DocumentSourceLookUp::getDependencies(DepsTracker* deps) const {
     if (wasConstructedWithPipelineSyntax()) {
+        // We will use the introspection pipeline which we prebuilt during construction.
+        invariant(_parsedIntrospectionPipeline);
+
+        DepsTracker subDeps(deps->getMetadataAvailable());
+
+        // Get the subpipeline dependencies. Subpipeline stages may reference both 'let' variables
+        // declared by this $lookup and variables declared externally.
+        for (auto&& source : _parsedIntrospectionPipeline->getSources()) {
+            source->getDependencies(&subDeps);
+        }
+
+        // Add the 'let' dependencies to the tracker. Because the caller is only interested in
+        // references to external variables, filter out any subpipeline references to 'let'
+        // variables declared by this $lookup.
         for (auto&& letVar : _letVariables) {
             letVar.expression->addDependencies(deps);
+            subDeps.vars.erase(letVar.id);
         }
+
+        // Add sub-pipeline variable dependencies. Do not add field dependencies, since these refer
+        // to the fields from the foreign collection rather than the local collection.
+        deps->vars.insert(subDeps.vars.begin(), subDeps.vars.end());
     } else {
         deps->fields.insert(_localField->fullPath());
     }
     return SEE_NEXT;
 }
 
-void DocumentSourceLookUp::doDetachFromOperationContext() {
+void DocumentSourceLookUp::detachFromOperationContext() {
     if (_pipeline) {
         // We have a pipeline we're going to be executing across multiple calls to getNext(), so we
         // use Pipeline::detachFromOperationContext() to take care of updating '_fromExpCtx->opCtx'.
@@ -609,7 +720,7 @@ void DocumentSourceLookUp::doDetachFromOperationContext() {
     }
 }
 
-void DocumentSourceLookUp::doReattachToOperationContext(OperationContext* opCtx) {
+void DocumentSourceLookUp::reattachToOperationContext(OperationContext* opCtx) {
     if (_pipeline) {
         // We have a pipeline we're going to be executing across multiple calls to getNext(), so we
         // use Pipeline::reattachToOperationContext() to take care of updating '_fromExpCtx->opCtx'.

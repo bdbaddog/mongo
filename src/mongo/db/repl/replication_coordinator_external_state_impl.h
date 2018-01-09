@@ -53,7 +53,6 @@ using UniqueLock = stdx::unique_lock<stdx::mutex>;
 
 class DropPendingCollectionReaper;
 class ReplicationProcess;
-class SnapshotThread;
 class StorageInterface;
 class NoopWriter;
 
@@ -81,6 +80,7 @@ public:
     virtual OldThreadPool* getDbWorkThreadPool() const override;
     virtual Status runRepairOnLocalDB(OperationContext* opCtx) override;
     virtual Status initializeReplSetStorage(OperationContext* opCtx, const BSONObj& config);
+    virtual void waitForAllEarlierOplogWritesToBeVisible(OperationContext* opCtx);
     void onDrainComplete(OperationContext* opCtx) override;
     OpTime onTransitionToPrimary(OperationContext* opCtx, bool isV1ElectionProtocol) override;
     virtual void forwardSlaveProgress();
@@ -92,7 +92,6 @@ public:
     virtual Status storeLocalLastVoteDocument(OperationContext* opCtx, const LastVote& lastVote);
     virtual void setGlobalTimestamp(ServiceContext* service, const Timestamp& newTime);
     virtual StatusWith<OpTime> loadLastOpTime(OperationContext* opCtx);
-    virtual void cleanUpLastApplyBatch(OperationContext* opCtx);
     virtual HostAndPort getClientHostAndPort(const OperationContext* opCtx);
     virtual void closeConnections();
     virtual void killAllUserOperations(OperationContext* opCtx);
@@ -101,9 +100,7 @@ public:
     virtual void stopProducer();
     virtual void startProducerIfStopped();
     void dropAllSnapshots() final;
-    void updateCommittedSnapshot(SnapshotName newCommitPoint) final;
-    void createSnapshot(OperationContext* opCtx, SnapshotName name) final;
-    void forceSnapshotCreation() final;
+    void updateCommittedSnapshot(const OpTime& newCommitPoint) final;
     virtual bool snapshotsEnabled() const;
     virtual void notifyOplogMetadataWaiters(const OpTime& committedOpTime);
     virtual double getElectionTimeoutOffsetLimitFraction() const;
@@ -171,6 +168,9 @@ private:
     // True when the threads have been started
     bool _startedThreads = false;
 
+    // Set to true when we are in the process of shutting down replication.
+    bool _inShutdown = false;
+
     // The SyncSourceFeedback class is responsible for sending replSetUpdatePosition commands
     // for forwarding replication progress information upstream when there is chained
     // replication.
@@ -193,8 +193,6 @@ private:
     stdx::mutex _nextThreadIdMutex;
     // Number used to uniquely name threads.
     long long _nextThreadId = 0;
-
-    std::unique_ptr<SnapshotThread> _snapshotThread;
 
     // Task executor used to run replication tasks.
     std::unique_ptr<executor::TaskExecutor> _taskExecutor;

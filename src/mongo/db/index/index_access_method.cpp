@@ -37,6 +37,9 @@
 
 #include "mongo/base/error_codes.h"
 #include "mongo/base/status.h"
+#include "mongo/db/catalog/collection_impl.h"
+#include "mongo/db/catalog/index_catalog.h"
+#include "mongo/db/catalog/index_consistency.h"
 #include "mongo/db/client.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/curop.h"
@@ -140,12 +143,14 @@ Status IndexAccessMethod::insert(OperationContext* opCtx,
         // Everything's OK, carry on.
         if (status.isOK()) {
             ++*numInserted;
+            IndexKeyEntry indexEntry = IndexKeyEntry(*i, loc);
             continue;
         }
 
         // Error cases.
 
         if (status.code() == ErrorCodes::KeyTooLong && ignoreKeyTooLong(opCtx)) {
+            IndexKeyEntry indexEntry = IndexKeyEntry(*i, loc);
             continue;
         }
 
@@ -178,8 +183,10 @@ void IndexAccessMethod::removeOneKey(OperationContext* opCtx,
                                      const BSONObj& key,
                                      const RecordId& loc,
                                      bool dupsAllowed) {
+
     try {
         _newInterface->unindex(opCtx, key, loc, dupsAllowed);
+        IndexKeyEntry indexEntry = IndexKeyEntry(key, loc);
     } catch (AssertionException& e) {
         log() << "Assertion failure: _unindex failed " << _descriptor->indexNamespace();
         log() << "Assertion failure: _unindex failed: " << redact(e) << "  key:" << key.toString()
@@ -274,13 +281,12 @@ RecordId IndexAccessMethod::findSingle(OperationContext* opCtx, const BSONObj& r
     return RecordId();
 }
 
-Status IndexAccessMethod::validate(OperationContext* opCtx,
-                                   int64_t* numKeys,
-                                   ValidateResults* fullResults) {
+void IndexAccessMethod::validate(OperationContext* opCtx,
+                                 int64_t* numKeys,
+                                 ValidateResults* fullResults) {
     long long keys = 0;
     _newInterface->fullValidate(opCtx, &keys, fullResults);
     *numKeys = keys;
-    return Status::OK();
 }
 
 bool IndexAccessMethod::appendCustomStats(OperationContext* opCtx,
@@ -379,6 +385,7 @@ Status IndexAccessMethod::update(OperationContext* opCtx,
 
     for (size_t i = 0; i < ticket.removed.size(); ++i) {
         _newInterface->unindex(opCtx, ticket.removed[i], ticket.loc, ticket.dupsAllowed);
+        IndexKeyEntry indexEntry = IndexKeyEntry(ticket.removed[i], ticket.loc);
     }
 
     for (size_t i = 0; i < ticket.added.size(); ++i) {
@@ -387,11 +394,14 @@ Status IndexAccessMethod::update(OperationContext* opCtx,
         if (!status.isOK()) {
             if (status.code() == ErrorCodes::KeyTooLong && ignoreKeyTooLong(opCtx)) {
                 // Ignore.
+                IndexKeyEntry indexEntry = IndexKeyEntry(ticket.added[i], ticket.loc);
                 continue;
             }
 
             return status;
         }
+
+        IndexKeyEntry indexEntry = IndexKeyEntry(ticket.added[i], ticket.loc);
     }
 
     *numInserted = ticket.added.size();
@@ -475,7 +485,7 @@ Status IndexAccessMethod::commitBulk(OperationContext* opCtx,
 
     std::unique_ptr<SortedDataBuilderInterface> builder;
 
-    MONGO_WRITE_CONFLICT_RETRY_LOOP_BEGIN {
+    writeConflictRetry(opCtx, "setting index multikey flag", "", [&] {
         WriteUnitOfWork wunit(opCtx);
 
         if (bulk->_everGeneratedMultipleKeys || isMultikeyFromPaths(bulk->_indexMultikeyPaths)) {
@@ -484,8 +494,7 @@ Status IndexAccessMethod::commitBulk(OperationContext* opCtx,
 
         builder.reset(_newInterface->getBulkBuilder(opCtx, dupsAllowed));
         wunit.commit();
-    }
-    MONGO_WRITE_CONFLICT_RETRY_LOOP_END(opCtx, "setting index multikey flag", "");
+    });
 
     while (i->more()) {
         if (mayInterrupt) {
@@ -572,7 +581,7 @@ void IndexAccessMethod::getKeys(const BSONObj& obj,
                                               13027};
     try {
         doGetKeys(obj, keys, multikeyPaths);
-    } catch (const UserException& ex) {
+    } catch (const AssertionException& ex) {
         if (mode == GetKeysMode::kEnforceConstraints) {
             throw;
         }
@@ -583,7 +592,7 @@ void IndexAccessMethod::getKeys(const BSONObj& obj,
             multikeyPaths->clear();
         }
         // Only suppress the errors in the whitelist.
-        if (whiteList.find(ex.getCode()) == whiteList.end()) {
+        if (whiteList.find(ex.code()) == whiteList.end()) {
             throw;
         }
         LOG(1) << "Ignoring indexing error for idempotency reasons: " << redact(ex)

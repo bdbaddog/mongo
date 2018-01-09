@@ -29,13 +29,14 @@
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/commands.h"
+#include "mongo/util/net/sock.h"
 
 namespace mongo {
 namespace {
 
-class IsDbGridCmd : public Command {
+class IsDbGridCmd : public BasicCommand {
 public:
-    IsDbGridCmd() : Command("isdbgrid") {}
+    IsDbGridCmd() : BasicCommand("isdbgrid") {}
 
 
     virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
@@ -55,7 +56,6 @@ public:
     virtual bool run(OperationContext* opCtx,
                      const std::string& dbname,
                      const BSONObj& cmdObj,
-                     std::string& errmsg,
                      BSONObjBuilder& result) {
         result.append("isdbgrid", 1);
         result.append("hostname", getHostNameCached());

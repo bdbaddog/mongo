@@ -30,16 +30,13 @@
 
 #include "mongo/platform/basic.h"
 
-#include <memory>
-
-#include "mongo/base/disallow_copying.h"
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/catalog/collection.h"
-#include "mongo/db/catalog/database.h"
 #include "mongo/db/client.h"
 #include "mongo/db/clientcursor.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/commands/run_aggregate.h"
+#include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/exec/working_set_common.h"
 #include "mongo/db/matcher/extensions_callback_real.h"
@@ -53,27 +50,22 @@
 #include "mongo/db/server_parameters.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/stats/counters.h"
+#include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/util/log.h"
 
 namespace mongo {
-
 namespace {
 
-const char kTermField[] = "term";
-
-}  // namespace
+const auto kTermField = "term"_sd;
 
 /**
  * A command for running .find() queries.
  */
-class FindCmd : public Command {
-    MONGO_DISALLOW_COPYING(FindCmd);
-
+class FindCmd : public BasicCommand {
 public:
-    FindCmd() : Command("find") {}
+    FindCmd() : BasicCommand("find") {}
 
-
-    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
+    bool supportsWriteConcern(const BSONObj& cmd) const override {
         return false;
     }
 
@@ -93,7 +85,7 @@ public:
         return false;
     }
 
-    bool supportsReadConcern(const std::string& dbName, const BSONObj& cmdObj) const final {
+    bool supportsNonLocalReadConcern(const std::string& dbName, const BSONObj& cmdObj) const final {
         return true;
     }
 
@@ -105,7 +97,7 @@ public:
         return LogicalOp::opQuery;
     }
 
-    ReadWriteType getReadWriteType() const {
+    ReadWriteType getReadWriteType() const override {
         return ReadWriteType::kRead;
     }
 
@@ -121,12 +113,17 @@ public:
         return false;
     }
 
-    Status checkAuthForCommand(Client* client,
-                               const std::string& dbname,
-                               const BSONObj& cmdObj) override {
-        const NamespaceString nss(parseNs(dbname, cmdObj));
+    Status checkAuthForOperation(OperationContext* opCtx,
+                                 const std::string& dbname,
+                                 const BSONObj& cmdObj) override {
+        AuthorizationSession* authSession = AuthorizationSession::get(opCtx->getClient());
+
+        if (!authSession->isAuthorizedToParseNamespaceElement(cmdObj.firstElement())) {
+            return Status(ErrorCodes::Unauthorized, "Unauthorized");
+        }
+        const NamespaceString nss(parseNsOrUUID(opCtx, dbname, cmdObj));
         auto hasTerm = cmdObj.hasField(kTermField);
-        return AuthorizationSession::get(client)->checkAuthForFind(nss, hasTerm);
+        return authSession->checkAuthForFind(nss, hasTerm);
     }
 
     Status explain(OperationContext* opCtx,
@@ -150,8 +147,14 @@ public:
         // Finish the parsing step by using the QueryRequest to create a CanonicalQuery.
 
         ExtensionsCallbackReal extensionsCallback(opCtx, &nss);
+        const boost::intrusive_ptr<ExpressionContext> expCtx;
         auto statusWithCQ =
-            CanonicalQuery::canonicalize(opCtx, std::move(qrStatus.getValue()), extensionsCallback);
+            CanonicalQuery::canonicalize(opCtx,
+                                         std::move(qrStatus.getValue()),
+                                         expCtx,
+                                         extensionsCallback,
+                                         MatchExpressionParser::kAllowAllSpecialFeatures &
+                                             ~MatchExpressionParser::AllowedFeatures::kIsolated);
         if (!statusWithCQ.isOK()) {
             return statusWithCQ.getStatus();
         }
@@ -183,7 +186,7 @@ public:
                 return runAggregate(
                     opCtx, nss, aggRequest.getValue(), viewAggregationCommand.getValue(), *out);
             } catch (DBException& error) {
-                if (error.getCode() == ErrorCodes::InvalidPipelineOperator) {
+                if (error.code() == ErrorCodes::InvalidPipelineOperator) {
                     return {ErrorCodes::InvalidPipelineOperator,
                             str::stream() << "Unsupported in view pipeline: " << error.what()};
                 }
@@ -220,22 +223,15 @@ public:
     bool run(OperationContext* opCtx,
              const std::string& dbname,
              const BSONObj& cmdObj,
-             std::string& errmsg,
              BSONObjBuilder& result) override {
-        const NamespaceString nss(parseNsOrUUID(opCtx, dbname, cmdObj));
-
         // Although it is a command, a find command gets counted as a query.
         globalOpCounters.gotQuery();
 
-        if (opCtx->getClient()->isInDirectClient()) {
-            return appendCommandStatus(
-                result,
-                Status(ErrorCodes::IllegalOperation, "Cannot run find command from eval()"));
-        }
-
         // Parse the command BSON to a QueryRequest.
         const bool isExplain = false;
-        auto qrStatus = QueryRequest::makeFromFindCommand(nss, cmdObj, isExplain);
+        // Pass parseNs to makeFromFindCommand in case cmdObj does not have a UUID.
+        auto qrStatus = QueryRequest::makeFromFindCommand(
+            NamespaceString(parseNs(dbname, cmdObj)), cmdObj, isExplain);
         if (!qrStatus.isOK()) {
             return appendCommandStatus(result, qrStatus.getStatus());
         }
@@ -252,6 +248,12 @@ public:
             }
         }
 
+        // Acquire locks. If the query is on a view, we release our locks and convert the query
+        // request into an aggregation command.
+        Lock::DBLock dbSLock(opCtx, dbname, MODE_IS);
+        const NamespaceString nss(parseNsOrUUID(opCtx, dbname, cmdObj));
+        qr->refreshNSS(opCtx);
+
         // Fill out curop information.
         //
         // We pass negative values for 'ntoreturn' and 'ntoskip' to indicate that these values
@@ -263,15 +265,20 @@ public:
 
         // Finish the parsing step by using the QueryRequest to create a CanonicalQuery.
         ExtensionsCallbackReal extensionsCallback(opCtx, &nss);
-        auto statusWithCQ = CanonicalQuery::canonicalize(opCtx, std::move(qr), extensionsCallback);
+        const boost::intrusive_ptr<ExpressionContext> expCtx;
+        auto statusWithCQ =
+            CanonicalQuery::canonicalize(opCtx,
+                                         std::move(qr),
+                                         expCtx,
+                                         extensionsCallback,
+                                         MatchExpressionParser::kAllowAllSpecialFeatures &
+                                             ~MatchExpressionParser::AllowedFeatures::kIsolated);
         if (!statusWithCQ.isOK()) {
             return appendCommandStatus(result, statusWithCQ.getStatus());
         }
         std::unique_ptr<CanonicalQuery> cq = std::move(statusWithCQ.getValue());
 
-        // Acquire locks. If the query is on a view, we release our locks and convert the query
-        // request into an aggregation command.
-        AutoGetCollectionOrViewForReadCommand ctx(opCtx, nss);
+        AutoGetCollectionOrViewForReadCommand ctx(opCtx, nss, std::move(dbSLock));
         Collection* collection = ctx.getCollection();
         if (ctx.getView()) {
             // Relinquish locks. The aggregation command will re-acquire them.
@@ -284,19 +291,19 @@ public:
             if (!viewAggregationCommand.isOK())
                 return appendCommandStatus(result, viewAggregationCommand.getStatus());
 
-            Command* agg = Command::findCommand("aggregate");
-            try {
-                agg->run(opCtx, dbname, viewAggregationCommand.getValue(), errmsg, result);
-            } catch (DBException& error) {
-                if (error.getCode() == ErrorCodes::InvalidPipelineOperator) {
-                    return appendCommandStatus(
-                        result,
-                        {ErrorCodes::InvalidPipelineOperator,
-                         str::stream() << "Unsupported in view pipeline: " << error.what()});
-                }
-                return appendCommandStatus(result, error.toStatus());
+            BSONObj aggResult = Command::runCommandDirectly(
+                opCtx,
+                OpMsgRequest::fromDBAndBody(dbname, std::move(viewAggregationCommand.getValue())));
+            auto status = getStatusFromCommandResult(aggResult);
+            if (status.code() == ErrorCodes::InvalidPipelineOperator) {
+                return appendCommandStatus(
+                    result,
+                    {ErrorCodes::InvalidPipelineOperator,
+                     str::stream() << "Unsupported in view pipeline: " << status.reason()});
             }
-            return true;
+            result.resetToEmpty();
+            result.appendElements(aggResult);
+            return status.isOK();
         }
 
         // Get the execution plan for the query.
@@ -403,4 +410,5 @@ public:
 
 } findCmd;
 
+}  // namespace
 }  // namespace mongo

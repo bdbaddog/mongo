@@ -1,5 +1,5 @@
 /*-
- * Public Domain 2014-2017 MongoDB, Inc.
+ * Public Domain 2014-2018 MongoDB, Inc.
  * Public Domain 2008-2014 WiredTiger, Inc.
  *
  * This is free and unencumbered software released into the public domain.
@@ -55,7 +55,8 @@ main(int argc, char *argv[])
 	pthread_t dump_id, id[MAX_THREADS];
 	int i;
 
-	if (!testutil_enable_long_tests())	/* Ignore unless requested */
+	/* Ignore unless requested */
+	if (!testutil_is_flag_set("TESTUTIL_ENABLE_LONG_TESTS"))
 		return (EXIT_SUCCESS);
 
 	opts = &_opts;
@@ -72,13 +73,12 @@ main(int argc, char *argv[])
 	testutil_check(__wt_rwlock_init(NULL, &rwlock));
 	testutil_check(pthread_rwlock_init(&p_rwlock, NULL));
 
-	testutil_check(pthread_create(
-	    &dump_id, NULL, thread_dump, (void *)opts));
+	testutil_check(pthread_create(&dump_id, NULL, thread_dump, opts));
 
 	__wt_epoch(NULL, &ts);
 	for (i = 0; i < (int)opts->nthreads; ++i)
-		testutil_check(pthread_create(
-		    &id[i], NULL, thread_rwlock, (void *)opts));
+		testutil_check(
+		    pthread_create(&id[i], NULL, thread_rwlock, opts));
 
 	while (--i >= 0)
 		testutil_check(pthread_join(id[i], NULL));

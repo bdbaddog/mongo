@@ -36,7 +36,7 @@
 #include "mongo/db/jsobj.h"
 #include "mongo/db/json.h"
 #include "mongo/db/matcher/expression_parser.h"
-#include "mongo/db/matcher/extensions_callback_disallow_extensions.h"
+#include "mongo/db/pipeline/expression_context_for_test.h"
 #include "mongo/db/query/collation/collator_factory_mock.h"
 #include "mongo/db/query/query_planner.h"
 #include "mongo/db/query/query_solution.h"
@@ -67,8 +67,10 @@ bool filterMatches(const BSONObj& testFilter,
         testCollator = std::move(collator.getValue());
     }
 
-    StatusWithMatchExpression statusWithMatcher = MatchExpressionParser::parse(
-        testFilter, ExtensionsCallbackDisallowExtensions(), testCollator.get());
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    expCtx->setCollator(testCollator.get());
+    StatusWithMatchExpression statusWithMatcher =
+        MatchExpressionParser::parse(testFilter, std::move(expCtx));
     if (!statusWithMatcher.isOK()) {
         return false;
     }

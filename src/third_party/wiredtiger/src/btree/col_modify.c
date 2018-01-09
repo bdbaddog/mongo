@@ -1,5 +1,5 @@
 /*-
- * Copyright (c) 2014-2017 MongoDB, Inc.
+ * Copyright (c) 2014-2018 MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -38,30 +38,33 @@ __wt_col_modify(WT_SESSION_IMPL *session, WT_CURSOR_BTREE *cbt,
 	upd = upd_arg;
 	append = logged = false;
 
-	if (modify_type == WT_UPDATE_DELETED ||
-	    modify_type == WT_UPDATE_RESERVED) {
-		/*
-		 * Fixed-size column-store doesn't have on-page deleted values,
-		 * it's a nul byte.
-		 */
-		if (modify_type == WT_UPDATE_DELETED &&
-		    btree->type == BTREE_COL_FIX) {
-			modify_type = WT_UPDATE_STANDARD;
-			value = &col_fix_remove;
+	if (upd_arg == NULL) {
+		if (modify_type == WT_UPDATE_RESERVE ||
+		    modify_type == WT_UPDATE_TOMBSTONE) {
+			/*
+			 * Fixed-size column-store doesn't have on-page deleted
+			 * values, it's a nul byte.
+			 */
+			if (modify_type == WT_UPDATE_TOMBSTONE &&
+			    btree->type == BTREE_COL_FIX) {
+				modify_type = WT_UPDATE_STANDARD;
+				value = &col_fix_remove;
+			}
+		} else {
+			/*
+			 * There's a chance the application specified a record
+			 * past the last record on the page.  If that's the
+			 * case, and we're inserting a new WT_INSERT/WT_UPDATE
+			 * pair, it goes on the append list, not the update
+			 * list. Also, an out-of-band recno implies an append
+			 * operation, we're allocating a new row.
+			 */
+			if (recno == WT_RECNO_OOB ||
+			    recno > (btree->type == BTREE_COL_VAR ?
+			    __col_var_last_recno(cbt->ref) :
+			    __col_fix_last_recno(cbt->ref)))
+				append = true;
 		}
-	} else {
-		/*
-		 * There's some chance the application specified a record past
-		 * the last record on the page.  If that's the case, and we're
-		 * inserting a new WT_INSERT/WT_UPDATE pair, it goes on the
-		 * append list, not the update list. Also, an out-of-band recno
-		 * implies an append operation, we're allocating a new row.
-		 */
-		if (recno == WT_RECNO_OOB ||
-		    recno > (btree->type == BTREE_COL_VAR ?
-		    __col_var_last_recno(cbt->ref) :
-		    __col_fix_last_recno(cbt->ref)))
-			append = true;
 	}
 
 	/* If we don't yet have a modify structure, we'll need one. */
@@ -197,7 +200,7 @@ __wt_col_modify(WT_SESSION_IMPL *session, WT_CURSOR_BTREE *cbt,
 	}
 
 	/* If the update was successful, add it to the in-memory log. */
-	if (logged && modify_type != WT_UPDATE_RESERVED)
+	if (logged && modify_type != WT_UPDATE_RESERVE)
 		WT_ERR(__wt_txn_log_op(session, cbt));
 
 	if (0) {

@@ -56,14 +56,15 @@ const Document kDefaultCursorOptionDocument{
 TEST(AggregationRequestTest, ShouldParseAllKnownOptions) {
     NamespaceString nss("a.collection");
     const BSONObj inputBson = fromjson(
-        "{pipeline: [{$match: {a: 'abc'}}], explain: false, allowDiskUse: true, fromRouter: true, "
-        "bypassDocumentValidation: true, collation: {locale: 'en_US'}, cursor: {batchSize: 10}, "
-        "hint: {a: 1}, maxTimeMS: 100, readConcern: {level: 'linearizable'}, "
+        "{pipeline: [{$match: {a: 'abc'}}], explain: false, allowDiskUse: true, fromMongos: true, "
+        "needsMerge: true, bypassDocumentValidation: true, collation: {locale: 'en_US'}, cursor: "
+        "{batchSize: 10}, hint: {a: 1}, maxTimeMS: 100, readConcern: {level: 'linearizable'}, "
         "$queryOptions: {$readPreference: 'nearest'}, comment: 'agg_comment'}}");
     auto request = unittest::assertGet(AggregationRequest::parseFromBSON(nss, inputBson));
     ASSERT_FALSE(request.getExplain());
     ASSERT_TRUE(request.shouldAllowDiskUse());
-    ASSERT_TRUE(request.isFromRouter());
+    ASSERT_TRUE(request.isFromMongos());
+    ASSERT_TRUE(request.needsMerge());
     ASSERT_TRUE(request.shouldBypassDocumentValidation());
     ASSERT_EQ(request.getBatchSize(), 10);
     ASSERT_BSONOBJ_EQ(request.getHint(), BSON("a" << 1));
@@ -98,7 +99,7 @@ TEST(AggregationRequestTest, ShouldParseExplicitExplainFalseWithCursorOption) {
 
 TEST(AggregationRequestTest, ShouldParseWithSeparateQueryPlannerExplainModeArg) {
     NamespaceString nss("a.collection");
-    const BSONObj inputBson = fromjson("{pipeline: []}");
+    const BSONObj inputBson = fromjson("{pipeline: [], cursor: {}}");
     auto request = unittest::assertGet(AggregationRequest::parseFromBSON(
         nss, inputBson, ExplainOptions::Verbosity::kQueryPlanner));
     ASSERT_TRUE(request.getExplain());
@@ -113,6 +114,19 @@ TEST(AggregationRequestTest, ShouldParseWithSeparateQueryPlannerExplainModeArgAn
     ASSERT_TRUE(request.getExplain());
     ASSERT(*request.getExplain() == ExplainOptions::Verbosity::kExecStats);
     ASSERT_EQ(request.getBatchSize(), 10);
+}
+
+TEST(AggregationRequestTest, ShouldParseExplainFlagWithReadConcern) {
+    NamespaceString nss("a.collection");
+    // Non-local readConcern should not be allowed with the explain flag, but this is checked
+    // elsewhere to avoid having to parse the readConcern in AggregationRequest.
+    const BSONObj inputBson =
+        fromjson("{pipeline: [], explain: true, readConcern: {level: 'majority'}}");
+    auto request = unittest::assertGet(AggregationRequest::parseFromBSON(nss, inputBson));
+    ASSERT_TRUE(request.getExplain());
+    ASSERT_BSONOBJ_EQ(request.getReadConcern(),
+                      BSON("level"
+                           << "majority"));
 }
 
 //
@@ -135,7 +149,8 @@ TEST(AggregationRequestTest, ShouldNotSerializeOptionalValuesIfEquivalentToDefau
     AggregationRequest request(nss, {});
     request.setExplain(boost::none);
     request.setAllowDiskUse(false);
-    request.setFromRouter(false);
+    request.setFromMongos(false);
+    request.setNeedsMerge(false);
     request.setBypassDocumentValidation(false);
     request.setCollation(BSONObj());
     request.setHint(BSONObj());
@@ -155,7 +170,8 @@ TEST(AggregationRequestTest, ShouldSerializeOptionalValuesIfSet) {
     NamespaceString nss("a.collection");
     AggregationRequest request(nss, {});
     request.setAllowDiskUse(true);
-    request.setFromRouter(true);
+    request.setFromMongos(true);
+    request.setNeedsMerge(true);
     request.setBypassDocumentValidation(true);
     request.setBatchSize(10);
     request.setMaxTimeMS(10u);
@@ -177,7 +193,8 @@ TEST(AggregationRequestTest, ShouldSerializeOptionalValuesIfSet) {
         Document{{AggregationRequest::kCommandName, nss.coll()},
                  {AggregationRequest::kPipelineName, Value(std::vector<Value>{})},
                  {AggregationRequest::kAllowDiskUseName, true},
-                 {AggregationRequest::kFromRouterName, true},
+                 {AggregationRequest::kFromMongosName, true},
+                 {AggregationRequest::kNeedsMergeName, true},
                  {bypassDocumentValidationCommandOption(), true},
                  {AggregationRequest::kCollationName, collationObj},
                  {AggregationRequest::kCursorName,
@@ -236,7 +253,7 @@ TEST(AggregationRequestTest, ShouldAcceptHintAsString) {
                            << "a_1"));
 }
 
-TEST(AggregationRequestTest, ShouldNotSerializeBatchSizeOrExplainWhenExplainSet) {
+TEST(AggregationRequestTest, ShouldNotSerializeBatchSizeWhenExplainSet) {
     NamespaceString nss("a.collection");
     AggregationRequest request(nss, {});
     request.setBatchSize(10);
@@ -244,7 +261,8 @@ TEST(AggregationRequestTest, ShouldNotSerializeBatchSizeOrExplainWhenExplainSet)
 
     auto expectedSerialization =
         Document{{AggregationRequest::kCommandName, nss.coll()},
-                 {AggregationRequest::kPipelineName, Value(std::vector<Value>{})}};
+                 {AggregationRequest::kPipelineName, Value(std::vector<Value>{})},
+                 {AggregationRequest::kCursorName, Value(Document())}};
     ASSERT_DOCUMENT_EQ(request.serializeToCommandObj(), expectedSerialization);
 }
 
@@ -312,10 +330,46 @@ TEST(AggregationRequestTest, ShouldRejectExplainIfObject) {
     ASSERT_NOT_OK(AggregationRequest::parseFromBSON(nss, inputBson).getStatus());
 }
 
-TEST(AggregationRequestTest, ShouldRejectNonBoolFromRouter) {
+TEST(AggregationRequestTest, ShouldRejectNonBoolFromMongos) {
+    NamespaceString nss("a.collection");
+    const BSONObj inputBson =
+        fromjson("{pipeline: [{$match: {a: 'abc'}}], cursor: {}, fromMongos: 1}");
+    ASSERT_NOT_OK(AggregationRequest::parseFromBSON(nss, inputBson).getStatus());
+}
+
+TEST(AggregationRequestTest, ShouldRejectNonBoolNeedsMerge) {
+    NamespaceString nss("a.collection");
+    const BSONObj inputBson =
+        fromjson("{pipeline: [{$match: {a: 'abc'}}], cursor: {}, needsMerge: 1, fromMongos: true}");
+    ASSERT_NOT_OK(AggregationRequest::parseFromBSON(nss, inputBson).getStatus());
+}
+
+TEST(AggregationRequestTest, ShouldRejectNeedsMergeIfFromMongosNotPresent) {
+    NamespaceString nss("a.collection");
+    const BSONObj inputBson =
+        fromjson("{pipeline: [{$match: {a: 'abc'}}], cursor: {}, needsMerge: true}");
+    ASSERT_NOT_OK(AggregationRequest::parseFromBSON(nss, inputBson).getStatus());
+}
+
+TEST(AggregationRequestTest, ShouldRejectNonBoolNeedsMerge34) {
     NamespaceString nss("a.collection");
     const BSONObj inputBson =
         fromjson("{pipeline: [{$match: {a: 'abc'}}], cursor: {}, fromRouter: 1}");
+    ASSERT_NOT_OK(AggregationRequest::parseFromBSON(nss, inputBson).getStatus());
+}
+
+TEST(AggregationRequestTest, ShouldRejectNeedsMergeIfNeedsMerge34AlsoPresent) {
+    NamespaceString nss("a.collection");
+    const BSONObj inputBson = fromjson(
+        "{pipeline: [{$match: {a: 'abc'}}], cursor: {}, needsMerge: true, fromMongos: true, "
+        "fromRouter: true}");
+    ASSERT_NOT_OK(AggregationRequest::parseFromBSON(nss, inputBson).getStatus());
+}
+
+TEST(AggregationRequestTest, ShouldRejectFromMongosIfNeedsMerge34AlsoPresent) {
+    NamespaceString nss("a.collection");
+    const BSONObj inputBson = fromjson(
+        "{pipeline: [{$match: {a: 'abc'}}], cursor: {}, fromMongos: true, fromRouter: true}");
     ASSERT_NOT_OK(AggregationRequest::parseFromBSON(nss, inputBson).getStatus());
 }
 
@@ -348,13 +402,6 @@ TEST(AggregationRequestTest, ShouldRejectExplainFalseWithSeparateExplainArg) {
             .getStatus());
 }
 
-TEST(AggregationRequestTest, ShouldRejectExplainWithReadConcernMajority) {
-    NamespaceString nss("a.collection");
-    const BSONObj inputBson =
-        fromjson("{pipeline: [], explain: true, readConcern: {level: 'majority'}}");
-    ASSERT_NOT_OK(AggregationRequest::parseFromBSON(nss, inputBson).getStatus());
-}
-
 TEST(AggregationRequestTest, ShouldRejectExplainExecStatsVerbosityWithReadConcernMajority) {
     NamespaceString nss("a.collection");
     const BSONObj inputBson = fromjson("{pipeline: [], readConcern: {level: 'majority'}}");
@@ -378,6 +425,13 @@ TEST(AggregationRequestTest, ShouldRejectExplainExecStatsVerbosityWithWriteConce
             .getStatus());
 }
 
+TEST(AggregationRequestTest, CannotParseNeedsMerge34) {
+    NamespaceString nss("a.collection");
+    const BSONObj inputBson =
+        fromjson("{pipeline: [{$match: {a: 'abc'}}], cursor: {}, fromRouter: true}");
+    ASSERT_NOT_OK(AggregationRequest::parseFromBSON(nss, inputBson).getStatus());
+}
+
 TEST(AggregationRequestTest, ParseNSShouldReturnAggregateOneNSIfAggregateFieldIsOne) {
     const std::vector<std::string> ones{
         "1", "1.0", "NumberInt(1)", "NumberLong(1)", "NumberDecimal('1')"};
@@ -392,25 +446,27 @@ TEST(AggregationRequestTest, ParseNSShouldReturnAggregateOneNSIfAggregateFieldIs
 TEST(AggregationRequestTest, ParseNSShouldRejectNumericNSIfAggregateFieldIsNotOne) {
     const BSONObj inputBSON = fromjson("{aggregate: 2, pipeline: []}");
     ASSERT_THROWS_CODE(
-        AggregationRequest::parseNs("a", inputBSON), UserException, ErrorCodes::FailedToParse);
+        AggregationRequest::parseNs("a", inputBSON), AssertionException, ErrorCodes::FailedToParse);
 }
 
 TEST(AggregationRequestTest, ParseNSShouldRejectNonStringNonNumericNS) {
     const BSONObj inputBSON = fromjson("{aggregate: {}, pipeline: []}");
     ASSERT_THROWS_CODE(
-        AggregationRequest::parseNs("a", inputBSON), UserException, ErrorCodes::TypeMismatch);
+        AggregationRequest::parseNs("a", inputBSON), AssertionException, ErrorCodes::TypeMismatch);
 }
 
 TEST(AggregationRequestTest, ParseNSShouldRejectAggregateOneStringAsCollectionName) {
     const BSONObj inputBSON = fromjson("{aggregate: '$cmd.aggregate', pipeline: []}");
-    ASSERT_THROWS_CODE(
-        AggregationRequest::parseNs("a", inputBSON), UserException, ErrorCodes::InvalidNamespace);
+    ASSERT_THROWS_CODE(AggregationRequest::parseNs("a", inputBSON),
+                       AssertionException,
+                       ErrorCodes::InvalidNamespace);
 }
 
 TEST(AggregationRequestTest, ParseNSShouldRejectInvalidCollectionName) {
     const BSONObj inputBSON = fromjson("{aggregate: '', pipeline: []}");
-    ASSERT_THROWS_CODE(
-        AggregationRequest::parseNs("a", inputBSON), UserException, ErrorCodes::InvalidNamespace);
+    ASSERT_THROWS_CODE(AggregationRequest::parseNs("a", inputBSON),
+                       AssertionException,
+                       ErrorCodes::InvalidNamespace);
 }
 
 TEST(AggregationRequestTest, ParseFromBSONOverloadsShouldProduceIdenticalRequests) {

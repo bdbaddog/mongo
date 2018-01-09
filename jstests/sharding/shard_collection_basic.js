@@ -81,10 +81,34 @@
     assert.commandFailed(
         mongos.adminCommand({shardCollection: kDbName + '.foo', key: {aKey: "hahahashed"}}));
 
-    // Error if a collection is already sharded.
-    assert.commandWorked(mongos.adminCommand({shardCollection: kDbName + '.foo', key: {_id: 1}}));
+    // Shard key cannot contain embedded objects.
+    assert.commandFailed(
+        mongos.adminCommand({shardCollection: kDbName + '.foo', key: {_id: {a: 1}}}));
+    assert.commandFailed(
+        mongos.adminCommand({shardCollection: kDbName + '.foo', key: {_id: {'a.b': 1}}}));
 
-    assert.commandFailed(mongos.adminCommand({shardCollection: kDbName + '.foo', key: {_id: 1}}));
+    // Shard key can contain dotted path to embedded element.
+    assert.commandWorked(mongos.adminCommand(
+        {shardCollection: kDbName + '.shard_key_dotted_path', key: {'_id.a': 1}}));
+
+    //
+    // Test shardCollection's idempotency
+    //
+
+    // Succeed if a collection is already sharded with the same options.
+    assert.commandWorked(mongos.adminCommand({shardCollection: kDbName + '.foo', key: {_id: 1}}));
+    assert.commandWorked(mongos.adminCommand({shardCollection: kDbName + '.foo', key: {_id: 1}}));
+    // Specifying the simple collation or not specifying a collation should be equivalent, because
+    // if no collation is specified, the collection default collation is used.
+    assert.commandWorked(mongos.adminCommand(
+        {shardCollection: kDbName + '.foo', key: {_id: 1}, collation: {locale: 'simple'}}));
+
+    // Fail if the collection is already sharded with different options.
+    // different shard key
+    assert.commandFailed(mongos.adminCommand({shardCollection: kDbName + '.foo', key: {x: 1}}));
+    // different 'unique'
+    assert.commandFailed(
+        mongos.adminCommand({shardCollection: kDbName + '.foo', key: {_id: 1}, unique: true}));
 
     mongos.getDB(kDbName).dropDatabase();
 
@@ -157,6 +181,21 @@
 
     assert.commandFailed(
         mongos.adminCommand({shardCollection: kDbName + '.foo', key: {aKey: 1}, unique: true}));
+
+    //
+    // Session-related tests
+    //
+
+    assert.commandWorked(mongos.getDB(kDbName).dropDatabase());
+    assert.commandWorked(mongos.adminCommand({enableSharding: kDbName}));
+
+    // shardCollection can be called under a session.
+    const sessionDb = mongos.startSession().getDatabase(kDbName);
+    assert.commandWorked(
+        sessionDb.adminCommand({shardCollection: kDbName + '.foo', key: {_id: 'hashed'}}));
+    sessionDb.getSession().endSession();
+
+    assert.commandWorked(mongos.getDB(kDbName).dropDatabase());
 
     //
     // Collation-related tests

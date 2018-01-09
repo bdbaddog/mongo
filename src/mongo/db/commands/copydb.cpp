@@ -87,9 +87,9 @@ using std::stringstream;
  * NOTE: Since internal cluster auth works differently, "copydb" currently doesn't work between
  * shards in a cluster when auth is enabled.  See SERVER-13080.
  */
-class CmdCopyDb : public Command {
+class CmdCopyDb : public ErrmsgCommandDeprecated {
 public:
-    CmdCopyDb() : Command("copydb") {}
+    CmdCopyDb() : ErrmsgCommandDeprecated("copydb") {}
 
     virtual bool adminOnly() const {
         return true;
@@ -115,11 +115,11 @@ public:
              << "[, slaveOk: <bool>, username: <username>, nonce: <nonce>, key: <key>]}";
     }
 
-    virtual bool run(OperationContext* opCtx,
-                     const string& dbname,
-                     const BSONObj& cmdObj,
-                     string& errmsg,
-                     BSONObjBuilder& result) {
+    virtual bool errmsgRun(OperationContext* opCtx,
+                           const string& dbname,
+                           const BSONObj& cmdObj,
+                           string& errmsg,
+                           BSONObjBuilder& result) {
         boost::optional<DisableDocumentValidation> maybeDisableValidation;
         if (shouldBypassDocumentValidationForCommand(cmdObj))
             maybeDisableValidation.emplace(opCtx);
@@ -166,30 +166,10 @@ public:
 
         Cloner cloner;
 
-        // Get MONGODB-CR parameters
-        string username = cmdObj.getStringField("username");
-        string nonce = cmdObj.getStringField("nonce");
-        string key = cmdObj.getStringField("key");
-
         auto& authConn = CopyDbAuthConnection::forClient(opCtx->getClient());
 
-        if (!username.empty() && !nonce.empty() && !key.empty()) {
-            uassert(13008, "must call copydbgetnonce first", authConn.get());
-            BSONObj ret;
-            {
-                if (!authConn->runCommand(
-                        cloneOptions.fromDB,
-                        BSON("authenticate" << 1 << "user" << username << "nonce" << nonce << "key"
-                                            << key),
-                        ret)) {
-                    errmsg = "unable to login " + ret.toString();
-                    authConn.reset();
-                    return false;
-                }
-            }
-            cloner.setConnection(authConn.release());
-        } else if (cmdObj.hasField(saslCommandConversationIdFieldName) &&
-                   cmdObj.hasField(saslCommandPayloadFieldName)) {
+        if (cmdObj.hasField(saslCommandConversationIdFieldName) &&
+            cmdObj.hasField(saslCommandPayloadFieldName)) {
             uassert(25487, "must call copydbsaslstart first", authConn.get());
             BSONObj ret;
             if (!authConn->runCommand(
@@ -208,16 +188,16 @@ public:
             }
 
             result.append("done", true);
-            cloner.setConnection(authConn.release());
+            cloner.setConnection(std::move(authConn));
         } else if (!fromSelf) {
             // If fromSelf leave the cloner's conn empty, it will use a DBDirectClient instead.
             const ConnectionString cs(uassertStatusOK(ConnectionString::parse(fromhost)));
 
-            DBClientBase* conn = cs.connect(StringData(), errmsg);
+            auto conn = cs.connect(StringData(), errmsg);
             if (!conn) {
                 return false;
             }
-            cloner.setConnection(conn);
+            cloner.setConnection(std::move(conn));
         }
 
         // Either we didn't need the authConn (if we even had one), or we already moved it

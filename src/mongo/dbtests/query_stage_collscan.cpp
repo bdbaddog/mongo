@@ -42,7 +42,6 @@
 #include "mongo/db/exec/plan_stage.h"
 #include "mongo/db/json.h"
 #include "mongo/db/matcher/expression_parser.h"
-#include "mongo/db/matcher/extensions_callback_disallow_extensions.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/query/plan_executor.h"
 #include "mongo/db/storage/record_store.h"
@@ -94,8 +93,10 @@ public:
 
         // Make the filter.
         const CollatorInterface* collator = nullptr;
-        StatusWithMatchExpression statusWithMatcher = MatchExpressionParser::parse(
-            filterObj, ExtensionsCallbackDisallowExtensions(), collator);
+        const boost::intrusive_ptr<ExpressionContext> expCtx(
+            new ExpressionContext(&_opCtx, collator));
+        StatusWithMatchExpression statusWithMatcher =
+            MatchExpressionParser::parse(filterObj, expCtx);
         verify(statusWithMatcher.isOK());
         unique_ptr<MatchExpression> filterExpr = std::move(statusWithMatcher.getValue());
 

@@ -42,6 +42,7 @@
 #include "mongo/db/service_context.h"
 #include "mongo/platform/unordered_set.h"
 #include "mongo/scripting/dbdirectclient_factory.h"
+#include "mongo/util/fail_point_service.h"
 #include "mongo/util/file.h"
 #include "mongo/util/log.h"
 #include "mongo/util/text.h"
@@ -55,7 +56,10 @@ using std::unique_ptr;
 
 AtomicInt64 Scope::_lastVersion(1);
 
+
 namespace {
+
+MONGO_FP_DECLARE(mr_killop_test_fp);
 // 2 GB is the largest support Javascript file size.
 const fileofs kMaxJsFileLength = fileofs(2) * 1024 * 1024 * 1024;
 
@@ -231,12 +235,21 @@ void Scope::loadStored(OperationContext* opCtx, bool ignoreNotConnected) {
         uassert(10209, str::stream() << "name has to be a string: " << n, n.type() == String);
         uassert(10210, "value has to be set", v.type() != EOO);
 
+        if (MONGO_FAIL_POINT(mr_killop_test_fp)) {
+
+            /* This thread sleep makes the interrupts in the test come in at a time
+            *  where the js misses the interrupt and throw an exception instead of
+            *  being interrupted
+            */
+            stdx::this_thread::sleep_for(stdx::chrono::seconds(1));
+        }
+
         try {
             setElement(n.valuestr(), v, o);
             thisTime.insert(n.valuestr());
             _storedNames.insert(n.valuestr());
         } catch (const DBException& setElemEx) {
-            if (setElemEx.getCode() == ErrorCodes::Interrupted) {
+            if (setElemEx.code() == ErrorCodes::Interrupted) {
                 throw;
             }
 
@@ -287,6 +300,7 @@ extern const JSFile explain_query;
 extern const JSFile explainable;
 extern const JSFile mongo;
 extern const JSFile mr;
+extern const JSFile session;
 extern const JSFile query;
 extern const JSFile utils;
 extern const JSFile utils_sh;
@@ -302,6 +316,7 @@ void Scope::execCoreFiles() {
     execSetup(JSFiles::db);
     execSetup(JSFiles::mongo);
     execSetup(JSFiles::mr);
+    execSetup(JSFiles::session);
     execSetup(JSFiles::query);
     execSetup(JSFiles::bulk_api);
     execSetup(JSFiles::error_codes);
@@ -425,6 +440,9 @@ public:
     void advanceGeneration() {
         _real->advanceGeneration();
     }
+    void requireOwnedObjects() override {
+        _real->requireOwnedObjects();
+    }
     bool isKillPending() const {
         return _real->isKillPending();
     }
@@ -541,7 +559,7 @@ unique_ptr<Scope> ScriptEngine::getPooledScope(OperationContext* opCtx,
     return p;
 }
 
-void (*ScriptEngine::_connectCallback)(DBClientWithCommands&) = 0;
+void (*ScriptEngine::_connectCallback)(DBClientBase&) = 0;
 
 ScriptEngine* getGlobalScriptEngine() {
     if (hasGlobalServiceContext())

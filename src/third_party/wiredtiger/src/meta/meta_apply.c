@@ -1,5 +1,5 @@
 /*-
- * Copyright (c) 2014-2017 MongoDB, Inc.
+ * Copyright (c) 2014-2018 MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -41,11 +41,11 @@ __meta_btree_apply(WT_SESSION_IMPL *session, WT_CURSOR *cursor,
 		 * dropping the handle (e.g in LSM when cleaning up obsolete
 		 * chunks).  Holding the metadata lock isn't enough.
 		 */
-		if ((ret = __wt_session_get_btree(
+		if ((ret = __wt_session_get_dhandle(
 		    session, uri, NULL, NULL, 0)) != 0)
 			return (ret == EBUSY ? 0 : ret);
 		WT_SAVE_DHANDLE(session, ret = file_func(session, cfg));
-		WT_TRET(__wt_session_release_btree(session));
+		WT_TRET(__wt_session_release_dhandle(session));
 		WT_RET(ret);
 	}
 	WT_RET_NOTFOUND_OK(ret);

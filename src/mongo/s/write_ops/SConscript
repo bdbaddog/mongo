@@ -9,20 +9,15 @@ env.Library(
     source=[
         'batched_command_request.cpp',
         'batched_command_response.cpp',
-        'batched_delete_document.cpp',
-        'batched_delete_request.cpp',
-        'batched_insert_request.cpp',
-        'batched_update_document.cpp',
-        'batched_update_request.cpp',
         'batched_upsert_detail.cpp',
         'write_error_detail.cpp',
-        env.Idlc('write_ops.idl')[0],
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/base',
         '$BUILD_DIR/mongo/db/common',
+        '$BUILD_DIR/mongo/db/ops/write_ops_parsers',
         '$BUILD_DIR/mongo/db/repl/optime',
-        '$BUILD_DIR/mongo/s/common',
+        '$BUILD_DIR/mongo/s/common_s',
     ],
 )
 
@@ -32,12 +27,15 @@ env.Library(
         'write_op.cpp',
         'batch_write_op.cpp',
         'batch_write_exec.cpp',
+        '$BUILD_DIR/mongo/s/commands/chunk_manager_targeter.cpp',
+        '$BUILD_DIR/mongo/s/commands/cluster_write.cpp',
     ],
     LIBDEPS=[
         'batch_write_types',
         '$BUILD_DIR/mongo/client/connection_string',
         '$BUILD_DIR/mongo/s/async_requests_sender',
         '$BUILD_DIR/mongo/s/client/sharding_client',
+        '$BUILD_DIR/mongo/s/commands/shared_cluster_commands',
         '$BUILD_DIR/mongo/s/coreshard',
     ],
 )
@@ -45,7 +43,6 @@ env.Library(
 env.Library(
     target='cluster_write_op_conversion',
     source=[
-        'batch_upconvert.cpp',
         'batch_downconvert.cpp',
     ],
     LIBDEPS=[
@@ -60,12 +57,10 @@ env.CppUnitTest(
     source=[
         'batched_command_request_test.cpp',
         'batched_command_response_test.cpp',
-        'batched_delete_request_test.cpp',
-        'batched_insert_request_test.cpp',
-        'batched_update_request_test.cpp',
     ],
     LIBDEPS=[
         'batch_write_types',
+        '$BUILD_DIR/mongo/db/ops/write_ops_parsers_test_helpers',
     ]
 )
 
@@ -87,7 +82,6 @@ env.CppUnitTest(
 env.CppUnitTest(
     target='cluster_write_op_conversion_test',
     source=[
-        'batch_upconvert_test.cpp',
         'batch_downconvert_test.cpp',
     ],
     LIBDEPS=[

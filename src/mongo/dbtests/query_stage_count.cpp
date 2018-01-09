@@ -30,6 +30,7 @@
 
 #include "mongo/platform/basic.h"
 
+#include "mongo/db/catalog/index_catalog.h"
 #include "mongo/db/client.h"
 #include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/db_raii.h"
@@ -41,7 +42,6 @@
 #include "mongo/db/exec/working_set.h"
 #include "mongo/db/matcher/expression.h"
 #include "mongo/db/matcher/expression_parser.h"
-#include "mongo/db/matcher/extensions_callback_disallow_extensions.h"
 #include "mongo/dbtests/dbtests.h"
 
 namespace QueryStageCount {
@@ -64,17 +64,18 @@ public:
     virtual void setup() {
         WriteUnitOfWork wunit(&_opCtx);
 
-        _ctx.db()->dropCollection(&_opCtx, ns());
+        _ctx.db()->dropCollection(&_opCtx, ns()).transitional_ignore();
         _coll = _ctx.db()->createCollection(&_opCtx, ns());
 
-        _coll->getIndexCatalog()->createIndexOnEmptyCollection(&_opCtx,
-                                                               BSON("key" << BSON("x" << 1)
-                                                                          << "name"
-                                                                          << "x_1"
-                                                                          << "ns"
-                                                                          << ns()
-                                                                          << "v"
-                                                                          << 1));
+        _coll->getIndexCatalog()
+            ->createIndexOnEmptyCollection(&_opCtx,
+                                           BSON("key" << BSON("x" << 1) << "name"
+                                                      << "x_1"
+                                                      << "ns"
+                                                      << ns()
+                                                      << "v"
+                                                      << 1))
+            .status_with_transitional_ignore();
 
         for (int i = 0; i < kDocuments; i++) {
             insert(BSON(GENOID << "x" << i));
@@ -107,14 +108,15 @@ public:
     void insert(const BSONObj& doc) {
         WriteUnitOfWork wunit(&_opCtx);
         OpDebug* const nullOpDebug = nullptr;
-        _coll->insertDocument(&_opCtx, doc, nullOpDebug, false);
+        _coll->insertDocument(&_opCtx, InsertStatement(doc), nullOpDebug, false)
+            .transitional_ignore();
         wunit.commit();
     }
 
     void remove(const RecordId& recordId) {
         WriteUnitOfWork wunit(&_opCtx);
         OpDebug* const nullOpDebug = nullptr;
-        _coll->deleteDocument(&_opCtx, recordId, nullOpDebug);
+        _coll->deleteDocument(&_opCtx, kUninitializedStmtId, recordId, nullOpDebug);
         wunit.commit();
     }
 
@@ -147,8 +149,10 @@ public:
         unique_ptr<WorkingSet> ws(new WorkingSet);
 
         const CollatorInterface* collator = nullptr;
-        StatusWithMatchExpression statusWithMatcher = MatchExpressionParser::parse(
-            request.getQuery(), ExtensionsCallbackDisallowExtensions(), collator);
+        const boost::intrusive_ptr<ExpressionContext> expCtx(
+            new ExpressionContext(&_opCtx, collator));
+        StatusWithMatchExpression statusWithMatcher =
+            MatchExpressionParser::parse(request.getQuery(), expCtx);
         ASSERT(statusWithMatcher.isOK());
         unique_ptr<MatchExpression> expression = std::move(statusWithMatcher.getValue());
 

@@ -36,7 +36,9 @@
 #include "mongo/s/catalog/type_chunk.h"
 #include "mongo/s/catalog/type_collection.h"
 #include "mongo/s/chunk_version.h"
+#include "mongo/stdx/memory.h"
 #include "mongo/util/concurrency/notification.h"
+#include "mongo/util/uuid.h"
 
 namespace mongo {
 
@@ -52,14 +54,33 @@ public:
     virtual ~CatalogCacheLoader() = default;
 
     /**
+     * Stores a loader on the specified service context. May only be called once for the lifetime of
+     * the service context.
+     */
+    static void set(ServiceContext* serviceContext, std::unique_ptr<CatalogCacheLoader> loader);
+
+    static CatalogCacheLoader& get(ServiceContext* serviceContext);
+    static CatalogCacheLoader& get(OperationContext* opCtx);
+
+
+    /**
      * Used as a return value for getChunksSince.
      */
     struct CollectionAndChangedChunks {
+        CollectionAndChangedChunks();
+        CollectionAndChangedChunks(boost::optional<UUID> uuid,
+                                   const OID& collEpoch,
+                                   const BSONObj& collShardKeyPattern,
+                                   const BSONObj& collDefaultCollation,
+                                   bool collShardKeyIsUnique,
+                                   std::vector<ChunkType> chunks);
+
         // Information about the entire collection
+        boost::optional<UUID> uuid;
         OID epoch;
         BSONObj shardKeyPattern;
         BSONObj defaultCollation;
-        bool shardKeyIsUnique;
+        bool shardKeyIsUnique{false};
 
         // The chunks which have changed sorted by their chunkVersion. This list might potentially
         // contain all the chunks in the collection.
@@ -82,6 +103,11 @@ public:
     virtual void onStepUp() = 0;
 
     /**
+     * Notifies the loader that the persisted collection version for 'nss' has been updated.
+     */
+    virtual void notifyOfCollectionVersionUpdate(const NamespaceString& nss) = 0;
+
+    /**
      * Non-blocking call, which requests the chunks changed since the specified version to be
      * fetched from the persistent metadata store and invokes the callback function with the result.
      * The callback function must never throw - it is a fatal error to do so.
@@ -98,6 +124,25 @@ public:
         ChunkVersion version,
         stdx::function<void(OperationContext*, StatusWith<CollectionAndChangedChunks>)>
             callbackFn) = 0;
+
+    /**
+     * Waits for any pending changes for the specified collection to be persisted locally (not
+     * necessarily replicated). If newer changes come after this method has started running, they
+     * will not be waited for except if there is a drop.
+     *
+     * May throw if the node steps down from primary or if the operation time is exceeded or due to
+     * any other error condition.
+     *
+     * If the specific loader implementation does not support persistence, this method is undefined
+     * and must fassert.
+     */
+    virtual void waitForCollectionFlush(OperationContext* opCtx, const NamespaceString& nss) = 0;
+
+    /**
+     * Only used for unit-tests, clears a previously-created catalog cache loader from the specified
+     * service context, so that 'create' can be called again.
+     */
+    static void clearForTests(ServiceContext* serviceContext);
 
 protected:
     CatalogCacheLoader() = default;

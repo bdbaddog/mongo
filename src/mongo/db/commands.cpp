@@ -43,19 +43,17 @@
 #include "mongo/db/auth/authorization_manager.h"
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/auth/privilege.h"
+#include "mongo/db/catalog/uuid_catalog.h"
 #include "mongo/db/client.h"
 #include "mongo/db/curop.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/server_parameters.h"
 #include "mongo/rpc/write_concern_error_detail.h"
+#include "mongo/s/stale_exception.h"
 #include "mongo/util/log.h"
-#include "mongo/util/uuid_catalog.h"
 
 namespace mongo {
-
-using std::string;
-using std::stringstream;
 
 using logger::LogComponent;
 
@@ -71,11 +69,68 @@ namespace {
 ExportedServerParameter<bool, ServerParameterType::kStartupOnly> testCommandsParameter(
     ServerParameterSet::getGlobal(), "enableTestCommands", &Command::testCommandsEnabled);
 
+const char kWriteConcernField[] = "writeConcern";
+const WriteConcernOptions kMajorityWriteConcern(
+    WriteConcernOptions::kMajority,
+    // Note: Even though we're setting UNSET here, kMajority implies JOURNAL if journaling is
+    // supported by the mongod.
+    WriteConcernOptions::SyncMode::UNSET,
+    Seconds(60));
+
 }  // namespace
 
 Command::~Command() = default;
 
-string Command::parseNsFullyQualified(const string& dbname, const BSONObj& cmdObj) {
+BSONObj Command::appendPassthroughFields(const BSONObj& cmdObjWithPassthroughFields,
+                                         const BSONObj& request) {
+    BSONObjBuilder b;
+    b.appendElements(request);
+    for (const auto& elem :
+         Command::filterCommandRequestForPassthrough(cmdObjWithPassthroughFields)) {
+        const auto name = elem.fieldNameStringData();
+        if (Command::isGenericArgument(name) && !request.hasField(name)) {
+            b.append(elem);
+        }
+    }
+    return b.obj();
+}
+
+BSONObj Command::appendMajorityWriteConcern(const BSONObj& cmdObj) {
+
+    WriteConcernOptions newWC = kMajorityWriteConcern;
+
+    if (cmdObj.hasField(kWriteConcernField)) {
+        auto wc = cmdObj.getField(kWriteConcernField);
+        // The command has a writeConcern field and it's majority, so we can
+        // return it as-is.
+        if (wc["w"].ok() && wc["w"].str() == "majority") {
+            return cmdObj;
+        }
+
+        if (wc["wtimeout"].ok()) {
+            // They set a timeout, but aren't using majority WC. We want to use their
+            // timeout along with majority WC.
+            newWC = WriteConcernOptions(WriteConcernOptions::kMajority,
+                                        WriteConcernOptions::SyncMode::UNSET,
+                                        wc["wtimeout"].Number());
+        }
+    }
+
+    // Append all original fields except the writeConcern field to the new command.
+    BSONObjBuilder cmdObjWithWriteConcern;
+    for (const auto& elem : cmdObj) {
+        const auto name = elem.fieldNameStringData();
+        if (name != "writeConcern" && !cmdObjWithWriteConcern.hasField(name)) {
+            cmdObjWithWriteConcern.append(elem);
+        }
+    }
+
+    // Finally, add the new write concern.
+    cmdObjWithWriteConcern.append(kWriteConcernField, newWC.toBSON());
+    return cmdObjWithWriteConcern.obj();
+}
+
+std::string Command::parseNsFullyQualified(const std::string& dbname, const BSONObj& cmdObj) {
     BSONElement first = cmdObj.firstElement();
     uassert(ErrorCodes::BadValue,
             str::stream() << "collection name has invalid type " << typeName(first.type()),
@@ -87,11 +142,12 @@ string Command::parseNsFullyQualified(const string& dbname, const BSONObj& cmdOb
     return nss.ns();
 }
 
-NamespaceString Command::parseNsCollectionRequired(const string& dbname, const BSONObj& cmdObj) {
+NamespaceString Command::parseNsCollectionRequired(const std::string& dbname,
+                                                   const BSONObj& cmdObj) {
     // Accepts both BSON String and Symbol for collection name per SERVER-16260
     // TODO(kangas) remove Symbol support in MongoDB 3.0 after Ruby driver audit
     BSONElement first = cmdObj.firstElement();
-    uassert(ErrorCodes::BadValue,
+    uassert(ErrorCodes::InvalidNamespace,
             str::stream() << "collection name has invalid type " << typeName(first.type()),
             first.canonicalType() == canonicalizeBSONType(mongo::String));
     const NamespaceString nss(dbname, first.valueStringData());
@@ -102,25 +158,33 @@ NamespaceString Command::parseNsCollectionRequired(const string& dbname, const B
 }
 
 NamespaceString Command::parseNsOrUUID(OperationContext* opCtx,
-                                       const string& dbname,
+                                       const std::string& dbname,
                                        const BSONObj& cmdObj) {
     BSONElement first = cmdObj.firstElement();
     if (first.type() == BinData && first.binDataType() == BinDataType::newUUID) {
-        StatusWith<UUID> uuidRes = UUID::parse(first);
-        uassertStatusOK(uuidRes);
-        UUIDCatalog& catalog = UUIDCatalog::get(opCtx->getServiceContext());
-        return catalog.lookupNSSByUUID(uuidRes.getValue());
+        UUIDCatalog& catalog = UUIDCatalog::get(opCtx);
+        UUID uuid = uassertStatusOK(UUID::parse(first));
+        NamespaceString nss = catalog.lookupNSSByUUID(uuid);
+        uassert(ErrorCodes::NamespaceNotFound,
+                str::stream() << "UUID " << uuid << " specified in "
+                              << cmdObj.firstElement().fieldNameStringData()
+                              << " command not found in "
+                              << dbname
+                              << " database",
+                nss.isValid() && nss.db() == dbname);
+
+        return nss;
     } else {
-        // Ensure collection identifier is not a Command or specialCommand
+        // Ensure collection identifier is not a Command
         const NamespaceString nss(parseNsCollectionRequired(dbname, cmdObj));
         uassert(ErrorCodes::InvalidNamespace,
                 str::stream() << "Invalid collection name specified '" << nss.ns() << "'",
-                !nss.isCommand() && !nss.isSpecialCommand());
+                nss.isNormal());
         return nss;
     }
 }
 
-string Command::parseNs(const string& dbname, const BSONObj& cmdObj) const {
+std::string Command::parseNs(const std::string& dbname, const BSONObj& cmdObj) const {
     BSONElement first = cmdObj.firstElement();
     if (first.type() != mongo::String)
         return dbname;
@@ -156,16 +220,35 @@ Command::Command(StringData name, StringData oldName)
         (*_commands)[oldName.toString()] = this;
 }
 
-void Command::help(stringstream& help) const {
+void Command::help(std::stringstream& help) const {
     help << "no help defined";
 }
 
 Status Command::explain(OperationContext* opCtx,
-                        const string& dbname,
+                        const std::string& dbname,
                         const BSONObj& cmdObj,
                         ExplainOptions::Verbosity verbosity,
                         BSONObjBuilder* out) const {
     return {ErrorCodes::IllegalOperation, str::stream() << "Cannot explain cmd: " << getName()};
+}
+
+BSONObj Command::runCommandDirectly(OperationContext* opCtx, const OpMsgRequest& request) {
+    auto command = Command::findCommand(request.getCommandName());
+    invariant(command);
+
+    BSONObjBuilder out;
+    try {
+        bool ok = command->publicRun(opCtx, request, out);
+        appendCommandStatus(out, ok);
+    } catch (const StaleConfigException&) {
+        // These exceptions are intended to be handled at a higher level and cannot losslessly
+        // round-trip through Status.
+        throw;
+    } catch (const DBException& ex) {
+        out.resetToEmpty();
+        appendCommandStatus(out, ex.toStatus());
+    }
+    return out.obj();
 }
 
 Command* Command::findCommand(StringData name) {
@@ -181,6 +264,9 @@ bool Command::appendCommandStatus(BSONObjBuilder& result, const Status& status) 
     if (!status.isOK() && !tmp.hasField("code")) {
         result.append("code", status.code());
         result.append("codeName", ErrorCodes::errorString(status.code()));
+    }
+    if (auto extraInfo = status.extraInfo()) {
+        extraInfo->serialize(&result);
     }
     return status.isOK();
 }
@@ -212,19 +298,20 @@ void Command::appendCommandWCStatus(BSONObjBuilder& result,
     }
 }
 
-void Command::appendOperationTime(BSONObjBuilder& result, LogicalTime operationTime) {
-    result.append("operationTime", operationTime.asTimestamp());
+Status BasicCommand::checkAuthForRequest(OperationContext* opCtx, const OpMsgRequest& request) {
+    uassertNoDocumentSequences(request);
+    return checkAuthForOperation(opCtx, request.getDatabase().toString(), request.body);
 }
 
-Status Command::checkAuthForOperation(OperationContext* opCtx,
-                                      const std::string& dbname,
-                                      const BSONObj& cmdObj) {
+Status BasicCommand::checkAuthForOperation(OperationContext* opCtx,
+                                           const std::string& dbname,
+                                           const BSONObj& cmdObj) {
     return checkAuthForCommand(opCtx->getClient(), dbname, cmdObj);
 }
 
-Status Command::checkAuthForCommand(Client* client,
-                                    const std::string& dbname,
-                                    const BSONObj& cmdObj) {
+Status BasicCommand::checkAuthForCommand(Client* client,
+                                         const std::string& dbname,
+                                         const BSONObj& cmdObj) {
     std::vector<Privilege> privileges;
     this->addRequiredPrivileges(dbname, cmdObj, &privileges);
     if (AuthorizationSession::get(client)->isAuthorizedForPrivileges(privileges))
@@ -245,19 +332,19 @@ BSONObj Command::getRedactedCopyForLogging(const BSONObj& cmdObj) {
 
 static Status _checkAuthorizationImpl(Command* c,
                                       OperationContext* opCtx,
-                                      const std::string& dbname,
-                                      const BSONObj& cmdObj) {
+                                      const OpMsgRequest& request) {
     namespace mmb = mutablebson;
     auto client = opCtx->getClient();
+    auto dbname = request.getDatabase();
     if (c->adminOnly() && dbname != "admin") {
         return Status(ErrorCodes::Unauthorized,
                       str::stream() << c->getName()
                                     << " may only be run against the admin database.");
     }
     if (AuthorizationSession::get(client)->getAuthorizationManager().isAuthEnabled()) {
-        Status status = c->checkAuthForOperation(opCtx, dbname, cmdObj);
+        Status status = c->checkAuthForRequest(opCtx, request);
         if (status == ErrorCodes::Unauthorized) {
-            mmb::Document cmdToLog(cmdObj, mmb::Document::kInPlaceDisabled);
+            mmb::Document cmdToLog(request.body, mmb::Document::kInPlaceDisabled);
             c->redactForLogging(&cmdToLog);
             return Status(ErrorCodes::Unauthorized,
                           str::stream() << "not authorized on " << dbname << " to execute command "
@@ -266,7 +353,7 @@ static Status _checkAuthorizationImpl(Command* c,
         if (!status.isOK()) {
             return status;
         }
-    } else if (c->adminOnly() && c->localHostOnlyIfNoAuth(cmdObj) &&
+    } else if (c->adminOnly() && c->localHostOnlyIfNoAuth() &&
                !client->getIsLocalHostConnection()) {
         return Status(ErrorCodes::Unauthorized,
                       str::stream() << c->getName()
@@ -275,17 +362,50 @@ static Status _checkAuthorizationImpl(Command* c,
     return Status::OK();
 }
 
+namespace {
+// A facade presenting CommandDefinition as an audit::CommandInterface.
+class CommandAuditHook : public audit::CommandInterface {
+public:
+    explicit CommandAuditHook(Command* command) : _command(command) {}
+
+    void redactForLogging(mutablebson::Document* cmdObj) const final {
+        _command->redactForLogging(cmdObj);
+    }
+
+    std::string parseNs(const std::string& dbname, const BSONObj& cmdObj) const final {
+        return _command->parseNs(dbname, cmdObj);
+    }
+
+private:
+    Command* _command;
+};
+}  // namespace
+
 Status Command::checkAuthorization(Command* c,
                                    OperationContext* opCtx,
-                                   const std::string& dbname,
-                                   const BSONObj& cmdObj) {
-    namespace mmb = mutablebson;
-    Status status = _checkAuthorizationImpl(c, opCtx, dbname, cmdObj);
+                                   const OpMsgRequest& request) {
+    Status status = _checkAuthorizationImpl(c, opCtx, request);
     if (!status.isOK()) {
         log(LogComponent::kAccessControl) << status;
     }
-    audit::logCommandAuthzCheck(opCtx->getClient(), dbname, cmdObj, c, status.code());
+    CommandAuditHook hook(c);
+    audit::logCommandAuthzCheck(opCtx->getClient(), request, &hook, status.code());
     return status;
+}
+
+bool Command::publicRun(OperationContext* opCtx,
+                        const OpMsgRequest& request,
+                        BSONObjBuilder& result) {
+    try {
+        return enhancedRun(opCtx, request, result);
+    } catch (const DBException& e) {
+        if (e.code() == ErrorCodes::Unauthorized) {
+            CommandAuditHook hook(this);
+            audit::logCommandAuthzCheck(
+                opCtx->getClient(), request, &hook, ErrorCodes::Unauthorized);
+        }
+        throw;
+    }
 }
 
 bool Command::isHelpRequest(const BSONElement& helpElem) {
@@ -303,7 +423,7 @@ void Command::generateHelpResponse(OperationContext* opCtx,
     command.help(ss);
     helpBuilder.append("help", ss.str());
 
-    replyBuilder->setCommandReply(helpBuilder.done());
+    replyBuilder->setCommandReply(helpBuilder.obj());
     replyBuilder->setMetadata(rpc::makeEmptyMetadata());
 }
 
@@ -322,23 +442,36 @@ const stdx::unordered_set<std::string> userManagementCommands{"createUser",
                                                               "revokePrivilegesFromRole",
                                                               "grantRolesToRole",
                                                               "revokeRolesFromRole",
-                                                              "_mergeAuthzCollections",
-                                                              "authSchemaUpgrade"};
+                                                              "_mergeAuthzCollections"};
 }  // namespace
 
 bool Command::isUserManagementCommand(const std::string& name) {
     return userManagementCommands.count(name);
 }
 
-bool Command::enhancedRun(OperationContext* opCtx,
-                          const OpMsgRequest& request,
-                          std::string& errmsg,
-                          BSONObjBuilder& result) {
+void BasicCommand::uassertNoDocumentSequences(const OpMsgRequest& request) {
     uassert(40472,
             str::stream() << "The " << getName() << " command does not support document sequences.",
             request.sequences.empty());
+}
 
-    return run(opCtx, request.getDatabase().toString(), request.body, errmsg, result);
+bool BasicCommand::enhancedRun(OperationContext* opCtx,
+                               const OpMsgRequest& request,
+                               BSONObjBuilder& result) {
+    uassertNoDocumentSequences(request);
+    return run(opCtx, request.getDatabase().toString(), request.body, result);
+}
+
+bool ErrmsgCommandDeprecated::run(OperationContext* opCtx,
+                                  const std::string& db,
+                                  const BSONObj& cmdObj,
+                                  BSONObjBuilder& result) {
+    std::string errmsg;
+    auto ok = errmsgRun(opCtx, db, cmdObj, errmsg, result);
+    if (!errmsg.empty()) {
+        appendCommandStatus(result, ok, errmsg);
+    }
+    return ok;
 }
 
 BSONObj Command::filterCommandRequestForPassthrough(const BSONObj& cmdObj) {
@@ -351,7 +484,9 @@ BSONObj Command::filterCommandRequestForPassthrough(const BSONObj& cmdObj) {
                    name == "$queryOptions" ||            //
                    name == "maxTimeMS" ||                //
                    name == "readConcern" ||              //
-                   name == "writeConcern") {
+                   name == "writeConcern" ||             //
+                   name == "lsid" ||                     //
+                   name == "txnNumber") {
             // This is the whitelist of generic arguments that commands can be trusted to blindly
             // forward to the shards.
             bob.append(elem);
@@ -365,7 +500,7 @@ void Command::filterCommandReplyForPassthrough(const BSONObj& cmdObj, BSONObjBui
         const auto name = elem.fieldNameStringData();
         if (name == "$configServerState" ||  //
             name == "$gleStats" ||           //
-            name == "$logicalTime" ||        //
+            name == "$clusterTime" ||        //
             name == "$oplogQueryData" ||     //
             name == "$replData" ||           //
             name == "operationTime") {

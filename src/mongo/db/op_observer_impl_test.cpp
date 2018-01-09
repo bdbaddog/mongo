@@ -29,6 +29,7 @@
 
 #include "mongo/db/op_observer_impl.h"
 #include "mongo/db/client.h"
+#include "mongo/db/concurrency/locker_noop.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/field_parser.h"
 #include "mongo/db/repl/oplog.h"
@@ -36,7 +37,7 @@
 #include "mongo/db/repl/repl_client_info.h"
 #include "mongo/db/repl/replication_coordinator_mock.h"
 #include "mongo/db/service_context_d_test_fixture.h"
-
+#include "mongo/unittest/death_test.h"
 
 namespace mongo {
 namespace {
@@ -59,13 +60,13 @@ private:
 
         // Ensure that we are primary.
         auto replCoord = repl::ReplicationCoordinator::get(opCtx.get());
-        ASSERT_TRUE(replCoord->setFollowerMode(repl::MemberState::RS_PRIMARY));
+        ASSERT_OK(replCoord->setFollowerMode(repl::MemberState::RS_PRIMARY));
     }
 
 protected:
     // Assert that oplog only has a single entry and return that oplog entry.
     BSONObj getSingleOplogEntry(OperationContext* opCtx) {
-        repl::OplogInterfaceLocal oplogInterface(opCtx, repl::rsOplogName);
+        repl::OplogInterfaceLocal oplogInterface(opCtx, NamespaceString::kRsOplogNamespace.ns());
         auto oplogIter = oplogInterface.makeIterator();
         auto opEntry = unittest::assertGet(oplogIter->next());
         ASSERT_EQUALS(ErrorCodes::CollectionIsEmpty, oplogIter->next().getStatus());
@@ -201,6 +202,73 @@ TEST_F(OpObserverTest, OnDropCollectionReturnsDropOpTime) {
 
     // Ensure that the drop optime returned is the same as the last optime in the ReplClientInfo.
     ASSERT_EQUALS(repl::ReplClientInfo::forClient(&cc()).getLastOp(), dropOpTime);
+}
+
+TEST_F(OpObserverTest, OnRenameCollectionReturnsRenameOpTime) {
+    OpObserverImpl opObserver;
+    auto opCtx = cc().makeOperationContext();
+
+    // Create 'renameCollection' command.
+    auto dropTarget = false;
+    auto stayTemp = false;
+    NamespaceString sourceNss("test.foo");
+    NamespaceString targetNss("test.bar");
+    auto renameCmd = BSON(
+        "renameCollection" << sourceNss.ns() << "to" << targetNss.ns() << "stayTemp" << stayTemp
+                           << "dropTarget"
+                           << dropTarget);
+
+    // Write to the oplog.
+    repl::OpTime renameOpTime;
+    {
+        AutoGetDb autoDb(opCtx.get(), sourceNss.db(), MODE_X);
+        WriteUnitOfWork wunit(opCtx.get());
+        renameOpTime = opObserver.onRenameCollection(
+            opCtx.get(), sourceNss, targetNss, {}, dropTarget, {}, stayTemp);
+        wunit.commit();
+    }
+
+    auto oplogEntry = getSingleOplogEntry(opCtx.get());
+
+    // Ensure that renameCollection fields were properly added to oplog entry.
+    auto o = oplogEntry.getObjectField("o");
+    auto oExpected = renameCmd;
+    ASSERT_BSONOBJ_EQ(oExpected, o);
+
+    // Ensure that the rename optime returned is the same as the last optime in the ReplClientInfo.
+    ASSERT_EQUALS(repl::ReplClientInfo::forClient(&cc()).getLastOp(), renameOpTime);
+}
+
+TEST_F(OpObserverTest, MultipleAboutToDeleteAndOnDelete) {
+    OpObserverImpl opObserver;
+    auto opCtx = cc().makeOperationContext();
+    NamespaceString nss = {"test", "coll"};
+    AutoGetDb autoDb(opCtx.get(), nss.db(), MODE_X);
+    WriteUnitOfWork wunit(opCtx.get());
+    opObserver.aboutToDelete(opCtx.get(), nss, BSON("_id" << 1));
+    opObserver.onDelete(opCtx.get(), nss, {}, {}, false, {});
+    opObserver.aboutToDelete(opCtx.get(), nss, BSON("_id" << 1));
+    opObserver.onDelete(opCtx.get(), nss, {}, {}, false, {});
+}
+
+DEATH_TEST_F(OpObserverTest, AboutToDeleteMustPreceedOnDelete, "invariant") {
+    OpObserverImpl opObserver;
+    auto opCtx = cc().makeOperationContext();
+    opCtx->releaseLockState();
+    opCtx->setLockState(stdx::make_unique<LockerNoop>());
+    NamespaceString nss = {"test", "coll"};
+    opObserver.onDelete(opCtx.get(), nss, {}, {}, false, {});
+}
+
+DEATH_TEST_F(OpObserverTest, EachOnDeleteRequiresAboutToDelete, "invariant") {
+    OpObserverImpl opObserver;
+    auto opCtx = cc().makeOperationContext();
+    opCtx->releaseLockState();
+    opCtx->setLockState(stdx::make_unique<LockerNoop>());
+    NamespaceString nss = {"test", "coll"};
+    opObserver.aboutToDelete(opCtx.get(), nss, {});
+    opObserver.onDelete(opCtx.get(), nss, {}, {}, false, {});
+    opObserver.onDelete(opCtx.get(), nss, {}, {}, false, {});
 }
 
 }  // namespace

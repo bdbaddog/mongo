@@ -57,14 +57,21 @@ public:
             kInclusionProjection,
             kComputedProjection,
             kReplaceRoot,
+            kChangeStreamTransformation,
         };
         virtual ~TransformerInterface() = default;
         virtual Document applyTransformation(const Document& input) = 0;
         virtual TransformerType getType() const = 0;
         virtual void optimize() = 0;
-        virtual Document serialize(boost::optional<ExplainOptions::Verbosity> explain) const = 0;
         virtual DocumentSource::GetDepsReturn addDependencies(DepsTracker* deps) const = 0;
         virtual GetModPathsReturn getModifiedPaths() const = 0;
+
+        /**
+         * Returns the document describing this stage, not including the stage name. For example,
+         * should return just {_id: 0, x: 1} for the stage parsed from {$project: {_id: 0, x: 1}}.
+         */
+        virtual Document serializeStageOptions(
+            boost::optional<ExplainOptions::Verbosity> explain) const = 0;
 
         /**
          * Returns true if this transformer is an inclusion projection and is a subset of
@@ -79,6 +86,9 @@ public:
         virtual bool isSubsetOfProjection(const BSONObj& proj) const {
             return false;
         }
+
+    private:
+        friend class DocumentSourceSingleDocumentTransformation;
     };
 
     DocumentSourceSingleDocumentTransformation(
@@ -94,8 +104,22 @@ public:
     DocumentSource::GetDepsReturn getDependencies(DepsTracker* deps) const final;
     GetModPathsReturn getModifiedPaths() const final;
 
-    bool canSwapWithMatch() const final {
-        return true;
+    StageConstraints constraints(Pipeline::SplitState pipeState) const final {
+        StageConstraints constraints(
+            StreamType::kStreaming,
+            PositionRequirement::kNone,
+            HostTypeRequirement::kNone,
+            DiskUseRequirement::kNoDiskUse,
+            (getType() == TransformerInterface::TransformerType::kChangeStreamTransformation
+                 ? FacetRequirement::kNotAllowed
+                 : FacetRequirement::kAllowed),
+            (getType() == TransformerInterface::TransformerType::kChangeStreamTransformation
+                 ? ChangeStreamRequirement::kChangeStreamStage
+                 : ChangeStreamRequirement::kWhitelist));
+
+        constraints.canSwapWithMatch = true;
+        constraints.canSwapWithLimit = true;
+        return constraints;
     }
 
     TransformerInterface::TransformerType getType() const {

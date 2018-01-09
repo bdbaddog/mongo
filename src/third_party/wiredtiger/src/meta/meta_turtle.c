@@ -1,5 +1,5 @@
 /*-
- * Copyright (c) 2014-2017 MongoDB, Inc.
+ * Copyright (c) 2014-2018 MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -148,8 +148,8 @@ int
 __wt_turtle_init(WT_SESSION_IMPL *session)
 {
 	WT_DECL_RET;
-	bool exist_backup, exist_incr, exist_isrc, exist_turtle, load;
 	char *metaconf;
+	bool exist_backup, exist_incr, exist_isrc, exist_turtle, load;
 
 	metaconf = NULL;
 	load = false;
@@ -246,6 +246,9 @@ __wt_turtle_read(WT_SESSION_IMPL *session, const char *key, char **valuep)
 
 	*valuep = NULL;
 
+	/* Require single-threading. */
+	WT_ASSERT(session, F_ISSET(session, WT_SESSION_LOCKED_TURTLE));
+
 	/*
 	 * Open the turtle file; there's one case where we won't find the turtle
 	 * file, yet still succeed.  We create the metadata file before creating
@@ -295,12 +298,15 @@ err:	WT_TRET(__wt_fclose(session, &fs));
 int
 __wt_turtle_update(WT_SESSION_IMPL *session, const char *key, const char *value)
 {
-	WT_FSTREAM *fs;
 	WT_DECL_RET;
+	WT_FSTREAM *fs;
 	int vmajor, vminor, vpatch;
 	const char *version;
 
 	fs = NULL;
+
+	/* Require single-threading. */
+	WT_ASSERT(session, F_ISSET(session, WT_SESSION_LOCKED_TURTLE));
 
 	/*
 	 * Create the turtle setup file: we currently re-write it from scratch

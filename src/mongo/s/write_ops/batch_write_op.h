@@ -28,12 +28,14 @@
 
 #pragma once
 
+#include <map>
 #include <set>
 #include <vector>
 
 #include "mongo/base/disallow_copying.h"
 #include "mongo/base/owned_pointer_vector.h"
 #include "mongo/base/status.h"
+#include "mongo/db/logical_session_id.h"
 #include "mongo/platform/unordered_map.h"
 #include "mongo/rpc/write_concern_error_detail.h"
 #include "mongo/s/ns_targeter.h"
@@ -46,9 +48,36 @@ namespace mongo {
 
 class OperationContext;
 class TargetedWriteBatch;
-struct ShardError;
-struct ShardWCError;
 class TrackedErrors;
+
+/**
+ * Simple struct for storing an error with an endpoint.
+ *
+ * Certain types of errors are not stored in WriteOps or must be returned to a caller.
+ */
+struct ShardError {
+    ShardError(const ShardEndpoint& endpoint, const WriteErrorDetail& error) : endpoint(endpoint) {
+        error.cloneTo(&this->error);
+    }
+
+    ShardEndpoint endpoint;
+    WriteErrorDetail error;
+};
+
+/**
+ * Simple struct for storing a write concern error with an endpoint.
+ *
+ * Certain types of errors are not stored in WriteOps or must be returned to a caller.
+ */
+struct ShardWCError {
+    ShardWCError(const ShardEndpoint& endpoint, const WriteConcernErrorDetail& error)
+        : endpoint(endpoint) {
+        error.cloneTo(&this->error);
+    }
+
+    ShardEndpoint endpoint;
+    WriteConcernErrorDetail error;
+};
 
 /**
  * Compares endpoints in a map.
@@ -89,7 +118,7 @@ class BatchWriteOp {
     MONGO_DISALLOW_COPYING(BatchWriteOp);
 
 public:
-    explicit BatchWriteOp(const BatchedCommandRequest& clientRequest);
+    BatchWriteOp(OperationContext* opCtx, const BatchedCommandRequest& clientRequest);
     ~BatchWriteOp();
 
     /**
@@ -108,16 +137,14 @@ public:
      *
      * Returned TargetedWriteBatches are owned by the caller.
      */
-    Status targetBatch(OperationContext* opCtx,
-                       const NSTargeter& targeter,
+    Status targetBatch(const NSTargeter& targeter,
                        bool recordTargetErrors,
                        std::map<ShardId, TargetedWriteBatch*>* targetedBatches);
 
     /**
      * Fills a BatchCommandRequest from a TargetedWriteBatch for this BatchWriteOp.
      */
-    void buildBatchRequest(const TargetedWriteBatch& targetedBatch,
-                           BatchedCommandRequest* request) const;
+    BatchedCommandRequest buildBatchRequest(const TargetedWriteBatch& targetedBatch) const;
 
     /**
      * Stores a response from one of the outstanding TargetedWriteBatches for this BatchWriteOp.
@@ -172,8 +199,13 @@ private:
      */
     void _cancelBatches(const WriteErrorDetail& why, TargetedBatchMap&& batchMapToCancel);
 
+    OperationContext* const _opCtx;
+
     // The incoming client request
     const BatchedCommandRequest& _clientRequest;
+
+    // Cached transaction number (if one is present on the operation contex)
+    boost::optional<TxnNumber> _batchTxnNum;
 
     // Array of ops being processed from the client request
     std::vector<WriteOp> _writeOps;
@@ -183,7 +215,7 @@ private:
     std::set<const TargetedWriteBatch*> _targeted;
 
     // Write concern responses from all write batches so far
-    std::vector<std::unique_ptr<ShardWCError>> _wcErrors;
+    std::vector<ShardWCError> _wcErrors;
 
     // Upserted ids for the whole write batch
     std::vector<std::unique_ptr<BatchedUpsertDetail>> _upsertedIds;
@@ -213,15 +245,24 @@ public:
         return _endpoint;
     }
 
-    /**
-     * TargetedWrite is owned here once given to the TargetedWriteBatch
-     */
-    void addWrite(TargetedWrite* targetedWrite) {
-        _writes.mutableVector().push_back(targetedWrite);
-    }
-
     const std::vector<TargetedWrite*>& getWrites() const {
         return _writes.vector();
+    }
+
+    size_t getNumOps() const {
+        return _writes.size();
+    }
+
+    int getEstimatedSizeBytes() const {
+        return _estimatedSizeBytes;
+    }
+
+    /**
+     * TargetedWrite is owned here once given to the TargetedWriteBatch.
+     */
+    void addWrite(TargetedWrite* targetedWrite, int estWriteSize) {
+        _writes.mutableVector().push_back(targetedWrite);
+        _estimatedSizeBytes += estWriteSize;
     }
 
 private:
@@ -231,35 +272,10 @@ private:
     // Where the responses go
     // TargetedWrite*s are owned by the TargetedWriteBatch
     OwnedPointerVector<TargetedWrite> _writes;
-};
 
-/**
- * Simple struct for storing an error with an endpoint.
- *
- * Certain types of errors are not stored in WriteOps or must be returned to a caller.
- */
-struct ShardError {
-    ShardError(const ShardEndpoint& endpoint, const WriteErrorDetail& error) : endpoint(endpoint) {
-        error.cloneTo(&this->error);
-    }
-
-    const ShardEndpoint endpoint;
-    WriteErrorDetail error;
-};
-
-/**
- * Simple struct for storing a write concern error with an endpoint.
- *
- * Certain types of errors are not stored in WriteOps or must be returned to a caller.
- */
-struct ShardWCError {
-    ShardWCError(const ShardEndpoint& endpoint, const WriteConcernErrorDetail& error)
-        : endpoint(endpoint) {
-        error.cloneTo(&this->error);
-    }
-
-    const ShardEndpoint endpoint;
-    WriteConcernErrorDetail error;
+    // Conservatvely estimated size of the batch, for ensuring it doesn't grow past the maximum BSON
+    // size
+    int _estimatedSizeBytes{0};
 };
 
 /**
@@ -267,20 +283,18 @@ struct ShardWCError {
  */
 class TrackedErrors {
 public:
-    ~TrackedErrors();
+    TrackedErrors() = default;
 
     void startTracking(int errCode);
 
     bool isTracking(int errCode) const;
 
-    void addError(ShardError* error);
+    void addError(ShardError error);
 
-    const std::vector<ShardError*>& getErrors(int errCode) const;
-
-    void clear();
+    const std::vector<ShardError>& getErrors(int errCode) const;
 
 private:
-    typedef unordered_map<int, std::vector<ShardError*>> TrackedErrorMap;
+    using TrackedErrorMap = stdx::unordered_map<int, std::vector<ShardError>>;
     TrackedErrorMap _errorMap;
 };
 

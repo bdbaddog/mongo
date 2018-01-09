@@ -34,10 +34,10 @@
 #include "mongo/base/status.h"
 #include "mongo/bson/bsonobj.h"
 #include "mongo/bson/oid.h"
+#include "mongo/s/chunk_version.h"
 
 namespace mongo {
 
-struct ChunkVersion;
 class ChunkType;
 class CollectionMetadata;
 class NamespaceString;
@@ -60,14 +60,22 @@ struct QueryAndSort {
 };
 
 /**
- * Subset of the shard's collections collection related to refresh state.
+ * Subset of the shard's collections collection document that relates to refresh state.
  */
 struct RefreshState {
-    bool operator==(RefreshState& other);
+    bool operator==(const RefreshState& other) const;
 
+    std::string toString() const;
+
+    // The current epoch of the collection metadata.
     OID epoch;
+
+    // Whether a refresh is currently in progress.
     bool refreshing;
-    long long sequenceNumber;
+
+    // The collection version after the last complete refresh. Indicates change if refreshing has
+    // started and finished since last loaded.
+    ChunkVersion lastRefreshedCollectionVersion;
 };
 
 /**
@@ -103,13 +111,20 @@ Status setPersistedRefreshFlags(OperationContext* opCtx, const NamespaceString& 
 
 /**
  * Writes a persisted signal to indicate that it is once again safe to read from the chunks
- * collection for 'nss'. It is essential to call this after updating the chunks collection so that
- * secondaries know they can safely use the chunk metadata again.
+ * collection for 'nss' and updates the collection's collection version to 'refreshedVersion'. It is
+ * essential to call this after updating the chunks collection so that secondaries know they can
+ * safely use the chunk metadata again.
+ *
+ * It is safe to call this multiple times: it's an idempotent action.
+ *
+ * refreshedVersion - the new collection version for the completed refresh.
  *
  * Note: if there is no document present in the collections collection for 'nss', nothing is
  * updated.
  */
-Status unsetPersistedRefreshFlags(OperationContext* opCtx, const NamespaceString& nss);
+Status unsetPersistedRefreshFlags(OperationContext* opCtx,
+                                  const NamespaceString& nss,
+                                  const ChunkVersion& refreshedVersion);
 
 /**
  * Reads the persisted refresh signal for 'nss' and returns those settings.
@@ -128,13 +143,12 @@ StatusWith<ShardCollectionType> readShardCollectionsEntry(OperationContext* opCt
  * concern.
  *
  * Uses the $set operator on the update so that updates can be applied without resetting everything.
+ * 'inc' can be used to specify fields and their increments: it will be assigned to the $inc
+ * operator.
  *
- * If 'upsert' is true, $setOnInsert is used to initialize the 'refreshSequenceNumber'.
- * upsert should only be used when applying updates from the config server, where the update never
- * includes the 'refreshing' and 'refreshSequenceNumber' fields.
- *
- * 'inc' contains fields and the desired increments, e.g. {'refreshSequenceNumber': 1}. Never use
- * 'upsert' true with a non-empty 'inc' object.
+ * If 'upsert' is true, expects neither 'refreshing' or 'lastRefreshedCollectionVersion' to be
+ * present in the update: these refreshing fields should only be added to an existing document.
+ * Similarly, 'inc' should not specify 'upsert' true.
  */
 Status updateShardCollectionsEntry(OperationContext* opCtx,
                                    const BSONObj& query,

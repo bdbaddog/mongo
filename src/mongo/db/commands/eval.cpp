@@ -152,7 +152,7 @@ bool dbEval(OperationContext* opCtx,
 }
 
 
-class CmdEval : public Command {
+class CmdEval : public ErrmsgCommandDeprecated {
 public:
     virtual bool slaveOk() const {
         return false;
@@ -172,13 +172,13 @@ public:
         RoleGraph::generateUniversalPrivileges(out);
     }
 
-    CmdEval() : Command("eval", "$eval") {}
+    CmdEval() : ErrmsgCommandDeprecated("eval", "$eval") {}
 
-    bool run(OperationContext* opCtx,
-             const string& dbname,
-             const BSONObj& cmdObj,
-             string& errmsg,
-             BSONObjBuilder& result) {
+    bool errmsgRun(OperationContext* opCtx,
+                   const string& dbname,
+                   const BSONObj& cmdObj,
+                   string& errmsg,
+                   BSONObjBuilder& result) {
         // Note: 'eval' is not allowed to touch sharded namespaces, but we can't check the
         // shardVersions of the namespaces accessed in the script until the script is evaluated.
         // Instead, we enforce that the script does not access sharded namespaces by ensuring the
@@ -207,14 +207,14 @@ public:
             OldClientContext ctx(opCtx, dbname, false /* no shard version checking here */);
 
             return dbEval(opCtx, dbname, cmdObj, result, errmsg);
-        } catch (const UserException& ex) {
+        } catch (const AssertionException& ex) {
             // Convert a stale shardVersion error to a stronger error to prevent this node or the
             // sending node from believing it needs to refresh its routing table.
-            if (ex.getCode() == ErrorCodes::RecvStaleConfig) {
+            if (ex.code() == ErrorCodes::StaleConfig) {
                 uasserted(ErrorCodes::BadValue,
                           str::stream() << "can't use sharded collection from db.eval");
             }
-            throw ex;
+            throw;
         }
     }
 

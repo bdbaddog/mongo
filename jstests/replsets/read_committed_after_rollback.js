@@ -24,14 +24,14 @@ load("jstests/replsets/rslib.js");  // For startSetIfSupportsReadMajority.
             coll.runCommand('find', {"readConcern": {"level": "majority"}, "maxTimeMS": 10000});
         assert.commandWorked(res,
                              'reading from ' + coll.getFullName() + ' on ' + coll.getMongo().host);
-        return new DBCommandCursor(coll.getMongo(), res).toArray()[0].state;
+        return new DBCommandCursor(coll.getDB(), res).toArray()[0].state;
     }
 
     function doDirtyRead(coll) {
         var res = coll.runCommand('find', {"readConcern": {"level": "local"}});
         assert.commandWorked(res,
                              'reading from ' + coll.getFullName() + ' on ' + coll.getMongo().host);
-        return new DBCommandCursor(coll.getMongo(), res).toArray()[0].state;
+        return new DBCommandCursor(coll.getDB(), res).toArray()[0].state;
     }
 
     // Set up a set and grab things for later.
@@ -119,8 +119,8 @@ load("jstests/replsets/rslib.js");  // For startSetIfSupportsReadMajority.
     assert.eq(doCommittedRead(oldPrimaryColl), 'old');
 
     // Reconnect oldPrimary to newPrimary, inducing rollback of the 'INVALID' write. This causes
-    // oldPrimary to drop all snapshots. oldPrimary still won't be connected to enough hosts to
-    // allow it to be elected, so newPrimary should stay primary for the rest of this test.
+    // oldPrimary to clear its read majority point. oldPrimary still won't be connected to enough
+    // hosts to allow it to be elected, so newPrimary should stay primary for the rest of this test.
     oldPrimary.reconnect(newPrimary);
     assert.soon(function() {
         try {
@@ -131,13 +131,6 @@ load("jstests/replsets/rslib.js");  // For startSetIfSupportsReadMajority.
         }
     }, '', 60 * 1000);
     assert.eq(doDirtyRead(oldPrimaryColl), 'new');
-    assertCommittedReadsBlock(oldPrimaryColl);
-
-    // Try asserts again after sleeping to make sure state doesn't change while pureSecondary isn't
-    // replicating.
-    sleep(1000);
-    assert.eq(doDirtyRead(oldPrimaryColl), 'new');
-    assertCommittedReadsBlock(oldPrimaryColl);
 
     // Resume oplog application on pureSecondary to allow the 'new' write to be committed. It should
     // now be visible as a committed read to both oldPrimary and newPrimary.
@@ -148,5 +141,13 @@ load("jstests/replsets/rslib.js");  // For startSetIfSupportsReadMajority.
     assert.writeOK(newPrimary.getDB(name).unrelatedCollection.insert(
         {a: 1}, {writeConcern: {w: 'majority', wtimeout: replTest.kDefaultTimeoutMS}}));
     assert.eq(doCommittedRead(newPrimaryColl), 'new');
+    // Do another write to the new primary so that the old primary can be sure to receive the
+    // new committed optime.
+    assert.writeOK(newPrimary.getDB(name).unrelatedCollection.insert(
+        {a: 2}, {writeConcern: {w: 'majority', wtimeout: replTest.kDefaultTimeoutMS}}));
     assert.eq(doCommittedRead(oldPrimaryColl), 'new');
+
+    // Verify data consistency between nodes.
+    replTest.checkReplicatedDataHashes();
+    replTest.checkOplogs();
 }());

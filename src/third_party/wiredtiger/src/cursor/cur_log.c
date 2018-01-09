@@ -1,5 +1,5 @@
 /*-
- * Copyright (c) 2014-2017 MongoDB, Inc.
+ * Copyright (c) 2014-2018 MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -104,6 +104,13 @@ __curlog_op_read(WT_SESSION_IMPL *session,
 	pp = cl->stepp;
 	end = pp + opsize;
 	switch (optype) {
+	case WT_LOGOP_COL_MODIFY:
+		WT_RET(__wt_logop_col_modify_unpack(session, &pp, end,
+		    fileid, &recno, &value));
+		WT_RET(__wt_buf_set(session, cl->opkey, &recno, sizeof(recno)));
+		WT_RET(__wt_buf_set(session,
+		    cl->opvalue, value.data, value.size));
+		break;
 	case WT_LOGOP_COL_PUT:
 		WT_RET(__wt_logop_col_put_unpack(session, &pp, end,
 		    fileid, &recno, &value));
@@ -116,6 +123,13 @@ __curlog_op_read(WT_SESSION_IMPL *session,
 		    fileid, &recno));
 		WT_RET(__wt_buf_set(session, cl->opkey, &recno, sizeof(recno)));
 		WT_RET(__wt_buf_set(session, cl->opvalue, NULL, 0));
+		break;
+	case WT_LOGOP_ROW_MODIFY:
+		WT_RET(__wt_logop_row_modify_unpack(session, &pp, end,
+		    fileid, &key, &value));
+		WT_RET(__wt_buf_set(session, cl->opkey, key.data, key.size));
+		WT_RET(__wt_buf_set(session,
+		    cl->opvalue, value.data, value.size));
 		break;
 	case WT_LOGOP_ROW_PUT:
 		WT_RET(__wt_logop_row_put_unpack(session, &pp, end,
@@ -303,9 +317,10 @@ __curlog_close(WT_CURSOR *cursor)
 	cl = (WT_CURSOR_LOG *)cursor;
 	conn = S2C(session);
 
-	WT_ASSERT(session, FLD_ISSET(conn->log_flags, WT_CONN_LOG_ENABLED));
-	if (F_ISSET(cl, WT_CURLOG_ARCHIVE_LOCK))
+	if (F_ISSET(cl, WT_CURLOG_ARCHIVE_LOCK)) {
+		(void)__wt_atomic_sub32(&conn->log_cursors, 1);
 		__wt_readunlock(session, &conn->log->log_archive_lock);
+	}
 
 	__wt_free(session, cl->cur_lsn);
 	__wt_free(session, cl->next_lsn);
@@ -355,9 +370,6 @@ __wt_curlog_open(WT_SESSION_IMPL *session,
 
 	WT_STATIC_ASSERT(offsetof(WT_CURSOR_LOG, iface) == 0);
 	conn = S2C(session);
-	if (!FLD_ISSET(conn->log_flags, WT_CONN_LOG_ENABLED))
-		WT_RET_MSG(session, EINVAL,
-		    "Cannot open a log cursor without logging enabled");
 
 	log = conn->log;
 	cl = NULL;
@@ -378,15 +390,19 @@ __wt_curlog_open(WT_SESSION_IMPL *session,
 
 	WT_ERR(__wt_cursor_init(cursor, uri, NULL, cfg, cursorp));
 
-	/*
-	 * The user may be trying to read a log record they just wrote.
-	 * Log records may be buffered, so force out any now.
-	 */
-	WT_ERR(__wt_log_force_write(session, 1, NULL));
+	if (log != NULL) {
+		/*
+		 * The user may be trying to read a log record they just wrote.
+		 * Log records may be buffered, so force out any now.
+		 */
+		WT_ERR(__wt_log_force_write(session, 1, NULL));
 
-	/* Log cursors block archiving. */
-	__wt_readlock(session, &log->log_archive_lock);
-	F_SET(cl, WT_CURLOG_ARCHIVE_LOCK);
+		/* Log cursors block archiving. */
+		__wt_readlock(session, &log->log_archive_lock);
+		F_SET(cl, WT_CURLOG_ARCHIVE_LOCK);
+		(void)__wt_atomic_add32(&conn->log_cursors, 1);
+
+	}
 
 	if (0) {
 err:		WT_TRET(__curlog_close(cursor));

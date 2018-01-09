@@ -37,6 +37,7 @@
 #include "mongo/base/status.h"
 #include "mongo/bson/util/bson_extract.h"
 #include "mongo/db/auth/action_type.h"
+#include "mongo/db/auth/address_restriction.h"
 #include "mongo/db/auth/authorization_manager.h"
 #include "mongo/db/auth/privilege.h"
 #include "mongo/db/auth/privilege_parser.h"
@@ -191,6 +192,10 @@ Status parseCreateOrUpdateUserCommands(const BSONObj& cmdObj,
     validFieldNames.insert("digestPassword");
     validFieldNames.insert("pwd");
     validFieldNames.insert("roles");
+    if (serverGlobalParams.featureCompatibility.getVersion() ==
+        ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo36) {
+        validFieldNames.insert("authenticationRestrictions");
+    }
 
     Status status = _checkNoExtraFields(cmdObj, cmdName, validFieldNames);
     if (!status.isOK()) {
@@ -246,6 +251,16 @@ Status parseCreateOrUpdateUserCommands(const BSONObj& cmdObj,
         }
         parsedArgs->customData = element.Obj();
         parsedArgs->hasCustomData = true;
+    }
+
+    // Parse authentication restrictions
+    if (cmdObj.hasField("authenticationRestrictions")) {
+        BSONElement element = cmdObj["authenticationRestrictions"];
+        if (element.type() != Array) {
+            return Status(ErrorCodes::BadValue, "authenticationRestrictions must be an array");
+        }
+        parsedArgs->authenticationRestrictions =
+            BSONArray(cmdObj["authenticationRestrictions"].Obj());
     }
 
     // Parse roles
@@ -308,6 +323,7 @@ Status parseAndValidateDropAllUsersFromDatabaseCommand(const BSONObj& cmdObj,
 Status parseUsersInfoCommand(const BSONObj& cmdObj, StringData dbname, UsersInfoArgs* parsedArgs) {
     unordered_set<std::string> validFieldNames;
     validFieldNames.insert("usersInfo");
+    validFieldNames.insert("showAuthenticationRestrictions");
     validFieldNames.insert("showPrivileges");
     validFieldNames.insert("showCredentials");
 
@@ -349,6 +365,20 @@ Status parseUsersInfoCommand(const BSONObj& cmdObj, StringData dbname, UsersInfo
         return status;
     }
 
+    const auto showAuthenticationRestrictions = cmdObj["showAuthenticationRestrictions"];
+    if (showAuthenticationRestrictions.eoo()) {
+        parsedArgs->authenticationRestrictionsFormat = AuthenticationRestrictionsFormat::kOmit;
+    } else {
+        bool show;
+        status = bsonExtractBooleanField(cmdObj, "showAuthenticationRestrictions", &show);
+        if (!status.isOK()) {
+            return status;
+        }
+        parsedArgs->authenticationRestrictionsFormat = show
+            ? AuthenticationRestrictionsFormat::kShow
+            : AuthenticationRestrictionsFormat::kOmit;
+    }
+
     return Status::OK();
 }
 
@@ -356,6 +386,7 @@ Status parseRolesInfoCommand(const BSONObj& cmdObj, StringData dbname, RolesInfo
     unordered_set<std::string> validFieldNames;
     validFieldNames.insert("rolesInfo");
     validFieldNames.insert("showPrivileges");
+    validFieldNames.insert("showAuthenticationRestrictions");
     validFieldNames.insert("showBuiltinRoles");
 
     Status status = _checkNoExtraFields(cmdObj, "rolesInfo", validFieldNames);
@@ -398,6 +429,24 @@ Status parseRolesInfoCommand(const BSONObj& cmdObj, StringData dbname, RolesInfo
                       str::stream() << "Failed to parse 'showPrivileges'. 'showPrivileges' should "
                                        "either be a boolean or the string 'asUserFragment', given: "
                                     << showPrivileges.toString());
+    }
+
+    const auto showAuthenticationRestrictions = cmdObj["showAuthenticationRestrictions"];
+    if (showAuthenticationRestrictions.eoo()) {
+        parsedArgs->authenticationRestrictionsFormat = AuthenticationRestrictionsFormat::kOmit;
+    } else if (parsedArgs->privilegeFormat == PrivilegeFormat::kShowAsUserFragment) {
+        return Status(
+            ErrorCodes::UnsupportedFormat,
+            "showAuthenticationRestrictions may not be used with showPrivileges='asUserFragment'");
+    } else {
+        bool show;
+        status = bsonExtractBooleanField(cmdObj, "showAuthenticationRestrictions", &show);
+        if (!status.isOK()) {
+            return status;
+        }
+        parsedArgs->authenticationRestrictionsFormat = show
+            ? AuthenticationRestrictionsFormat::kShow
+            : AuthenticationRestrictionsFormat::kOmit;
     }
 
     status = bsonExtractBooleanFieldWithDefault(
@@ -459,6 +508,10 @@ Status parseCreateOrUpdateRoleCommands(const BSONObj& cmdObj,
     validFieldNames.insert(cmdName.toString());
     validFieldNames.insert("privileges");
     validFieldNames.insert("roles");
+    if (serverGlobalParams.featureCompatibility.getVersion() ==
+        ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo36) {
+        validFieldNames.insert("authenticationRestrictions");
+    }
 
     Status status = _checkNoExtraFields(cmdObj, cmdName, validFieldNames);
     if (!status.isOK()) {
@@ -506,6 +559,22 @@ Status parseCreateOrUpdateRoleCommands(const BSONObj& cmdObj,
         }
         parsedArgs->hasRoles = true;
     }
+
+    // Parse restrictions
+    if (cmdObj.hasField("authenticationRestrictions")) {
+        BSONElement restrictionsElement;
+        status = bsonExtractTypedField(
+            cmdObj, "authenticationRestrictions", Array, &restrictionsElement);
+        if (!status.isOK()) {
+            return status;
+        }
+        auto restrictions = getRawAuthenticationRestrictions(BSONArray(restrictionsElement.Obj()));
+        if (!restrictions.isOK()) {
+            return restrictions.getStatus();
+        }
+        parsedArgs->authenticationRestrictions = restrictions.getValue();
+    }
+
     return Status::OK();
 }
 
@@ -622,44 +691,5 @@ Status parseMergeAuthzCollectionsCommand(const BSONObj& cmdObj,
     return Status::OK();
 }
 
-Status parseAuthSchemaUpgradeCommand(const BSONObj& cmdObj,
-                                     const std::string& dbname,
-                                     AuthSchemaUpgradeArgs* parsedArgs) {
-    static const int minUpgradeSteps = 1;
-    static const int maxUpgradeSteps = 2;
-
-    unordered_set<std::string> validFieldNames;
-    validFieldNames.insert("authSchemaUpgrade");
-    validFieldNames.insert("maxSteps");
-    validFieldNames.insert("upgradeShards");
-
-    Status status = _checkNoExtraFields(cmdObj, "authSchemaUpgrade", validFieldNames);
-    if (!status.isOK()) {
-        return status;
-    }
-
-    status = bsonExtractBooleanFieldWithDefault(
-        cmdObj, "upgradeShards", true, &parsedArgs->shouldUpgradeShards);
-    if (!status.isOK()) {
-        return status;
-    }
-
-    long long steps;
-    status = bsonExtractIntegerFieldWithDefault(cmdObj, "maxSteps", maxUpgradeSteps, &steps);
-    if (!status.isOK())
-        return status;
-    if (steps < minUpgradeSteps || steps > maxUpgradeSteps) {
-        return Status(ErrorCodes::BadValue,
-                      mongoutils::str::stream() << "Legal values for \"maxSteps\" are at least "
-                                                << minUpgradeSteps
-                                                << " and no more than "
-                                                << maxUpgradeSteps
-                                                << "; found "
-                                                << steps);
-    }
-    parsedArgs->maxSteps = static_cast<int>(steps);
-
-    return Status::OK();
-}
 }  // namespace auth
 }  // namespace mongo

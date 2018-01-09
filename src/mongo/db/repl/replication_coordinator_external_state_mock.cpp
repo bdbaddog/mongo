@@ -37,7 +37,6 @@
 #include "mongo/db/client.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/repl/oplog_buffer_blocking_queue.h"
-#include "mongo/db/storage/snapshot_name.h"
 #include "mongo/stdx/memory.h"
 #include "mongo/util/log.h"
 #include "mongo/util/net/hostandport.h"
@@ -83,6 +82,9 @@ Status ReplicationCoordinatorExternalStateMock::initializeReplSetStorage(Operati
                                                                          const BSONObj& config) {
     return storeLocalConfigDocument(opCtx, config);
 }
+
+void ReplicationCoordinatorExternalStateMock::waitForAllEarlierOplogWritesToBeVisible(
+    OperationContext* opCtx) {}
 
 void ReplicationCoordinatorExternalStateMock::shutdown(OperationContext*) {}
 
@@ -166,8 +168,6 @@ void ReplicationCoordinatorExternalStateMock::setLocalLastVoteDocument(
 void ReplicationCoordinatorExternalStateMock::setGlobalTimestamp(ServiceContext* service,
                                                                  const Timestamp& newTime) {}
 
-void ReplicationCoordinatorExternalStateMock::cleanUpLastApplyBatch(OperationContext* opCtx) {}
-
 StatusWith<OpTime> ReplicationCoordinatorExternalStateMock::loadLastOpTime(
     OperationContext* opCtx) {
     return _lastOpTime;
@@ -197,6 +197,10 @@ void ReplicationCoordinatorExternalStateMock::setStoreLocalLastVoteDocumentToHan
     }
 }
 
+void ReplicationCoordinatorExternalStateMock::setFirstOpTimeOfMyTerm(const OpTime& opTime) {
+    _firstOpTimeOfMyTerm = opTime;
+}
+
 void ReplicationCoordinatorExternalStateMock::closeConnections() {
     _connectionsClosed = true;
 }
@@ -213,13 +217,8 @@ void ReplicationCoordinatorExternalStateMock::startProducerIfStopped() {}
 
 void ReplicationCoordinatorExternalStateMock::dropAllSnapshots() {}
 
-void ReplicationCoordinatorExternalStateMock::updateCommittedSnapshot(SnapshotName newCommitPoint) {
-}
-
-void ReplicationCoordinatorExternalStateMock::createSnapshot(OperationContext* opCtx,
-                                                             SnapshotName name) {}
-
-void ReplicationCoordinatorExternalStateMock::forceSnapshotCreation() {}
+void ReplicationCoordinatorExternalStateMock::updateCommittedSnapshot(
+    const OpTime& newCommitPoint) {}
 
 bool ReplicationCoordinatorExternalStateMock::snapshotsEnabled() const {
     return _areSnapshotsEnabled;
@@ -277,9 +276,8 @@ void ReplicationCoordinatorExternalStateMock::onDrainComplete(OperationContext* 
 
 OpTime ReplicationCoordinatorExternalStateMock::onTransitionToPrimary(OperationContext* opCtx,
                                                                       bool isV1ElectionProtocol) {
-    if (isV1ElectionProtocol) {
-        _lastOpTime = OpTime(Timestamp(1, 0), 1);
-    }
+    _lastOpTime = _firstOpTimeOfMyTerm;
+    _firstOpTimeOfMyTerm = OpTime();
     return fassertStatusOK(40297, _lastOpTime);
 }
 

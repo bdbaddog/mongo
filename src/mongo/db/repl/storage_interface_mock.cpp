@@ -40,15 +40,15 @@ namespace mongo {
 namespace repl {
 
 StatusWith<int> StorageInterfaceMock::getRollbackID(OperationContext* opCtx) {
-    stdx::lock_guard<stdx::mutex> lock(_rbidMutex);
+    stdx::lock_guard<stdx::mutex> lock(_mutex);
     if (!_rbidInitialized) {
         return Status(ErrorCodes::NamespaceNotFound, "Rollback ID not initialized");
     }
     return _rbid;
 }
 
-Status StorageInterfaceMock::initializeRollbackID(OperationContext* opCtx) {
-    stdx::lock_guard<stdx::mutex> lock(_rbidMutex);
+StatusWith<int> StorageInterfaceMock::initializeRollbackID(OperationContext* opCtx) {
+    stdx::lock_guard<stdx::mutex> lock(_mutex);
     if (_rbidInitialized) {
         return Status(ErrorCodes::NamespaceExists, "Rollback ID already initialized");
     }
@@ -56,17 +56,39 @@ Status StorageInterfaceMock::initializeRollbackID(OperationContext* opCtx) {
 
     // Start the mock RBID at a very high number to differentiate it from uninitialized RBIDs.
     _rbid = 100;
-    return Status::OK();
+    return _rbid;
 }
 
-Status StorageInterfaceMock::incrementRollbackID(OperationContext* opCtx) {
-    stdx::lock_guard<stdx::mutex> lock(_rbidMutex);
+StatusWith<int> StorageInterfaceMock::incrementRollbackID(OperationContext* opCtx) {
+    stdx::lock_guard<stdx::mutex> lock(_mutex);
     if (!_rbidInitialized) {
         return Status(ErrorCodes::NamespaceNotFound, "Rollback ID not initialized");
     }
     _rbid++;
-    return Status::OK();
+    return _rbid;
 }
+
+void StorageInterfaceMock::setStableTimestamp(ServiceContext* serviceCtx, Timestamp snapshotName) {
+    stdx::lock_guard<stdx::mutex> lock(_mutex);
+    _stableTimestamp = snapshotName;
+}
+
+void StorageInterfaceMock::setInitialDataTimestamp(ServiceContext* serviceCtx,
+                                                   Timestamp snapshotName) {
+    stdx::lock_guard<stdx::mutex> lock(_mutex);
+    _initialDataTimestamp = snapshotName;
+}
+
+Timestamp StorageInterfaceMock::getStableTimestamp() const {
+    stdx::lock_guard<stdx::mutex> lock(_mutex);
+    return _stableTimestamp;
+}
+
+Timestamp StorageInterfaceMock::getInitialDataTimestamp() const {
+    stdx::lock_guard<stdx::mutex> lock(_mutex);
+    return _initialDataTimestamp;
+}
+
 Status CollectionBulkLoaderMock::init(const std::vector<BSONObj>& secondaryIndexSpecs) {
     LOG(1) << "CollectionBulkLoaderMock::init called";
     stats->initCalled = true;

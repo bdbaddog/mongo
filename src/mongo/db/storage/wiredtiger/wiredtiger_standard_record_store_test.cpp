@@ -40,8 +40,10 @@
 #include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/json.h"
 #include "mongo/db/operation_context_noop.h"
+#include "mongo/db/storage/kv/kv_engine_test_harness.h"
 #include "mongo/db/storage/kv/kv_prefix.h"
 #include "mongo/db/storage/record_store_test_harness.h"
+#include "mongo/db/storage/wiredtiger/wiredtiger_kv_engine.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_record_store.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_record_store_oplog_stones.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_recovery_unit.h"
@@ -51,6 +53,7 @@
 #include "mongo/stdx/memory.h"
 #include "mongo/unittest/temp_dir.h"
 #include "mongo/unittest/unittest.h"
+#include "mongo/util/clock_source_mock.h"
 #include "mongo/util/fail_point.h"
 #include "mongo/util/scopeguard.h"
 
@@ -63,42 +66,32 @@ using std::stringstream;
 
 class WiredTigerHarnessHelper final : public RecordStoreHarnessHelper {
 public:
-    static WT_CONNECTION* createConnection(StringData dbpath, StringData extraStrings) {
-        WT_CONNECTION* conn = NULL;
-
-        std::stringstream ss;
-        ss << "create,";
-        ss << "statistics=(all),";
-        ss << extraStrings;
-        string config = ss.str();
-        int ret = wiredtiger_open(dbpath.toString().c_str(), NULL, config.c_str(), &conn);
-        ASSERT_OK(wtRCToStatus(ret));
-        ASSERT(conn);
-
-        return conn;
-    }
-
     WiredTigerHarnessHelper()
         : _dbpath("wt_test"),
-          _conn(createConnection(_dbpath.path(), "")),
-          _sessionCache(new WiredTigerSessionCache(_conn)) {}
+          _engine(kWiredTigerEngineName, _dbpath.path(), &_cs, "", 1, false, false, false, false) {}
 
     WiredTigerHarnessHelper(StringData extraStrings)
         : _dbpath("wt_test"),
-          _conn(createConnection(_dbpath.path(), extraStrings)),
-          _sessionCache(new WiredTigerSessionCache(_conn)) {}
+          _engine(kWiredTigerEngineName,
+                  _dbpath.path(),
+                  &_cs,
+                  extraStrings.toString(),
+                  1,
+                  false,
+                  false,
+                  false,
+                  false) {}
 
-    ~WiredTigerHarnessHelper() {
-        delete _sessionCache;
-        _conn->close(_conn, NULL);
-    }
+
+    ~WiredTigerHarnessHelper() {}
 
     virtual std::unique_ptr<RecordStore> newNonCappedRecordStore() {
         return newNonCappedRecordStore("a.b");
     }
 
     virtual std::unique_ptr<RecordStore> newNonCappedRecordStore(const std::string& ns) {
-        WiredTigerRecoveryUnit* ru = new WiredTigerRecoveryUnit(_sessionCache);
+        WiredTigerRecoveryUnit* ru =
+            dynamic_cast<WiredTigerRecoveryUnit*>(_engine.newRecoveryUnit());
         OperationContextNoop opCtx(ru);
         string uri = "table:" + ns;
 
@@ -110,7 +103,7 @@ public:
 
         {
             WriteUnitOfWork uow(&opCtx);
-            WT_SESSION* s = ru->getSession(&opCtx)->getSession();
+            WT_SESSION* s = ru->getSession()->getSession();
             invariantWTOK(s->create(s, uri.c_str(), config.c_str()));
             uow.commit();
         }
@@ -126,7 +119,7 @@ public:
         params.cappedCallback = nullptr;
         params.sizeStorer = nullptr;
 
-        auto ret = stdx::make_unique<StandardWiredTigerRecordStore>(&opCtx, params);
+        auto ret = stdx::make_unique<StandardWiredTigerRecordStore>(&_engine, &opCtx, params);
         ret->postConstructorInit(&opCtx);
         return std::move(ret);
     }
@@ -139,7 +132,8 @@ public:
     virtual std::unique_ptr<RecordStore> newCappedRecordStore(const std::string& ns,
                                                               int64_t cappedMaxSize,
                                                               int64_t cappedMaxDocs) {
-        WiredTigerRecoveryUnit* ru = new WiredTigerRecoveryUnit(_sessionCache);
+        WiredTigerRecoveryUnit* ru =
+            dynamic_cast<WiredTigerRecoveryUnit*>(_engine.newRecoveryUnit());
         OperationContextNoop opCtx(ru);
         string uri = "table:a.b";
 
@@ -154,7 +148,7 @@ public:
 
         {
             WriteUnitOfWork uow(&opCtx);
-            WT_SESSION* s = ru->getSession(&opCtx)->getSession();
+            WT_SESSION* s = ru->getSession()->getSession();
             invariantWTOK(s->create(s, uri.c_str(), config.c_str()));
             uow.commit();
         }
@@ -170,27 +164,28 @@ public:
         params.cappedCallback = nullptr;
         params.sizeStorer = nullptr;
 
-        auto ret = stdx::make_unique<StandardWiredTigerRecordStore>(&opCtx, params);
+        auto ret = stdx::make_unique<StandardWiredTigerRecordStore>(&_engine, &opCtx, params);
         ret->postConstructorInit(&opCtx);
         return std::move(ret);
     }
 
     virtual std::unique_ptr<RecoveryUnit> newRecoveryUnit() final {
-        return stdx::make_unique<WiredTigerRecoveryUnit>(_sessionCache);
+        return std::unique_ptr<RecoveryUnit>(_engine.newRecoveryUnit());
     }
 
     virtual bool supportsDocLocking() final {
         return true;
     }
 
-    virtual WT_CONNECTION* conn() const {
-        return _conn;
+    virtual WT_CONNECTION* conn() {
+        return _engine.getConnection();
     }
 
 private:
     unittest::TempDir _dbpath;
-    WT_CONNECTION* _conn;
-    WiredTigerSessionCache* _sessionCache;
+    ClockSourceMock _cs;
+
+    WiredTigerKVEngine _engine;
 };
 
 std::unique_ptr<HarnessHelper> makeHarnessHelper() {
@@ -207,7 +202,7 @@ TEST(WiredTigerRecordStoreTest, StorageSizeStatisticsDisabled) {
     unique_ptr<RecordStore> rs(harnessHelper.newNonCappedRecordStore("a.b"));
 
     ServiceContext::UniqueOperationContext opCtx(harnessHelper.newOperationContext());
-    ASSERT_THROWS(rs->storageSize(opCtx.get()), UserException);
+    ASSERT_THROWS(rs->storageSize(opCtx.get()), AssertionException);
 }
 
 TEST(WiredTigerRecordStoreTest, SizeStorer1) {
@@ -217,7 +212,8 @@ TEST(WiredTigerRecordStoreTest, SizeStorer1) {
     string uri = checked_cast<WiredTigerRecordStore*>(rs.get())->getURI();
 
     string indexUri = "table:myindex";
-    WiredTigerSizeStorer ss(harnessHelper->conn(), indexUri);
+    const bool enableWtLogging = false;
+    WiredTigerSizeStorer ss(harnessHelper->conn(), indexUri, enableWtLogging);
     checked_cast<WiredTigerRecordStore*>(rs.get())->setSizeStorer(&ss);
 
     int N = 12;
@@ -227,7 +223,8 @@ TEST(WiredTigerRecordStoreTest, SizeStorer1) {
         {
             WriteUnitOfWork uow(opCtx.get());
             for (int i = 0; i < N; i++) {
-                StatusWith<RecordId> res = rs->insertRecord(opCtx.get(), "a", 2, false);
+                StatusWith<RecordId> res =
+                    rs->insertRecord(opCtx.get(), "a", 2, Timestamp(), false);
                 ASSERT_OK(res.getStatus());
             }
             uow.commit();
@@ -261,7 +258,7 @@ TEST(WiredTigerRecordStoreTest, SizeStorer1) {
         params.cappedCallback = nullptr;
         params.sizeStorer = &ss;
 
-        auto ret = new StandardWiredTigerRecordStore(opCtx.get(), params);
+        auto ret = new StandardWiredTigerRecordStore(nullptr, opCtx.get(), params);
         ret->postConstructorInit(opCtx.get());
         rs.reset(ret);
     }
@@ -277,7 +274,7 @@ TEST(WiredTigerRecordStoreTest, SizeStorer1) {
 
         {
             WriteUnitOfWork uow(opCtx.get());
-            WT_SESSION* s = ru->getSession(opCtx.get())->getSession();
+            WT_SESSION* s = ru->getSession()->getSession();
             invariantWTOK(s->create(s, indexUri.c_str(), ""));
             uow.commit();
         }
@@ -287,7 +284,8 @@ TEST(WiredTigerRecordStoreTest, SizeStorer1) {
 
     {
         ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
-        WiredTigerSizeStorer ss2(harnessHelper->conn(), indexUri);
+        const bool enableWtLogging = false;
+        WiredTigerSizeStorer ss2(harnessHelper->conn(), indexUri, enableWtLogging);
         ss2.fillCache();
         long long numRecords;
         long long dataSize;
@@ -318,7 +316,9 @@ class SizeStorerValidateTest : public mongo::unittest::Test {
 private:
     virtual void setUp() {
         harnessHelper.reset(new WiredTigerHarnessHelper());
-        sizeStorer.reset(new WiredTigerSizeStorer(harnessHelper->conn(), "table:sizeStorer"));
+        const bool enableWtLogging = false;
+        sizeStorer.reset(
+            new WiredTigerSizeStorer(harnessHelper->conn(), "table:sizeStorer", enableWtLogging));
         rs = harnessHelper->newNonCappedRecordStore();
         WiredTigerRecordStore* wtrs = checked_cast<WiredTigerRecordStore*>(rs.get());
         wtrs->setSizeStorer(sizeStorer.get());
@@ -330,7 +330,7 @@ private:
             ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
             WriteUnitOfWork uow(opCtx.get());
             for (int i = 0; i < expectedNumRecords; i++) {
-                ASSERT_OK(rs->insertRecord(opCtx.get(), "a", 2, false).getStatus());
+                ASSERT_OK(rs->insertRecord(opCtx.get(), "a", 2, Timestamp(), false).getStatus());
             }
             uow.commit();
         }
@@ -375,9 +375,10 @@ protected:
 // Basic validation - size storer data is updated.
 TEST_F(SizeStorerValidateTest, Basic) {
     ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+    GoodValidateAdaptor adaptor;
     ValidateResults results;
     BSONObjBuilder output;
-    ASSERT_OK(rs->validate(opCtx.get(), kValidateIndex, NULL, &results, &output));
+    ASSERT_OK(rs->validate(opCtx.get(), kValidateIndex, &adaptor, &results, &output));
     BSONObj obj = output.obj();
     ASSERT_EQUALS(expectedNumRecords, obj.getIntField("nrecords"));
     ASSERT_EQUALS(expectedNumRecords, getNumRecords());
@@ -395,17 +396,6 @@ TEST_F(SizeStorerValidateTest, FullWithGoodAdaptor) {
     ASSERT_EQUALS(expectedNumRecords, obj.getIntField("nrecords"));
     ASSERT_EQUALS(expectedNumRecords, getNumRecords());
     ASSERT_EQUALS(expectedDataSize, getDataSize());
-}
-
-// Basic validation does not use the validation adaptor. So passing a bad adaptor
-// should not cause validate to fail.
-TEST_F(SizeStorerValidateTest, BasicWithBadAdapter) {
-    ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
-    BadValidateAdaptor adaptor;
-    ValidateResults results;
-    BSONObjBuilder output;
-    ASSERT_OK(rs->validate(opCtx.get(), kValidateIndex, &adaptor, &results, &output));
-    ASSERT_EQUALS(true, results.valid);
 }
 
 // Full validation with a validation adaptor that fails - size storer data is not updated.
@@ -439,7 +429,7 @@ TEST_F(SizeStorerValidateTest, InvalidSizeStorerAtCreation) {
     params.cappedCallback = nullptr;
     params.sizeStorer = sizeStorer.get();
 
-    auto ret = new StandardWiredTigerRecordStore(opCtx.get(), params);
+    auto ret = new StandardWiredTigerRecordStore(nullptr, opCtx.get(), params);
     ret->postConstructorInit(opCtx.get());
     rs.reset(ret);
 

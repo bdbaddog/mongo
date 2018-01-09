@@ -52,11 +52,11 @@ LegacyReplyBuilder::LegacyReplyBuilder(Message&& message) : _message{std::move(m
 LegacyReplyBuilder::~LegacyReplyBuilder() {}
 
 LegacyReplyBuilder& LegacyReplyBuilder::setCommandReply(Status nonOKStatus,
-                                                        const BSONObj& extraErrorInfo) {
+                                                        BSONObj extraErrorInfo) {
     invariant(_state == State::kCommandReply);
-    if (nonOKStatus == ErrorCodes::SendStaleConfig) {
+    if (nonOKStatus == ErrorCodes::StaleConfig) {
         _staleConfigError = true;
-        // Need to use the special $err format for SendStaleConfig errors to be backwards
+        // Need to use the special $err format for StaleConfig errors to be backwards
         // compatible.
         BSONObjBuilder err;
         // $err must be the first field in object.
@@ -66,7 +66,7 @@ LegacyReplyBuilder& LegacyReplyBuilder::setCommandReply(Status nonOKStatus,
         setRawCommandReply(err.done());
     } else {
         // All other errors proceed through the normal path, which also handles state transitions.
-        ReplyBuilderInterface::setCommandReply(std::move(nonOKStatus), extraErrorInfo);
+        ReplyBuilderInterface::setCommandReply(std::move(nonOKStatus), std::move(extraErrorInfo));
     }
     return *this;
 }
@@ -90,18 +90,8 @@ BSONObjBuilder LegacyReplyBuilder::getInPlaceReplyBuilder(std::size_t reserveByt
 
 LegacyReplyBuilder& LegacyReplyBuilder::setMetadata(const BSONObj& metadata) {
     invariant(_state == State::kMetadata);
-    // HACK: the only thing we need to downconvert is ShardingMetadata, which can go at the end of
-    // the object. So we do that in place to avoid copying the command reply.
-    auto shardingMetadata = rpc::ShardingMetadata::readFromMetadata(metadata);
-    invariant(shardingMetadata.isOK() || shardingMetadata.getStatus() == ErrorCodes::NoSuchKey);
-
-    if (shardingMetadata.isOK()) {
-        // Write the sharding metadata in to the end of the object. The third parameter is needed
-        // because we already have skipped some bytes for the message header.
-        BSONObjBuilder resumedBuilder(
-            BSONObjBuilder::ResumeBuildingTag(), _builder, sizeof(QueryResult::Value));
-        shardingMetadata.getValue().writeToMetadata(&resumedBuilder);
-    }
+    BSONObjBuilder(BSONObjBuilder::ResumeBuildingTag(), _builder, sizeof(QueryResult::Value))
+        .appendElements(metadata);
     _state = State::kOutputDocs;
     return *this;
 }
@@ -130,7 +120,7 @@ Message LegacyReplyBuilder::done() {
     QueryResult::View qr = _builder.buf();
 
     if (_staleConfigError) {
-        // For compatibility with legacy mongos, we need to set this result flag on SendStaleConfig
+        // For compatibility with legacy mongos, we need to set this result flag on StaleConfig
         qr.setResultFlags(ResultFlag_ErrSet | ResultFlag_ShardConfigStale);
     } else {
         qr.setResultFlagsToOk();

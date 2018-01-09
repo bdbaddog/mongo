@@ -51,6 +51,7 @@
 #include "mongo/dbtests/framework.h"
 #include "mongo/scripting/engine.h"
 #include "mongo/stdx/memory.h"
+#include "mongo/util/clock_source_mock.h"
 #include "mongo/util/quick_exit.h"
 #include "mongo/util/signal_handlers_synchronous.h"
 #include "mongo/util/startup_test.h"
@@ -64,11 +65,17 @@ const auto kIndexVersion = IndexDescriptor::IndexVersion::kV2;
 
 void initWireSpec() {
     WireSpec& spec = WireSpec::instance();
-    // accept from any version
-    spec.incoming.minWireVersion = RELEASE_2_4_AND_BEFORE;
-    spec.incoming.maxWireVersion = LATEST_WIRE_VERSION;
-    // connect to any version
-    spec.outgoing.minWireVersion = RELEASE_2_4_AND_BEFORE;
+
+    // Accept from internal clients of the same version, as in upgrade featureCompatibilityVersion.
+    spec.incomingInternalClient.minWireVersion = LATEST_WIRE_VERSION;
+    spec.incomingInternalClient.maxWireVersion = LATEST_WIRE_VERSION;
+
+    // Accept from any version external client.
+    spec.incomingExternalClient.minWireVersion = RELEASE_2_4_AND_BEFORE;
+    spec.incomingExternalClient.maxWireVersion = LATEST_WIRE_VERSION;
+
+    // Connect to servers of the same version, as in upgrade featureCompatibilityVersion.
+    spec.outgoing.minWireVersion = LATEST_WIRE_VERSION;
     spec.outgoing.maxWireVersion = LATEST_WIRE_VERSION;
 }
 
@@ -120,6 +127,8 @@ int dbtestsMain(int argc, char** argv, char** envp) {
     ::mongo::setupSynchronousSignalHandlers();
     mongo::dbtests::initWireSpec();
     mongo::runGlobalInitializersOrDie(argc, argv, envp);
+    serverGlobalParams.featureCompatibility.setVersion(
+        ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo36);
     repl::ReplSettings replSettings;
     replSettings.setOplogSizeBytes(10 * 1024 * 1024);
     ServiceContext* service = getGlobalServiceContext();
@@ -127,9 +136,26 @@ int dbtestsMain(int argc, char** argv, char** envp) {
     auto logicalClock = stdx::make_unique<LogicalClock>(service);
     LogicalClock::set(service, std::move(logicalClock));
 
+    auto fastClock = stdx::make_unique<ClockSourceMock>();
+    // Timestamps are split into two 32-bit integers, seconds and "increments". Currently (but
+    // maybe not for eternity), a Timestamp with a value of `0` seconds is always considered
+    // "null" by `Timestamp::isNull`, regardless of its increment value. Ticking the
+    // `ClockSourceMock` only bumps the "increment" counter, thus by default, generating "null"
+    // timestamps. Bumping by one second here avoids any accidental interpretations.
+    fastClock->advance(Seconds(1));
+    service->setFastClockSource(std::move(fastClock));
+
+    auto preciseClock = stdx::make_unique<ClockSourceMock>();
+    // See above.
+    preciseClock->advance(Seconds(1));
+    service->setPreciseClockSource(std::move(preciseClock));
+
     repl::setGlobalReplicationCoordinator(
         new repl::ReplicationCoordinatorMock(service, replSettings));
-    repl::getGlobalReplicationCoordinator()->setFollowerMode(repl::MemberState::RS_PRIMARY);
+    repl::getGlobalReplicationCoordinator()
+        ->setFollowerMode(repl::MemberState::RS_PRIMARY)
+        .ignore();
+
     getGlobalAuthorizationManager()->setAuthEnabled(false);
     ScriptEngine::setup();
     StartupTest::runTests();

@@ -30,8 +30,6 @@
 
 #include "mongo/platform/basic.h"
 
-#include <set>
-
 #include "mongo/db/audit.h"
 #include "mongo/db/auth/action_set.h"
 #include "mongo/db/auth/action_type.h"
@@ -41,15 +39,18 @@
 #include "mongo/db/commands.h"
 #include "mongo/s/catalog/sharding_catalog_client.h"
 #include "mongo/s/catalog_cache.h"
+#include "mongo/s/client/shard_registry.h"
+#include "mongo/s/commands/cluster_commands_helpers.h"
 #include "mongo/s/grid.h"
 #include "mongo/util/log.h"
+#include "mongo/util/scopeguard.h"
 
 namespace mongo {
 namespace {
 
-class EnableShardingCmd : public Command {
+class EnableShardingCmd : public ErrmsgCommandDeprecated {
 public:
-    EnableShardingCmd() : Command("enableSharding", "enablesharding") {}
+    EnableShardingCmd() : ErrmsgCommandDeprecated("enableSharding", "enablesharding") {}
 
     virtual bool slaveOk() const {
         return true;
@@ -59,9 +60,8 @@ public:
         return true;
     }
 
-
     virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
-        return false;
+        return true;
     }
 
     virtual void help(std::stringstream& help) const {
@@ -86,34 +86,31 @@ public:
         return cmdObj.firstElement().str();
     }
 
-    virtual bool run(OperationContext* opCtx,
-                     const std::string& dbname_unused,
-                     const BSONObj& cmdObj,
-                     std::string& errmsg,
-                     BSONObjBuilder& result) {
-        const std::string dbname = parseNs("", cmdObj);
+    virtual bool errmsgRun(OperationContext* opCtx,
+                           const std::string& dbname_unused,
+                           const BSONObj& cmdObj,
+                           std::string& errmsg,
+                           BSONObjBuilder& result) {
+        const std::string db = parseNs("", cmdObj);
 
-        uassert(
-            ErrorCodes::InvalidNamespace,
-            str::stream() << "invalid db name specified: " << dbname,
-            NamespaceString::validDBName(dbname, NamespaceString::DollarInDbNameBehavior::Allow));
+        // Invalidate the routing table cache entry for this database so that we reload the
+        // collection the next time it's accessed, even if we receive a failure, e.g. NetworkError.
+        ON_BLOCK_EXIT([opCtx, db] { Grid::get(opCtx)->catalogCache()->purgeDatabase(db); });
 
-        if (dbname == NamespaceString::kAdminDb || dbname == NamespaceString::kConfigDb ||
-            dbname == NamespaceString::kLocalDb) {
-            errmsg = "can't shard " + dbname + " database";
-            return false;
-        }
+        auto configShard = Grid::get(opCtx)->shardRegistry()->getConfigShard();
+        auto cmdResponse = uassertStatusOK(configShard->runCommandWithFixedRetryAttempts(
+            opCtx,
+            ReadPreferenceSetting(ReadPreference::PrimaryOnly),
+            "admin",
+            Command::appendMajorityWriteConcern(
+                Command::appendPassthroughFields(cmdObj, BSON("_configsvrEnableSharding" << db))),
+            Shard::RetryPolicy::kIdempotent));
 
-        uassertStatusOK(Grid::get(opCtx)->catalogClient(opCtx)->enableSharding(opCtx, dbname));
-        audit::logEnableSharding(Client::getCurrent(), dbname);
-
-        // Make sure to force update of any stale metadata
-        Grid::get(opCtx)->catalogCache()->purgeDatabase(dbname);
-
+        Command::filterCommandReplyForPassthrough(cmdResponse.response, &result);
         return true;
     }
 
-} enableShardingCmd;
+} clusterEnableShardingCmd;
 
 }  // namespace
 }  // namespace mongo

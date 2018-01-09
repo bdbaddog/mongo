@@ -1,5 +1,5 @@
 /*-
- * Copyright (c) 2014-2017 MongoDB, Inc.
+ * Copyright (c) 2014-2018 MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -1247,8 +1247,8 @@ __wt_block_extlist_write(WT_SESSION_IMPL *session,
 	WT_DECL_RET;
 	WT_EXT *ext;
 	WT_PAGE_HEADER *dsk;
-	uint32_t entries;
 	size_t size;
+	uint32_t entries;
 	uint8_t *p;
 
 	WT_RET(__block_extlist_dump(session, block, el, "write"));

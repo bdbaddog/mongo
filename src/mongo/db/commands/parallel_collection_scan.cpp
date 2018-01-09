@@ -49,7 +49,7 @@ using stdx::make_unique;
 
 namespace {
 
-class ParallelCollectionScanCmd : public Command {
+class ParallelCollectionScanCmd : public BasicCommand {
 public:
     struct ExtentInfo {
         ExtentInfo(RecordId dl, size_t s) : diskLoc(dl), size(s) {}
@@ -57,7 +57,7 @@ public:
         size_t size;
     };
 
-    ParallelCollectionScanCmd() : Command("parallelCollectionScan") {}
+    ParallelCollectionScanCmd() : BasicCommand("parallelCollectionScan") {}
 
     virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
         return false;
@@ -66,7 +66,7 @@ public:
         return true;
     }
 
-    bool supportsReadConcern(const std::string& dbName, const BSONObj& cmdObj) const final {
+    bool supportsNonLocalReadConcern(const std::string& dbName, const BSONObj& cmdObj) const final {
         return true;
     }
 
@@ -74,25 +74,31 @@ public:
         return ReadWriteType::kCommand;
     }
 
-    virtual Status checkAuthForCommand(Client* client,
-                                       const std::string& dbname,
-                                       const BSONObj& cmdObj) {
-        ActionSet actions;
-        actions.addAction(ActionType::find);
-        Privilege p(parseResourcePattern(dbname, cmdObj), actions);
-        if (AuthorizationSession::get(client)->isAuthorizedForPrivilege(p))
-            return Status::OK();
-        return Status(ErrorCodes::Unauthorized, "Unauthorized");
+    Status checkAuthForOperation(OperationContext* opCtx,
+                                 const std::string& dbname,
+                                 const BSONObj& cmdObj) override {
+        AuthorizationSession* authSession = AuthorizationSession::get(opCtx->getClient());
+
+        if (!authSession->isAuthorizedToParseNamespaceElement(cmdObj.firstElement())) {
+            return Status(ErrorCodes::Unauthorized, "Unauthorized");
+        }
+
+        const NamespaceString ns(parseNsOrUUID(opCtx, dbname, cmdObj));
+        if (!authSession->isAuthorizedForActionsOnNamespace(ns, ActionType::find)) {
+            return Status(ErrorCodes::Unauthorized, "Unauthorized");
+        }
+
+        return Status::OK();
     }
 
     virtual bool run(OperationContext* opCtx,
                      const string& dbname,
                      const BSONObj& cmdObj,
-                     string& errmsg,
                      BSONObjBuilder& result) {
-        const NamespaceString ns(parseNsCollectionRequired(dbname, cmdObj));
+        Lock::DBLock dbSLock(opCtx, dbname, MODE_IS);
+        const NamespaceString ns(parseNsOrUUID(opCtx, dbname, cmdObj));
 
-        AutoGetCollectionForReadCommand ctx(opCtx, ns);
+        AutoGetCollectionForReadCommand ctx(opCtx, ns, std::move(dbSLock));
 
         Collection* collection = ctx.getCollection();
         if (!collection)
@@ -110,9 +116,20 @@ public:
                                                   << " was: "
                                                   << numCursors));
 
-        auto iterators = collection->getManyCursors(opCtx);
-        if (iterators.size() < numCursors) {
-            numCursors = iterators.size();
+        std::vector<std::unique_ptr<RecordCursor>> iterators;
+        // Opening multiple cursors on a capped collection and reading them in parallel can produce
+        // behavior that is not well defined. This can be removed when support for parallel
+        // collection scan on capped collections is officially added. The 'getCursor' function
+        // ensures that the cursor returned iterates the capped collection in proper document
+        // insertion order.
+        if (collection->isCapped()) {
+            iterators.push_back(collection->getCursor(opCtx));
+            numCursors = 1;
+        } else {
+            iterators = collection->getManyCursors(opCtx);
+            if (iterators.size() < numCursors) {
+                numCursors = iterators.size();
+            }
         }
 
         std::vector<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> execs;

@@ -36,7 +36,9 @@
 #include "mongo/bson/mutable/document.h"
 #include "mongo/bson/mutable/mutable_bson_test_utils.h"
 #include "mongo/db/catalog/collection.h"
+#include "mongo/db/catalog/index_catalog.h"
 #include "mongo/db/client.h"
+#include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/db.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/dbdirectclient.h"
@@ -71,9 +73,11 @@ protected:
     const ServiceContext::UniqueOperationContext _opCtxPtr = cc().makeOperationContext();
     OperationContext& _opCtx = *_opCtxPtr;
     mutable DBDirectClient _client;
+    ReplSettings _defaultReplSettings;
 
 public:
-    Base() : _client(&_opCtx) {
+    Base()
+        : _client(&_opCtx), _defaultReplSettings(getGlobalReplicationCoordinator()->getSettings()) {
         ReplSettings replSettings;
         replSettings.setOplogSizeBytes(10 * 1024 * 1024);
         replSettings.setMaster(true);
@@ -105,10 +109,13 @@ public:
         try {
             deleteAll(ns());
             deleteAll(cllNS());
-            ReplSettings replSettings;
-            replSettings.setOplogSizeBytes(10 * 1024 * 1024);
-            setGlobalReplicationCoordinator(
-                new repl::ReplicationCoordinatorMock(_opCtx.getServiceContext(), replSettings));
+            setGlobalReplicationCoordinator(new repl::ReplicationCoordinatorMock(
+                _opCtx.getServiceContext(), _defaultReplSettings));
+            repl::getGlobalReplicationCoordinator()
+                ->setFollowerMode(repl::MemberState::RS_PRIMARY)
+                .ignore();
+
+
         } catch (...) {
             FAIL("Exception while cleaning up test");
         }
@@ -172,7 +179,7 @@ protected:
             DBDirectClient db(&_opCtx);
             auto cursor = db.query(cllNS(), BSONObj());
             while (cursor->more()) {
-                ops.push_back(cursor->nextSafeOwned());
+                ops.push_back(cursor->nextSafe());
             }
         }
         {
@@ -210,17 +217,19 @@ protected:
     }
     // These deletes don't get logged.
     void deleteAll(const char* ns) const {
-        Lock::GlobalWrite lk(&_opCtx);
-        OldClientContext ctx(&_opCtx, ns);
-        WriteUnitOfWork wunit(&_opCtx);
-        Database* db = ctx.db();
-        Collection* coll = db->getCollection(&_opCtx, ns);
-        if (!coll) {
-            coll = db->createCollection(&_opCtx, ns);
-        }
+        ::mongo::writeConflictRetry(&_opCtx, "deleteAll", ns, [&] {
+            Lock::GlobalWrite lk(&_opCtx);
+            OldClientContext ctx(&_opCtx, ns);
+            WriteUnitOfWork wunit(&_opCtx);
+            Database* db = ctx.db();
+            Collection* coll = db->getCollection(&_opCtx, ns);
+            if (!coll) {
+                coll = db->createCollection(&_opCtx, ns);
+            }
 
-        ASSERT_OK(coll->truncate(&_opCtx));
-        wunit.commit();
+            ASSERT_OK(coll->truncate(&_opCtx));
+            wunit.commit();
+        });
     }
     void insert(const BSONObj& o) const {
         Lock::GlobalWrite lk(&_opCtx);
@@ -235,7 +244,8 @@ protected:
         OpDebug* const nullOpDebug = nullptr;
         if (o.hasField("_id")) {
             repl::UnreplicatedWritesBlock uwb(&_opCtx);
-            coll->insertDocument(&_opCtx, o, nullOpDebug, true);
+            coll->insertDocument(&_opCtx, InsertStatement(o), nullOpDebug, true)
+                .transitional_ignore();
             wunit.commit();
             return;
         }
@@ -246,7 +256,8 @@ protected:
         b.appendOID("_id", &id);
         b.appendElements(o);
         repl::UnreplicatedWritesBlock uwb(&_opCtx);
-        coll->insertDocument(&_opCtx, b.obj(), nullOpDebug, true);
+        coll->insertDocument(&_opCtx, InsertStatement(b.obj()), nullOpDebug, true)
+            .transitional_ignore();
         wunit.commit();
     }
     static BSONObj wid(const char* json) {
@@ -891,36 +902,6 @@ public:
     }
 };
 
-class EmptyPushSparseIndex : public EmptyPush {
-public:
-    EmptyPushSparseIndex() {
-        _client.insert("unittests.system.indexes",
-                       BSON("ns" << ns() << "key" << BSON("a" << 1) << "name"
-                                 << "foo"
-                                 << "sparse"
-                                 << true));
-    }
-    ~EmptyPushSparseIndex() {
-        _client.dropIndexes(ns());
-    }
-};
-
-class PushAll : public Base {
-public:
-    void doIt() const {
-        _client.update(ns(), BSON("_id" << 0), fromjson("{$pushAll:{a:[5.0,6.0]}}"));
-    }
-    using ReplTests::Base::check;
-    void check() const {
-        ASSERT_EQUALS(1, count());
-        check(fromjson("{'_id':0,a:[4,5,6]}"), one(fromjson("{'_id':0}")));
-    }
-    void reset() const {
-        deleteAll(ns());
-        insert(fromjson("{'_id':0,a:[4]}"));
-    }
-};
-
 class PushWithDollarSigns : public Base {
     void doIt() const {
         _client.update(ns(), BSON("_id" << 0), BSON("$push" << BSON("a" << BSON("$foo" << 1))));
@@ -987,38 +968,6 @@ class PushSliceToZero : public Base {
     void reset() const {
         deleteAll(ns());
         insert(BSON("_id" << 0));
-    }
-};
-
-class PushAllUpsert : public Base {
-public:
-    void doIt() const {
-        _client.update(ns(), BSON("_id" << 0), fromjson("{$pushAll:{a:[5.0,6.0]}}"), true);
-    }
-    using ReplTests::Base::check;
-    void check() const {
-        ASSERT_EQUALS(1, count());
-        check(fromjson("{'_id':0,a:[4,5,6]}"), one(fromjson("{'_id':0}")));
-    }
-    void reset() const {
-        deleteAll(ns());
-        insert(fromjson("{'_id':0,a:[4]}"));
-    }
-};
-
-class EmptyPushAll : public Base {
-public:
-    void doIt() const {
-        _client.update(ns(), BSON("_id" << 0), fromjson("{$pushAll:{a:[5.0,6.0]}}"));
-    }
-    using ReplTests::Base::check;
-    void check() const {
-        ASSERT_EQUALS(1, count());
-        check(fromjson("{'_id':0,a:[5,6]}"), one(fromjson("{'_id':0}")));
-    }
-    void reset() const {
-        deleteAll(ns());
-        insert(fromjson("{'_id':0}"));
     }
 };
 
@@ -1375,7 +1324,7 @@ public:
     bool returnEmpty;
     SyncTest() : SyncTail(nullptr, SyncTail::MultiSyncApplyFunc()), returnEmpty(false) {}
     virtual ~SyncTest() {}
-    virtual BSONObj getMissingDoc(OperationContext* opCtx, Database* db, const BSONObj& o) {
+    virtual BSONObj getMissingDoc(OperationContext* opCtx, const BSONObj& o) {
         if (returnEmpty) {
             BSONObj o;
             return o;
@@ -1387,7 +1336,7 @@ public:
     }
 };
 
-class ShouldRetry : public Base {
+class FetchAndInsertMissingDocument : public Base {
 public:
     void run() {
         bool threw = false;
@@ -1407,7 +1356,7 @@ public:
             badSource.setHostname("localhost:123");
 
             OldClientContext ctx(&_opCtx, ns());
-            badSource.getMissingDoc(&_opCtx, ctx.db(), o);
+            badSource.getMissingDoc(&_opCtx, o);
         } catch (DBException&) {
             threw = true;
         }
@@ -1415,7 +1364,7 @@ public:
 
         // now this should succeed
         SyncTest t;
-        verify(t.shouldRetry(&_opCtx, o));
+        verify(t.fetchAndInsertMissingDocument(&_opCtx, o));
         verify(!_client
                     .findOne(ns(),
                              BSON("_id"
@@ -1424,7 +1373,7 @@ public:
 
         // force it not to find an obj
         t.returnEmpty = true;
-        verify(!t.shouldRetry(&_opCtx, o));
+        verify(!t.fetchAndInsertMissingDocument(&_opCtx, o));
     }
 };
 
@@ -1465,13 +1414,9 @@ public:
         add<Idempotence::PushUpsert>();
         add<Idempotence::MultiPush>();
         add<Idempotence::EmptyPush>();
-        add<Idempotence::EmptyPushSparseIndex>();
-        add<Idempotence::PushAll>();
         add<Idempotence::PushSlice>();
         add<Idempotence::PushSliceInitiallyInexistent>();
         add<Idempotence::PushSliceToZero>();
-        add<Idempotence::PushAllUpsert>();
-        add<Idempotence::EmptyPushAll>();
         add<Idempotence::Pull>();
         add<Idempotence::PullNothing>();
         add<Idempotence::PullAll>();
@@ -1491,7 +1436,7 @@ public:
         add<DeleteOpIsIdBased>();
         add<DatabaseIgnorerBasic>();
         add<DatabaseIgnorerUpdate>();
-        add<ShouldRetry>();
+        add<FetchAndInsertMissingDocument>();
     }
 };
 

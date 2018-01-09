@@ -38,7 +38,8 @@
 
 #include "mongo/db/jsobj.h"
 #include "mongo/db/json.h"
-#include "mongo/db/matcher/extensions_callback_disallow_extensions.h"
+#include "mongo/db/matcher/extensions_callback_noop.h"
+#include "mongo/db/pipeline/expression_context_for_test.h"
 #include "mongo/db/query/collation/collator_interface_mock.h"
 #include "mongo/db/query/plan_ranker.h"
 #include "mongo/db/query/query_knobs.h"
@@ -72,8 +73,13 @@ unique_ptr<CanonicalQuery> canonicalize(const BSONObj& queryObj) {
 
     auto qr = stdx::make_unique<QueryRequest>(nss);
     qr->setFilter(queryObj);
-    auto statusWithCQ = CanonicalQuery::canonicalize(
-        opCtx.get(), std::move(qr), ExtensionsCallbackDisallowExtensions());
+    const boost::intrusive_ptr<ExpressionContext> expCtx;
+    auto statusWithCQ =
+        CanonicalQuery::canonicalize(opCtx.get(),
+                                     std::move(qr),
+                                     expCtx,
+                                     ExtensionsCallbackNoop(),
+                                     MatchExpressionParser::kAllowAllSpecialFeatures);
     ASSERT_OK(statusWithCQ.getStatus());
     return std::move(statusWithCQ.getValue());
 }
@@ -95,8 +101,13 @@ unique_ptr<CanonicalQuery> canonicalize(const char* queryStr,
     qr->setSort(fromjson(sortStr));
     qr->setProj(fromjson(projStr));
     qr->setCollation(fromjson(collationStr));
-    auto statusWithCQ = CanonicalQuery::canonicalize(
-        opCtx.get(), std::move(qr), ExtensionsCallbackDisallowExtensions());
+    const boost::intrusive_ptr<ExpressionContext> expCtx;
+    auto statusWithCQ =
+        CanonicalQuery::canonicalize(opCtx.get(),
+                                     std::move(qr),
+                                     expCtx,
+                                     ExtensionsCallbackNoop(),
+                                     MatchExpressionParser::kAllowAllSpecialFeatures);
     ASSERT_OK(statusWithCQ.getStatus());
     return std::move(statusWithCQ.getValue());
 }
@@ -125,8 +136,13 @@ unique_ptr<CanonicalQuery> canonicalize(const char* queryStr,
     qr->setHint(fromjson(hintStr));
     qr->setMin(fromjson(minStr));
     qr->setMax(fromjson(maxStr));
-    auto statusWithCQ = CanonicalQuery::canonicalize(
-        opCtx.get(), std::move(qr), ExtensionsCallbackDisallowExtensions());
+    const boost::intrusive_ptr<ExpressionContext> expCtx;
+    auto statusWithCQ =
+        CanonicalQuery::canonicalize(opCtx.get(),
+                                     std::move(qr),
+                                     expCtx,
+                                     ExtensionsCallbackNoop(),
+                                     MatchExpressionParser::kAllowAllSpecialFeatures);
     ASSERT_OK(statusWithCQ.getStatus());
     return std::move(statusWithCQ.getValue());
 }
@@ -159,8 +175,13 @@ unique_ptr<CanonicalQuery> canonicalize(const char* queryStr,
     qr->setMax(fromjson(maxStr));
     qr->setSnapshot(snapshot);
     qr->setExplain(explain);
-    auto statusWithCQ = CanonicalQuery::canonicalize(
-        opCtx.get(), std::move(qr), ExtensionsCallbackDisallowExtensions());
+    const boost::intrusive_ptr<ExpressionContext> expCtx;
+    auto statusWithCQ =
+        CanonicalQuery::canonicalize(opCtx.get(),
+                                     std::move(qr),
+                                     expCtx,
+                                     ExtensionsCallbackNoop(),
+                                     MatchExpressionParser::kAllowAllSpecialFeatures);
     ASSERT_OK(statusWithCQ.getStatus());
     return std::move(statusWithCQ.getValue());
 }
@@ -169,9 +190,12 @@ unique_ptr<CanonicalQuery> canonicalize(const char* queryStr,
  * Utility function to create MatchExpression
  */
 unique_ptr<MatchExpression> parseMatchExpression(const BSONObj& obj) {
-    const CollatorInterface* collator = nullptr;
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
     StatusWithMatchExpression status =
-        MatchExpressionParser::parse(obj, ExtensionsCallbackDisallowExtensions(), collator);
+        MatchExpressionParser::parse(obj,
+                                     std::move(expCtx),
+                                     ExtensionsCallbackNoop(),
+                                     MatchExpressionParser::kAllowAllSpecialFeatures);
     if (!status.isOK()) {
         str::stream ss;
         ss << "failed to parse query: " << obj.toString()
@@ -403,7 +427,8 @@ TEST(PlanCacheTest, AddEmptySolutions) {
     unique_ptr<CanonicalQuery> cq(canonicalize("{a: 1}"));
     std::vector<QuerySolution*> solns;
     unique_ptr<PlanRankingDecision> decision(createDecision(1U));
-    ASSERT_NOT_OK(planCache.add(*cq, solns, decision.get()));
+    QueryTestServiceContext serviceContext;
+    ASSERT_NOT_OK(planCache.add(*cq, solns, decision.get(), Date_t{}));
 }
 
 TEST(PlanCacheTest, AddValidSolution) {
@@ -417,7 +442,8 @@ TEST(PlanCacheTest, AddValidSolution) {
 
     // Check if key is in cache before and after add().
     ASSERT_FALSE(planCache.contains(*cq));
-    ASSERT_OK(planCache.add(*cq, solns, createDecision(1U)));
+    QueryTestServiceContext serviceContext;
+    ASSERT_OK(planCache.add(*cq, solns, createDecision(1U), Date_t{}));
 
     ASSERT_TRUE(planCache.contains(*cq));
     ASSERT_EQUALS(planCache.size(), 1U);
@@ -563,8 +589,13 @@ protected:
         qr->setMin(minObj);
         qr->setMax(maxObj);
         qr->setSnapshot(snapshot);
-        auto statusWithCQ = CanonicalQuery::canonicalize(
-            opCtx.get(), std::move(qr), ExtensionsCallbackDisallowExtensions());
+        const boost::intrusive_ptr<ExpressionContext> expCtx;
+        auto statusWithCQ =
+            CanonicalQuery::canonicalize(opCtx.get(),
+                                         std::move(qr),
+                                         expCtx,
+                                         ExtensionsCallbackNoop(),
+                                         MatchExpressionParser::kAllowAllSpecialFeatures);
         ASSERT_OK(statusWithCQ.getStatus());
         Status s = QueryPlanner::plan(*statusWithCQ.getValue(), params, &solns);
         ASSERT_OK(s);
@@ -585,8 +616,13 @@ protected:
         std::unique_ptr<QueryRequest> qr(
             assertGet(QueryRequest::makeFromFindCommand(nss, cmdObj, isExplain)));
 
-        auto statusWithCQ = CanonicalQuery::canonicalize(
-            opCtx.get(), std::move(qr), ExtensionsCallbackDisallowExtensions());
+        const boost::intrusive_ptr<ExpressionContext> expCtx;
+        auto statusWithCQ =
+            CanonicalQuery::canonicalize(opCtx.get(),
+                                         std::move(qr),
+                                         expCtx,
+                                         ExtensionsCallbackNoop(),
+                                         MatchExpressionParser::kAllowAllSpecialFeatures);
         ASSERT_OK(statusWithCQ.getStatus());
         Status s = QueryPlanner::plan(*statusWithCQ.getValue(), params, &solns);
         ASSERT_OK(s);
@@ -666,8 +702,13 @@ protected:
         qr->setSort(sort);
         qr->setProj(proj);
         qr->setCollation(collation);
-        auto statusWithCQ = CanonicalQuery::canonicalize(
-            opCtx.get(), std::move(qr), ExtensionsCallbackDisallowExtensions());
+        const boost::intrusive_ptr<ExpressionContext> expCtx;
+        auto statusWithCQ =
+            CanonicalQuery::canonicalize(opCtx.get(),
+                                         std::move(qr),
+                                         expCtx,
+                                         ExtensionsCallbackNoop(),
+                                         MatchExpressionParser::kAllowAllSpecialFeatures);
         ASSERT_OK(statusWithCQ.getStatus());
         unique_ptr<CanonicalQuery> scopedCq = std::move(statusWithCQ.getValue());
 

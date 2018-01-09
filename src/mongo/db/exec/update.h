@@ -132,17 +132,17 @@ public:
      *
      * Fills out whether or not this is a fastmodinsert in 'stats'.
      *
-     * Returns the document to insert in *out.
+     * Returns the document to insert.
      */
-    static Status applyUpdateOpsForInsert(OperationContext* opCtx,
-                                          const CanonicalQuery* cq,
-                                          const BSONObj& query,
-                                          UpdateDriver* driver,
-                                          mutablebson::Document* doc,
-                                          bool isInternalRequest,
-                                          const NamespaceString& ns,
-                                          UpdateStats* stats,
-                                          BSONObj* out);
+    static BSONObj applyUpdateOpsForInsert(OperationContext* opCtx,
+                                           const CanonicalQuery* cq,
+                                           const BSONObj& query,
+                                           UpdateDriver* driver,
+                                           mutablebson::Document* doc,
+                                           bool isInternalRequest,
+                                           const NamespaceString& ns,
+                                           bool enforceOkForStorage,
+                                           UpdateStats* stats);
 
 private:
     /**
@@ -171,11 +171,6 @@ private:
     bool needInsert();
 
     /**
-     * Helper for restoring the state of this update.
-     */
-    Status restoreUpdateState();
-
-    /**
      * Stores 'idToRetry' in '_idRetrying' so the update can be retried during the next call to
      * work(). Always returns NEED_YIELD and sets 'out' to WorkingSet::INVALID_ID.
      */
@@ -197,6 +192,9 @@ private:
 
     // Stats
     UpdateStats _specificStats;
+
+    // True if updated documents should be validated with storage_validation::storageValid().
+    bool _enforceOkForStorage;
 
     // If the update was in-place, we may see it again.  This only matters if we're doing
     // a multi-update; if we're not doing a multi-update we stop after one update and we

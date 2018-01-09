@@ -37,6 +37,7 @@
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/repl/optime.h"
 #include "mongo/db/repl/replication_consistency_markers.h"
+#include "mongo/db/repl/replication_recovery.h"
 #include "mongo/stdx/mutex.h"
 
 namespace mongo {
@@ -61,18 +62,7 @@ class ReplicationProcess {
     MONGO_DISALLOW_COPYING(ReplicationProcess);
 
 public:
-    /**
-     * Contains at most one document representing the progress of the current rollback process.
-     *
-     * Schema:
-     *     {_id: "rollbackProgress", applyUntil: <optime>}
-     *
-     * '_id' is always "rollbackProgress".
-     *
-     * 'applyUntil' contains the optime of the last oplog entry from the sync source that we need to
-     * apply in order to complete rollback successfully.
-     */
-    static const NamespaceString kRollbackProgressNamespace;
+    static const int kUninitializedRollbackId = -1;
 
     // Operation Context binding.
     static ReplicationProcess* get(ServiceContext* service);
@@ -81,7 +71,8 @@ public:
     static void set(ServiceContext* service, std::unique_ptr<ReplicationProcess> process);
 
     ReplicationProcess(StorageInterface* storageInterface,
-                       std::unique_ptr<ReplicationConsistencyMarkers> consistencyMarkers);
+                       std::unique_ptr<ReplicationConsistencyMarkers> consistencyMarkers,
+                       std::unique_ptr<ReplicationRecovery> recovery);
     virtual ~ReplicationProcess() = default;
 
     /**
@@ -92,47 +83,14 @@ public:
     Status incrementRollbackID(OperationContext* opCtx);
 
     /**
-     * Rollback progress is set after we have retrieved all the information from the sync source
-     * that we need to complete rollback without further communication with the sync source.
-     * Rollback progress is cleared when rollback has completed successfully. This information is
-     * stored in the 'kRollbackProgressNamespace' collection.
-     * If the collection is not empty, it will hold the optime of the oplog entry we pulled down
-     * from the sync source into the local.system.rollback.oplog collection that we need to apply
-     * through from that collection. It is safe to exit rollback once we have applied this optime.
-     *
-     * If the collection is not present, we return NamespaceNotFound.
-     * If the document is not present, we return NoSuchKey.
-     *
-     * This function is used at replication startup to check if a previously interrupted rollback
-     * process has occurred and that the rollback process can be resumed without contacting any
-     * sync source.
-     * An error status returned by this function indicates that we did not detect any interrupted
-     * rollback and that we can continue with normal replication startup.
-     */
-    StatusWith<OpTime> getRollbackProgress(OperationContext* opCtx);
-
-    /**
-     * Upon success, a document representing the current rollback progress will be present in the
-     * 'kRollbackProgressNamespace' collection. This document will contain the optime that this
-     * node will have to reach in order to consider rollback complete.
-     *
-     * If the 'kRollbackProgressNamespace' collection is not present when this function is called,
-     * this function will create it before inserting the document.
-     */
-    Status setRollbackProgress(OperationContext* opCtx, const OpTime& applyUntil);
-
-    /**
-     * Removes the rollback progress document from the 'kRollbackProgressNamespace' collection.
-     *
-     * If the collection is not found, this function will return a successful Status because there's
-     * nothing further to do.
-     */
-    Status clearRollbackProgress(OperationContext* opCtx);
-
-    /**
      * Returns an object used for operating on the documents that maintain replication consistency.
      */
     ReplicationConsistencyMarkers* getConsistencyMarkers();
+
+    /**
+     * Returns an object used to recover from the oplog on startup or rollback.
+     */
+    ReplicationRecovery* getReplicationRecovery();
 
 private:
     // All member variables are labeled with one of the following codes indicating the
@@ -150,6 +108,8 @@ private:
 
     // Used for operations on documents that maintain replication consistency.
     std::unique_ptr<ReplicationConsistencyMarkers> _consistencyMarkers;  // (S)
+
+    std::unique_ptr<ReplicationRecovery> _recovery;  // (S)
 
     // Rollback ID. This is a cached copy of the persisted value in the local.system.rollback.id
     // collection.

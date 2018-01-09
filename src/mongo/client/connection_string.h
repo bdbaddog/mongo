@@ -28,11 +28,14 @@
 
 #pragma once
 
+#include <memory>
+#include <sstream>
 #include <string>
 #include <vector>
 
 #include "mongo/base/status_with.h"
 #include "mongo/base/string_data.h"
+#include "mongo/bson/util/builder.h"
 #include "mongo/stdx/mutex.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/net/hostandport.h"
@@ -117,10 +120,10 @@ public:
     bool operator==(const ConnectionString& other) const;
     bool operator!=(const ConnectionString& other) const;
 
-    DBClientBase* connect(StringData applicationName,
-                          std::string& errmsg,
-                          double socketTimeout = 0,
-                          const MongoURI* uri = nullptr) const;
+    std::unique_ptr<DBClientBase> connect(StringData applicationName,
+                                          std::string& errmsg,
+                                          double socketTimeout = 0,
+                                          const MongoURI* uri = nullptr) const;
 
     static StatusWith<ConnectionString> parse(const std::string& url);
 
@@ -137,9 +140,9 @@ public:
         virtual ~ConnectionHook() {}
 
         // Returns an alternative connection object for a string
-        virtual DBClientBase* connect(const ConnectionString& c,
-                                      std::string& errmsg,
-                                      double socketTimeout) = 0;
+        virtual std::unique_ptr<DBClientBase> connect(const ConnectionString& c,
+                                                      std::string& errmsg,
+                                                      double socketTimeout) = 0;
     };
 
     static void setConnectionHook(ConnectionHook* hook) {
@@ -156,6 +159,10 @@ public:
     bool operator<(const ConnectionString& other) const {
         return _string < other._string;
     }
+
+
+    friend std::ostream& operator<<(std::ostream&, const ConnectionString&);
+    friend StringBuilder& operator<<(StringBuilder&, const ConnectionString&);
 
 private:
     /**
@@ -179,4 +186,15 @@ private:
     static stdx::mutex _connectHookMutex;
     static ConnectionHook* _connectHook;
 };
+
+inline std::ostream& operator<<(std::ostream& ss, const ConnectionString& cs) {
+    ss << cs._string;
+    return ss;
+}
+
+inline StringBuilder& operator<<(StringBuilder& sb, const ConnectionString& cs) {
+    sb << cs._string;
+    return sb;
+}
+
 }  // namespace mongo

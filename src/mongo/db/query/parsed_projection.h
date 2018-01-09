@@ -45,10 +45,10 @@ public:
      * Returns Status::OK() if it's a valid spec.
      * Returns a Status indicating how it's invalid otherwise.
      */
-    static Status make(const BSONObj& spec,
+    static Status make(OperationContext* opCtx,
+                       const BSONObj& spec,
                        const MatchExpression* const query,
-                       ParsedProjection** out,
-                       const ExtensionsCallback& extensionsCallback);
+                       ParsedProjection** out);
 
     /**
      * Returns true if the projection requires match details from the query,
@@ -80,6 +80,10 @@ public:
      */
     const BSONObj& getProjObj() const {
         return _source;
+    }
+
+    bool wantTextScore() const {
+        return _wantTextScore;
     }
 
     /**
@@ -179,6 +183,8 @@ private:
     bool _requiresDocument = true;
 
     BSONObj _source;
+
+    bool _wantTextScore = false;
 
     bool _wantGeoNearDistance = false;
 

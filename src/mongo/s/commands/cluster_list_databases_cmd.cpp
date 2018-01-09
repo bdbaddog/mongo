@@ -35,6 +35,7 @@
 #include "mongo/bson/util/bson_extract.h"
 #include "mongo/client/read_preference.h"
 #include "mongo/client/remote_command_targeter.h"
+#include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/commands.h"
 #include "mongo/s/catalog/sharding_catalog_client.h"
 #include "mongo/s/client/shard.h"
@@ -51,44 +52,47 @@ using std::vector;
 
 namespace {
 
-class ListDatabasesCmd : public Command {
+class ListDatabasesCmd : public BasicCommand {
 public:
-    ListDatabasesCmd() : Command("listDatabases", "listdatabases") {}
+    ListDatabasesCmd() : BasicCommand("listDatabases", "listdatabases") {}
 
-    virtual bool slaveOk() const {
+    bool slaveOk() const final {
         return true;
     }
 
-    virtual bool slaveOverrideOk() const {
+    bool slaveOverrideOk() const final {
         return true;
     }
 
-    virtual bool adminOnly() const {
+    bool adminOnly() const final {
         return true;
     }
 
 
-    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
+    bool supportsWriteConcern(const BSONObj& cmd) const final {
         return false;
     }
 
-    virtual void help(std::stringstream& help) const {
+    void help(std::stringstream& help) const final {
         help << "list databases in a cluster";
     }
 
-    virtual void addRequiredPrivileges(const std::string& dbname,
-                                       const BSONObj& cmdObj,
-                                       std::vector<Privilege>* out) {
-        ActionSet actions;
-        actions.addAction(ActionType::listDatabases);
-        out->push_back(Privilege(ResourcePattern::forClusterResource(), actions));
+    /* listDatabases is always authorized,
+     * however the results returned will be redacted
+     * based on read privileges if auth is enabled
+     * and the current user does not have listDatabases permisison.
+     */
+    Status checkAuthForCommand(Client* client,
+                               const std::string& dbname,
+                               const BSONObj& cmdObj) final {
+        return Status::OK();
     }
 
-    virtual bool run(OperationContext* opCtx,
-                     const std::string& dbname_unused,
-                     const BSONObj& cmdObj,
-                     std::string& errmsg,
-                     BSONObjBuilder& result) {
+
+    bool run(OperationContext* opCtx,
+             const std::string& dbname_unused,
+             const BSONObj& cmdObj,
+             BSONObjBuilder& result) final {
         const bool nameOnly = cmdObj["nameOnly"].trueValue();
 
         map<string, long long> sizes;
@@ -96,6 +100,9 @@ public:
 
         vector<ShardId> shardIds;
         grid.shardRegistry()->getAllShardIds(&shardIds);
+        shardIds.emplace_back(ShardRegistry::kConfigServerShardId);
+
+        auto filteredCmd = filterCommandRequestForPassthrough(cmdObj);
 
         for (const ShardId& shardId : shardIds) {
             const auto shardStatus = grid.shardRegistry()->getShard(opCtx, shardId);
@@ -108,7 +115,7 @@ public:
                 opCtx,
                 ReadPreferenceSetting{ReadPreference::PrimaryPreferred},
                 "admin",
-                filterCommandRequestForPassthrough(cmdObj),
+                filteredCmd,
                 Shard::RetryPolicy::kIdempotent));
             uassertStatusOK(response.commandStatus);
             BSONObj x = std::move(response.response);
@@ -118,6 +125,17 @@ public:
                 BSONObj dbObj = j.next().Obj();
 
                 const string name = dbObj["name"].String();
+
+                // If this is the admin db, only collect its stats from the config servers.
+                if (name == "admin" && !s->isConfig()) {
+                    continue;
+                }
+
+                // We don't collect config server info for dbs other than "admin" and "config".
+                if (s->isConfig() && name != "config" && name != "admin") {
+                    continue;
+                }
+
                 const long long size = dbObj["sizeOnDisk"].numberLong();
 
                 long long& sizeSumForDbAcrossShards = sizes[name];
@@ -138,59 +156,58 @@ public:
             }
         }
 
-        BSONArrayBuilder dbListBuilder(result.subarrayStart("databases"));
-        for (map<string, long long>::iterator i = sizes.begin(); i != sizes.end(); ++i) {
-            const string name = i->first;
+        // If we have ActionType::listDatabases,
+        // then we don't need to test each record in the output.
+        // Otherwise, we'll test the database names as we enumerate them.
+        const auto as = AuthorizationSession::get(opCtx->getClient());
+        const bool checkAuth = as &&
+            !as->isAuthorizedForActionsOnResource(ResourcePattern::forClusterResource(),
+                                                  ActionType::listDatabases);
 
-            if (name == "local") {
-                // We don't return local, since all shards have their own independent local
-                continue;
-            }
-
-            if (name == "config" || name == "admin") {
-                // Always get this from the config servers
-                continue;
-            }
-
-            long long size = i->second;
-
-            BSONObjBuilder temp;
-            temp.append("name", name);
-            if (!nameOnly) {
-                temp.appendNumber("sizeOnDisk", size);
-                temp.appendBool("empty", size == 1);
-                temp.append("shards", dbShardInfo[name]->obj());
-            }
-
-            dbListBuilder.append(temp.obj());
-        }
-
-        // Get information for config and admin dbs from the config servers.
-        auto catalogClient = grid.catalogClient(opCtx);
-        auto appendStatus = catalogClient->appendInfoForConfigServerDatabases(
-            opCtx, filterCommandRequestForPassthrough(cmdObj), &dbListBuilder);
-        dbListBuilder.doneFast();
-        if (!appendStatus.isOK()) {
-            result.resetToEmpty();
-            return Command::appendCommandStatus(result, appendStatus);
-        }
-
-        if (nameOnly)
-            return true;
-
-        // Compute the combined total size based on the response we've built so far.
+        // Now that we have aggregated results for all the shards, convert to a response,
+        // and compute total sizes.
         long long totalSize = 0;
-        for (auto&& dbElt : result.asTempObj()["databases"].Obj()) {
-            long long sizeOnDisk;
-            uassertStatusOK(bsonExtractIntegerField(dbElt.Obj(), "sizeOnDisk"_sd, &sizeOnDisk));
-            uassert(ErrorCodes::BadValue,
-                    str::stream() << "Found negative 'sizeOnDisk' in: " << dbElt.Obj(),
-                    sizeOnDisk >= 0);
-            totalSize += sizeOnDisk;
+        {
+            BSONArrayBuilder dbListBuilder(result.subarrayStart("databases"));
+            for (map<string, long long>::iterator i = sizes.begin(); i != sizes.end(); ++i) {
+                const string name = i->first;
+
+                if (name == "local") {
+                    // We don't return local, since all shards have their own independent local
+                    continue;
+                }
+
+                if (checkAuth && as &&
+                    !as->isAuthorizedForActionsOnResource(ResourcePattern::forDatabaseName(name),
+                                                          ActionType::find)) {
+                    // We don't have listDatabases on the cluser or find on this database.
+                    continue;
+                }
+
+                long long size = i->second;
+
+                BSONObjBuilder temp;
+                temp.append("name", name);
+                if (!nameOnly) {
+                    temp.appendNumber("sizeOnDisk", size);
+                    temp.appendBool("empty", size == 1);
+                    temp.append("shards", dbShardInfo[name]->obj());
+
+                    uassert(ErrorCodes::BadValue,
+                            str::stream() << "Found negative 'sizeOnDisk' in: " << name,
+                            size >= 0);
+
+                    totalSize += size;
+                }
+
+                dbListBuilder.append(temp.obj());
+            }
         }
 
-        result.appendNumber("totalSize", totalSize);
-        result.appendNumber("totalSizeMb", totalSize / (1024 * 1024));
+        if (!nameOnly) {
+            result.appendNumber("totalSize", totalSize);
+            result.appendNumber("totalSizeMb", totalSize / (1024 * 1024));
+        }
 
         return true;
     }

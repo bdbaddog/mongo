@@ -2,6 +2,11 @@
 config_variables:
 - &keyFile jstests/libs/authTestsKey
 - &keyFileData Thiskeyisonlyforrunningthesuitewithauthenticationdontuseitinanytestsdirectly
+- &authOptions
+  authenticationDatabase: local
+  authenticationMechanism: SCRAM-SHA-1
+  password: *keyFileData
+  username: __system
 
 test_kind: js_test
 
@@ -11,23 +16,30 @@ selector:
   exclude_files:
   # Skip any tests that run with auth explicitly.
   - jstests/core/**/*[aA]uth*.js
+  # Commands using UUIDs are not compatible with name-based auth
+  - jstests/core/commands_with_uuid.js
 
 executor:
   config:
     shell_options:
       global_vars:
-        TestData:
+        TestData: &TestData
           auth: true
           authMechanism: SCRAM-SHA-1
           keyFile: *keyFile
           keyFileData: *keyFileData
       eval: jsTest.authenticate(db.getMongo())
-      authenticationDatabase: local
-      authenticationMechanism: SCRAM-SHA-1
-      password: *keyFileData
-      username: __system
+      <<: *authOptions
       readMode: commands
   hooks:
+  - class: ValidateCollections
+    shell_options:
+      global_vars:
+        TestData:
+          <<: *TestData
+          skipValidationOnNamespaceNotFound: false
+      eval: jsTest.authenticate(db.getMongo())
+      <<: *authOptions
   - class: CleanEveryN
     n: 20
   fixture:

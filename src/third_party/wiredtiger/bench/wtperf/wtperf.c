@@ -1,5 +1,5 @@
 /*-
- * Public Domain 2014-2017 MongoDB, Inc.
+ * Public Domain 2014-2018 MongoDB, Inc.
  * Public Domain 2008-2014 WiredTiger, Inc.
  *
  * This is free and unencumbered software released into the public domain.
@@ -1750,7 +1750,7 @@ execute_workload(WTPERF *wtperf)
 		lprintf(wtperf, 0, 1,
 		    "Starting workload #%u: %" PRId64 " threads, inserts=%"
 		    PRId64 ", reads=%" PRId64 ", updates=%" PRId64
-		    ", truncate=%" PRId64 ", throttle=%" PRId64,
+		    ", truncate=%" PRId64 ", throttle=%" PRIu64,
 		    i + 1, workp->threads, workp->insert,
 		    workp->read, workp->update, workp->truncate,
 		    workp->throttle);

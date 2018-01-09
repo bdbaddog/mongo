@@ -64,12 +64,22 @@ void LogicalClockTestFixture::setUp() {
     // Set master to false (set to true in ShardingMongodTestFixture::setUp()) so follower mode can
     // be toggled meaningfully. Default follower mode to primary, so writes can be accepted.
     replicationCoordinator()->setMaster(false);
-    replicationCoordinator()->setFollowerMode(repl::MemberState::RS_PRIMARY);
+    ASSERT_OK(replicationCoordinator()->setFollowerMode(repl::MemberState::RS_PRIMARY));
 }
 
 void LogicalClockTestFixture::tearDown() {
     _dbDirectClient.reset();
     ShardingMongodTestFixture::tearDown();
+}
+
+LogicalClock* LogicalClockTestFixture::resetClock() {
+    auto service = getServiceContext();
+    auto logicalClock = stdx::make_unique<LogicalClock>(service);
+
+    LogicalClock::set(service, std::move(logicalClock));
+    _clock = LogicalClock::get(service);
+
+    return _clock;
 }
 
 LogicalClock* LogicalClockTestFixture::getClock() const {

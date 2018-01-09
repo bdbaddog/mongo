@@ -41,22 +41,49 @@ namespace {
 
 using unittest::assertGet;
 
+std::unique_ptr<CollectionMetadata> makeCollectionMetadataImpl(
+    const KeyPattern& shardKeyPattern,
+    const std::vector<std::pair<BSONObj, BSONObj>>& thisShardsChunks) {
+
+    const OID epoch = OID::gen();
+    const NamespaceString kNss("test.foo");
+    const ShardId kThisShard("thisShard");
+    const ShardId kOtherShard("otherShard");
+
+    std::vector<ChunkType> allChunks;
+    auto nextMinKey = shardKeyPattern.globalMin();
+    ChunkVersion version{1, 0, epoch};
+    for (const auto& myNextChunk : thisShardsChunks) {
+        if (SimpleBSONObjComparator::kInstance.evaluate(nextMinKey < myNextChunk.first)) {
+            // Need to add a chunk to the other shard from nextMinKey to myNextChunk.first.
+            allChunks.emplace_back(
+                kNss, ChunkRange{nextMinKey, myNextChunk.first}, version, kOtherShard);
+            version.incMajor();
+        }
+        allChunks.emplace_back(
+            kNss, ChunkRange{myNextChunk.first, myNextChunk.second}, version, kThisShard);
+        version.incMajor();
+        nextMinKey = myNextChunk.second;
+    }
+    if (SimpleBSONObjComparator::kInstance.evaluate(nextMinKey < shardKeyPattern.globalMax())) {
+        allChunks.emplace_back(
+            kNss, ChunkRange{nextMinKey, shardKeyPattern.globalMax()}, version, kOtherShard);
+    }
+
+    UUID uuid(UUID::gen());
+    auto cm = ChunkManager::makeNew(kNss, uuid, shardKeyPattern, nullptr, false, epoch, allChunks);
+    return stdx::make_unique<CollectionMetadata>(cm, kThisShard);
+}
+
 class NoChunkFixture : public unittest::Test {
 protected:
     std::unique_ptr<CollectionMetadata> makeCollectionMetadata() const {
-        const OID epoch = OID::gen();
-
-        return stdx::make_unique<CollectionMetadata>(
-            BSON("a" << 1),
-            ChunkVersion(1, 0, epoch),
-            ChunkVersion(0, 0, epoch),
-            SimpleBSONObjComparator::kInstance.makeBSONObjIndexedMap<CachedChunkInfo>());
+        return makeCollectionMetadataImpl(KeyPattern(BSON("a" << 1)), {});
     }
 };
 
 struct stRangeMap : public RangeMap {
-    stRangeMap()
-        : RangeMap(SimpleBSONObjComparator::kInstance.makeBSONObjIndexedMap<CachedChunkInfo>()) {}
+    stRangeMap() : RangeMap(SimpleBSONObjComparator::kInstance.makeBSONObjIndexedMap<BSONObj>()) {}
 };
 
 TEST_F(NoChunkFixture, BasicBelongsToMe) {
@@ -100,11 +127,11 @@ TEST_F(NoChunkFixture, OrphanedDataRangeBegin) {
     auto keyRange = metadata->getNextOrphanRange(pending, lookupKey);
     ASSERT(keyRange);
 
-    ASSERT(keyRange->minKey.woCompare(metadata->getMinKey()) == 0);
-    ASSERT(keyRange->maxKey.woCompare(metadata->getMaxKey()) == 0);
+    ASSERT(keyRange->getMin().woCompare(metadata->getMinKey()) == 0);
+    ASSERT(keyRange->getMax().woCompare(metadata->getMaxKey()) == 0);
 
     // Make sure we don't have any more ranges
-    ASSERT(!metadata->getNextOrphanRange(pending, keyRange->maxKey));
+    ASSERT(!metadata->getNextOrphanRange(pending, keyRange->getMax()));
 }
 
 TEST_F(NoChunkFixture, OrphanedDataRangeMiddle) {
@@ -115,12 +142,11 @@ TEST_F(NoChunkFixture, OrphanedDataRangeMiddle) {
     auto keyRange = metadata->getNextOrphanRange(pending, lookupKey);
     ASSERT(keyRange);
 
-    ASSERT(keyRange->minKey.woCompare(metadata->getMinKey()) == 0);
-    ASSERT(keyRange->maxKey.woCompare(metadata->getMaxKey()) == 0);
-    ASSERT(keyRange->keyPattern.woCompare(metadata->getKeyPattern()) == 0);
+    ASSERT(keyRange->getMin().woCompare(metadata->getMinKey()) == 0);
+    ASSERT(keyRange->getMax().woCompare(metadata->getMaxKey()) == 0);
 
     // Make sure we don't have any more ranges
-    ASSERT(!metadata->getNextOrphanRange(pending, keyRange->maxKey));
+    ASSERT(!metadata->getNextOrphanRange(pending, keyRange->getMax()));
 }
 
 TEST_F(NoChunkFixture, OrphanedDataRangeEnd) {
@@ -137,17 +163,8 @@ TEST_F(NoChunkFixture, OrphanedDataRangeEnd) {
 class SingleChunkFixture : public unittest::Test {
 protected:
     std::unique_ptr<CollectionMetadata> makeCollectionMetadata() const {
-        const OID epoch = OID::gen();
-
-        auto shardChunksMap =
-            SimpleBSONObjComparator::kInstance.makeBSONObjIndexedMap<CachedChunkInfo>();
-        shardChunksMap.emplace(BSON("a" << 10),
-                               CachedChunkInfo(BSON("a" << 20), ChunkVersion(1, 0, epoch)));
-
-        return stdx::make_unique<CollectionMetadata>(BSON("a" << 1),
-                                                     ChunkVersion(1, 0, epoch),
-                                                     ChunkVersion(1, 0, epoch),
-                                                     std::move(shardChunksMap));
+        return makeCollectionMetadataImpl(KeyPattern(BSON("a" << 1)),
+                                          {std::make_pair(BSON("a" << 10), BSON("a" << 20))});
     }
 };
 
@@ -195,17 +212,15 @@ TEST_F(SingleChunkFixture, ChunkOrphanedDataRanges) {
         pending, makeCollectionMetadata()->getMinKey());
     ASSERT(keyRange);
 
-    ASSERT(keyRange->minKey.woCompare(makeCollectionMetadata()->getMinKey()) == 0);
-    ASSERT(keyRange->maxKey.woCompare(BSON("a" << 10)) == 0);
-    ASSERT(keyRange->keyPattern.woCompare(makeCollectionMetadata()->getKeyPattern()) == 0);
+    ASSERT(keyRange->getMin().woCompare(makeCollectionMetadata()->getMinKey()) == 0);
+    ASSERT(keyRange->getMax().woCompare(BSON("a" << 10)) == 0);
 
-    keyRange = makeCollectionMetadata()->getNextOrphanRange(pending, keyRange->maxKey);
+    keyRange = makeCollectionMetadata()->getNextOrphanRange(pending, keyRange->getMax());
     ASSERT(keyRange);
-    ASSERT(keyRange->minKey.woCompare(BSON("a" << 20)) == 0);
-    ASSERT(keyRange->maxKey.woCompare(makeCollectionMetadata()->getMaxKey()) == 0);
-    ASSERT(keyRange->keyPattern.woCompare(makeCollectionMetadata()->getKeyPattern()) == 0);
+    ASSERT(keyRange->getMin().woCompare(BSON("a" << 20)) == 0);
+    ASSERT(keyRange->getMax().woCompare(makeCollectionMetadata()->getMaxKey()) == 0);
 
-    ASSERT(!makeCollectionMetadata()->getNextOrphanRange(pending, keyRange->maxKey));
+    ASSERT(!makeCollectionMetadata()->getNextOrphanRange(pending, keyRange->getMax()));
 }
 
 /**
@@ -215,18 +230,10 @@ TEST_F(SingleChunkFixture, ChunkOrphanedDataRanges) {
 class SingleChunkMinMaxCompoundKeyFixture : public unittest::Test {
 protected:
     std::unique_ptr<CollectionMetadata> makeCollectionMetadata() const {
-        const OID epoch = OID::gen();
-
-        auto shardChunksMap =
-            SimpleBSONObjComparator::kInstance.makeBSONObjIndexedMap<CachedChunkInfo>();
-        shardChunksMap.emplace(
-            BSON("a" << MINKEY << "b" << MINKEY),
-            CachedChunkInfo(BSON("a" << MAXKEY << "b" << MAXKEY), ChunkVersion(1, 0, epoch)));
-
-        return stdx::make_unique<CollectionMetadata>(BSON("a" << 1 << "b" << 1),
-                                                     ChunkVersion(1, 0, epoch),
-                                                     ChunkVersion(1, 0, epoch),
-                                                     std::move(shardChunksMap));
+        const KeyPattern shardKeyPattern(BSON("a" << 1 << "b" << 1));
+        return makeCollectionMetadataImpl(
+            shardKeyPattern,
+            {std::make_pair(shardKeyPattern.globalMin(), shardKeyPattern.globalMax())});
     }
 };
 
@@ -247,46 +254,33 @@ TEST_F(SingleChunkMinMaxCompoundKeyFixture, CompoundKeyBelongsToMe) {
 class TwoChunksWithGapCompoundKeyFixture : public unittest::Test {
 protected:
     std::unique_ptr<CollectionMetadata> makeCollectionMetadata() const {
-        const OID epoch = OID::gen();
-
-        auto shardChunksMap =
-            SimpleBSONObjComparator::kInstance.makeBSONObjIndexedMap<CachedChunkInfo>();
-        shardChunksMap.emplace(
-            BSON("a" << 10 << "b" << 0),
-            CachedChunkInfo(BSON("a" << 20 << "b" << 0), ChunkVersion(1, 0, epoch)));
-        shardChunksMap.emplace(
-            BSON("a" << 30 << "b" << 0),
-            CachedChunkInfo(BSON("a" << 40 << "b" << 0), ChunkVersion(1, 1, epoch)));
-
-        return stdx::make_unique<CollectionMetadata>(BSON("a" << 1 << "b" << 1),
-                                                     ChunkVersion(1, 1, epoch),
-                                                     ChunkVersion(1, 1, epoch),
-                                                     std::move(shardChunksMap));
+        return makeCollectionMetadataImpl(
+            KeyPattern(BSON("a" << 1 << "b" << 1)),
+            {std::make_pair(BSON("a" << 10 << "b" << 0), BSON("a" << 20 << "b" << 0)),
+             std::make_pair(BSON("a" << 30 << "b" << 0), BSON("a" << 40 << "b" << 0))});
     }
 };
 
 TEST_F(TwoChunksWithGapCompoundKeyFixture, ChunkGapOrphanedDataRanges) {
     stRangeMap pending;
+
     auto keyRange = makeCollectionMetadata()->getNextOrphanRange(
         pending, makeCollectionMetadata()->getMinKey());
     ASSERT(keyRange);
-    ASSERT(keyRange->minKey.woCompare(makeCollectionMetadata()->getMinKey()) == 0);
-    ASSERT(keyRange->maxKey.woCompare(BSON("a" << 10 << "b" << 0)) == 0);
-    ASSERT(keyRange->keyPattern.woCompare(makeCollectionMetadata()->getKeyPattern()) == 0);
+    ASSERT(keyRange->getMin().woCompare(makeCollectionMetadata()->getMinKey()) == 0);
+    ASSERT(keyRange->getMax().woCompare(BSON("a" << 10 << "b" << 0)) == 0);
 
-    keyRange = makeCollectionMetadata()->getNextOrphanRange(pending, keyRange->maxKey);
+    keyRange = makeCollectionMetadata()->getNextOrphanRange(pending, keyRange->getMax());
     ASSERT(keyRange);
-    ASSERT(keyRange->minKey.woCompare(BSON("a" << 20 << "b" << 0)) == 0);
-    ASSERT(keyRange->maxKey.woCompare(BSON("a" << 30 << "b" << 0)) == 0);
-    ASSERT(keyRange->keyPattern.woCompare(makeCollectionMetadata()->getKeyPattern()) == 0);
+    ASSERT(keyRange->getMin().woCompare(BSON("a" << 20 << "b" << 0)) == 0);
+    ASSERT(keyRange->getMax().woCompare(BSON("a" << 30 << "b" << 0)) == 0);
 
-    keyRange = makeCollectionMetadata()->getNextOrphanRange(pending, keyRange->maxKey);
+    keyRange = makeCollectionMetadata()->getNextOrphanRange(pending, keyRange->getMax());
     ASSERT(keyRange);
-    ASSERT(keyRange->minKey.woCompare(BSON("a" << 40 << "b" << 0)) == 0);
-    ASSERT(keyRange->maxKey.woCompare(makeCollectionMetadata()->getMaxKey()) == 0);
-    ASSERT(keyRange->keyPattern.woCompare(makeCollectionMetadata()->getKeyPattern()) == 0);
+    ASSERT(keyRange->getMin().woCompare(BSON("a" << 40 << "b" << 0)) == 0);
+    ASSERT(keyRange->getMax().woCompare(makeCollectionMetadata()->getMaxKey()) == 0);
 
-    ASSERT(!makeCollectionMetadata()->getNextOrphanRange(pending, keyRange->maxKey));
+    ASSERT(!makeCollectionMetadata()->getNextOrphanRange(pending, keyRange->getMax()));
 }
 
 /**
@@ -296,39 +290,32 @@ TEST_F(TwoChunksWithGapCompoundKeyFixture, ChunkGapOrphanedDataRanges) {
 class ThreeChunkWithRangeGapFixture : public unittest::Test {
 protected:
     std::unique_ptr<CollectionMetadata> makeCollectionMetadata() const {
-        const OID epoch = OID::gen();
 
-        auto shardChunksMap =
-            SimpleBSONObjComparator::kInstance.makeBSONObjIndexedMap<CachedChunkInfo>();
-        shardChunksMap.emplace(BSON("a" << MINKEY),
-                               CachedChunkInfo(BSON("a" << 10), ChunkVersion(1, 1, epoch)));
-        shardChunksMap.emplace(BSON("a" << 10),
-                               CachedChunkInfo(BSON("a" << 20), ChunkVersion(1, 3, epoch)));
-        shardChunksMap.emplace(BSON("a" << 30),
-                               CachedChunkInfo(BSON("a" << MAXKEY), ChunkVersion(1, 2, epoch)));
-
-        return stdx::make_unique<CollectionMetadata>(BSON("a" << 1),
-                                                     ChunkVersion(1, 3, epoch),
-                                                     ChunkVersion(1, 3, epoch),
-                                                     std::move(shardChunksMap));
+        return makeCollectionMetadataImpl(KeyPattern(BSON("a" << 1)),
+                                          {std::make_pair(BSON("a" << MINKEY), BSON("a" << 10)),
+                                           std::make_pair(BSON("a" << 10), BSON("a" << 20)),
+                                           std::make_pair(BSON("a" << 30), BSON("a" << MAXKEY))});
     }
 };
 
-TEST_F(ThreeChunkWithRangeGapFixture, ChunkVersionsMatch) {
+TEST_F(ThreeChunkWithRangeGapFixture, GetNextChunkMatch) {
     auto metadata(makeCollectionMetadata());
 
     ChunkType chunk;
 
     ASSERT(metadata->getNextChunk(BSON("a" << MINKEY), &chunk));
-    ASSERT_EQ(ChunkVersion(1, 1, metadata->getCollVersion().epoch()), chunk.getVersion());
     ASSERT_BSONOBJ_EQ(metadata->getMinKey(), chunk.getMin());
+    ASSERT_BSONOBJ_EQ(BSON("a" << MINKEY), chunk.getMin());
+    ASSERT_BSONOBJ_EQ(BSON("a" << 10), chunk.getMax());
 
     ASSERT(metadata->getNextChunk(BSON("a" << 10), &chunk));
-    ASSERT_EQ(ChunkVersion(1, 3, metadata->getCollVersion().epoch()), chunk.getVersion());
+    ASSERT_BSONOBJ_EQ(BSON("a" << 10), chunk.getMin());
+    ASSERT_BSONOBJ_EQ(BSON("a" << 20), chunk.getMax());
 
     ASSERT(metadata->getNextChunk(BSON("a" << 30), &chunk));
-    ASSERT_EQ(ChunkVersion(1, 2, metadata->getCollVersion().epoch()), chunk.getVersion());
+    ASSERT_BSONOBJ_EQ(BSON("a" << 30), chunk.getMin());
     ASSERT_BSONOBJ_EQ(metadata->getMaxKey(), chunk.getMax());
+    ASSERT_BSONOBJ_EQ(BSON("a" << MAXKEY), chunk.getMax());
 }
 
 TEST_F(ThreeChunkWithRangeGapFixture, ShardOwnsDoc) {
@@ -339,6 +326,7 @@ TEST_F(ThreeChunkWithRangeGapFixture, ShardOwnsDoc) {
 }
 
 TEST_F(ThreeChunkWithRangeGapFixture, ShardDoesntOwnDoc) {
+    ASSERT_FALSE(makeCollectionMetadata()->keyBelongsToMe(BSON("a" << 20)));
     ASSERT_FALSE(makeCollectionMetadata()->keyBelongsToMe(BSON("a" << 25)));
     ASSERT_FALSE(makeCollectionMetadata()->keyBelongsToMe(BSON("a" << MAXKEY)));
 }

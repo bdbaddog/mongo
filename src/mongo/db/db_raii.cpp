@@ -30,69 +30,14 @@
 
 #include "mongo/db/db_raii.h"
 
-#include "mongo/db/catalog/collection.h"
-#include "mongo/db/catalog/database.h"
 #include "mongo/db/catalog/database_holder.h"
-#include "mongo/db/client.h"
+#include "mongo/db/catalog/uuid_catalog.h"
 #include "mongo/db/curop.h"
-#include "mongo/db/repl/replication_coordinator_global.h"
+#include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/s/collection_sharding_state.h"
 #include "mongo/db/stats/top.h"
-#include "mongo/util/fail_point_service.h"
 
 namespace mongo {
-
-namespace {
-MONGO_FP_DECLARE(setAutoGetCollectionWait);
-}  // namespace
-
-AutoGetDb::AutoGetDb(OperationContext* opCtx, StringData ns, LockMode mode)
-    : _dbLock(opCtx, ns, mode), _db(dbHolder().get(opCtx, ns)) {}
-
-AutoGetCollection::AutoGetCollection(OperationContext* opCtx,
-                                     const NamespaceString& nss,
-                                     LockMode modeDB,
-                                     LockMode modeColl,
-                                     ViewMode viewMode)
-    : _viewMode(viewMode),
-      _autoDb(opCtx, nss.db(), modeDB),
-      _collLock(opCtx->lockState(), nss.ns(), modeColl),
-      _coll(_autoDb.getDb() ? _autoDb.getDb()->getCollection(opCtx, nss) : nullptr) {
-    Database* db = _autoDb.getDb();
-    // If the database exists, but not the collection, check for views.
-    if (_viewMode == ViewMode::kViewsForbidden && db && !_coll &&
-        db->getViewCatalog()->lookup(opCtx, nss.ns()))
-        uasserted(ErrorCodes::CommandNotSupportedOnView,
-                  str::stream() << "Namespace " << nss.ns() << " is a view, not a collection");
-
-    // Wait for a configured amount of time after acquiring locks if the failpoint is enabled.
-    MONGO_FAIL_POINT_BLOCK(setAutoGetCollectionWait, customWait) {
-        const BSONObj& data = customWait.getData();
-        sleepFor(Milliseconds(data["waitForMillis"].numberInt()));
-    }
-}
-
-AutoGetCollectionOrView::AutoGetCollectionOrView(OperationContext* opCtx,
-                                                 const NamespaceString& nss,
-                                                 LockMode modeAll)
-    : _autoColl(opCtx, nss, modeAll, modeAll, AutoGetCollection::ViewMode::kViewsPermitted),
-      _view(_autoColl.getDb() && !_autoColl.getCollection()
-                ? _autoColl.getDb()->getViewCatalog()->lookup(opCtx, nss.ns())
-                : nullptr) {}
-
-AutoGetOrCreateDb::AutoGetOrCreateDb(OperationContext* opCtx, StringData ns, LockMode mode)
-    : _dbLock(opCtx, ns, mode), _db(dbHolder().get(opCtx, ns)) {
-    invariant(mode == MODE_IX || mode == MODE_X);
-    _justCreated = false;
-    // If the database didn't exist, relock in MODE_X
-    if (_db == NULL) {
-        if (mode != MODE_X) {
-            _dbLock.relockWithMode(MODE_X);
-        }
-        _db = dbHolder().openDb(opCtx, ns);
-        _justCreated = true;
-    }
-}
 
 AutoStatsTracker::AutoStatsTracker(OperationContext* opCtx,
                                    const NamespaceString& nss,
@@ -107,6 +52,7 @@ AutoStatsTracker::AutoStatsTracker(OperationContext* opCtx,
             dbProfilingLevel = autoDb.getDb()->getProfilingLevel();
         }
     }
+
     stdx::lock_guard<Client> clientLock(*_opCtx->getClient());
     CurOp::get(_opCtx)->enter_inlock(nss.ns().c_str(), dbProfilingLevel);
 }
@@ -124,6 +70,25 @@ AutoStatsTracker::~AutoStatsTracker() {
 }
 
 AutoGetCollectionForRead::AutoGetCollectionForRead(OperationContext* opCtx,
+                                                   const StringData dbName,
+                                                   const UUID& uuid) {
+    // Lock the database since a UUID will always be in the same database even though its
+    // collection name may change.
+    Lock::DBLock dbSLock(opCtx, dbName, MODE_IS);
+
+    auto nss = UUIDCatalog::get(opCtx).lookupNSSByUUID(uuid);
+
+    // If the UUID doesn't exist, we leave _autoColl to be boost::none.
+    if (!nss.isEmpty()) {
+        _autoColl.emplace(
+            opCtx, nss, MODE_IS, AutoGetCollection::ViewMode::kViewsForbidden, std::move(dbSLock));
+
+        // Note: this can yield.
+        _ensureMajorityCommittedSnapshotIsValid(nss, opCtx);
+    }
+}
+
+AutoGetCollectionForRead::AutoGetCollectionForRead(OperationContext* opCtx,
                                                    const NamespaceString& nss,
                                                    AutoGetCollection::ViewMode viewMode) {
     _autoColl.emplace(opCtx, nss, MODE_IS, MODE_IS, viewMode);
@@ -132,6 +97,15 @@ AutoGetCollectionForRead::AutoGetCollectionForRead(OperationContext* opCtx,
     _ensureMajorityCommittedSnapshotIsValid(nss, opCtx);
 }
 
+AutoGetCollectionForRead::AutoGetCollectionForRead(OperationContext* opCtx,
+                                                   const NamespaceString& nss,
+                                                   AutoGetCollection::ViewMode viewMode,
+                                                   Lock::DBLock lock) {
+    _autoColl.emplace(opCtx, nss, MODE_IS, viewMode, std::move(lock));
+
+    // Note: this can yield.
+    _ensureMajorityCommittedSnapshotIsValid(nss, opCtx);
+}
 void AutoGetCollectionForRead::_ensureMajorityCommittedSnapshotIsValid(const NamespaceString& nss,
                                                                        OperationContext* opCtx) {
     while (true) {
@@ -169,9 +143,11 @@ void AutoGetCollectionForRead::_ensureMajorityCommittedSnapshotIsValid(const Nam
 }
 
 AutoGetCollectionForReadCommand::AutoGetCollectionForReadCommand(
-    OperationContext* opCtx, const NamespaceString& nss, AutoGetCollection::ViewMode viewMode) {
-
-    _autoCollForRead.emplace(opCtx, nss, viewMode);
+    OperationContext* opCtx,
+    const NamespaceString& nss,
+    AutoGetCollection::ViewMode viewMode,
+    Lock::DBLock lock) {
+    _autoCollForRead.emplace(opCtx, nss, viewMode, std::move(lock));
     const int doNotChangeProfilingLevel = 0;
     _statsTracker.emplace(opCtx,
                           nss,
@@ -185,12 +161,42 @@ AutoGetCollectionForReadCommand::AutoGetCollectionForReadCommand(
     css->checkShardVersionOrThrow(opCtx);
 }
 
+AutoGetCollectionForReadCommand::AutoGetCollectionForReadCommand(
+    OperationContext* opCtx, const NamespaceString& nss, AutoGetCollection::ViewMode viewMode)
+    : AutoGetCollectionForReadCommand(
+          opCtx, nss, viewMode, Lock::DBLock(opCtx, nss.db(), MODE_IS)) {}
+
 AutoGetCollectionOrViewForReadCommand::AutoGetCollectionOrViewForReadCommand(
     OperationContext* opCtx, const NamespaceString& nss)
     : AutoGetCollectionForReadCommand(opCtx, nss, AutoGetCollection::ViewMode::kViewsPermitted),
       _view(_autoCollForRead->getDb() && !getCollection()
                 ? _autoCollForRead->getDb()->getViewCatalog()->lookup(opCtx, nss.ns())
                 : nullptr) {}
+
+AutoGetCollectionOrViewForReadCommand::AutoGetCollectionOrViewForReadCommand(
+    OperationContext* opCtx, const NamespaceString& nss, Lock::DBLock lock)
+    : AutoGetCollectionForReadCommand(
+          opCtx, nss, AutoGetCollection::ViewMode::kViewsPermitted, std::move(lock)),
+      _view(_autoCollForRead->getDb() && !getCollection()
+                ? _autoCollForRead->getDb()->getViewCatalog()->lookup(opCtx, nss.ns())
+                : nullptr) {}
+
+AutoGetCollectionForReadCommand::AutoGetCollectionForReadCommand(OperationContext* opCtx,
+                                                                 const StringData dbName,
+                                                                 const UUID& uuid) {
+    _autoCollForRead.emplace(opCtx, dbName, uuid);
+    if (_autoCollForRead->getCollection()) {
+        _statsTracker.emplace(opCtx,
+                              _autoCollForRead->getCollection()->ns(),
+                              Top::LockType::ReadLocked,
+                              _autoCollForRead->getDb()->getProfilingLevel());
+
+        // We have both the DB and collection locked, which is the prerequisite to do a stable shard
+        // version check, but we'd like to do the check after we have a satisfactory snapshot.
+        auto css = CollectionShardingState::get(opCtx, _autoCollForRead->getCollection()->ns());
+        css->checkShardVersionOrThrow(opCtx);
+    }
+}
 
 void AutoGetCollectionOrViewForReadCommand::releaseLocksForView() noexcept {
     invariant(_view);

@@ -1,5 +1,5 @@
 /*-
- * Copyright (c) 2014-2017 MongoDB, Inc.
+ * Copyright (c) 2014-2018 MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -116,6 +116,12 @@ __wt_gen_drain(WT_SESSION_IMPL *session, int which, uint64_t generation)
 			if (v == 0 || v >= generation)
 				break;
 
+			/* If we're waiting on ourselves, we're deadlocked. */
+			if (session == s) {
+				WT_ASSERT(session, session != s);
+				WT_IGNORE_RET(__wt_panic(session));
+			}
+
 			/*
 			 * The pause count is cumulative, quit spinning if it's
 			 * not doing us any good, that can happen in generations
@@ -221,8 +227,8 @@ __stash_discard(WT_SESSION_IMPL *session, int which)
 	WT_CONNECTION_IMPL *conn;
 	WT_SESSION_STASH *session_stash;
 	WT_STASH *stash;
-	uint64_t oldest;
 	size_t i;
+	uint64_t oldest;
 
 	conn = S2C(session);
 	session_stash = &session->stash[which];
@@ -327,8 +333,8 @@ __wt_stash_discard_all(WT_SESSION_IMPL *session_safe, WT_SESSION_IMPL *session)
 {
 	WT_SESSION_STASH *session_stash;
 	WT_STASH *stash;
-	int which;
 	size_t i;
+	int which;
 
 	/*
 	 * This function is called during WT_CONNECTION.close to discard any

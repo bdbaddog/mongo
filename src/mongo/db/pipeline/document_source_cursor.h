@@ -30,6 +30,7 @@
 
 #include <deque>
 
+#include "mongo/db/db_raii.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/pipeline/document_source.h"
 #include "mongo/db/pipeline/document_source_limit.h"
@@ -50,8 +51,16 @@ public:
         return _outputSorts;
     }
     Value serialize(boost::optional<ExplainOptions::Verbosity> explain = boost::none) const final;
-    InitialSourceType getInitialSourceType() const final {
-        return InitialSourceType::kInitialSource;
+
+    StageConstraints constraints(Pipeline::SplitState pipeState) const final {
+        StageConstraints constraints(StreamType::kStreaming,
+                                     PositionRequirement::kFirst,
+                                     HostTypeRequirement::kAnyShard,
+                                     DiskUseRequirement::kNoDiskUse,
+                                     FacetRequirement::kNotAllowed);
+
+        constraints.requiresInputDocSource = false;
+        return constraints;
     }
 
     void detachFromOperationContext() final;
@@ -123,6 +132,13 @@ public:
         _shouldProduceEmptyDocs = true;
     }
 
+    Timestamp getLatestOplogTimestamp() const {
+        if (_exec) {
+            return _exec->getLatestOplogTimestamp();
+        }
+        return Timestamp();
+    }
+
     const std::string& getPlanSummaryStr() const {
         return _planSummary;
     }
@@ -133,8 +149,8 @@ public:
 
 protected:
     /**
-     * Disposes of '_exec' and '_rangePreserver' if they haven't been disposed already. This
-     * involves taking a collection lock.
+     * Disposes of '_exec' if it hasn't been disposed already. This involves taking a collection
+     * lock.
      */
     void doDispose() final;
 
@@ -151,9 +167,15 @@ private:
     ~DocumentSourceCursor();
 
     /**
-     * Acquires locks to properly destroy and de-register '_exec'. '_exec' must be non-null.
+     * Acquires the appropriate locks, then destroys and de-registers '_exec'. '_exec' must be
+     * non-null.
      */
     void cleanupExecutor();
+
+    /**
+     * Destroys and de-registers '_exec'. '_exec' must be non-null.
+     */
+    void cleanupExecutor(const AutoGetCollectionForRead& readLock);
 
     /**
      * Reads a batch of data from '_exec'.

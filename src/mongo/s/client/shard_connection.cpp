@@ -89,9 +89,9 @@ private:
 /**
  * Command to allow access to the sharded conn pool information in mongos.
  */
-class ShardedPoolStats : public Command {
+class ShardedPoolStats : public BasicCommand {
 public:
-    ShardedPoolStats() : Command("shardConnPoolStats") {}
+    ShardedPoolStats() : BasicCommand("shardConnPoolStats") {}
     virtual void help(stringstream& help) const {
         help << "stats about the shard connection pool";
     }
@@ -114,7 +114,6 @@ public:
     virtual bool run(OperationContext* opCtx,
                      const string& dbname,
                      const mongo::BSONObj& cmdObj,
-                     std::string& errmsg,
                      mongo::BSONObjBuilder& result) {
         // Connection information
         executor::ConnectionPoolStats stats{};
@@ -365,18 +364,17 @@ public:
 
     // -----
 
-    static thread_specific_ptr<ClientConnections> _perThread;
+    static thread_local std::unique_ptr<ClientConnections> _perThread;
 
     static ClientConnections* threadInstance() {
-        ClientConnections* cc = _perThread.get();
-        if (!cc) {
-            cc = new ClientConnections();
-            _perThread.reset(cc);
+        if (!_perThread) {
+            _perThread = stdx::make_unique<ClientConnections>();
         }
-        return cc;
+        return _perThread.get();
     }
 };
 
+thread_local std::unique_ptr<ClientConnections> ClientConnections::_perThread;
 
 void ActiveClientConnections::appendInfo(BSONObjBuilder& b) {
     BSONArrayBuilder arr(64 * 1024);  // There may be quite a few threads
@@ -394,8 +392,6 @@ void ActiveClientConnections::appendInfo(BSONObjBuilder& b) {
 
     b.appendArray("threads", arr.obj());
 }
-
-thread_specific_ptr<ClientConnections> ClientConnections::_perThread;
 
 }  // namespace
 

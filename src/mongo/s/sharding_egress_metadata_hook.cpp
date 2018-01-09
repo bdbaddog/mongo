@@ -45,10 +45,12 @@
 #include "mongo/util/net/hostandport.h"
 
 namespace mongo {
-
 namespace rpc {
 
-using std::shared_ptr;
+ShardingEgressMetadataHook::ShardingEgressMetadataHook(ServiceContext* serviceContext)
+    : _serviceContext(serviceContext) {
+    invariant(_serviceContext);
+}
 
 Status ShardingEgressMetadataHook::writeRequestMetadata(OperationContext* opCtx,
                                                         BSONObjBuilder* metadataBob) {
@@ -62,7 +64,8 @@ Status ShardingEgressMetadataHook::writeRequestMetadata(OperationContext* opCtx,
     }
 }
 
-Status ShardingEgressMetadataHook::readReplyMetadata(StringData replySource,
+Status ShardingEgressMetadataHook::readReplyMetadata(OperationContext* opCtx,
+                                                     StringData replySource,
                                                      const BSONObj& metadataObj) {
     try {
         _saveGLEStats(metadataObj, replySource);
@@ -74,8 +77,10 @@ Status ShardingEgressMetadataHook::readReplyMetadata(StringData replySource,
 
 Status ShardingEgressMetadataHook::_advanceConfigOptimeFromShard(ShardId shardId,
                                                                  const BSONObj& metadataObj) {
+    auto const grid = Grid::get(_serviceContext);
+
     try {
-        auto shard = grid.shardRegistry()->getShardNoReload(shardId);
+        auto shard = grid->shardRegistry()->getShardNoReload(shardId);
         if (!shard) {
             return Status::OK();
         }
@@ -97,7 +102,7 @@ Status ShardingEgressMetadataHook::_advanceConfigOptimeFromShard(ShardId shardId
                 // is safe to use.
                 const auto& replMetadata = parseStatus.getValue();
                 auto opTime = replMetadata.getLastOpCommitted();
-                grid.advanceConfigOpTime(opTime);
+                grid->advanceConfigOpTime(opTime);
             }
         } else {
             // Regular shards return the config opTime as part of ConfigServerMetadata.
@@ -109,7 +114,7 @@ Status ShardingEgressMetadataHook::_advanceConfigOptimeFromShard(ShardId shardId
             const auto& configMetadata = parseStatus.getValue();
             auto opTime = configMetadata.getOpTime();
             if (opTime.is_initialized()) {
-                grid.advanceConfigOpTime(opTime.get());
+                grid->advanceConfigOpTime(opTime.get());
             }
         }
         return Status::OK();

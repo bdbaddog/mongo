@@ -1,5 +1,5 @@
 /*-
- * Copyright (c) 2014-2017 MongoDB, Inc.
+ * Copyright (c) 2014-2018 MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -18,8 +18,8 @@ util_list(WT_SESSION *session, int argc, char *argv[])
 {
 	WT_DECL_RET;
 	int ch;
-	bool cflag, vflag;
 	char *uri;
+	bool cflag, vflag;
 
 	cflag = vflag = false;
 	uri = NULL;
@@ -102,8 +102,8 @@ list_print(WT_SESSION *session, const char *uri, bool cflag, bool vflag)
 {
 	WT_CURSOR *cursor;
 	WT_DECL_RET;
-	bool found;
 	const char *key, *value;
+	bool found;
 
 	/* Open the metadata file. */
 	if ((ret = session->open_cursor(
@@ -175,8 +175,8 @@ static int
 list_print_checkpoint(WT_SESSION *session, const char *key)
 {
 	WT_BLOCK_CKPT ci;
-	WT_DECL_RET;
 	WT_CKPT *ckpt, *ckptbase;
+	WT_DECL_RET;
 	size_t allocsize, len;
 	time_t t;
 	uint64_t v;
@@ -231,7 +231,8 @@ list_print_checkpoint(WT_SESSION *session, const char *key)
 		if (ci.root_size != 0) {
 			printf("\t\t" "root offset: %" PRIuMAX
 			    " (0x%" PRIxMAX ")\n",
-			    (intmax_t)ci.root_offset, (intmax_t)ci.root_offset);
+			    (uintmax_t)ci.root_offset,
+			    (uintmax_t)ci.root_offset);
 			printf("\t\t" "root size: %" PRIu32
 			    " (0x%" PRIx32 ")\n",
 			    ci.root_size, ci.root_size);

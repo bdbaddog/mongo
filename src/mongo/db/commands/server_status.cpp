@@ -48,9 +48,10 @@
 #include "mongo/db/stats/counters.h"
 #include "mongo/platform/process_id.h"
 #include "mongo/transport/message_compressor_registry.h"
-#include "mongo/transport/transport_layer.h"
+#include "mongo/transport/service_entry_point.h"
 #include "mongo/util/log.h"
 #include "mongo/util/net/hostname_canonicalization.h"
+#include "mongo/util/net/sock.h"
 #include "mongo/util/net/ssl_manager.h"
 #include "mongo/util/processinfo.h"
 #include "mongo/util/ramlog.h"
@@ -64,9 +65,9 @@ using std::map;
 using std::string;
 using std::stringstream;
 
-class CmdServerStatus : public Command {
+class CmdServerStatus : public BasicCommand {
 public:
-    CmdServerStatus() : Command("serverStatus"), _started(Date_t::now()), _runCalled(false) {}
+    CmdServerStatus() : BasicCommand("serverStatus"), _started(Date_t::now()), _runCalled(false) {}
 
     virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
         return false;
@@ -74,7 +75,9 @@ public:
     virtual bool slaveOk() const {
         return true;
     }
-
+    virtual bool allowsAfterClusterTime(const BSONObj& cmdObj) const override {
+        return false;
+    }
     virtual void help(stringstream& help) const {
         help << "returns lots of administrative server statistics";
     }
@@ -88,7 +91,6 @@ public:
     bool run(OperationContext* opCtx,
              const string& dbname,
              const BSONObj& cmdObj,
-             string& errmsg,
              BSONObjBuilder& result) {
         _runCalled = true;
 
@@ -233,7 +235,11 @@ public:
 
     BSONObj generateSection(OperationContext* opCtx, const BSONElement& configElement) const {
         BSONObjBuilder bb;
-        auto stats = opCtx->getServiceContext()->getTransportLayer()->sessionStats();
+
+        auto serviceEntryPoint = opCtx->getServiceContext()->getServiceEntryPoint();
+        invariant(serviceEntryPoint);
+
+        auto stats = serviceEntryPoint->sessionStats();
         bb.append("current", static_cast<int>(stats.numOpenSessions));
         bb.append("available", static_cast<int>(stats.numAvailableSessions));
         bb.append("totalCreated", static_cast<int>(stats.numCreatedSessions));
@@ -293,6 +299,10 @@ public:
         BSONObjBuilder b;
         networkCounter.append(b);
         appendMessageCompressionStats(&b);
+        auto executor = opCtx->getServiceContext()->getServiceExecutor();
+        if (executor)
+            executor->appendStats(&b);
+
         return b.obj();
     }
 

@@ -39,10 +39,12 @@
 #include "mongo/db/s/active_migrations_registry.h"
 #include "mongo/db/s/collection_sharding_state.h"
 #include "mongo/db/s/migration_session_id.h"
+#include "mongo/db/s/session_catalog_migration_destination.h"
 #include "mongo/s/shard_id.h"
 #include "mongo/stdx/condition_variable.h"
 #include "mongo/stdx/mutex.h"
 #include "mongo/stdx/thread.h"
+#include "mongo/util/concurrency/with_lock.h"
 #include "mongo/util/timer.h"
 
 namespace mongo {
@@ -162,8 +164,10 @@ private:
      * it schedules deletion of any documents in the range, so that process must be seen to be
      * complete before migrating any new documents in.
      */
-    auto _notePending(OperationContext*, NamespaceString const&, OID const&, ChunkRange const&)
-        -> CollectionShardingState::CleanupNotification;
+    CollectionShardingState::CleanupNotification _notePending(OperationContext*,
+                                                              NamespaceString const&,
+                                                              OID const&,
+                                                              ChunkRange const&);
 
     /**
      * Stops tracking a chunk range between 'min' and 'max' that previously was having data
@@ -174,10 +178,8 @@ private:
     /**
      * Checks whether the MigrationDestinationManager is currently handling a migration by checking
      * that the migration "_sessionId" is initialized.
-     *
-     * Expects the caller to have the class _mutex locked!
      */
-    bool _isActive_inlock() const;
+    bool _isActive(WithLock) const;
 
     // Mutex to guard all fields
     mutable stdx::mutex _mutex;
@@ -212,6 +214,8 @@ private:
 
     State _state{READY};
     std::string _errmsg;
+
+    std::unique_ptr<SessionCatalogMigrationDestination> _sessionMigration;
 };
 
 }  // namespace mongo

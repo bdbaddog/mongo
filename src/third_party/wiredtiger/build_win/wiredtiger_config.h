@@ -79,6 +79,9 @@
 /* Define to 1 if you have the <memory.h> header file. */
 /* #undef HAVE_MEMORY_H */
 
+/* Define to 1 if pthread condition variables support monotonic clocks. */
+/* #undef HAVE_PTHREAD_COND_MONOTONIC */
+
 /* Define to 1 if you have the `posix_fadvise' function. */
 /* #undef HAVE_POSIX_FADVISE */
 
@@ -121,9 +124,6 @@
 /* Define to 1 if you have the <unistd.h> header file. */
 /* #undef HAVE_UNISTD_H */
 
-/* Enable verbose message configuration. */
-/* #undef HAVE_VERBOSE */
-
 /* Define to 1 if you have the <x86intrin.h> header file. */
 #define HAVE_X86INTRIN_H 1
 
@@ -132,6 +132,9 @@
 
 /* Define to 1 if you have the ANSI C header files. */
 #define STDC_HEADERS 1
+
+/* Size of a transaction timestamp in bytes */
+#define WT_TIMESTAMP_SIZE 8
 
 /* Define WORDS_BIGENDIAN to 1 if your processor stores words with the most
    significant byte first (like Motorola and SPARC, unlike Intel). */

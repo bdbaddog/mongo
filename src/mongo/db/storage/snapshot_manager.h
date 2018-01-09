@@ -34,7 +34,6 @@
 #include "mongo/base/status.h"
 #include "mongo/bson/timestamp.h"
 #include "mongo/db/operation_context.h"
-#include "mongo/db/storage/snapshot_name.h"
 #include "mongo/util/assert_util.h"
 
 namespace mongo {
@@ -61,16 +60,6 @@ public:
     virtual Status prepareForCreateSnapshot(OperationContext* opCtx) = 0;
 
     /**
-     * Creates a new named snapshot representing the same point-in-time captured in
-     * prepareForCreateSnapshot().
-     *
-     * Must be called in the same ScopedTransaction as prepareForCreateSnapshot.
-     *
-     * Caller guarantees that this name must compare greater than all existing snapshots.
-     */
-    virtual Status createSnapshot(OperationContext* opCtx, const SnapshotName& name) = 0;
-
-    /**
      * Sets the snapshot to be used for committed reads.
      *
      * Implementations are allowed to assume that all older snapshots have names that compare
@@ -80,7 +69,7 @@ public:
      * can be done later. In particular, cleaning up of old snapshots should be deferred until
      * cleanupUnneededSnapshots is called.
      */
-    virtual void setCommittedSnapshot(const SnapshotName& name) = 0;
+    virtual void setCommittedSnapshot(const Timestamp& timestamp) = 0;
 
     /**
      * Cleans up all snapshots older than the current committed snapshot.

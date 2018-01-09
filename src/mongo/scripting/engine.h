@@ -38,13 +38,12 @@ typedef unsigned long long ScriptingFunction;
 typedef BSONObj (*NativeFunction)(const BSONObj& args, void* data);
 typedef std::map<std::string, ScriptingFunction> FunctionCacheMap;
 
-class DBClientWithCommands;
 class DBClientBase;
 class OperationContext;
 
 struct JSFile {
     const char* name;
-    const StringData& source;
+    const StringData source;
 };
 
 class Scope {
@@ -102,6 +101,8 @@ public:
     virtual void gc() = 0;
 
     virtual void advanceGeneration() = 0;
+
+    virtual void requireOwnedObjects() = 0;
 
     virtual ScriptingFunction createFunction(const char* code);
 
@@ -264,10 +265,10 @@ public:
     void setScopeInitCallback(void (*func)(Scope&)) {
         _scopeInitCallback = func;
     }
-    static void setConnectCallback(void (*func)(DBClientWithCommands&)) {
+    static void setConnectCallback(void (*func)(DBClientBase&)) {
         _connectCallback = func;
     }
-    static void runConnectCallback(DBClientWithCommands& c) {
+    static void runConnectCallback(DBClientBase& c) {
         if (_connectCallback)
             _connectCallback(c);
     }
@@ -285,7 +286,7 @@ protected:
     void (*_scopeInitCallback)(Scope&);
 
 private:
-    static void (*_connectCallback)(DBClientWithCommands&);
+    static void (*_connectCallback)(DBClientBase&);
 };
 
 void installGlobalUtils(Scope& scope);

@@ -33,6 +33,7 @@
 #include "mongo/db/repl/repl_set_config.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/platform/atomic_word.h"
+#include "mongo/stdx/functional.h"
 
 namespace mongo {
 
@@ -118,7 +119,7 @@ public:
     virtual void setMyLastAppliedOpTime(const OpTime& opTime);
     virtual void setMyLastDurableOpTime(const OpTime& opTime);
 
-    virtual void setMyLastAppliedOpTimeForward(const OpTime& opTime);
+    virtual void setMyLastAppliedOpTimeForward(const OpTime& opTime, DataConsistency consistency);
     virtual void setMyLastDurableOpTimeForward(const OpTime& opTime);
 
     virtual void resetMyLastOpTimes();
@@ -131,13 +132,16 @@ public:
     virtual Status waitUntilOpTimeForRead(OperationContext* opCtx,
                                           const ReadConcernArgs& settings) override;
 
+    virtual Status waitUntilOpTimeForReadUntil(OperationContext* opCtx,
+                                               const ReadConcernArgs& settings,
+                                               boost::optional<Date_t> deadline) override;
     virtual OID getElectionId();
 
     virtual OID getMyRID() const;
 
     virtual int getMyId() const;
 
-    virtual bool setFollowerMode(const MemberState& newState);
+    virtual Status setFollowerMode(const MemberState& newState);
 
     virtual ApplierState getApplierState();
 
@@ -149,8 +153,7 @@ public:
 
     virtual Status resyncData(OperationContext* opCtx, bool waitUntilCompleted) override;
 
-    virtual StatusWith<BSONObj> prepareReplSetUpdatePositionCommand(
-        ReplSetUpdatePositionCommandStyle commandStyle) const override;
+    virtual StatusWith<BSONObj> prepareReplSetUpdatePositionCommand() const override;
 
     virtual Status processReplSetGetStatus(BSONObjBuilder*, ReplSetGetStatusResponseStyle);
 
@@ -195,8 +198,6 @@ public:
 
     virtual Status processReplSetElect(const ReplSetElectArgs& args, BSONObjBuilder* resultObj);
 
-    virtual Status processReplSetUpdatePosition(const OldUpdatePositionArgs& updates,
-                                                long long* configVersion);
     virtual Status processReplSetUpdatePosition(const UpdatePositionArgs& updates,
                                                 long long* configVersion);
 
@@ -216,7 +217,7 @@ public:
 
     virtual void blacklistSyncSource(const HostAndPort& host, Date_t until);
 
-    virtual void resetLastOpTimesFromOplog(OperationContext* opCtx);
+    virtual void resetLastOpTimesFromOplog(OperationContext* opCtx, DataConsistency consistency);
 
     virtual bool shouldChangeSyncSource(const HostAndPort& currentSource,
                                         const rpc::ReplSetMetadata& replMetadata,
@@ -246,20 +247,14 @@ public:
 
     virtual Status updateTerm(OperationContext* opCtx, long long term);
 
-    virtual SnapshotName reserveSnapshotName(OperationContext* opCtx);
-
-    virtual void forceSnapshotCreation() override;
-
-    virtual void createSnapshot(OperationContext* opCtx,
-                                OpTime timeOfSnapshot,
-                                SnapshotName name) override;
+    virtual Timestamp reserveSnapshotName(OperationContext* opCtx);
 
     virtual void dropAllSnapshots() override;
 
     virtual OpTime getCurrentCommittedSnapshotOpTime() const override;
 
     virtual void waitUntilSnapshotCommitted(OperationContext* opCtx,
-                                            const SnapshotName& untilSnapshot) override;
+                                            const Timestamp& untilSnapshot) override;
 
     virtual size_t getNumUncommittedSnapshots() override;
 
@@ -275,6 +270,16 @@ public:
      * Sets the return value for calls to getConfig.
      */
     void setGetConfigReturnValue(ReplSetConfig returnValue);
+
+    /**
+     * Sets the function to generate the return value for calls to awaitReplication() and
+     * awaitReplicationOfLastOpForClient().
+     * 'opTime' is the optime passed to awaitReplication() and set to null when called from
+     * awaitReplicationOfLastOpForClient().
+     */
+    using AwaitReplicationReturnValueFunction = stdx::function<StatusAndDuration(const OpTime&)>;
+    void setAwaitReplicationReturnValueFunction(
+        AwaitReplicationReturnValueFunction returnValueFunction);
 
     /**
      * Always allow writes even if this node is not master. Used by sharding unit tests.
@@ -297,6 +302,9 @@ private:
     OpTime _myLastDurableOpTime;
     OpTime _myLastAppliedOpTime;
     ReplSetConfig _getConfigReturnValue;
+    AwaitReplicationReturnValueFunction _awaitReplicationReturnValueFunction = [](const OpTime&) {
+        return StatusAndDuration(Status::OK(), Milliseconds(0));
+    };
     bool _alwaysAllowWrites = false;
 };
 

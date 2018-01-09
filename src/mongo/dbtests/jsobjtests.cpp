@@ -39,6 +39,7 @@
 #include "mongo/bson/bsonobj_comparator.h"
 #include "mongo/bson/simple_bsonelement_comparator.h"
 #include "mongo/bson/util/builder.h"
+#include "mongo/db/bson/bson_helper.h"
 #include "mongo/db/bson/dotted_path_support.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/json.h"
@@ -1048,7 +1049,7 @@ public:
          * should fail with an assertion
          */
         nestedBSON = recursiveBSON(BSONObj::maxToStringRecursionDepth + 1);
-        ASSERT_THROWS(nestedBSON.toString(s, false, true), UserException);
+        ASSERT_THROWS(nestedBSON.toString(s, false, true), AssertionException);
     }
 };
 
@@ -1544,18 +1545,18 @@ class LabelishOr : public LabelBase {
                                                 << "p")));
     }
     BSONObj actual() {
-        return OR(BSON("a" << GT << 1 << LTE << "x"),
-                  BSON("b" << NE << 1 << NE << "f" << NE << 22.3),
-                  BSON("x"
-                       << "p"));
+        return BSON(OR(BSON("a" << GT << 1 << LTE << "x"),
+                       BSON("b" << NE << 1 << NE << "f" << NE << 22.3),
+                       BSON("x"
+                            << "p")));
     }
 };
 
 class Unallowed {
 public:
     void run() {
-        ASSERT_THROWS(BSON(GT << 4), MsgAssertionException);
-        ASSERT_THROWS(BSON("a" << 1 << GT << 4), MsgAssertionException);
+        ASSERT_THROWS(BSON(GT << 4), AssertionException);
+        ASSERT_THROWS(BSON("a" << 1 << GT << 4), AssertionException);
     }
 };
 
@@ -2040,7 +2041,7 @@ public:
     void good(BSONObj o) {
         if (o.storageValidEmbedded().isOK())
             return;
-        throw UserException(12528, (string) "should be ok for storage:" + o.toString());
+        uasserted(12528, (string) "should be ok for storage:" + o.toString());
     }
 
     void bad(string s) {
@@ -2050,7 +2051,7 @@ public:
     void bad(BSONObj o) {
         if (!o.storageValidEmbedded().isOK())
             return;
-        throw UserException(12529, (string) "should NOT be ok for storage:" + o.toString());
+        uasserted(12529, (string) "should NOT be ok for storage:" + o.toString());
     }
 
     void run() {
@@ -2296,7 +2297,7 @@ public:
 
             ASSERT(!"Expected Throw");
         } catch (const DBException& e) {
-            if (e.getCode() != 13548)  // we expect the code for oversized buffer
+            if (e.code() != 13548)  // we expect the code for oversized buffer
                 throw;
         }
     }

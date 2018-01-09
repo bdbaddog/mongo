@@ -53,6 +53,14 @@ public:
         size_t facetId,
         const boost::intrusive_ptr<TeeBuffer>& bufferSource);
 
+    StageConstraints constraints(Pipeline::SplitState pipeState) const final {
+        return {StreamType::kStreaming,
+                PositionRequirement::kNone,
+                HostTypeRequirement::kNone,
+                DiskUseRequirement::kNoDiskUse,
+                FacetRequirement::kAllowed};
+    }
+
     GetNextResult getNext() final;
 
     /**

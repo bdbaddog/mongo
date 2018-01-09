@@ -45,7 +45,6 @@
 #include "mongo/db/exec/working_set.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/json.h"
-#include "mongo/db/matcher/extensions_callback_disallow_extensions.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/ops/update_lifecycle_impl.h"
 #include "mongo/db/ops/update_request.h"
@@ -91,8 +90,7 @@ public:
     unique_ptr<CanonicalQuery> canonicalize(const BSONObj& query) {
         auto qr = stdx::make_unique<QueryRequest>(nss);
         qr->setFilter(query);
-        auto statusWithCQ = CanonicalQuery::canonicalize(
-            &_opCtx, std::move(qr), ExtensionsCallbackDisallowExtensions());
+        auto statusWithCQ = CanonicalQuery::canonicalize(&_opCtx, std::move(qr));
         ASSERT_OK(statusWithCQ.getStatus());
         return std::move(statusWithCQ.getValue());
     }
@@ -191,7 +189,8 @@ public:
             OldClientWriteContext ctx(&_opCtx, nss.ns());
             CurOp& curOp = *CurOp::get(_opCtx);
             OpDebug* opDebug = &curOp.debug();
-            UpdateDriver driver((UpdateDriver::Options()));
+            const CollatorInterface* collator = nullptr;
+            UpdateDriver driver(new ExpressionContext(&_opCtx, collator));
             Collection* collection = ctx.getCollection();
 
             // Collection should be empty.
@@ -209,7 +208,9 @@ public:
             request.setQuery(query);
             request.setUpdates(updates);
 
-            ASSERT_OK(driver.parse(request.getUpdates(), request.isMulti()));
+            const std::map<StringData, std::unique_ptr<ExpressionWithPlaceholder>> arrayFilters;
+
+            ASSERT_OK(driver.parse(request.getUpdates(), arrayFilters, request.isMulti()));
 
             // Setup update params.
             UpdateStageParams params(&request, &driver, opDebug);
@@ -259,7 +260,8 @@ public:
 
             CurOp& curOp = *CurOp::get(_opCtx);
             OpDebug* opDebug = &curOp.debug();
-            UpdateDriver driver((UpdateDriver::Options()));
+            const CollatorInterface* collator = nullptr;
+            UpdateDriver driver(new ExpressionContext(&_opCtx, collator));
             Database* db = ctx.db();
             Collection* coll = db->getCollection(&_opCtx, nss);
 
@@ -280,7 +282,9 @@ public:
             request.setQuery(query);
             request.setUpdates(updates);
 
-            ASSERT_OK(driver.parse(request.getUpdates(), request.isMulti()));
+            const std::map<StringData, std::unique_ptr<ExpressionWithPlaceholder>> arrayFilters;
+
+            ASSERT_OK(driver.parse(request.getUpdates(), arrayFilters, request.isMulti()));
 
             // Configure the scan.
             CollectionScanParams collScanParams;
@@ -375,7 +379,8 @@ public:
         Collection* coll = ctx.getCollection();
         UpdateLifecycleImpl updateLifecycle(nss);
         UpdateRequest request(nss);
-        UpdateDriver driver((UpdateDriver::Options()));
+        const CollatorInterface* collator = nullptr;
+        UpdateDriver driver(new ExpressionContext(&_opCtx, collator));
         const int targetDocIndex = 0;  // We'll be working with the first doc in the collection.
         const BSONObj query = BSON("foo" << BSON("$gte" << targetDocIndex));
         const auto ws = make_unique<WorkingSet>();
@@ -393,7 +398,9 @@ public:
         request.setReturnDocs(UpdateRequest::RETURN_OLD);
         request.setLifecycle(&updateLifecycle);
 
-        ASSERT_OK(driver.parse(request.getUpdates(), request.isMulti()));
+        const std::map<StringData, std::unique_ptr<ExpressionWithPlaceholder>> arrayFilters;
+
+        ASSERT_OK(driver.parse(request.getUpdates(), arrayFilters, request.isMulti()));
 
         // Configure a QueuedDataStage to pass the first object in the collection back in a
         // RID_AND_OBJ state.
@@ -463,7 +470,8 @@ public:
         Collection* coll = ctx.getCollection();
         UpdateLifecycleImpl updateLifecycle(nss);
         UpdateRequest request(nss);
-        UpdateDriver driver((UpdateDriver::Options()));
+        const CollatorInterface* collator = nullptr;
+        UpdateDriver driver(new ExpressionContext(&_opCtx, collator));
         const int targetDocIndex = 10;
         const BSONObj query = BSON("foo" << BSON("$gte" << targetDocIndex));
         const auto ws = make_unique<WorkingSet>();
@@ -481,7 +489,9 @@ public:
         request.setReturnDocs(UpdateRequest::RETURN_NEW);
         request.setLifecycle(&updateLifecycle);
 
-        ASSERT_OK(driver.parse(request.getUpdates(), request.isMulti()));
+        const std::map<StringData, std::unique_ptr<ExpressionWithPlaceholder>> arrayFilters;
+
+        ASSERT_OK(driver.parse(request.getUpdates(), arrayFilters, request.isMulti()));
 
         // Configure a QueuedDataStage to pass the first object in the collection back in a
         // RID_AND_OBJ state.
@@ -547,7 +557,8 @@ public:
         Collection* coll = ctx.getCollection();
         UpdateLifecycleImpl updateLifecycle(nss);
         UpdateRequest request(nss);
-        UpdateDriver driver((UpdateDriver::Options()));
+        const CollatorInterface* collator = nullptr;
+        UpdateDriver driver(new ExpressionContext(&_opCtx, collator));
         const BSONObj query = BSONObj();
         const auto ws = make_unique<WorkingSet>();
         const unique_ptr<CanonicalQuery> cq(canonicalize(query));
@@ -559,7 +570,9 @@ public:
         request.setMulti(false);
         request.setLifecycle(&updateLifecycle);
 
-        ASSERT_OK(driver.parse(request.getUpdates(), request.isMulti()));
+        const std::map<StringData, std::unique_ptr<ExpressionWithPlaceholder>> arrayFilters;
+
+        ASSERT_OK(driver.parse(request.getUpdates(), arrayFilters, request.isMulti()));
 
         // Configure a QueuedDataStage to pass an OWNED_OBJ to the update stage.
         auto qds = make_unique<QueuedDataStage>(&_opCtx, ws.get());

@@ -32,6 +32,8 @@
 
 #include "mongo/db/logical_clock.h"
 #include "mongo/db/logical_time_validator.h"
+#include "mongo/db/operation_time_tracker.h"
+#include "mongo/db/server_options.h"
 #include "mongo/rpc/metadata/logical_time_metadata.h"
 #include "mongo/stdx/memory.h"
 
@@ -39,6 +41,9 @@ namespace mongo {
 
 namespace rpc {
 
+namespace {
+const char kOperationTimeFieldName[] = "operationTime";
+}
 LogicalTimeMetadataHook::LogicalTimeMetadataHook(ServiceContext* service) : _service(service) {}
 
 Status LogicalTimeMetadataHook::writeRequestMetadata(OperationContext* opCtx,
@@ -54,7 +59,8 @@ Status LogicalTimeMetadataHook::writeRequestMetadata(OperationContext* opCtx,
     return Status::OK();
 }
 
-Status LogicalTimeMetadataHook::readReplyMetadata(StringData replySource,
+Status LogicalTimeMetadataHook::readReplyMetadata(OperationContext* opCtx,
+                                                  StringData replySource,
                                                   const BSONObj& metadataObj) {
     auto parseStatus = LogicalTimeMetadata::readFromMetadata(metadataObj);
     if (!parseStatus.isOK()) {
@@ -63,12 +69,26 @@ Status LogicalTimeMetadataHook::readReplyMetadata(StringData replySource,
 
     auto& signedTime = parseStatus.getValue().getSignedTime();
 
-    // LogicalTimeMetadata is default constructed if no logical time metadata was sent, so a
+    // LogicalTimeMetadata is default constructed if no cluster time metadata was sent, so a
     // default constructed SignedLogicalTime should be ignored.
     if (signedTime.getTime() == LogicalTime::kUninitialized) {
         return Status::OK();
     }
 
+    if (serverGlobalParams.featureCompatibility.getVersion() !=
+        ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo36) {
+        return Status::OK();
+    }
+
+    if (opCtx) {
+        auto timeTracker = OperationTimeTracker::get(opCtx);
+
+        auto operationTime = metadataObj[kOperationTimeFieldName];
+        if (!operationTime.eoo()) {
+            invariant(operationTime.type() == BSONType::bsonTimestamp);
+            timeTracker->updateOperationTime(LogicalTime(operationTime.timestamp()));
+        }
+    }
     return LogicalClock::get(_service)->advanceClusterTime(signedTime.getTime());
 }
 

@@ -33,7 +33,6 @@
 #include "mongo/s/commands/chunk_manager_targeter.h"
 
 #include "mongo/db/matcher/extensions_callback_noop.h"
-#include "mongo/db/operation_context.h"
 #include "mongo/db/query/canonical_query.h"
 #include "mongo/db/query/collation/collation_index_key.h"
 #include "mongo/s/client/shard_registry.h"
@@ -273,9 +272,8 @@ const NamespaceString& ChunkManagerTargeter::getNS() const {
     return _nss;
 }
 
-Status ChunkManagerTargeter::targetInsert(OperationContext* opCtx,
-                                          const BSONObj& doc,
-                                          ShardEndpoint** endpoint) const {
+StatusWith<ShardEndpoint> ChunkManagerTargeter::targetInsert(OperationContext* opCtx,
+                                                             const BSONObj& doc) const {
     BSONObj shardKey;
 
     if (_routingInfo->cm()) {
@@ -303,7 +301,7 @@ Status ChunkManagerTargeter::targetInsert(OperationContext* opCtx,
 
     // Target the shard key or database primary
     if (!shardKey.isEmpty()) {
-        *endpoint = targetShardKey(shardKey, CollationSpec::kSimpleSpec, doc.objsize()).release();
+        return _targetShardKey(shardKey, CollationSpec::kSimpleSpec, doc.objsize());
     } else {
         if (!_routingInfo->primary()) {
             return Status(ErrorCodes::NamespaceNotFound,
@@ -311,16 +309,14 @@ Status ChunkManagerTargeter::targetInsert(OperationContext* opCtx,
                                         << "; no metadata found");
         }
 
-        *endpoint = new ShardEndpoint(_routingInfo->primary()->getId(), ChunkVersion::UNSHARDED());
+        return ShardEndpoint(_routingInfo->primary()->getId(), ChunkVersion::UNSHARDED());
     }
 
     return Status::OK();
 }
 
-Status ChunkManagerTargeter::targetUpdate(
-    OperationContext* opCtx,
-    const BatchedUpdateDocument& updateDoc,
-    std::vector<std::unique_ptr<ShardEndpoint>>* endpoints) const {
+StatusWith<std::vector<ShardEndpoint>> ChunkManagerTargeter::targetUpdate(
+    OperationContext* opCtx, const write_ops::UpdateOpEntry& updateDoc) const {
     //
     // Update targeting may use either the query or the update.  This is to support save-style
     // updates, of the form:
@@ -331,16 +327,16 @@ Status ChunkManagerTargeter::targetUpdate(
     // into the query doc, and to correctly support upsert we must target a single shard.
     //
     // The rule is simple - If the update is replacement style (no '$set'), we target using the
-    // update.  If the update is replacement style, we target using the query.
+    // update.  If the update is not replacement style, we target using the query.
     //
     // If we have the exact shard key in either the query or replacement doc, we target using
     // that extracted key.
     //
 
-    BSONObj query = updateDoc.getQuery();
-    BSONObj updateExpr = updateDoc.getUpdateExpr();
+    BSONObj query = updateDoc.getQ();
+    BSONObj updateExpr = updateDoc.getU();
 
-    UpdateType updateType = getUpdateExprType(updateDoc.getUpdateExpr());
+    UpdateType updateType = getUpdateExprType(updateExpr);
 
     if (updateType == UpdateType_Unknown) {
         return {ErrorCodes::UnsupportedFormat,
@@ -382,14 +378,13 @@ Status ChunkManagerTargeter::targetUpdate(
         }
     }
 
-    const BSONObj collation = updateDoc.isCollationSet() ? updateDoc.getCollation() : BSONObj();
+    const auto collation = write_ops::collationOf(updateDoc);
 
     // Target the shard key, query, or replacement doc
     if (!shardKey.isEmpty()) {
         try {
-            endpoints->push_back(
-                targetShardKey(shardKey, collation, (query.objsize() + updateExpr.objsize())));
-            return Status::OK();
+            return std::vector<ShardEndpoint>{
+                _targetShardKey(shardKey, collation, (query.objsize() + updateExpr.objsize()))};
         } catch (const DBException&) {
             // This update is potentially not constrained to a single shard
         }
@@ -409,42 +404,53 @@ Status ChunkManagerTargeter::targetUpdate(
 
     // Parse update query.
     auto qr = stdx::make_unique<QueryRequest>(getNS());
-    qr->setFilter(updateDoc.getQuery());
+    qr->setFilter(updateDoc.getQ());
     if (!collation.isEmpty()) {
         qr->setCollation(collation);
     }
-    auto cq = CanonicalQuery::canonicalize(opCtx, std::move(qr), ExtensionsCallbackNoop());
+    // $expr is not allowed in the query for an upsert, since it is not clear what the equality
+    // extraction behavior for $expr should be.
+    auto allowedMatcherFeatures = MatchExpressionParser::kAllowAllSpecialFeatures;
+    if (updateDoc.getUpsert()) {
+        allowedMatcherFeatures &= ~MatchExpressionParser::AllowedFeatures::kExpr;
+    }
+    const boost::intrusive_ptr<ExpressionContext> expCtx;
+    auto cq = CanonicalQuery::canonicalize(
+        opCtx, std::move(qr), expCtx, ExtensionsCallbackNoop(), allowedMatcherFeatures);
+    if (!cq.isOK() && cq.getStatus().code() == ErrorCodes::QueryFeatureNotAllowed) {
+        // The default error message for disallowed $expr is not descriptive enough, so we rewrite
+        // it here.
+        return {ErrorCodes::QueryFeatureNotAllowed,
+                "$expr is not allowed in the query predicate for an upsert"};
+    }
     if (!cq.isOK()) {
-        return Status(cq.getStatus().code(),
-                      str::stream() << "Could not parse update query " << updateDoc.getQuery()
-                                    << causedBy(cq.getStatus()));
+        return {cq.getStatus().code(),
+                str::stream() << "Could not parse update query " << updateDoc.getQ()
+                              << causedBy(cq.getStatus())};
     }
 
     // Single (non-multi) updates must target a single shard or be exact-ID.
     if (_routingInfo->cm() && !updateDoc.getMulti() &&
         !isExactIdQuery(opCtx, *cq.getValue(), _routingInfo->cm().get())) {
-        return Status(ErrorCodes::ShardKeyNotFound,
-                      str::stream()
-                          << "A single update on a sharded collection must contain an exact "
-                             "match on _id (and have the collection default collation) or "
-                             "contain the shard key (and have the simple collation). Update "
-                             "request: "
-                          << updateDoc.toBSON()
-                          << ", shard key pattern: "
-                          << _routingInfo->cm()->getShardKeyPattern().toString());
+        return {ErrorCodes::ShardKeyNotFound,
+                str::stream() << "A single update on a sharded collection must contain an exact "
+                                 "match on _id (and have the collection default collation) or "
+                                 "contain the shard key (and have the simple collation). Update "
+                                 "request: "
+                              << updateDoc.toBSON()
+                              << ", shard key pattern: "
+                              << _routingInfo->cm()->getShardKeyPattern().toString()};
     }
 
     if (updateType == UpdateType_OpStyle) {
-        return targetQuery(opCtx, query, collation, endpoints);
+        return _targetQuery(opCtx, query, collation);
     } else {
-        return targetDoc(opCtx, updateExpr, collation, endpoints);
+        return _targetDoc(opCtx, updateExpr, collation);
     }
 }
 
-Status ChunkManagerTargeter::targetDelete(
-    OperationContext* opCtx,
-    const BatchedDeleteDocument& deleteDoc,
-    std::vector<std::unique_ptr<ShardEndpoint>>* endpoints) const {
+StatusWith<std::vector<ShardEndpoint>> ChunkManagerTargeter::targetDelete(
+    OperationContext* opCtx, const write_ops::DeleteOpEntry& deleteDoc) const {
     BSONObj shardKey;
 
     if (_routingInfo->cm()) {
@@ -457,7 +463,7 @@ Status ChunkManagerTargeter::targetDelete(
         // Get the shard key
         StatusWith<BSONObj> status =
             _routingInfo->cm()->getShardKeyPattern().extractShardKeyFromQuery(opCtx,
-                                                                              deleteDoc.getQuery());
+                                                                              deleteDoc.getQ());
 
         // Bad query
         if (!status.isOK())
@@ -466,14 +472,12 @@ Status ChunkManagerTargeter::targetDelete(
         shardKey = status.getValue();
     }
 
-    const BSONObj collation = deleteDoc.isCollationSet() ? deleteDoc.getCollation() : BSONObj();
-
+    const auto collation = write_ops::collationOf(deleteDoc);
 
     // Target the shard key or delete query
     if (!shardKey.isEmpty()) {
         try {
-            endpoints->push_back(targetShardKey(shardKey, collation, 0));
-            return Status::OK();
+            return std::vector<ShardEndpoint>{_targetShardKey(shardKey, collation, 0)};
         } catch (const DBException&) {
             // This delete is potentially not constrained to a single shard
         }
@@ -483,19 +487,24 @@ Status ChunkManagerTargeter::targetDelete(
 
     // Parse delete query.
     auto qr = stdx::make_unique<QueryRequest>(getNS());
-    qr->setFilter(deleteDoc.getQuery());
+    qr->setFilter(deleteDoc.getQ());
     if (!collation.isEmpty()) {
         qr->setCollation(collation);
     }
-    auto cq = CanonicalQuery::canonicalize(opCtx, std::move(qr), ExtensionsCallbackNoop());
+    const boost::intrusive_ptr<ExpressionContext> expCtx;
+    auto cq = CanonicalQuery::canonicalize(opCtx,
+                                           std::move(qr),
+                                           expCtx,
+                                           ExtensionsCallbackNoop(),
+                                           MatchExpressionParser::kAllowAllSpecialFeatures);
     if (!cq.isOK()) {
         return Status(cq.getStatus().code(),
-                      str::stream() << "Could not parse delete query " << deleteDoc.getQuery()
+                      str::stream() << "Could not parse delete query " << deleteDoc.getQ()
                                     << causedBy(cq.getStatus()));
     }
 
     // Single deletes must target a single shard or be exact-ID.
-    if (_routingInfo->cm() && deleteDoc.getLimit() == 1 &&
+    if (_routingInfo->cm() && !deleteDoc.getMulti() &&
         !isExactIdQuery(opCtx, *cq.getValue(), _routingInfo->cm().get())) {
         return Status(ErrorCodes::ShardKeyNotFound,
                       str::stream()
@@ -508,24 +517,18 @@ Status ChunkManagerTargeter::targetDelete(
                           << _routingInfo->cm()->getShardKeyPattern().toString());
     }
 
-    return targetQuery(opCtx, deleteDoc.getQuery(), collation, endpoints);
+    return _targetQuery(opCtx, deleteDoc.getQ(), collation);
 }
 
-Status ChunkManagerTargeter::targetDoc(
-    OperationContext* opCtx,
-    const BSONObj& doc,
-    const BSONObj& collation,
-    std::vector<std::unique_ptr<ShardEndpoint>>* endpoints) const {
-    // NOTE: This is weird and fragile, but it's the way our language works right now -
-    // documents are either A) invalid or B) valid equality queries over themselves.
-    return targetQuery(opCtx, doc, collation, endpoints);
+StatusWith<std::vector<ShardEndpoint>> ChunkManagerTargeter::_targetDoc(
+    OperationContext* opCtx, const BSONObj& doc, const BSONObj& collation) const {
+    // NOTE: This is weird and fragile, but it's the way our language works right now - documents
+    // are either A) invalid or B) valid equality queries over themselves.
+    return _targetQuery(opCtx, doc, collation);
 }
 
-Status ChunkManagerTargeter::targetQuery(
-    OperationContext* opCtx,
-    const BSONObj& query,
-    const BSONObj& collation,
-    std::vector<std::unique_ptr<ShardEndpoint>>* endpoints) const {
+StatusWith<std::vector<ShardEndpoint>> ChunkManagerTargeter::_targetQuery(
+    OperationContext* opCtx, const BSONObj& query, const BSONObj& collation) const {
     if (!_routingInfo->primary() && !_routingInfo->cm()) {
         return {ErrorCodes::NamespaceNotFound,
                 str::stream() << "could not target query in " << getNS().ns()
@@ -543,20 +546,20 @@ Status ChunkManagerTargeter::targetQuery(
         shardIds.insert(_routingInfo->primary()->getId());
     }
 
-    for (const ShardId& shardId : shardIds) {
-        endpoints->push_back(stdx::make_unique<ShardEndpoint>(
-            shardId,
-            _routingInfo->cm() ? _routingInfo->cm()->getVersion(shardId)
-                               : ChunkVersion::UNSHARDED()));
+    std::vector<ShardEndpoint> endpoints;
+    for (auto&& shardId : shardIds) {
+        const auto version = _routingInfo->cm() ? _routingInfo->cm()->getVersion(shardId)
+                                                : ChunkVersion::UNSHARDED();
+        endpoints.emplace_back(std::move(shardId), version);
     }
 
-    return Status::OK();
+    return endpoints;
 }
 
-std::unique_ptr<ShardEndpoint> ChunkManagerTargeter::targetShardKey(const BSONObj& shardKey,
-                                                                    const BSONObj& collation,
-                                                                    long long estDataSize) const {
-    auto chunk = _routingInfo->cm()->findIntersectingChunk(shardKey, collation);
+ShardEndpoint ChunkManagerTargeter::_targetShardKey(const BSONObj& shardKey,
+                                                    const BSONObj& collation,
+                                                    long long estDataSize) const {
+    const auto chunk = _routingInfo->cm()->findIntersectingChunk(shardKey, collation);
 
     // Track autosplit stats for sharded collections
     // Note: this is only best effort accounting and is not accurate.
@@ -564,12 +567,10 @@ std::unique_ptr<ShardEndpoint> ChunkManagerTargeter::targetShardKey(const BSONOb
         _stats->chunkSizeDelta[chunk->getMin()] += estDataSize;
     }
 
-    return stdx::make_unique<ShardEndpoint>(chunk->getShardId(),
-                                            _routingInfo->cm()->getVersion(chunk->getShardId()));
+    return {chunk->getShardId(), _routingInfo->cm()->getVersion(chunk->getShardId())};
 }
 
-Status ChunkManagerTargeter::targetCollection(
-    std::vector<std::unique_ptr<ShardEndpoint>>* endpoints) const {
+StatusWith<std::vector<ShardEndpoint>> ChunkManagerTargeter::targetCollection() const {
     if (!_routingInfo->primary() && !_routingInfo->cm()) {
         return {ErrorCodes::NamespaceNotFound,
                 str::stream() << "could not target full range of " << getNS().ns()
@@ -583,18 +584,18 @@ Status ChunkManagerTargeter::targetCollection(
         shardIds.insert(_routingInfo->primary()->getId());
     }
 
-    for (const ShardId& shardId : shardIds) {
-        endpoints->push_back(stdx::make_unique<ShardEndpoint>(
-            shardId,
-            _routingInfo->cm() ? _routingInfo->cm()->getVersion(shardId)
-                               : ChunkVersion::UNSHARDED()));
+    std::vector<ShardEndpoint> endpoints;
+    for (auto&& shardId : shardIds) {
+        const auto version = _routingInfo->cm() ? _routingInfo->cm()->getVersion(shardId)
+                                                : ChunkVersion::UNSHARDED();
+        endpoints.emplace_back(std::move(shardId), version);
     }
 
-    return Status::OK();
+    return endpoints;
 }
 
-Status ChunkManagerTargeter::targetAllShards(
-    std::vector<std::unique_ptr<ShardEndpoint>>* endpoints) const {
+StatusWith<std::vector<ShardEndpoint>> ChunkManagerTargeter::targetAllShards(
+    OperationContext* opCtx) const {
     if (!_routingInfo->primary() && !_routingInfo->cm()) {
         return {ErrorCodes::NamespaceNotFound,
                 str::stream() << "could not target every shard with versions for " << getNS().ns()
@@ -602,16 +603,21 @@ Status ChunkManagerTargeter::targetAllShards(
     }
 
     std::vector<ShardId> shardIds;
-    grid.shardRegistry()->getAllShardIds(&shardIds);
+    Grid::get(opCtx)->shardRegistry()->getAllShardIds(&shardIds);
 
-    for (const ShardId& shardId : shardIds) {
-        endpoints->push_back(stdx::make_unique<ShardEndpoint>(
-            shardId,
-            _routingInfo->cm() ? _routingInfo->cm()->getVersion(shardId)
-                               : ChunkVersion::UNSHARDED()));
+    std::vector<ShardEndpoint> endpoints;
+    for (auto&& shardId : shardIds) {
+        const auto version = _routingInfo->cm() ? _routingInfo->cm()->getVersion(shardId)
+                                                : ChunkVersion::UNSHARDED();
+        endpoints.emplace_back(std::move(shardId), version);
     }
 
-    return Status::OK();
+    return endpoints;
+}
+
+void ChunkManagerTargeter::noteCouldNotTarget() {
+    dassert(_remoteShardVersions.empty());
+    _needsTargetingRefresh = true;
 }
 
 void ChunkManagerTargeter::noteStaleResponse(const ShardEndpoint& endpoint,
@@ -644,11 +650,6 @@ void ChunkManagerTargeter::noteStaleResponse(const ShardEndpoint& endpoint,
             previouslyNotedVersion = ChunkVersion::IGNORED();
         }
     }
-}
-
-void ChunkManagerTargeter::noteCouldNotTarget() {
-    dassert(_remoteShardVersions.empty());
-    _needsTargetingRefresh = true;
 }
 
 Status ChunkManagerTargeter::refreshIfNeeded(OperationContext* opCtx, bool* wasChanged) {
@@ -700,7 +701,7 @@ Status ChunkManagerTargeter::refreshIfNeeded(OperationContext* opCtx, bool* wasC
         // If didn't already refresh the targeting information, refresh it
         if (!alreadyRefreshed) {
             // To match previous behavior, we just need an incremental refresh here
-            return refreshNow(opCtx);
+            return _refreshNow(opCtx);
         }
 
         *wasChanged = isMetadataDifferent(
@@ -717,7 +718,7 @@ Status ChunkManagerTargeter::refreshIfNeeded(OperationContext* opCtx, bool* wasC
 
         if (result == CompareResult_Unknown || result == CompareResult_LT) {
             // Our current shard versions aren't all comparable to the old versions, maybe drop
-            return refreshNow(opCtx);
+            return _refreshNow(opCtx);
         }
 
         *wasChanged = isMetadataDifferent(
@@ -728,7 +729,7 @@ Status ChunkManagerTargeter::refreshIfNeeded(OperationContext* opCtx, bool* wasC
     MONGO_UNREACHABLE;
 }
 
-Status ChunkManagerTargeter::refreshNow(OperationContext* opCtx) {
+Status ChunkManagerTargeter::_refreshNow(OperationContext* opCtx) {
     Grid::get(opCtx)->catalogCache()->onStaleConfigError(std::move(*_routingInfo));
 
     return init(opCtx);

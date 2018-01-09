@@ -144,6 +144,16 @@ void BSONCollectionCatalogEntry::getAllIndexes(OperationContext* opCtx,
     }
 }
 
+void BSONCollectionCatalogEntry::getReadyIndexes(OperationContext* opCtx,
+                                                 std::vector<std::string>* names) const {
+    MetaData md = _getMetaData(opCtx);
+
+    for (unsigned i = 0; i < md.indexes.size(); i++) {
+        if (md.indexes[i].ready)
+            names->push_back(md.indexes[i].spec["name"].String());
+    }
+}
+
 bool BSONCollectionCatalogEntry::isIndexMultikey(OperationContext* opCtx,
                                                  StringData indexName,
                                                  MultikeyPaths* multikeyPaths) const {
@@ -280,7 +290,8 @@ void BSONCollectionCatalogEntry::MetaData::parse(const BSONObj& obj) {
     ns = obj["ns"].valuestrsafe();
 
     if (obj["options"].isABSONObj()) {
-        options.parse(obj["options"].Obj(), CollectionOptions::parseForStorage);
+        options.parse(obj["options"].Obj(), CollectionOptions::parseForStorage)
+            .transitional_ignore();
     }
 
     BSONElement indexList = obj["indexes"];

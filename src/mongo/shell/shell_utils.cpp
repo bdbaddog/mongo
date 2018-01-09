@@ -35,15 +35,12 @@
 
 #include "mongo/client/dbclientinterface.h"
 #include "mongo/client/replica_set_monitor.h"
-#include "mongo/db/catalog/index_key_validate.h"
-#include "mongo/db/index/external_key_generator.h"
 #include "mongo/platform/random.h"
 #include "mongo/scripting/engine.h"
 #include "mongo/shell/bench.h"
 #include "mongo/shell/shell_options.h"
 #include "mongo/shell/shell_utils_extended.h"
 #include "mongo/shell/shell_utils_launcher.h"
-#include "mongo/util/concurrency/threadlocal.h"
 #include "mongo/util/log.h"
 #include "mongo/util/processinfo.h"
 #include "mongo/util/quick_exit.h"
@@ -113,7 +110,7 @@ BSONObj JSGetMemInfo(const BSONObj& args, void* data) {
 }
 
 #if !defined(_WIN32)
-ThreadLocalValue<unsigned int> _randomSeed;
+thread_local unsigned int _randomSeed = 0;
 #endif
 
 BSONObj JSSrand(const BSONObj& a, void* data) {
@@ -127,7 +124,7 @@ BSONObj JSSrand(const BSONObj& a, void* data) {
         seed = static_cast<unsigned int>(rand->nextInt64());
     }
 #if !defined(_WIN32)
-    _randomSeed.set(seed);
+    _randomSeed = seed;
 #else
     srand(seed);
 #endif
@@ -138,7 +135,7 @@ BSONObj JSRand(const BSONObj& a, void* data) {
     uassert(12519, "rand accepts no arguments", a.nFields() == 0);
     unsigned r;
 #if !defined(_WIN32)
-    r = rand_r(&_randomSeed.getRef());
+    r = rand_r(&_randomSeed);
 #else
     r = rand();
 #endif
@@ -161,26 +158,31 @@ BSONObj getBuildInfo(const BSONObj& a, void* data) {
     return BSON("" << b.done());
 }
 
-BSONObj isKeyTooLarge(const BSONObj& a, void* data) {
-    uassert(17428, "keyTooLarge takes exactly 2 arguments", a.nFields() == 2);
-    BSONObjIterator i(a);
-    BSONObj index = i.next().Obj();
-    BSONObj doc = i.next().Obj();
+BSONObj computeSHA256Block(const BSONObj& a, void* data) {
+    std::vector<ConstDataRange> blocks;
 
-    return BSON("" << isAnyIndexKeyTooLarge(index, doc));
-}
+    auto ele = a[0];
 
-BSONObj validateIndexKey(const BSONObj& a, void* data) {
-    BSONObj key = a[0].Obj();
-    // This is related to old upgrade-checking code when v:1 indexes were the latest version, hence
-    // always validate using v:1 rules here.
-    Status indexValid =
-        index_key_validate::validateKeyPattern(key, IndexDescriptor::IndexVersion::kV1);
-    if (!indexValid.isOK()) {
-        return BSON("" << BSON("ok" << false << "type" << indexValid.codeString() << "errmsg"
-                                    << indexValid.reason()));
+    BSONObjBuilder bob;
+    switch (ele.type()) {
+        case BinData: {
+            int len;
+            const char* ptr = ele.binData(len);
+            SHA256Block::computeHash({ConstDataRange(ptr, len)}).appendAsBinData(bob, ""_sd);
+
+            break;
+        }
+        case String: {
+            auto str = ele.valueStringData();
+            SHA256Block::computeHash({ConstDataRange(str.rawData(), str.size())})
+                .appendAsBinData(bob, ""_sd);
+            break;
+        }
+        default:
+            uasserted(ErrorCodes::BadValue, "Can only computeSHA256Block of strings and bindata");
     }
-    return BSON("" << BSON("ok" << true));
+
+    return bob.obj();
 }
 
 BSONObj replMonitorStats(const BSONObj& a, void* data) {
@@ -211,9 +213,20 @@ BSONObj readMode(const BSONObj&, void*) {
     return BSON("" << shellGlobalParams.readMode);
 }
 
+BSONObj shouldRetryWrites(const BSONObj&, void* data) {
+    return BSON("" << shellGlobalParams.shouldRetryWrites);
+}
+
 BSONObj interpreterVersion(const BSONObj& a, void* data) {
     uassert(16453, "interpreterVersion accepts no arguments", a.nFields() == 0);
     return BSON("" << getGlobalScriptEngine()->getInterpreterVersionString());
+}
+
+BSONObj fileExistsJS(const BSONObj& a, void*) {
+    uassert(40678,
+            "fileExists expects one string argument",
+            a.nFields() == 1 && a.firstElement().type() == String);
+    return BSON("" << fileExists(a.firstElement().valuestrsafe()));
 }
 
 void installShellUtils(Scope& scope) {
@@ -224,8 +237,8 @@ void installShellUtils(Scope& scope) {
     scope.injectNative("_isWindows", isWindows);
     scope.injectNative("interpreterVersion", interpreterVersion);
     scope.injectNative("getBuildInfo", getBuildInfo);
-    scope.injectNative("isKeyTooLarge", isKeyTooLarge);
-    scope.injectNative("validateIndexKey", validateIndexKey);
+    scope.injectNative("computeSHA256Block", computeSHA256Block);
+    scope.injectNative("fileExists", fileExistsJS);
 
 #ifndef MONGO_SAFE_SHELL
     // can't launch programs
@@ -239,6 +252,7 @@ void initScope(Scope& scope) {
     scope.injectNative("_useWriteCommandsDefault", useWriteCommandsDefault);
     scope.injectNative("_writeMode", writeMode);
     scope.injectNative("_readMode", readMode);
+    scope.injectNative("_shouldRetryWrites", shouldRetryWrites);
     scope.externalSetup();
     mongo::shell_utils::installShellUtils(scope);
     scope.execSetup(JSFiles::servers);
@@ -280,10 +294,10 @@ bool Prompter::confirm() {
 
 ConnectionRegistry::ConnectionRegistry() = default;
 
-void ConnectionRegistry::registerConnection(DBClientWithCommands& client) {
+void ConnectionRegistry::registerConnection(DBClientBase& client) {
     BSONObj info;
     if (client.runCommand("admin", BSON("whatsmyuri" << 1), info)) {
-        string connstr = dynamic_cast<DBClientBase&>(client).getServerAddress();
+        string connstr = client.getServerAddress();
         stdx::lock_guard<stdx::mutex> lk(_mutex);
         _connectionUris[connstr].insert(info["you"].str());
     }
@@ -303,7 +317,7 @@ void ConnectionRegistry::killOperationsOnAllConnections(bool withPrompt) const {
         const ConnectionString cs(status.getValue());
 
         string errmsg;
-        std::unique_ptr<DBClientWithCommands> conn(cs.connect("MongoDB Shell", errmsg));
+        std::unique_ptr<DBClientBase> conn(cs.connect("MongoDB Shell", errmsg));
         if (!conn) {
             continue;
         }
@@ -362,7 +376,7 @@ void ConnectionRegistry::killOperationsOnAllConnections(bool withPrompt) const {
 ConnectionRegistry connectionRegistry;
 
 bool _nokillop = false;
-void onConnect(DBClientWithCommands& c) {
+void onConnect(DBClientBase& c) {
     if (_nokillop) {
         return;
     }

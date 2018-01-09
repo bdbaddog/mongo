@@ -49,7 +49,6 @@
 #include "mongo/s/grid.h"
 #include "mongo/s/write_ops/batched_command_request.h"
 #include "mongo/s/write_ops/batched_command_response.h"
-#include "mongo/s/write_ops/batched_update_request.h"
 #include "mongo/util/time_support.h"
 
 namespace mongo {
@@ -159,8 +158,8 @@ StatusWith<OID> extractElectionId(const BSONObj& responseObj) {
 
 }  // unnamed namespace
 
-DistLockCatalogImpl::DistLockCatalogImpl(ShardRegistry* shardRegistry)
-    : _client(shardRegistry), _lockPingNS(LockpingsType::ConfigNS), _locksNS(LocksType::ConfigNS) {}
+DistLockCatalogImpl::DistLockCatalogImpl()
+    : _lockPingNS(LockpingsType::ConfigNS), _locksNS(LocksType::ConfigNS) {}
 
 DistLockCatalogImpl::~DistLockCatalogImpl() = default;
 
@@ -199,7 +198,8 @@ Status DistLockCatalogImpl::ping(OperationContext* opCtx, StringData processID, 
     request.setUpsert(true);
     request.setWriteConcern(kMajorityWriteConcern);
 
-    auto resultStatus = _client->getConfigShard()->runCommandWithFixedRetryAttempts(
+    auto const shardRegistry = Grid::get(opCtx)->shardRegistry();
+    auto resultStatus = shardRegistry->getConfigShard()->runCommandWithFixedRetryAttempts(
         opCtx,
         ReadPreferenceSetting{ReadPreference::PrimaryOnly},
         _locksNS.db().toString(),
@@ -236,7 +236,8 @@ StatusWith<LocksType> DistLockCatalogImpl::grabLock(OperationContext* opCtx,
     request.setShouldReturnNew(true);
     request.setWriteConcern(writeConcern);
 
-    auto resultStatus = _client->getConfigShard()->runCommandWithFixedRetryAttempts(
+    auto const shardRegistry = Grid::get(opCtx)->shardRegistry();
+    auto resultStatus = shardRegistry->getConfigShard()->runCommandWithFixedRetryAttempts(
         opCtx,
         ReadPreferenceSetting{ReadPreference::PrimaryOnly},
         _locksNS.db().toString(),
@@ -293,7 +294,8 @@ StatusWith<LocksType> DistLockCatalogImpl::overtakeLock(OperationContext* opCtx,
     request.setShouldReturnNew(true);
     request.setWriteConcern(kMajorityWriteConcern);
 
-    auto resultStatus = _client->getConfigShard()->runCommandWithFixedRetryAttempts(
+    auto const shardRegistry = Grid::get(opCtx)->shardRegistry();
+    auto resultStatus = shardRegistry->getConfigShard()->runCommandWithFixedRetryAttempts(
         opCtx,
         ReadPreferenceSetting{ReadPreference::PrimaryOnly},
         _locksNS.db().toString(),
@@ -338,7 +340,8 @@ Status DistLockCatalogImpl::unlock(OperationContext* opCtx,
 }
 
 Status DistLockCatalogImpl::_unlock(OperationContext* opCtx, const FindAndModifyRequest& request) {
-    auto resultStatus = _client->getConfigShard()->runCommandWithFixedRetryAttempts(
+    auto const shardRegistry = Grid::get(opCtx)->shardRegistry();
+    auto resultStatus = shardRegistry->getConfigShard()->runCommandWithFixedRetryAttempts(
         opCtx,
         ReadPreferenceSetting{ReadPreference::PrimaryOnly},
         _locksNS.db().toString(),
@@ -358,22 +361,24 @@ Status DistLockCatalogImpl::_unlock(OperationContext* opCtx, const FindAndModify
 }
 
 Status DistLockCatalogImpl::unlockAll(OperationContext* opCtx, const std::string& processID) {
-    std::unique_ptr<BatchedUpdateDocument> updateDoc(new BatchedUpdateDocument());
-    updateDoc->setQuery(BSON(LocksType::process(processID)));
-    updateDoc->setUpdateExpr(BSON("$set" << BSON(LocksType::state(LocksType::UNLOCKED))));
-    updateDoc->setUpsert(false);
-    updateDoc->setMulti(true);
-
-    std::unique_ptr<BatchedUpdateRequest> updateRequest(new BatchedUpdateRequest());
-    updateRequest->addToUpdates(updateDoc.release());
-
-    BatchedCommandRequest request(updateRequest.release());
-    request.setNS(_locksNS);
+    BatchedCommandRequest request([&] {
+        write_ops::Update updateOp(_locksNS);
+        updateOp.setUpdates({[&] {
+            write_ops::UpdateOpEntry entry;
+            entry.setQ(BSON(LocksType::process(processID)));
+            entry.setU(BSON("$set" << BSON(LocksType::state(LocksType::UNLOCKED))));
+            entry.setUpsert(false);
+            entry.setMulti(true);
+            return entry;
+        }()});
+        return updateOp;
+    }());
     request.setWriteConcern(kLocalWriteConcern.toBSON());
 
     BSONObj cmdObj = request.toBSON();
 
-    auto response = _client->getConfigShard()->runCommandWithFixedRetryAttempts(
+    auto const shardRegistry = Grid::get(opCtx)->shardRegistry();
+    auto response = shardRegistry->getConfigShard()->runCommandWithFixedRetryAttempts(
         opCtx,
         ReadPreferenceSetting{ReadPreference::PrimaryOnly},
         _locksNS.db().toString(),
@@ -405,7 +410,8 @@ Status DistLockCatalogImpl::unlockAll(OperationContext* opCtx, const std::string
 
 StatusWith<DistLockCatalog::ServerInfo> DistLockCatalogImpl::getServerInfo(
     OperationContext* opCtx) {
-    auto resultStatus = _client->getConfigShard()->runCommandWithFixedRetryAttempts(
+    auto const shardRegistry = Grid::get(opCtx)->shardRegistry();
+    auto resultStatus = shardRegistry->getConfigShard()->runCommandWithFixedRetryAttempts(
         opCtx,
         kReadPref,
         "admin",
@@ -497,7 +503,8 @@ Status DistLockCatalogImpl::stopPing(OperationContext* opCtx, StringData process
         FindAndModifyRequest::makeRemove(_lockPingNS, BSON(LockpingsType::process() << processId));
     request.setWriteConcern(kMajorityWriteConcern);
 
-    auto resultStatus = _client->getConfigShard()->runCommandWithFixedRetryAttempts(
+    auto const shardRegistry = Grid::get(opCtx)->shardRegistry();
+    auto resultStatus = shardRegistry->getConfigShard()->runCommandWithFixedRetryAttempts(
         opCtx,
         ReadPreferenceSetting{ReadPreference::PrimaryOnly},
         _locksNS.db().toString(),
@@ -516,7 +523,8 @@ StatusWith<vector<BSONObj>> DistLockCatalogImpl::_findOnConfig(
     const BSONObj& query,
     const BSONObj& sort,
     boost::optional<long long> limit) {
-    auto result = _client->getConfigShard()->exhaustiveFindOnConfig(
+    auto const shardRegistry = Grid::get(opCtx)->shardRegistry();
+    auto result = shardRegistry->getConfigShard()->exhaustiveFindOnConfig(
         opCtx, readPref, repl::ReadConcernLevel::kMajorityReadConcern, nss, query, sort, limit);
     if (!result.isOK()) {
         return result.getStatus();

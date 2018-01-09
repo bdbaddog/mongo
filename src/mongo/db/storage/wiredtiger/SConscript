@@ -18,8 +18,10 @@ env.Library(
     ],
     LIBDEPS= ['$BUILD_DIR/mongo/base',
               '$BUILD_DIR/mongo/db/service_context'],
+    LIBDEPS_DEPENDENTS=[
+        '$BUILD_DIR/mongo/mongodmain',
+    ],
     PROGDEPS_DEPENDENTS=[
-        '$BUILD_DIR/mongo/mongod',
         '$BUILD_DIR/mongo/mongos',
     ],
 )
@@ -37,6 +39,7 @@ if wiredtiger:
             'wiredtiger_global_options.cpp',
             'wiredtiger_index.cpp',
             'wiredtiger_kv_engine.cpp',
+            'wiredtiger_oplog_manager.cpp',
             'wiredtiger_record_store.cpp',
             'wiredtiger_recovery_unit.cpp',
             'wiredtiger_session_cache.cpp',
@@ -52,7 +55,10 @@ if wiredtiger:
             '$BUILD_DIR/mongo/db/concurrency/lock_manager',
             '$BUILD_DIR/mongo/db/concurrency/write_conflict_exception',
             '$BUILD_DIR/mongo/db/index/index_descriptor',
+            '$BUILD_DIR/mongo/db/mongod_options',
             '$BUILD_DIR/mongo/db/namespace_string',
+            '$BUILD_DIR/mongo/db/repl/repl_settings',
+            '$BUILD_DIR/mongo/db/server_options_core',
             '$BUILD_DIR/mongo/db/service_context',
             '$BUILD_DIR/mongo/db/storage/index_entry_comparison',
             '$BUILD_DIR/mongo/db/storage/journal_listener',
@@ -68,6 +74,10 @@ if wiredtiger:
             '$BUILD_DIR/third_party/shim_zlib',
             'storage_wiredtiger_customization_hooks',
             ],
+        LIBDEPS_PRIVATE= [
+            # SERVER-31802 : remove this.
+            '$BUILD_DIR/mongo/db/repl/repl_coordinator_interface',
+            ],
         )
 
     wtEnv.Library(
@@ -78,16 +88,20 @@ if wiredtiger:
             'wiredtiger_parameters.cpp',
             'wiredtiger_record_store_mongod.cpp',
             'wiredtiger_server_status.cpp',
-            ],
-        LIBDEPS=['storage_wiredtiger_core',
-                 'storage_wiredtiger_customization_hooks',
-                 '$BUILD_DIR/mongo/db/db_raii',
-                 '$BUILD_DIR/mongo/db/storage/kv/kv_engine',
-                 '$BUILD_DIR/mongo/db/storage/storage_engine_lock_file',
-                 '$BUILD_DIR/mongo/db/storage/storage_engine_metadata',
-                 '$BUILD_DIR/mongo/db/commands/server_status',
-                 ],
-        )
+        ],
+        LIBDEPS=[
+            'storage_wiredtiger_core',
+            'storage_wiredtiger_customization_hooks',
+            '$BUILD_DIR/mongo/db/db_raii',
+            '$BUILD_DIR/mongo/db/storage/kv/kv_engine',
+            '$BUILD_DIR/mongo/db/storage/storage_engine_lock_file',
+            '$BUILD_DIR/mongo/db/storage/storage_engine_metadata',
+            '$BUILD_DIR/mongo/db/commands/server_status',
+        ],
+        LIBDEPS_PRIVATE=[
+            '$BUILD_DIR/mongo/db/concurrency/lock_manager',
+        ],
+    )
 
     wtEnv.Library(
         target='storage_wiredtiger_mock',
@@ -104,17 +118,23 @@ if wiredtiger:
                 ],
         LIBDEPS=[
             '$BUILD_DIR/mongo/db/serveronly',
+            '$BUILD_DIR/mongo/db/service_context',
+            '$BUILD_DIR/mongo/db/storage/storage_engine_metadata',
+            '$BUILD_DIR/mongo/db/storage/storage_options',
+            '$BUILD_DIR/mongo/db/storage/wiredtiger/storage_wiredtiger_core',
             ],
         )
 
     wtEnv.Library(
         target='additional_wiredtiger_record_store_tests',
         source=[
+            'record_store_test_oplog.cpp',
             'wiredtiger_record_store_test.cpp',
         ],
         LIBDEPS=[
             '$BUILD_DIR/mongo/db/storage/kv/kv_engine_core',
             '$BUILD_DIR/mongo/db/storage/record_store_test_harness',
+            '$BUILD_DIR/mongo/util/clock_source_mock',
             'storage_wiredtiger_mock',
         ],
     )

@@ -46,7 +46,8 @@ StatusWith<BSONObj> storePossibleCursor(OperationContext* opCtx,
                                         const BSONObj& cmdResult,
                                         const NamespaceString& requestedNss,
                                         executor::TaskExecutor* executor,
-                                        ClusterCursorManager* cursorManager) {
+                                        ClusterCursorManager* cursorManager,
+                                        TailableMode tailableMode) {
     if (!cmdResult["ok"].trueValue() || !cmdResult.hasField("cursor")) {
         return cmdResult;
     }
@@ -63,19 +64,23 @@ StatusWith<BSONObj> storePossibleCursor(OperationContext* opCtx,
     ClusterClientCursorParams params(
         incomingCursorResponse.getValue().getNSS(),
         AuthorizationSession::get(opCtx->getClient())->getAuthenticatedUserNames());
-    params.remotes.emplace_back(
-        shardId,
-        server,
-        CursorResponse(requestedNss, incomingCursorResponse.getValue().getCursorId(), {}));
-
+    params.remotes.emplace_back(shardId,
+                                server,
+                                CursorResponse(incomingCursorResponse.getValue().getNSS(),
+                                               incomingCursorResponse.getValue().getCursorId(),
+                                               {}));
+    params.tailableMode = tailableMode;
 
     auto ccc = ClusterClientCursorImpl::make(opCtx, executor, std::move(params));
 
+    // We don't expect to use this cursor until a subsequent getMore, so detach from the current
+    // OperationContext until then.
+    ccc->detachFromOperationContext();
     auto clusterCursorId =
         cursorManager->registerCursor(opCtx,
                                       ccc.releaseCursor(),
                                       requestedNss,
-                                      ClusterCursorManager::CursorType::NamespaceNotSharded,
+                                      ClusterCursorManager::CursorType::SingleTarget,
                                       ClusterCursorManager::CursorLifetime::Mortal);
     if (!clusterCursorId.isOK()) {
         return clusterCursorId.getStatus();

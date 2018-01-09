@@ -33,11 +33,14 @@
 #include <wiredtiger.h>
 
 #include "mongo/base/disallow_copying.h"
+#include "mongo/bson/timestamp.h"
 #include "mongo/db/storage/snapshot_manager.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_util.h"
 #include "mongo/stdx/mutex.h"
 
 namespace mongo {
+
+class WiredTigerOplogManager;
 
 class WiredTigerSnapshotManager final : public SnapshotManager {
     MONGO_DISALLOW_COPYING(WiredTigerSnapshotManager);
@@ -45,6 +48,7 @@ class WiredTigerSnapshotManager final : public SnapshotManager {
 public:
     explicit WiredTigerSnapshotManager(WT_CONNECTION* conn) {
         invariantWTOK(conn->open_session(conn, NULL, NULL, &_session));
+        _conn = conn;
     }
 
     ~WiredTigerSnapshotManager() {
@@ -52,8 +56,7 @@ public:
     }
 
     Status prepareForCreateSnapshot(OperationContext* opCtx) final;
-    Status createSnapshot(OperationContext* ru, const SnapshotName& name) final;
-    void setCommittedSnapshot(const SnapshotName& name) final;
+    void setCommittedSnapshot(const Timestamp& timestamp) final;
     void cleanupUnneededSnapshots() final;
     void dropAllSnapshots() final;
 
@@ -66,12 +69,19 @@ public:
      */
     void shutdown();
 
+    Status beginTransactionAtTimestamp(Timestamp pointInTime, WT_SESSION* session) const;
+
     /**
      * Starts a transaction and returns the SnapshotName used.
      *
      * Throws if there is currently no committed snapshot.
      */
-    SnapshotName beginTransactionOnCommittedSnapshot(WT_SESSION* session) const;
+    Timestamp beginTransactionOnCommittedSnapshot(WT_SESSION* session) const;
+
+    /**
+     * Starts a transaction on the oplog using an appropriate timestamp for oplog visiblity.
+     */
+    void beginTransactionOnOplog(WiredTigerOplogManager* oplogManager, WT_SESSION* session) const;
 
     /**
      * Returns lowest SnapshotName that could possibly be used by a future call to
@@ -81,11 +91,12 @@ public:
      * This should not be used for starting a transaction on this SnapshotName since the named
      * snapshot may be deleted by the time you start the transaction.
      */
-    boost::optional<SnapshotName> getMinSnapshotForNextCommittedRead() const;
+    boost::optional<Timestamp> getMinSnapshotForNextCommittedRead() const;
 
 private:
     mutable stdx::mutex _mutex;  // Guards all members.
-    boost::optional<SnapshotName> _committedSnapshot;
-    WT_SESSION* _session;  // only used for dropping snapshots.
+    boost::optional<Timestamp> _committedSnapshot;
+    WT_SESSION* _session;
+    WT_CONNECTION* _conn;
 };
 }

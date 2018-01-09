@@ -37,6 +37,7 @@ var StandaloneFixture, ShardedFixture, runReadOnlyTest, zip2, cycleN;
             var options = {queryableBackupMode: "", noCleanData: true, dbpath: this.dbpath};
 
             this.mongod = MongoRunner.runMongod(options);
+            assert.neq(this.mongod, null);
 
             test.exec(this.mongod.getDB("test")[test.name]);
 
@@ -58,7 +59,7 @@ var StandaloneFixture, ShardedFixture, runReadOnlyTest, zip2, cycleN;
         jsTest.log("sharding test collection...");
 
         // Use a hashed shard key so we actually hit multiple shards.
-        this.shardingTest.shardColl(test.name, {_id: "hashed"});
+        this.shardingTest.shardColl(test.name, {_id: "hashed"}, false);
 
         test.load(this.shardingTest.getDB("test")[test.name]);
     };

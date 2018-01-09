@@ -50,7 +50,6 @@ private:
     bool run(OperationContext* opCtx,
              const std::string&,
              const BSONObj& cmdObj,
-             std::string& errmsg,
              BSONObjBuilder& result) final {
         Status status = getGlobalReplicationCoordinator()->checkReplEnabledForCommand(&result);
         if (!status.isOK()) {
@@ -62,22 +61,6 @@ private:
         if (!status.isOK()) {
             return appendCommandStatus(result, status);
         }
-
-        // We want to keep request vote connection open when relinquishing primary.
-        // Tag it here.
-        transport::Session::TagMask originalTag = 0;
-        auto session = opCtx->getClient()->session();
-        if (session) {
-            originalTag = session->getTags();
-            session->replaceTags(originalTag | transport::Session::kKeepOpen);
-        }
-
-        // Untag the connection on exit.
-        ON_BLOCK_EXIT([session, originalTag]() {
-            if (session) {
-                session->replaceTags(originalTag);
-            }
-        });
 
         ReplSetRequestVotesResponse response;
         status = getGlobalReplicationCoordinator()->processReplSetRequestVotes(

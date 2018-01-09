@@ -35,17 +35,17 @@
 
 namespace mongo {
 
-class CmdShutdown : public Command {
+class CmdShutdown : public BasicCommand {
 public:
-    CmdShutdown() : Command("shutdown") {}
+    CmdShutdown() : BasicCommand("shutdown") {}
 
-    virtual bool requiresAuth() {
+    bool requiresAuth() const override {
         return true;
     }
     virtual bool adminOnly() const {
         return true;
     }
-    virtual bool localHostOnlyIfNoAuth(const BSONObj& cmdObj) {
+    virtual bool localHostOnlyIfNoAuth() {
         return true;
     }
     virtual bool slaveOk() const {

@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 #
-# Public Domain 2014-2017 MongoDB, Inc.
+# Public Domain 2014-2018 MongoDB, Inc.
 # Public Domain 2008-2014 WiredTiger, Inc.
 #
 # This is free and unencumbered software released into the public domain.
@@ -88,5 +88,5 @@ except:
 shutil.rmtree('WT_TEST', True)
 os.mkdir('WT_TEST')
 
-from .core import txn, extensions_config, op_group_transaction, op_log_like, op_multi_table
+from .core import txn, extensions_config, op_append, op_group_transaction, op_log_like, op_multi_table, op_populate_with_range
 from .latency import workload_latency

@@ -31,11 +31,11 @@
 #include "mongo/platform/atomic_word.h"
 #include "mongo/platform/process_id.h"
 #include "mongo/s/catalog/sharding_catalog_client.h"
-#include "mongo/util/net/listen.h"  // For DEFAULT_MAX_CONN
 
 namespace mongo {
 
 const int DEFAULT_UNIX_PERMS = 0700;
+constexpr size_t DEFAULT_MAX_CONN = 1000000;
 
 enum class ClusterRole { None, ShardServer, ConfigServer };
 
@@ -50,7 +50,10 @@ struct ServerGlobalParams {
     }
 
     std::string bind_ip;  // --bind_ip
-    bool rest = false;    // --rest
+    bool enableIPv6 = false;
+    bool rest = false;  // --rest
+
+    int listenBacklog = 0;  // --listenBacklog, real default is SOMAXCONN
 
     bool indexBuildRetry = true;  // --noIndexBuildRetry
 
@@ -71,8 +74,12 @@ struct ServerGlobalParams {
     bool noUnixSocket = false;    // --nounixsocket
     bool doFork = false;          // --fork
     std::string socket = "/tmp";  // UNIX domain socket directory
+    std::string transportLayer;   // --transportLayer (must be either "asio" or "legacy")
 
-    int maxConns = DEFAULT_MAX_CONN;  // Maximum number of simultaneous open connections.
+    // --serviceExecutor ("adaptive", "synchronous")
+    std::string serviceExecutor;
+
+    size_t maxConns = DEFAULT_MAX_CONN;  // Maximum number of simultaneous open connections.
 
     int unixSocketPermissions = DEFAULT_UNIX_PERMS;  // permissions for the UNIX domain socket
 
@@ -139,31 +146,102 @@ struct ServerGlobalParams {
     BSONObj overrideShardIdentity;
 
     struct FeatureCompatibility {
+        /**
+         * The combination of the fields in the admin.system.version document in the format
+         * (version, targetVersion) are represented by this enum and determine this node's behavior.
+         *
+         * The legal enum (and featureCompatiblityVersion document) states are:
+         *
+         * kFullyDowngradedTo34
+         * (3.4, Unset): Only 3.4 features are available, and new and existing storage
+         *               engine entries use the 3.4 format
+         *
+         * kUpgradingTo36
+         * (3.4, 3.6): Only 3.4 features are available, but new storage engine entries
+         *             use the 3.6 format, and existing entries may have either the
+         *             3.4 or 3.6 format
+         *
+         * kFullyUpgradedTo36
+         * (3.6, Unset): 3.6 features are available, and new and existing storage
+         *               engine entries use the 3.6 format
+         *
+         * kDowngradingTo34
+         * (3.4, 3.4): Only 3.4 features are available and new storage engine
+         *             entries use the 3.4 format, but existing entries may have
+         *             either the 3.4 or 3.6 format
+         *
+         * kUnsetDefault34Behavior
+         * (Unset, Unset): This is the case on startup before the fCV document is
+         *                 loaded into memory. isVersionInitialized() will return
+         *                 false, and getVersion() will return the default
+         *                 (kFullyDowngradedTo34).
+         *
+         */
         enum class Version {
-            /**
-             * In this mode, the cluster will expose a 3.4-like API. Attempts by a client to use new
-             * features in 3.6 will be rejected.
-             */
-            k34,
-
-            /**
-             * In this mode, new features in 3.6 are allowed. The system should guarantee that no
-             * 3.4 node can participate in a cluster whose feature compatibility version is 3.6.
-             */
-            k36,
+            kFullyDowngradedTo34,
+            kUpgradingTo36,
+            kFullyUpgradedTo36,
+            kDowngradingTo34,
+            kUnsetDefault34Behavior
         };
 
-        // Read-only parameter featureCompatibilityVersion.
-        AtomicWord<Version> version{Version::k34};
+        /**
+         * On startup, the featureCompatibilityVersion may not have been explicitly set yet. This
+         * exposes the actual state of the featureCompatibilityVersion if it is uninitialized.
+         */
+        const bool isVersionInitialized() const {
+            return _version.load() != Version::kUnsetDefault34Behavior;
+        }
 
-        // Feature validation differs depending on the role of a mongod in a replica set or
-        // master/slave configuration. Masters/primaries can accept user-initiated writes and
-        // validate based on the feature compatibility version. A secondary/slave (which is not also
-        // a master) always validates in "3.4" mode so that it can sync 3.4 features, even when in
-        // "3.2" feature compatibility mode.
-        AtomicWord<bool> validateFeaturesAsMaster{true};
+        /**
+         * This safe getter for the featureCompatibilityVersion returns a default value when the
+         * version has not yet been set.
+         */
+        const Version getVersion() const {
+            Version v = _version.load();
+            return (v == Version::kUnsetDefault34Behavior) ? Version::kFullyDowngradedTo34 : v;
+        }
+
+        void reset() {
+            _version.store(Version::kFullyDowngradedTo34);
+        }
+
+        void setVersion(Version version) {
+            return _version.store(version);
+        }
+
+        // This determines whether to give Collections UUIDs upon creation.
+        const bool isSchemaVersion36() {
+            return (getVersion() == Version::kFullyUpgradedTo36 ||
+                    getVersion() == Version::kUpgradingTo36);
+        }
+
+    private:
+        AtomicWord<Version> _version{Version::kUnsetDefault34Behavior};
+
     } featureCompatibility;
+
+    // Feature validation differs depending on the role of a mongod in a replica set or
+    // master/slave configuration. Masters/primaries can accept user-initiated writes and
+    // validate based on the feature compatibility version. A secondary/slave (which is not also
+    // a master) always validates in the upgraded mode so that it can sync new features, even
+    // when in the downgraded feature compatibility mode.
+    AtomicWord<bool> validateFeaturesAsMaster{true};
+
+    std::vector<std::string> disabledSecureAllocatorDomains;
 };
 
 extern ServerGlobalParams serverGlobalParams;
+
+template <typename NameTrait>
+struct TraitNamedDomain {
+    static bool peg() {
+        const auto& dsmd = serverGlobalParams.disabledSecureAllocatorDomains;
+        const auto contains = [&](StringData dt) {
+            return std::find(dsmd.begin(), dsmd.end(), dt) != dsmd.end();
+        };
+        static const bool ret = !(contains("*"_sd) || contains(NameTrait::DomainType));
+        return ret;
+    }
+};
 }

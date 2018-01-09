@@ -1,3 +1,5 @@
+// @tags: [does_not_support_stepdowns]
+
 // Confirms that profiled insert execution contains all expected metrics with proper values.
 
 (function() {
@@ -29,8 +31,6 @@
     assert.eq(profileObj.ninserted, 1, tojson(profileObj));
     assert.eq(profileObj.keysInserted, 1, tojson(profileObj));
     if (isWriteCommand) {
-        assert.eq(profileObj.command.documents.length, 1, tojson(profileObj));
-        assert.eq(profileObj.command.documents[0], doc, tojson(profileObj));
         assert.eq(profileObj.command.ordered, true, tojson(profileObj));
         assert.eq(profileObj.protocol,
                   getProfilerProtocolStringForCommand(testDB.getMongo()),
@@ -64,7 +64,6 @@
     if (isWriteCommand) {
         assert.eq(profileObj.ninserted, 2, tojson(profileObj));
         assert.eq(profileObj.keysInserted, 2, tojson(profileObj));
-        assert.eq(profileObj.command.documents, docArray, tojson(profileObj));
         assert.eq(profileObj.appName, "MongoDB Shell", tojson(profileObj));
     } else {
         // Documents were inserted one at a time.

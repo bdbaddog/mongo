@@ -11,10 +11,11 @@ load("jstests/aggregation/extras/utils.js");  // For "assertErrorCode".
     var local = db.local;
 
     local.drop();
-    local.insert({});
+    assert.writeOK(local.insert({b: 0}));
 
     var pipeline = {$graphLookup: 4};
-    assertErrorCode(local, pipeline, 40327, "$graphLookup spec must be an object");
+    assertErrorCode(
+        local, pipeline, ErrorCodes.FailedToParse, "$graphLookup spec must be an object");
 
     pipeline = {
         $graphLookup: {
@@ -61,7 +62,7 @@ load("jstests/aggregation/extras/utils.js");  // For "assertErrorCode".
             as: "output"
         }
     };
-    assertErrorCode(local, pipeline, 40329, "from must be a string");
+    assertErrorCode(local, pipeline, ErrorCodes.FailedToParse, "from must be a string");
 
     pipeline = {
         $graphLookup: {
@@ -72,7 +73,7 @@ load("jstests/aggregation/extras/utils.js");  // For "assertErrorCode".
             as: "output"
         }
     };
-    assertErrorCode(local, pipeline, 40330, "from must be a valid namespace");
+    assertErrorCode(local, pipeline, ErrorCodes.InvalidNamespace, "from must be a valid namespace");
 
     pipeline = {
         $graphLookup: {
@@ -219,7 +220,7 @@ load("jstests/aggregation/extras/utils.js");  // For "assertErrorCode".
         $graphLookup:
             {startWith: {$literal: 0}, connectToField: "a", connectFromField: "b", as: "output"}
     };
-    assertErrorCode(local, pipeline, 40328, "from was not specified");
+    assertErrorCode(local, pipeline, ErrorCodes.FailedToParse, "from was not specified");
 
     // restrictSearchWithMatch must be a valid match expression.
     pipeline = {
@@ -271,7 +272,7 @@ load("jstests/aggregation/extras/utils.js");  // For "assertErrorCode".
             }
         }
     };
-    assertErrorCode(local, pipeline, 40187, "cannot use $near inside $graphLookup");
+    assertErrorCode(local, pipeline, 40186, "cannot use $near inside $graphLookup");
 
     pipeline = {
         $graphLookup: {
@@ -292,10 +293,39 @@ load("jstests/aggregation/extras/utils.js");  // For "assertErrorCode".
             }
         }
     };
-    assertErrorCode(local, pipeline, 40187, "cannot use $near inside $graphLookup at any depth");
+    assertErrorCode(local, pipeline, 40186, "cannot use $near inside $graphLookup at any depth");
+
+    let foreign = db.foreign;
+    foreign.drop();
+    assert.writeOK(foreign.insert({a: 0, x: 0}));
+
+    // Test a restrictSearchWithMatch expression that fails to parse.
+    pipeline = {
+        $graphLookup: {
+            from: 'foreign',
+            startWith: {$literal: 0},
+            connectToField: "a",
+            connectFromField: "b",
+            as: "output",
+            restrictSearchWithMatch: {$expr: {$eq: ["$x", "$$unbound"]}}
+        }
+    };
+    assertErrorCode(local, pipeline, 40186, "cannot use $expr with unbound variable");
+
+    // Test a restrictSearchWithMatchExpression that throws at runtime.
+    pipeline = {
+        $graphLookup: {
+            from: 'foreign',
+            startWith: {$literal: 0},
+            connectToField: "a",
+            connectFromField: "b",
+            as: "output",
+            restrictSearchWithMatch: {$expr: {$divide: [1, "$x"]}}
+        }
+    };
+    assertErrorCode(local, pipeline, 16608, "division by zero in $expr");
 
     // $graphLookup can only consume at most 100MB of memory.
-    var foreign = db.foreign;
     foreign.drop();
 
     // Here, the visited set exceeds 100MB.

@@ -1,5 +1,5 @@
 /*-
- * Copyright (c) 2014-2017 MongoDB, Inc.
+ * Copyright (c) 2014-2018 MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -233,8 +233,8 @@ __wt_cell_pack_data_match(
     WT_CELL *page_cell, WT_CELL *val_cell, const uint8_t *val_data,
     bool *matchp)
 {
-	const uint8_t *a, *b;
 	uint64_t av, bv;
+	const uint8_t *a, *b;
 	bool rle;
 
 	*matchp = 0;				/* Default to no-match */
@@ -729,6 +729,7 @@ __cell_data_ref(WT_SESSION_IMPL *session,
     WT_PAGE *page, int page_type, WT_CELL_UNPACK *unpack, WT_ITEM *store)
 {
 	WT_BTREE *btree;
+	bool decoded;
 	void *huffman;
 
 	btree = S2BT(session);
@@ -749,14 +750,16 @@ __cell_data_ref(WT_SESSION_IMPL *session,
 		huffman = btree->huffman_value;
 		break;
 	case WT_CELL_KEY_OVFL:
-		WT_RET(__wt_ovfl_read(session, page, unpack, store));
-		if (page_type == WT_PAGE_ROW_INT)
+		WT_RET(__wt_ovfl_read(session, page, unpack, store, &decoded));
+		if (page_type == WT_PAGE_ROW_INT || decoded)
 			return (0);
 
 		huffman = btree->huffman_key;
 		break;
 	case WT_CELL_VALUE_OVFL:
-		WT_RET(__wt_ovfl_read(session, page, unpack, store));
+		WT_RET(__wt_ovfl_read(session, page, unpack, store, &decoded));
+		if (decoded)
+			return (0);
 		huffman = btree->huffman_value;
 		break;
 	WT_ILLEGAL_VALUE(session);

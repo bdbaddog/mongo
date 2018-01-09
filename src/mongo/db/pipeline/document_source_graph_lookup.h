@@ -36,9 +36,9 @@
 
 namespace mongo {
 
-class DocumentSourceGraphLookUp final : public DocumentSourceNeedsMongod {
+class DocumentSourceGraphLookUp final : public DocumentSource {
 public:
-    static std::unique_ptr<LiteParsedDocumentSourceOneForeignCollection> liteParse(
+    static std::unique_ptr<LiteParsedDocumentSourceForeignCollections> liteParse(
         const AggregationRequest& request, const BSONElement& spec);
 
     GetNextResult getNext() final;
@@ -53,8 +53,15 @@ public:
      */
     GetModPathsReturn getModifiedPaths() const final;
 
-    bool canSwapWithMatch() const final {
-        return true;
+    StageConstraints constraints(Pipeline::SplitState pipeState) const final {
+        StageConstraints constraints(StreamType::kStreaming,
+                                     PositionRequirement::kNone,
+                                     HostTypeRequirement::kPrimaryShard,
+                                     DiskUseRequirement::kNoDiskUse,
+                                     FacetRequirement::kAllowed);
+
+        constraints.canSwapWithMatch = true;
+        return constraints;
     }
 
     GetDepsReturn getDependencies(DepsTracker* deps) const final {
@@ -62,17 +69,13 @@ public:
         return SEE_NEXT;
     };
 
-    bool needsPrimaryShard() const final {
-        return true;
-    }
-
     void addInvolvedCollections(std::vector<NamespaceString>* collections) const final {
         collections->push_back(_from);
     }
 
-    void doDetachFromOperationContext() final;
+    void detachFromOperationContext() final;
 
-    void doReattachToOperationContext(OperationContext* opCtx) final;
+    void reattachToOperationContext(OperationContext* opCtx) final;
 
     static boost::intrusive_ptr<DocumentSourceGraphLookUp> create(
         const boost::intrusive_ptr<ExpressionContext>& expCtx,

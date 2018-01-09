@@ -3,6 +3,7 @@ var wait;
 var occasionally;
 var reconnect;
 var getLatestOp;
+var getLeastRecentOp;
 var waitForAllMembers;
 var reconfig;
 var awaitOpTime;
@@ -12,6 +13,7 @@ var waitForState;
 var reInitiateWithoutThrowingOnAbortedMember;
 var awaitRSClientHosts;
 var getLastOpTime;
+var setLogVerbosity;
 
 (function() {
     "use strict";
@@ -144,6 +146,16 @@ var getLastOpTime;
         return null;
     };
 
+    getLeastRecentOp = function({server, readConcern}) {
+        server.getDB("admin").getMongo().setSlaveOk();
+        const oplog = server.getDB("local").oplog.rs;
+        const cursor = oplog.find().sort({$natural: 1}).limit(1).readConcern(readConcern);
+        if (cursor.hasNext()) {
+            return cursor.next();
+        }
+        return null;
+    };
+
     waitForAllMembers = function(master, timeout) {
         var failCount = 0;
 
@@ -182,8 +194,20 @@ var getLastOpTime;
         var e;
         var master;
         try {
-            assert.commandWorked(admin.runCommand(
-                {replSetReconfig: rs._updateConfigIfNotDurable(config), force: force}));
+            var reconfigCommand = {
+                replSetReconfig: rs._updateConfigIfNotDurable(config),
+                force: force
+            };
+            var res = admin.runCommand(reconfigCommand);
+
+            // Retry reconfig if quorum check failed because not enough voting nodes responded.
+            if (!res.ok && res.code === ErrorCodes.NodeNotFound) {
+                print("Replset reconfig failed because quorum check failed. Retry reconfig once. " +
+                      "Error: " + tojson(res));
+                res = admin.runCommand(reconfigCommand);
+            }
+
+            assert.commandWorked(res);
         } catch (e) {
             if (!isNetworkError(e)) {
                 throw e;
@@ -197,20 +221,16 @@ var getLastOpTime;
         return master;
     };
 
-    awaitOpTime = function(node, opTime) {
-        var ts, ex;
+    awaitOpTime = function(catchingUpNode, latestOpTimeNode) {
+        var ts, ex, opTime;
         assert.soon(
             function() {
                 try {
                     // The following statement extracts the timestamp field from the most recent
                     // element of
                     // the oplog, and stores it in "ts".
-                    ts = node.getDB("local")['oplog.rs']
-                             .find({})
-                             .sort({'$natural': -1})
-                             .limit(1)
-                             .next()
-                             .ts;
+                    ts = getLatestOp(catchingUpNode).ts;
+                    opTime = getLatestOp(latestOpTimeNode).ts;
                     if ((ts.t == opTime.t) && (ts.i == opTime.i)) {
                         return true;
                     }
@@ -221,8 +241,8 @@ var getLastOpTime;
                 }
             },
             function() {
-                var message = "Node " + node + " only reached optime " + tojson(ts) + " not " +
-                    tojson(opTime);
+                var message = "Node " + catchingUpNode + " only reached optime " + tojson(ts) +
+                    " not " + tojson(opTime);
                 if (ex) {
                     message += "; last attempt failed with exception " + tojson(ex);
                 }
@@ -275,7 +295,8 @@ var getLastOpTime;
     };
 
     /**
-     * Waits for the given node to reach the given state, ignoring network errors.
+     * Waits for the given node to reach the given state, ignoring network errors.  Ensures that the
+     * connection is re-connected and usable when the function returns.
      */
     waitForState = function(node, state) {
         assert.soonNoExcept(function() {
@@ -283,6 +304,10 @@ var getLastOpTime;
                 {replSetTest: 1, waitForMemberState: state, timeoutMillis: 60 * 1000 * 5}));
             return true;
         });
+        // Some state transitions cause connections to be closed, but whether the connection close
+        // happens before or after the replSetTest command above returns is racy, so to ensure that
+        // the connection to 'node' is usable after this function returns, reconnect it first.
+        reconnect(node);
     };
 
     /**
@@ -294,17 +319,10 @@ var getLastOpTime;
      * @param options - The options passed to {@link ReplSetTest.startSet}
      */
     startSetIfSupportsReadMajority = function(replSetTest, options) {
-        try {
-            replSetTest.startSet(options);
-        } catch (e) {
-            var conn = MongoRunner.runMongod();
-            if (!conn.getDB("admin").serverStatus().storageEngine.supportsCommittedReads) {
-                MongoRunner.stopMongod(conn);
-                return false;
-            }
-            throw e;
-        }
-        return true;
+        replSetTest.startSet(options);
+        return replSetTest.nodes[0]
+            .adminCommand("serverStatus")
+            .storageEngine.supportsCommittedReads;
     };
 
     /**
@@ -428,4 +446,19 @@ var getLastOpTime;
         var connStatus = replSetStatus.members.filter(m => m.self)[0];
         return connStatus.optime;
     };
+
+    /**
+     * Set log verbosity on all given nodes.
+     * e.g. setLogVerbosity(replTest.nodes, { "replication": {"verbosity": 3} });
+     */
+    setLogVerbosity = function(nodes, logVerbosity) {
+        var verbosity = {
+            "setParameter": 1,
+            "logComponentVerbosity": logVerbosity,
+        };
+        nodes.forEach(function(node) {
+            assert.commandWorked(node.adminCommand(verbosity));
+        });
+    };
+
 }());

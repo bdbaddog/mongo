@@ -1,5 +1,12 @@
-// Tests administrative sharding operations and map-reduce work or fail as expected, when key-based
-// authentication is used
+/**
+ * Tests administrative sharding operations and map-reduce work or fail as expected, when key-based
+ * authentication is used
+ *
+ * This test is labeled resource intensive because its total io_write is 30MB compared to a median
+ * of 5MB across all sharding tests in wiredTiger. Its total io_write is 630MB compared to a median
+ * of 135MB in mmapv1.
+ * @tags: [resource_intensive]
+ */
 (function() {
     'use strict';
     load("jstests/replsets/rslib.js");
@@ -38,7 +45,7 @@
         name: "auth",
         mongos: 1,
         shards: 0,
-        other: {keyFile: "jstests/libs/key1", chunkSize: 1, enableAutoSplit: true},
+        other: {keyFile: "jstests/libs/key1", chunkSize: 1, enableAutoSplit: false},
     });
 
     if (s.getDB('admin').runCommand('buildInfo').bits < 64) {
@@ -66,7 +73,7 @@
     s.restartMongos(0);
     login(adminUser);
 
-    var d1 = new ReplSetTest({name: "d1", nodes: 3, useHostName: true});
+    var d1 = new ReplSetTest({name: "d1", nodes: 3, useHostName: true, waitForKeys: false});
     d1.startSet({keyFile: "jstests/libs/key2", shardsvr: ""});
     d1.initiate();
 
@@ -147,7 +154,7 @@
 
     logout(testUser);
 
-    var d2 = new ReplSetTest({name: "d2", nodes: 3, useHostName: true});
+    var d2 = new ReplSetTest({name: "d2", nodes: 3, useHostName: true, waitForKeys: false});
     d2.startSet({keyFile: "jstests/libs/key1", shardsvr: ""});
     d2.initiate();
     d2.awaitSecondaryNodes();
@@ -167,6 +174,7 @@
     s.getDB("test").foo.remove({});
 
     var num = 10000;
+    assert.commandWorked(s.s.adminCommand({split: "test.foo", middle: {x: num / 2}}));
     var bulk = s.getDB("test").foo.initializeUnorderedBulkOp();
     for (i = 0; i < num; i++) {
         bulk.insert(
@@ -177,9 +185,9 @@
     s.startBalancer(60000);
 
     assert.soon(function() {
-        var d1Chunks = s.getDB("config").chunks.count({shard: "d1"});
-        var d2Chunks = s.getDB("config").chunks.count({shard: "d2"});
-        var totalChunks = s.getDB("config").chunks.count({ns: "test.foo"});
+        var d1Chunks = s.getDB("config").chunks.count({ns: 'test.foo', shard: "d1"});
+        var d2Chunks = s.getDB("config").chunks.count({ns: 'test.foo', shard: "d2"});
+        var totalChunks = s.getDB("config").chunks.count({ns: 'test.foo'});
 
         print("chunks: " + d1Chunks + " " + d2Chunks + " " + totalChunks);
 

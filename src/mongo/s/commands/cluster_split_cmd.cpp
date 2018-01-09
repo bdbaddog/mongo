@@ -84,9 +84,9 @@ BSONObj selectMedianKey(OperationContext* opCtx,
               "Unable to find median in chunk, possibly because chunk is empty.");
 }
 
-class SplitCollectionCmd : public Command {
+class SplitCollectionCmd : public ErrmsgCommandDeprecated {
 public:
-    SplitCollectionCmd() : Command("split", "split") {}
+    SplitCollectionCmd() : ErrmsgCommandDeprecated("split", "split") {}
 
     bool slaveOk() const override {
         return true;
@@ -123,11 +123,11 @@ public:
         return parseNsFullyQualified(dbname, cmdObj);
     }
 
-    bool run(OperationContext* opCtx,
-             const std::string& dbname,
-             const BSONObj& cmdObj,
-             std::string& errmsg,
-             BSONObjBuilder& result) override {
+    bool errmsgRun(OperationContext* opCtx,
+                   const std::string& dbname,
+                   const BSONObj& cmdObj,
+                   std::string& errmsg,
+                   BSONObjBuilder& result) override {
         const NamespaceString nss(parseNs(dbname, cmdObj));
 
         auto routingInfo = uassertStatusOK(
@@ -196,7 +196,7 @@ public:
             BSONObj shardKey =
                 uassertStatusOK(cm->getShardKeyPattern().extractShardKeyFromQuery(opCtx, find));
             if (shardKey.isEmpty()) {
-                errmsg = stream() << "no shard key found in chunk query " << find;
+                errmsg = str::stream() << "no shard key found in chunk query " << find;
                 return false;
             }
 
@@ -272,6 +272,8 @@ public:
                                                   ChunkRange(chunk->getMin(), chunk->getMax()),
                                                   {splitPoint}));
 
+        // This invalidation is only necessary so that auto-split can begin to track statistics for
+        // the chunks produced after the split instead of the single original chunk.
         Grid::get(opCtx)->catalogCache()->onStaleConfigError(std::move(routingInfo));
 
         return true;

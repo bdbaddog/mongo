@@ -1,5 +1,5 @@
 /*-
- * Copyright (c) 2014-2017 MongoDB, Inc.
+ * Copyright (c) 2014-2018 MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -85,12 +85,6 @@ __wt_delete_page(WT_SESSION_IMPL *session, WT_REF *ref, bool *skipp)
 	/*
 	 * Atomically switch the page's state to lock it.  If the page is not
 	 * on-disk, other threads may be using it, no fast delete.
-	 *
-	 * Possible optimization: if the page is already deleted and the delete
-	 * is visible to us (the delete has been committed), we could skip the
-	 * page instead of instantiating it and figuring out there are no rows
-	 * in the page.  While that's a huge amount of work to no purpose, it's
-	 * unclear optimizing for overlapping range deletes is worth the effort.
 	 */
 	if (ref->state != WT_REF_DISK ||
 	    !__wt_atomic_casv32(&ref->state, WT_REF_DISK, WT_REF_LOCKED))
@@ -153,6 +147,7 @@ void
 __wt_delete_page_rollback(WT_SESSION_IMPL *session, WT_REF *ref)
 {
 	WT_UPDATE **upd;
+	uint64_t sleep_count, yield_count;
 
 	/*
 	 * If the page is still "deleted", it's as we left it, reset the state
@@ -160,9 +155,10 @@ __wt_delete_page_rollback(WT_SESSION_IMPL *session, WT_REF *ref)
 	 * instantiated or being instantiated.  Loop because it's possible for
 	 * the page to return to the deleted state if instantiation fails.
 	 */
-	for (;; __wt_yield())
+	for (sleep_count = yield_count = 0;;) {
 		switch (ref->state) {
 		case WT_REF_DISK:
+		case WT_REF_LOOKASIDE:
 		case WT_REF_READING:
 			WT_ASSERT(session, 0);		/* Impossible, assert */
 			break;
@@ -205,6 +201,15 @@ __wt_delete_page_rollback(WT_SESSION_IMPL *session, WT_REF *ref)
 			__wt_free(session, ref->page_del);
 			return;
 		}
+		/*
+		 * We wait for the change in page state, yield before retrying,
+		 * and if we've yielded enough times, start sleeping so we don't
+		 * burn CPU to no purpose.
+		 */
+		__wt_ref_state_yield_sleep(&yield_count, &sleep_count);
+		WT_STAT_CONN_INCRV(session, page_del_rollback_blocked,
+		    sleep_count);
+	}
 }
 
 /*
@@ -242,8 +247,10 @@ __wt_delete_page_skip(WT_SESSION_IMPL *session, WT_REF *ref, bool visible_all)
 		return (false);
 
 	skip = ref->page_del == NULL || (visible_all ?
-	    __wt_txn_visible_all(session, ref->page_del->txnid) :
-	    __wt_txn_visible(session, ref->page_del->txnid));
+	    __wt_txn_visible_all(session, ref->page_del->txnid,
+		WT_TIMESTAMP_NULL(&ref->page_del->timestamp)):
+	    __wt_txn_visible(session, ref->page_del->txnid,
+		WT_TIMESTAMP_NULL(&ref->page_del->timestamp)));
 
 	/*
 	 * The page_del structure can be freed as soon as the delete is stable:
@@ -252,7 +259,8 @@ __wt_delete_page_skip(WT_SESSION_IMPL *session, WT_REF *ref, bool visible_all)
 	 * no longer need synchronization to check the ref.
 	 */
 	if (skip && ref->page_del != NULL && (visible_all ||
-	    __wt_txn_visible_all(session, ref->page_del->txnid))) {
+	    __wt_txn_visible_all(session, ref->page_del->txnid,
+		WT_TIMESTAMP_NULL(&ref->page_del->timestamp)))) {
 		__wt_free(session, ref->page_del->update_list);
 		__wt_free(session, ref->page_del);
 	}
@@ -333,7 +341,7 @@ __wt_delete_page_instantiate(WT_SESSION_IMPL *session, WT_REF *ref)
 	 */
 	for (i = 0, size = 0; i < page->entries; ++i) {
 		WT_ERR(__wt_calloc_one(session, &upd));
-		upd->type = WT_UPDATE_DELETED;
+		upd->type = WT_UPDATE_TOMBSTONE;
 
 		if (page_del == NULL)
 			upd->txnid = WT_TXN_NONE;	/* Globally visible */

@@ -120,7 +120,7 @@ public:
         params.limit = limit();
 
         auto keyGenStage = make_unique<SortKeyGeneratorStage>(
-            &_opCtx, queuedDataStage.release(), ws.get(), params.pattern, BSONObj(), nullptr);
+            &_opCtx, queuedDataStage.release(), ws.get(), params.pattern, nullptr);
 
         auto ss = make_unique<SortStage>(&_opCtx, params, ws.get(), keyGenStage.release());
 
@@ -159,7 +159,7 @@ public:
         params.limit = limit();
 
         auto keyGenStage = make_unique<SortKeyGeneratorStage>(
-            &_opCtx, queuedDataStage.release(), ws.get(), params.pattern, BSONObj(), nullptr);
+            &_opCtx, queuedDataStage.release(), ws.get(), params.pattern, nullptr);
 
         auto sortStage = make_unique<SortStage>(&_opCtx, params, ws.get(), keyGenStage.release());
 
@@ -350,20 +350,22 @@ public:
         set<RecordId>::iterator it = recordIds.begin();
         Snapshotted<BSONObj> oldDoc = coll->docFor(&_opCtx, *it);
 
-        OID updatedId = oldDoc.value().getField("_id").OID();
-        SnapshotId idBeforeUpdate = oldDoc.snapshotId();
+        const OID updatedId = oldDoc.value().getField("_id").OID();
+        const SnapshotId idBeforeUpdate = oldDoc.snapshotId();
         // We purposefully update the document to have a 'foo' value greater than limit().
         // This allows us to check that we don't return the new copy of a doc by asserting
         // foo < limit().
-        BSONObj newDoc = BSON("_id" << updatedId << "foo" << limit() + 10);
+        auto newDoc = [&](const Snapshotted<BSONObj>& oldDoc) {
+            return BSON("_id" << oldDoc.value()["_id"] << "foo" << limit() + 10);
+        };
         OplogUpdateEntryArgs args;
         args.nss = coll->ns();
         {
             WriteUnitOfWork wuow(&_opCtx);
-            coll->updateDocument(&_opCtx, *it, oldDoc, newDoc, false, false, NULL, &args);
+            coll->updateDocument(&_opCtx, *it, oldDoc, newDoc(oldDoc), false, false, NULL, &args);
             wuow.commit();
         }
-        exec->restoreState();
+        ASSERT_OK(exec->restoreState());
 
         // Read the rest of the data from the queued data stage.
         while (!queuedDataStage->isEOF()) {
@@ -378,11 +380,12 @@ public:
             oldDoc = coll->docFor(&_opCtx, *it);
             {
                 WriteUnitOfWork wuow(&_opCtx);
-                coll->updateDocument(&_opCtx, *it++, oldDoc, newDoc, false, false, NULL, &args);
+                coll->updateDocument(
+                    &_opCtx, *it++, oldDoc, newDoc(oldDoc), false, false, NULL, &args);
                 wuow.commit();
             }
         }
-        exec->restoreState();
+        ASSERT_OK(exec->restoreState());
 
         // Verify that it's sorted, the right number of documents are returned, and they're all
         // in the expected range.
@@ -459,10 +462,10 @@ public:
         set<RecordId>::iterator it = recordIds.begin();
         {
             WriteUnitOfWork wuow(&_opCtx);
-            coll->deleteDocument(&_opCtx, *it++, nullOpDebug);
+            coll->deleteDocument(&_opCtx, kUninitializedStmtId, *it++, nullOpDebug);
             wuow.commit();
         }
-        exec->restoreState();
+        ASSERT_OK(exec->restoreState());
 
         // Read the rest of the data from the queued data stage.
         while (!queuedDataStage->isEOF()) {
@@ -475,11 +478,11 @@ public:
         while (it != recordIds.end()) {
             {
                 WriteUnitOfWork wuow(&_opCtx);
-                coll->deleteDocument(&_opCtx, *it++, nullOpDebug);
+                coll->deleteDocument(&_opCtx, kUninitializedStmtId, *it++, nullOpDebug);
                 wuow.commit();
             }
         }
-        exec->restoreState();
+        ASSERT_OK(exec->restoreState());
 
         // Regardless of storage engine, all the documents should come back with their objects
         int count = 0;
@@ -558,7 +561,7 @@ public:
         params.limit = 0;
 
         auto keyGenStage = make_unique<SortKeyGeneratorStage>(
-            &_opCtx, queuedDataStage.release(), ws.get(), params.pattern, BSONObj(), nullptr);
+            &_opCtx, queuedDataStage.release(), ws.get(), params.pattern, nullptr);
 
         auto sortStage = make_unique<SortStage>(&_opCtx, params, ws.get(), keyGenStage.release());
 

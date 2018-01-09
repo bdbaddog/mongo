@@ -31,6 +31,7 @@
 #include "mongo/platform/basic.h"
 
 #include "mongo/base/init.h"
+#include "mongo/bson/timestamp.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/operation_context.h"
@@ -39,9 +40,9 @@
 #include "mongo/db/storage/snapshot_manager.h"
 
 namespace mongo {
-class CmdMakeSnapshot final : public Command {
+class CmdMakeSnapshot final : public BasicCommand {
 public:
-    CmdMakeSnapshot() : Command("makeSnapshot") {}
+    CmdMakeSnapshot() : BasicCommand("makeSnapshot") {}
 
     virtual bool slaveOk() const {
         return true;
@@ -67,7 +68,6 @@ public:
     bool run(OperationContext* opCtx,
              const std::string& dbname,
              const BSONObj& cmdObj,
-             std::string& errmsg,
              BSONObjBuilder& result) {
         auto snapshotManager =
             getGlobalServiceContext()->getGlobalStorageEngine()->getSnapshotManager();
@@ -79,18 +79,16 @@ public:
 
         auto status = snapshotManager->prepareForCreateSnapshot(opCtx);
         if (status.isOK()) {
-            const auto name =
-                repl::ReplicationCoordinator::get(opCtx)->reserveSnapshotName(nullptr);
-            result.append("name", static_cast<long long>(name.asU64()));
-            status = snapshotManager->createSnapshot(opCtx, name);
+            const auto name = repl::ReplicationCoordinator::get(opCtx)->reserveSnapshotName(opCtx);
+            result.append("name", static_cast<long long>(name.asULL()));
         }
         return appendCommandStatus(result, status);
     }
 };
 
-class CmdSetCommittedSnapshot final : public Command {
+class CmdSetCommittedSnapshot final : public BasicCommand {
 public:
-    CmdSetCommittedSnapshot() : Command("setCommittedSnapshot") {}
+    CmdSetCommittedSnapshot() : BasicCommand("setCommittedSnapshot") {}
 
     virtual bool slaveOk() const {
         return true;
@@ -116,7 +114,6 @@ public:
     bool run(OperationContext* opCtx,
              const std::string& dbname,
              const BSONObj& cmdObj,
-             std::string& errmsg,
              BSONObjBuilder& result) {
         auto snapshotManager =
             getGlobalServiceContext()->getGlobalStorageEngine()->getSnapshotManager();
@@ -125,8 +122,8 @@ public:
         }
 
         Lock::GlobalLock lk(opCtx, MODE_IX, UINT_MAX);
-        auto name = SnapshotName(cmdObj.firstElement().Long());
-        snapshotManager->setCommittedSnapshot(name);
+        auto timestamp = Timestamp(cmdObj.firstElement().Long());
+        snapshotManager->setCommittedSnapshot(timestamp);
         return true;
     }
 };

@@ -177,8 +177,7 @@ void BackgroundJob::go() {
     // If the job is already 'done', for instance because it was cancelled or already
     // finished, ignore additional requests to run the job.
     if (_status->state == NotStarted) {
-        stdx::thread t(stdx::bind(&BackgroundJob::jobBody, this));
-        t.detach();
+        stdx::thread{[this] { jobBody(); }}.detach();
         _status->state = Running;
     }
 }
@@ -262,7 +261,7 @@ Status PeriodicTask::stopRunningPeriodicTasks(int gracePeriodMillis) {
     if (runnerDestroyed || !runner)
         return status;
 
-    runner->cancel();
+    runner->cancel().transitional_ignore();
     status = runner->stop(gracePeriodMillis);
 
     if (status.isOK()) {

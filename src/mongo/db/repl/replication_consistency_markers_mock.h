@@ -60,11 +60,17 @@ public:
     void setMinValid(OperationContext* opCtx, const OpTime& minValid) override;
     void setMinValidToAtLeast(OperationContext* opCtx, const OpTime& minValid) override;
 
-    void setOplogDeleteFromPoint(OperationContext* opCtx, const Timestamp& timestamp) override;
-    Timestamp getOplogDeleteFromPoint(OperationContext* opCtx) const override;
+    void setOplogTruncateAfterPoint(OperationContext* opCtx, const Timestamp& timestamp) override;
+    Timestamp getOplogTruncateAfterPoint(OperationContext* opCtx) const override;
+
+    void removeOldOplogDeleteFromPointField(OperationContext* opCtx) override;
 
     void setAppliedThrough(OperationContext* opCtx, const OpTime& optime) override;
+    void clearAppliedThrough(OperationContext* opCtx, const Timestamp& writeTimestamp) override;
     OpTime getAppliedThrough(OperationContext* opCtx) const override;
+
+    void writeCheckpointTimestamp(OperationContext* opCtx, const Timestamp& timestamp) override;
+    Timestamp getCheckpointTimestamp(OperationContext* opCtx) override;
 
 private:
     mutable stdx::mutex _initialSyncFlagMutex;
@@ -73,7 +79,8 @@ private:
     mutable stdx::mutex _minValidBoundariesMutex;
     OpTime _appliedThrough;
     OpTime _minValid;
-    Timestamp _oplogDeleteFromPoint;
+    Timestamp _oplogTruncateAfterPoint;
+    Timestamp _checkpointTimestamp;
 };
 
 }  // namespace repl

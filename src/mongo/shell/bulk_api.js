@@ -15,9 +15,6 @@ var _bulk_api_module = (function() {
     var UNKNOWN_REPL_WRITE_CONCERN = 79;
     var NOT_MASTER = 10107;
 
-    // Constants
-    var IndexCollPattern = new RegExp('system\.indexes$');
-
     /**
      * Helper function to define properties
      */
@@ -659,10 +656,6 @@ var _bulk_api_module = (function() {
          * @param document {Object} the document to insert.
          */
         this.insert = function(document) {
-            if (!IndexCollPattern.test(coll.getName())) {
-                collection._validateForStorage(document);
-            }
-
             return addToOperationsList(INSERT, document);
         };
 
@@ -670,8 +663,6 @@ var _bulk_api_module = (function() {
         // Find based operations
         var findOperations = {
             update: function(updateDocument) {
-                collection._validateUpdateDoc(updateDocument);
-
                 // Set the top value for the update 0 = multi true, 1 = multi false
                 var upsert = typeof currentOp.upsert == 'boolean' ? currentOp.upsert : false;
                 // Establish the update command
@@ -695,8 +686,6 @@ var _bulk_api_module = (function() {
             },
 
             updateOne: function(updateDocument) {
-                collection._validateUpdateDoc(updateDocument);
-
                 // Set the top value for the update 0 = multi true, 1 = multi false
                 var upsert = typeof currentOp.upsert == 'boolean' ? currentOp.upsert : false;
                 // Establish the update command
@@ -730,8 +719,6 @@ var _bulk_api_module = (function() {
             },
 
             removeOne: function() {
-                collection._validateRemoveDoc(currentOp.selector);
-
                 // Establish the removeOne command
                 var document = {q: currentOp.selector, limit: 1};
 
@@ -747,8 +734,6 @@ var _bulk_api_module = (function() {
             },
 
             remove: function() {
-                collection._validateRemoveDoc(currentOp.selector);
-
                 // Establish the remove command
                 var document = {q: currentOp.selector, limit: 0};
 
@@ -892,6 +877,19 @@ var _bulk_api_module = (function() {
                 cmd.writeConcern = writeConcern;
             }
 
+            {
+                const kWireVersionSupportingRetryableWrites = 6;
+                const serverSupportsRetryableWrites =
+                    coll.getMongo().getMinWireVersion() <= kWireVersionSupportingRetryableWrites &&
+                    kWireVersionSupportingRetryableWrites <= coll.getMongo().getMaxWireVersion();
+
+                const session = collection.getDB().getSession();
+                if (serverSupportsRetryableWrites && session.getOptions().shouldRetryWrites() &&
+                    session._serverSession.canRetryWrites(cmd)) {
+                    cmd = session._serverSession.assignTransactionNumber(cmd);
+                }
+            }
+
             return cmd;
         };
 
@@ -902,26 +900,7 @@ var _bulk_api_module = (function() {
             var cmd = buildBatchCmd(batch);
 
             // Run the command (may throw)
-
-            // Get command collection
-            var cmdColl = collection._db.getCollection('$cmd');
-            // Bypass runCommand to ignore slaveOk and read pref settings
-            var cursor = new DBQuery(collection.getMongo(),
-                                     collection._db,
-                                     cmdColl,
-                                     cmdColl.getFullName(),
-                                     cmd,
-                                     {} /* proj */,
-                                     -1 /* limit */,
-                                     0 /* skip */,
-                                     0 /* batchSize */,
-                                     0 /* flags */);
-            var rc = collection.getMongo().getReadConcern();
-            if (rc) {
-                cursor.readConcern(rc);
-            }
-
-            result = cursor.next();
+            result = collection.runCommand(cmd);
 
             if (result.ok == 0) {
                 throw new WriteCommandError(result);

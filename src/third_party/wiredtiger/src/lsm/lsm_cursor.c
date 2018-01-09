@@ -1,5 +1,5 @@
 /*-
- * Copyright (c) 2014-2017 MongoDB, Inc.
+ * Copyright (c) 2014-2018 MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -240,7 +240,7 @@ __clsm_enter(WT_CURSOR_LSM *clsm, bool reset, bool update)
 						break;
 					WT_ASSERT(session,
 					    !__wt_txn_visible_all(
-					    session, switch_txn));
+					    session, switch_txn, NULL));
 				}
 			}
 		}
@@ -446,10 +446,10 @@ __clsm_open_cursors(
 	WT_LSM_TREE *lsm_tree;
 	WT_SESSION_IMPL *session;
 	WT_TXN *txn;
-	const char *checkpoint, *ckpt_cfg[3];
 	uint64_t saved_gen;
-	u_int i, nchunks, ngood, nupdates;
 	u_int close_range_end, close_range_start;
+	u_int i, nchunks, ngood, nupdates;
+	const char *checkpoint, *ckpt_cfg[3];
 	bool locked;
 
 	c = &clsm->iface;
@@ -514,8 +514,6 @@ retry:	if (F_ISSET(clsm, WT_CLSM_MERGE)) {
 			/* We have to find the start chunk: merge locked it. */
 			WT_ASSERT(session, start_chunk < lsm_tree->nchunks);
 		}
-
-		WT_ASSERT(session, start_chunk + nchunks <= lsm_tree->nchunks);
 	} else {
 		nchunks = lsm_tree->nchunks;
 		WT_ERR(__clsm_resize_chunks(session, clsm, nchunks));
@@ -538,8 +536,7 @@ retry:	if (F_ISSET(clsm, WT_CLSM_MERGE)) {
 				chunk = lsm_tree->chunk[ngood - 1];
 				clsm->chunks[ngood - 1]->switch_txn =
 				    chunk->switch_txn;
-				if (__wt_txn_visible_all(
-				    session, chunk->switch_txn))
+				if (__wt_lsm_chunk_visible_all(session, chunk))
 					break;
 			}
 		} else {
@@ -560,13 +557,19 @@ retry:	if (F_ISSET(clsm, WT_CLSM_MERGE)) {
 			if (strcmp(cursor->uri, chunk->uri) != 0)
 				break;
 
-			/* Make sure the checkpoint config matches. */
-			checkpoint = ((WT_CURSOR_BTREE *)cursor)->
-			    btree->dhandle->checkpoint;
-			if (checkpoint == NULL &&
-			    F_ISSET(chunk, WT_LSM_CHUNK_ONDISK) &&
-			    !chunk->empty)
-				break;
+			/*
+			 * Make sure the checkpoint config matches when not
+			 * using a custom data source.
+			 */
+			if (lsm_tree->custom_generation == 0 ||
+			    chunk->generation < lsm_tree->custom_generation) {
+				checkpoint = ((WT_CURSOR_BTREE *)cursor)->
+				    btree->dhandle->checkpoint;
+				if (checkpoint == NULL &&
+				    F_ISSET(chunk, WT_LSM_CHUNK_ONDISK) &&
+				    !chunk->empty)
+					break;
+			}
 
 			/* Make sure the Bloom config matches. */
 			if (clsm->chunks[ngood]->bloom == NULL &&
@@ -619,6 +622,7 @@ retry:	if (F_ISSET(clsm, WT_CLSM_MERGE)) {
 		clsm->current = NULL;
 	}
 
+	WT_ASSERT(session, start_chunk + nchunks <= lsm_tree->nchunks);
 	clsm->nchunks = nchunks;
 
 	/* Open the cursors for chunks that have changed. */
@@ -672,9 +676,10 @@ retry:	if (F_ISSET(clsm, WT_CLSM_MERGE)) {
 		    WT_CURSTD_OVERWRITE | WT_CURSTD_RAW);
 	}
 
-	/* Setup the count values for each chunk in the chunks*/
+	/* Setup the count values for each chunk in the chunks */
 	for (i = 0; i != clsm->nchunks; i++)
-		clsm->chunks[i]->count = lsm_tree->chunk[i]->count;
+		clsm->chunks[i]->count =
+		    lsm_tree->chunk[i + start_chunk]->count;
 
 	/* The last chunk is our new primary. */
 	if (chunk != NULL &&
@@ -722,13 +727,19 @@ err:
 			WT_ASSERT(
 			    session, strcmp(cursor->uri, chunk->uri) == 0);
 
-			/* Make sure the checkpoint config matches. */
-			checkpoint = ((WT_CURSOR_BTREE *)cursor)->
-			    btree->dhandle->checkpoint;
-			WT_ASSERT(session,
-			    (F_ISSET(chunk, WT_LSM_CHUNK_ONDISK) &&
-			    !chunk->empty) ?
-			    checkpoint != NULL : checkpoint == NULL);
+			/*
+			 * Make sure the checkpoint config matches when not
+			 * using a custom data source.
+			 */
+			if (lsm_tree->custom_generation == 0 ||
+			    chunk->generation < lsm_tree->custom_generation) {
+				checkpoint = ((WT_CURSOR_BTREE *)cursor)->
+				    btree->dhandle->checkpoint;
+				WT_ASSERT(session,
+				    (F_ISSET(chunk, WT_LSM_CHUNK_ONDISK) &&
+				    !chunk->empty) ?
+				    checkpoint != NULL : checkpoint == NULL);
+			}
 
 			/* Make sure the Bloom config matches. */
 			WT_ASSERT(session,
@@ -778,8 +789,8 @@ __clsm_get_current(WT_SESSION_IMPL *session,
     WT_CURSOR_LSM *clsm, bool smallest, bool *deletedp)
 {
 	WT_CURSOR *c, *current;
-	int cmp;
 	u_int i;
+	int cmp;
 	bool multiple;
 
 	current = NULL;
@@ -860,8 +871,8 @@ err:	API_END_RET(session, ret);
 static int
 __clsm_next(WT_CURSOR *cursor)
 {
-	WT_CURSOR_LSM *clsm;
 	WT_CURSOR *c;
+	WT_CURSOR_LSM *clsm;
 	WT_DECL_RET;
 	WT_SESSION_IMPL *session;
 	u_int i;
@@ -937,10 +948,9 @@ retry:		/*
 		goto retry;
 
 err:	__clsm_leave(clsm);
-	API_END(session, ret);
 	if (ret == 0)
 		__clsm_deleted_decode(clsm, &cursor->value);
-	return (ret);
+	API_END_RET(session, ret);
 }
 
 /*
@@ -987,8 +997,8 @@ __clsm_random_chunk(WT_SESSION_IMPL *session,
 static int
 __clsm_next_random(WT_CURSOR *cursor)
 {
-	WT_CURSOR_LSM *clsm;
 	WT_CURSOR *c;
+	WT_CURSOR_LSM *clsm;
 	WT_DECL_RET;
 	WT_SESSION_IMPL *session;
 	int exact;
@@ -1029,8 +1039,7 @@ __clsm_next_random(WT_CURSOR *cursor)
 err:		F_CLR(cursor, WT_CURSTD_KEY_INT | WT_CURSTD_VALUE_INT);
 	}
 	__clsm_leave(clsm);
-	API_END(session, ret);
-	return (ret);
+	API_END_RET(session, ret);
 }
 
 /*
@@ -1040,8 +1049,8 @@ err:		F_CLR(cursor, WT_CURSTD_KEY_INT | WT_CURSTD_VALUE_INT);
 static int
 __clsm_prev(WT_CURSOR *cursor)
 {
-	WT_CURSOR_LSM *clsm;
 	WT_CURSOR *c;
+	WT_CURSOR_LSM *clsm;
 	WT_DECL_RET;
 	WT_SESSION_IMPL *session;
 	u_int i;
@@ -1116,10 +1125,9 @@ retry:		/*
 		goto retry;
 
 err:	__clsm_leave(clsm);
-	API_END(session, ret);
 	if (ret == 0)
 		__clsm_deleted_decode(clsm, &cursor->value);
-	return (ret);
+	API_END_RET(session, ret);
 }
 
 /*
@@ -1275,10 +1283,9 @@ __clsm_search(WT_CURSOR *cursor)
 	ret = __clsm_lookup(clsm, &cursor->value);
 
 err:	__clsm_leave(clsm);
-	API_END(session, ret);
 	if (ret == 0)
 		__clsm_deleted_decode(clsm, &cursor->value);
-	return (ret);
+	API_END_RET(session, ret);
 }
 
 /*
@@ -1418,7 +1425,6 @@ __clsm_search_near(WT_CURSOR *cursor, int *exactp)
 	*exactp = cmp;
 
 err:	__clsm_leave(clsm);
-	API_END(session, ret);
 	if (closest != NULL)
 		WT_TRET(closest->reset(closest));
 
@@ -1428,7 +1434,7 @@ err:	__clsm_leave(clsm);
 	} else
 		clsm->current = NULL;
 
-	return (ret);
+	API_END_RET(session, ret);
 }
 
 /*
@@ -1466,8 +1472,8 @@ __clsm_put(WT_SESSION_IMPL *session, WT_CURSOR_LSM *clsm,
 
 	for (i = 0, slot = clsm->nchunks - 1; i < clsm->nupdates; i++, slot--) {
 		/* Check if we need to keep updating old chunks. */
-		if (i > 0 &&
-		    __wt_txn_visible(session, clsm->chunks[slot]->switch_txn)) {
+		if (i > 0 && __wt_txn_visible(
+		    session, clsm->chunks[slot]->switch_txn, NULL)) {
 			clsm->nupdates = i;
 			break;
 		}
@@ -1775,9 +1781,7 @@ __wt_clsm_open(WT_SESSION_IMPL *session,
 	if (!WT_PREFIX_MATCH(uri, "lsm:"))
 		return (__wt_unexpected_object_type(session, uri, "lsm:"));
 
-	if (F_ISSET(S2C(session), WT_CONN_IN_MEMORY))
-		WT_RET_MSG(session, EINVAL,
-		    "LSM trees not supported by in-memory configurations");
+	WT_RET(__wt_inmem_unsupported_op(session, "LSM trees"));
 
 	WT_RET(__wt_config_gets_def(session, cfg, "checkpoint", 0, &cval));
 	if (cval.len != 0)
@@ -1834,7 +1838,8 @@ __wt_clsm_open(WT_SESSION_IMPL *session,
 		WT_ERR(__wt_clsm_open_bulk(clsm, cfg));
 
 	if (0) {
-err:		if (clsm != NULL)
+err:
+		if (clsm != NULL)
 			WT_TRET(__wt_clsm_close(cursor));
 		else if (lsm_tree != NULL)
 			__wt_lsm_tree_release(session, lsm_tree);

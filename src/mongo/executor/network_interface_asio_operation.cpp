@@ -40,7 +40,6 @@
 #include "mongo/executor/network_interface_asio.h"
 #include "mongo/rpc/factory.h"
 #include "mongo/rpc/metadata/metadata_hook.h"
-#include "mongo/rpc/request_builder_interface.h"
 #include "mongo/util/log.h"
 #include "mongo/util/time_support.h"
 
@@ -61,20 +60,6 @@ namespace {
 // Used to generate unique identifiers for AsyncOps, the same AsyncOp may
 // be used to run multiple distinct requests.
 AtomicUInt64 kAsyncOpIdCounter(0);
-
-StatusWith<Message> messageFromRequest(const RemoteCommandRequest& request,
-                                       rpc::Protocol protocol) {
-    BSONObj query = request.cmdObj;
-    auto requestBuilder = rpc::makeRequestBuilder(protocol);
-
-    auto toSend = rpc::makeRequestBuilder(protocol)
-                      ->setDatabase(request.dbname)
-                      .setCommandName(request.cmdObj.firstElementFieldName())
-                      .setCommandArgs(request.cmdObj)
-                      .setMetadata(request.metadata)
-                      .done();
-    return std::move(toSend);
-}
 
 }  // namespace
 
@@ -179,16 +164,21 @@ Status NetworkInterfaceASIO::AsyncOp::beginCommand(Message&& newCommand,
 }
 
 Status NetworkInterfaceASIO::AsyncOp::beginCommand(const RemoteCommandRequest& request) {
-    auto newCommand = messageFromRequest(request, operationProtocol());
-    if (!newCommand.isOK()) {
-        return newCommand.getStatus();
-    }
-    return beginCommand(std::move(newCommand.getValue()), request.target);
+    return beginCommand(
+        rpc::messageFromOpMsgRequest(
+            operationProtocol(),
+            OpMsgRequest::fromDBAndBody(request.dbname, request.cmdObj, request.metadata)),
+        request.target);
 }
 
-NetworkInterfaceASIO::AsyncCommand* NetworkInterfaceASIO::AsyncOp::command() {
+NetworkInterfaceASIO::AsyncCommand& NetworkInterfaceASIO::AsyncOp::command() {
     MONGO_ASYNC_OP_INVARIANT(_command.is_initialized(), "Command is not yet initialized");
-    return _command.get_ptr();
+
+    return *_command;
+}
+
+bool NetworkInterfaceASIO::AsyncOp::commandIsInitialized() const {
+    return _command.is_initialized();
 }
 
 void NetworkInterfaceASIO::AsyncOp::finish(ResponseStatus&& rs) {
@@ -197,13 +187,6 @@ void NetworkInterfaceASIO::AsyncOp::finish(ResponseStatus&& rs) {
 
     LOG(2) << "Request " << _request.id << " finished with response: "
            << redact(rs.isOK() ? rs.data.toString() : rs.status.toString());
-
-    // Our own internally generated time outs have a different error code to allow us to retry
-    // internal timeouts.  But the outside world (and our tests) still expect the one true
-    // ExceededTimeLimit, so we convert back here so they get what they expect.
-    if (!rs.isOK() && rs.status.code() == ErrorCodes::NetworkInterfaceExceededTimeLimit) {
-        rs.status = Status(ErrorCodes::ExceededTimeLimit, rs.status.reason());
-    }
 
     // Calling the completion handler may invalidate state in this op, so do it last.
     _onFinish(rs);

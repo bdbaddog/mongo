@@ -210,7 +210,7 @@ Status DatabasesCloner::startup() noexcept {
     _listDBsScheduler = stdx::make_unique<RemoteCommandRetryScheduler>(
         _exec,
         listDBsReq,
-        stdx::bind(&DatabasesCloner::_onListDatabaseFinish, this, stdx::placeholders::_1),
+        [this](const auto& x) { this->_onListDatabaseFinish(x); },
         RemoteCommandRetryScheduler::makeRetryPolicy(
             numInitialSyncListDatabasesAttempts.load(),
             executor::RemoteCommandRequest::kNoTimeout,
@@ -230,7 +230,46 @@ void DatabasesCloner::setScheduleDbWorkFn_forTest(const CollectionCloner::Schedu
     _scheduleDbWorkFn = work;
 }
 
-void DatabasesCloner::_onListDatabaseFinish(const CommandCallbackArgs& cbd) {
+StatusWith<std::vector<BSONElement>> DatabasesCloner::parseListDatabasesResponse_forTest(
+    BSONObj dbResponse) {
+    return _parseListDatabasesResponse(dbResponse);
+}
+
+void DatabasesCloner::setAdminAsFirst_forTest(std::vector<BSONElement>& dbsArray) {
+    _setAdminAsFirst(dbsArray);
+}
+
+StatusWith<std::vector<BSONElement>> DatabasesCloner::_parseListDatabasesResponse(
+    BSONObj dbResponse) {
+    if (!dbResponse.hasField("databases")) {
+        return Status(ErrorCodes::BadValue,
+                      "The 'listDatabases' response does not contain a 'databases' field.");
+    }
+    BSONElement response = dbResponse["databases"];
+    try {
+        return response.Array();
+    } catch (const AssertionException&) {
+        return Status(ErrorCodes::BadValue,
+                      "The 'listDatabases' response is unable to be transformed into an array.");
+    }
+}
+
+void DatabasesCloner::_setAdminAsFirst(std::vector<BSONElement>& dbsArray) {
+    auto adminIter = std::find_if(dbsArray.begin(), dbsArray.end(), [](BSONElement elem) {
+        if (!elem.isABSONObj()) {
+            return false;
+        }
+        auto bsonObj = elem.Obj();
+        std::string databaseName = bsonObj.getStringField("name");
+        return (databaseName == "admin");
+    });
+    if (adminIter != dbsArray.end()) {
+        std::iter_swap(adminIter, dbsArray.begin());
+    }
+}
+
+void DatabasesCloner::_onListDatabaseFinish(
+    const executor::TaskExecutor::RemoteCommandCallbackArgs& cbd) {
     Status respStatus = cbd.response.status;
     if (respStatus.isOK()) {
         respStatus = getStatusFromCommandResult(cbd.response.data);
@@ -238,22 +277,42 @@ void DatabasesCloner::_onListDatabaseFinish(const CommandCallbackArgs& cbd) {
 
     UniqueLock lk(_mutex);
     if (!respStatus.isOK()) {
-        LOG(1) << "listDatabases failed: " << respStatus;
+        LOG(1) << "'listDatabases' failed: " << respStatus;
         _fail_inlock(&lk, respStatus);
         return;
     }
 
-    const auto respBSON = cbd.response.data;
-    // There should not be any cloners yet
+    // There should not be any cloners yet.
     invariant(_databaseCloners.size() == 0);
-    const auto dbsElem = respBSON["databases"].Obj();
-    BSONForEach(arrayElement, dbsElem) {
+    const auto respBSON = cbd.response.data;
+
+    auto databasesArray = _parseListDatabasesResponse(respBSON);
+    if (!databasesArray.isOK()) {
+        LOG(1) << "'listDatabases' returned a malformed response: "
+               << databasesArray.getStatus().toString();
+        _fail_inlock(&lk, databasesArray.getStatus());
+        return;
+    }
+
+    auto dbsArray = databasesArray.getValue();
+    // Ensure that the 'admin' database is the first element in the array of databases so that it
+    // will be the first to be cloned. This allows users to authenticate against a database while
+    // initial sync is occurring.
+    _setAdminAsFirst(dbsArray);
+
+    for (BSONElement arrayElement : dbsArray) {
         const BSONObj dbBSON = arrayElement.Obj();
 
         // Check to see if we want to exclude this db from the clone.
         if (!_includeDbFn(dbBSON)) {
-            LOG(1) << "excluding db: " << dbBSON;
+            LOG(1) << "Excluding database from the 'listDatabases' response: " << dbBSON;
             continue;
+        }
+
+        if (!dbBSON.hasField("name")) {
+            LOG(1) << "Excluding database due to the 'listDatabases' response not containing a "
+                      "'name' field for this entry: "
+                   << dbBSON;
         }
 
         const std::string dbName = dbBSON["name"].str();
@@ -263,7 +322,7 @@ void DatabasesCloner::_onListDatabaseFinish(const CommandCallbackArgs& cbd) {
         const auto collectionFilterPred = [dbName](const BSONObj& collInfo) {
             const auto collName = collInfo["name"].str();
             const NamespaceString ns(dbName, collName);
-            if (ns.isSystem() && !legalClientSystemNS(ns.ns())) {
+            if (ns.isSystem() && !ns.isLegalClientSystemNS()) {
                 LOG(1) << "Skipping 'system' collection: " << ns.ns();
                 return false;
             }
@@ -320,7 +379,6 @@ void DatabasesCloner::_onListDatabaseFinish(const CommandCallbackArgs& cbd) {
         // add cloner to list.
         _databaseCloners.push_back(dbCloner);
     }
-
     if (_databaseCloners.size() == 0) {
         if (_status.isOK()) {
             _succeed_inlock(&lk);

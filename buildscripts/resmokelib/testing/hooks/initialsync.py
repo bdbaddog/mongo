@@ -13,6 +13,7 @@ import pymongo.errors
 
 from . import cleanup
 from . import jsfile
+from ..fixtures import replicaset
 from ... import errors
 from ... import utils
 
@@ -35,6 +36,10 @@ class BackgroundInitialSync(jsfile.JsCustomBehavior):
     DEFAULT_N = cleanup.CleanEveryN.DEFAULT_N
 
     def __init__(self, hook_logger, fixture, use_resync=False, n=DEFAULT_N, shell_options=None):
+        if not isinstance(fixture, replicaset.ReplicaSetFixture):
+            raise ValueError("`fixture` must be an instance of ReplicaSetFixture, not {}".format(
+                fixture.__class__.__name__))
+
         description = "Background Initial Sync"
         js_filename = os.path.join("jstests", "hooks", "run_initial_sync_node_validation.js")
         jsfile.JsCustomBehavior.__init__(self, hook_logger, fixture, js_filename,
@@ -64,7 +69,7 @@ class BackgroundInitialSync(jsfile.JsCustomBehavior):
     def _after_test_impl(self, test, test_report, description):
         self.tests_run += 1
         sync_node = self.fixture.get_initial_sync_node()
-        sync_node_conn = utils.new_mongo_client(port=sync_node.port)
+        sync_node_conn = sync_node.mongo_client()
 
         # If it's been 'n' tests so far, wait for the initial sync node to finish syncing.
         if self.tests_run >= self.n:
@@ -134,6 +139,10 @@ class IntermediateInitialSync(jsfile.JsCustomBehavior):
     DEFAULT_N = cleanup.CleanEveryN.DEFAULT_N
 
     def __init__(self, hook_logger, fixture, use_resync=False, n=DEFAULT_N):
+        if not isinstance(fixture, replicaset.ReplicaSetFixture):
+            raise ValueError("`fixture` must be an instance of ReplicaSetFixture, not {}".format(
+                fixture.__class__.__name__))
+
         description = "Intermediate Initial Sync"
         js_filename = os.path.join("jstests", "hooks", "run_initial_sync_node_validation.js")
         jsfile.JsCustomBehavior.__init__(self, hook_logger, fixture, js_filename, description)
@@ -154,7 +163,7 @@ class IntermediateInitialSync(jsfile.JsCustomBehavior):
 
     def _after_test_impl(self, test, test_report, description):
         sync_node = self.fixture.get_initial_sync_node()
-        sync_node_conn = utils.new_mongo_client(port=sync_node.port)
+        sync_node_conn = sync_node.mongo_client()
 
         if self.use_resync:
             self.hook_test_case.logger.info("Calling resync on initial sync node...")

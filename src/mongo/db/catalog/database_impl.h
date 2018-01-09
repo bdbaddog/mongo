@@ -50,6 +50,7 @@ class DatabaseCatalogEntry;
 class IndexCatalog;
 class NamespaceDetails;
 class OperationContext;
+class PseudoRandom;
 
 /**
  * Represents a logical database containing Collections.
@@ -148,6 +149,10 @@ public:
         return _profileName.c_str();
     }
 
+    void setDropPending(OperationContext* opCtx, bool dropPending) final;
+
+    bool isDropPending(OperationContext* opCtx) const final;
+
     void getStats(OperationContext* opCtx, BSONObjBuilder* output, double scale = 1) final;
 
     const DatabaseCatalogEntry* getDatabaseCatalogEntry() const final;
@@ -219,6 +224,9 @@ public:
         return _viewsName;
     }
 
+    StatusWith<NamespaceString> makeUniqueCollectionNamespace(OperationContext* opCtx,
+                                                              StringData collectionNameModel) final;
+
     inline CollectionMap& collections() final {
         return _collections;
     }
@@ -276,6 +284,17 @@ private:
     const std::string _viewsName;        // "dbname.system.views"
 
     int _profile;  // 0=off.
+
+    // If '_dropPending' is true, this Database is in the midst of a two-phase drop. No new
+    // collections may be created in this Database.
+    // This variable may only be read/written while the database is locked in MODE_X.
+    bool _dropPending = false;
+
+    // Random number generator used to create unique collection namespaces suitable for temporary
+    // collections.
+    // Lazily created on first call to makeUniqueCollectionNamespace().
+    // This variable may only be read/written while the database is locked in MODE_X.
+    std::unique_ptr<PseudoRandom> _uniqueCollectionNamespacePseudoRandom;
 
     CollectionMap _collections;
 

@@ -84,6 +84,10 @@ class LSMStat(Stat):
     prefix = 'LSM'
     def __init__(self, name, desc, flags=''):
         Stat.__init__(self, name, LSMStat.prefix, desc, flags)
+class PerfHistStat(Stat):
+    prefix = 'perf'
+    def __init__(self, name, desc, flags=''):
+        Stat.__init__(self, name, PerfHistStat.prefix, desc, flags)
 class RecStat(Stat):
     prefix = 'reconciliation'
     def __init__(self, name, desc, flags=''):
@@ -128,6 +132,7 @@ groups['memory'] = [
 groups['system'] = [
     ConnStat.prefix,
     DhandleStat.prefix,
+    PerfHistStat.prefix,
     SessionStat.prefix,
     ThreadStat.prefix
 ]
@@ -190,6 +195,7 @@ connection_stats = [
     CacheStat('cache_bytes_internal', 'tracked bytes belonging to internal pages in the cache', 'no_clear,no_scale,size'),
     CacheStat('cache_bytes_inuse', 'bytes currently in the cache', 'no_clear,no_scale,size'),
     CacheStat('cache_bytes_leaf', 'tracked bytes belonging to leaf pages in the cache', 'no_clear,no_scale,size'),
+    CacheStat('cache_bytes_lookaside', 'bytes belonging to the lookaside table in the cache', 'no_clear,no_scale,size'),
     CacheStat('cache_bytes_max', 'maximum bytes configured', 'no_clear,no_scale,size'),
     CacheStat('cache_bytes_other', 'bytes not belonging to page images in the cache', 'no_clear,no_scale,size'),
     CacheStat('cache_bytes_read', 'bytes read into cache', 'size'),
@@ -205,12 +211,12 @@ connection_stats = [
     CacheStat('cache_eviction_empty_score', 'eviction empty score', 'no_clear,no_scale'),
     CacheStat('cache_eviction_fail', 'pages selected for eviction unable to be evicted'),
     CacheStat('cache_eviction_force', 'pages evicted because they exceeded the in-memory maximum count'),
-    CacheStat('cache_eviction_force_time', 'pages evicted because they exceeded the in-memory maximum time (usecs)'),
     CacheStat('cache_eviction_force_delete', 'pages evicted because they had chains of deleted items count'),
     CacheStat('cache_eviction_force_delete_time', 'pages evicted because they had chains of deleted items time (usecs)'),
     CacheStat('cache_eviction_force_fail', 'failed eviction of pages that exceeded the in-memory maximum count'),
     CacheStat('cache_eviction_force_fail_time',  'failed eviction of pages that exceeded the in-memory maximum time (usecs)'),
     CacheStat('cache_eviction_force_retune', 'force re-tuning of eviction workers once in a while'),
+    CacheStat('cache_eviction_force_time', 'pages evicted because they exceeded the in-memory maximum time (usecs)'),
     CacheStat('cache_eviction_get_ref', 'eviction calls to get a page'),
     CacheStat('cache_eviction_get_ref_empty', 'eviction calls to get a page found queue empty'),
     CacheStat('cache_eviction_get_ref_empty2', 'eviction calls to get a page found queue empty after locking'),
@@ -230,10 +236,22 @@ connection_stats = [
     CacheStat('cache_eviction_split_leaf', 'leaf pages split during eviction'),
     CacheStat('cache_eviction_stable_state_workers', 'eviction worker thread stable number', 'no_clear'),
     CacheStat('cache_eviction_state', 'eviction state', 'no_clear,no_scale'),
+    CacheStat('cache_eviction_target_page_ge128', 'eviction walk target pages histogram - 128 and higher'),
+    CacheStat('cache_eviction_target_page_lt10', 'eviction walk target pages histogram - 0-9'),
+    CacheStat('cache_eviction_target_page_lt32', 'eviction walk target pages histogram - 10-31'),
+    CacheStat('cache_eviction_target_page_lt64', 'eviction walk target pages histogram - 32-63'),
+    CacheStat('cache_eviction_target_page_lt128', 'eviction walk target pages histogram - 64-128'),
     CacheStat('cache_eviction_walk', 'pages walked for eviction'),
+    CacheStat('cache_eviction_walk_from_root', 'eviction walks started from root of tree'),
+    CacheStat('cache_eviction_walk_passes', 'eviction passes of a file'),
+    CacheStat('cache_eviction_walk_saved_pos', 'eviction walks started from saved location in tree'),
     CacheStat('cache_eviction_walks_abandoned', 'eviction walks abandoned'),
     CacheStat('cache_eviction_walks_active', 'files with active eviction walks', 'no_clear,no_scale'),
+    CacheStat('cache_eviction_walks_ended', 'eviction walks reached end of tree'),
+    CacheStat('cache_eviction_walks_gave_up_no_targets', 'eviction walks gave up because they saw too many pages and found no candidates'),
+    CacheStat('cache_eviction_walks_gave_up_ratio', 'eviction walks gave up because they saw too many pages and found too few candidates'),
     CacheStat('cache_eviction_walks_started', 'files with new eviction walks started'),
+    CacheStat('cache_eviction_walks_stopped', 'eviction walks gave up because they restarted their walk twice'),
     CacheStat('cache_eviction_worker_created', 'eviction worker thread created'),
     CacheStat('cache_eviction_worker_evicting', 'eviction worker thread evicting pages'),
     CacheStat('cache_eviction_worker_removed', 'eviction worker thread removed'),
@@ -242,9 +260,10 @@ connection_stats = [
     CacheStat('cache_hazard_walks', 'hazard pointer check entries walked'),
     CacheStat('cache_inmem_split', 'in-memory page splits'),
     CacheStat('cache_inmem_splittable', 'in-memory page passed criteria to be split'),
+    CacheStat('cache_lookaside_entries', 'lookaside table entries', 'no_clear,no_scale'),
     CacheStat('cache_lookaside_insert', 'lookaside table insert calls'),
     CacheStat('cache_lookaside_remove', 'lookaside table remove calls'),
-    CacheStat('cache_overflow_value', 'overflow values cached in memory', 'no_scale'),
+    CacheStat('cache_lookaside_score', 'lookaside score', 'no_clear,no_scale'),
     CacheStat('cache_overhead', 'percentage overhead', 'no_clear,no_scale'),
     CacheStat('cache_pages_dirty', 'tracked dirty pages in the cache', 'no_clear,no_scale'),
     CacheStat('cache_pages_inuse', 'pages currently held in the cache', 'no_clear,no_scale'),
@@ -295,6 +314,10 @@ connection_stats = [
     LockStat('lock_checkpoint_count', 'checkpoint lock acquisitions'),
     LockStat('lock_checkpoint_wait_application', 'checkpoint lock application thread wait time (usecs)'),
     LockStat('lock_checkpoint_wait_internal', 'checkpoint lock internal thread wait time (usecs)'),
+    LockStat('lock_commit_timestamp_read_count', 'commit timestamp queue read lock acquisitions'),
+    LockStat('lock_commit_timestamp_wait_application', 'commit timestamp queue lock application thread time waiting for the dhandle lock (usecs)'),
+    LockStat('lock_commit_timestamp_wait_internal', 'commit timestamp queue lock internal thread time waiting for the dhandle lock (usecs)'),
+    LockStat('lock_commit_timestamp_write_count', 'commit timestamp queue write lock acquisitions'),
     LockStat('lock_dhandle_read_count', 'dhandle read lock acquisitions'),
     LockStat('lock_dhandle_wait_application', 'dhandle lock application thread time waiting for the dhandle lock (usecs)'),
     LockStat('lock_dhandle_wait_internal', 'dhandle lock internal thread time waiting for the dhandle lock (usecs)'),
@@ -302,6 +325,10 @@ connection_stats = [
     LockStat('lock_metadata_count', 'metadata lock acquisitions'),
     LockStat('lock_metadata_wait_application', 'metadata lock application thread wait time (usecs)'),
     LockStat('lock_metadata_wait_internal', 'metadata lock internal thread wait time (usecs)'),
+    LockStat('lock_read_timestamp_read_count', 'read timestamp queue read lock acquisitions'),
+    LockStat('lock_read_timestamp_wait_application', 'read timestamp queue lock application thread time waiting for the dhandle lock (usecs)'),
+    LockStat('lock_read_timestamp_wait_internal', 'read timestamp queue lock internal thread time waiting for the dhandle lock (usecs)'),
+    LockStat('lock_read_timestamp_write_count', 'read timestamp queue write lock acquisitions'),
     LockStat('lock_schema_count', 'schema lock acquisitions'),
     LockStat('lock_schema_wait_application', 'schema lock application thread wait time (usecs)'),
     LockStat('lock_schema_wait_internal', 'schema lock internal thread wait time (usecs)'),
@@ -309,6 +336,10 @@ connection_stats = [
     LockStat('lock_table_wait_application', 'table lock application thread time waiting for the table lock (usecs)'),
     LockStat('lock_table_wait_internal', 'table lock internal thread time waiting for the table lock (usecs)'),
     LockStat('lock_table_write_count', 'table write lock acquisitions'),
+    LockStat('lock_txn_global_read_count', 'txn global read lock acquisitions'),
+    LockStat('lock_txn_global_wait_application', 'txn global lock application thread time waiting for the dhandle lock (usecs)'),
+    LockStat('lock_txn_global_wait_internal', 'txn global lock internal thread time waiting for the dhandle lock (usecs)'),
+    LockStat('lock_txn_global_write_count', 'txn global write lock acquisitions'),
 
     ##########################################
     # Logging statistics
@@ -323,6 +354,7 @@ connection_stats = [
     LogStat('log_compress_write_fails', 'log records not compressed'),
     LogStat('log_compress_writes', 'log records compressed'),
     LogStat('log_flush', 'log flush operations'),
+    LogStat('log_force_ckpt_sleep', 'force checkpoint calls slept'),
     LogStat('log_force_write', 'log force write operations'),
     LogStat('log_force_write_skip', 'log force write operations skipped'),
     LogStat('log_max_filesize', 'maximum log file size', 'no_clear,no_scale,size'),
@@ -374,6 +406,32 @@ connection_stats = [
     LSMStat('lsm_work_units_done', 'tree maintenance operations executed'),
 
     ##########################################
+    # Performance Histogram Stats
+    ##########################################
+    PerfHistStat('perf_hist_fsread_latency_gt1000', 'file system read latency histogram (bucket 6) - 1000ms+'),
+    PerfHistStat('perf_hist_fsread_latency_lt50', 'file system read latency histogram (bucket 1) - 10-49ms'),
+    PerfHistStat('perf_hist_fsread_latency_lt100', 'file system read latency histogram (bucket 2) - 50-99ms'),
+    PerfHistStat('perf_hist_fsread_latency_lt250', 'file system read latency histogram (bucket 3) - 100-249ms'),
+    PerfHistStat('perf_hist_fsread_latency_lt500', 'file system read latency histogram (bucket 4) - 250-499ms'),
+    PerfHistStat('perf_hist_fsread_latency_lt1000', 'file system read latency histogram (bucket 5) - 500-999ms'),
+    PerfHistStat('perf_hist_fswrite_latency_gt1000', 'file system write latency histogram (bucket 6) - 1000ms+'),
+    PerfHistStat('perf_hist_fswrite_latency_lt50', 'file system write latency histogram (bucket 1) - 10-49ms'),
+    PerfHistStat('perf_hist_fswrite_latency_lt100', 'file system write latency histogram (bucket 2) - 50-99ms'),
+    PerfHistStat('perf_hist_fswrite_latency_lt250', 'file system write latency histogram (bucket 3) - 100-249ms'),
+    PerfHistStat('perf_hist_fswrite_latency_lt500', 'file system write latency histogram (bucket 4) - 250-499ms'),
+    PerfHistStat('perf_hist_fswrite_latency_lt1000', 'file system write latency histogram (bucket 5) - 500-999ms'),
+    PerfHistStat('perf_hist_opread_latency_gt10000', 'operation read latency histogram (bucket 5) - 10000us+'),
+    PerfHistStat('perf_hist_opread_latency_lt250', 'operation read latency histogram (bucket 1) - 100-249us'),
+    PerfHistStat('perf_hist_opread_latency_lt500', 'operation read latency histogram (bucket 2) - 250-499us'),
+    PerfHistStat('perf_hist_opread_latency_lt1000', 'operation read latency histogram (bucket 3) - 500-999us'),
+    PerfHistStat('perf_hist_opread_latency_lt10000', 'operation read latency histogram (bucket 4) - 1000-9999us'),
+    PerfHistStat('perf_hist_opwrite_latency_gt10000', 'operation write latency histogram (bucket 5) - 10000us+'),
+    PerfHistStat('perf_hist_opwrite_latency_lt250', 'operation write latency histogram (bucket 1) - 100-249us'),
+    PerfHistStat('perf_hist_opwrite_latency_lt500', 'operation write latency histogram (bucket 2) - 250-499us'),
+    PerfHistStat('perf_hist_opwrite_latency_lt1000', 'operation write latency histogram (bucket 3) - 500-999us'),
+    PerfHistStat('perf_hist_opwrite_latency_lt10000', 'operation write latency histogram (bucket 4) - 1000-9999us'),
+
+##########################################
     # Reconciliation statistics
     ##########################################
     RecStat('rec_page_delete', 'pages deleted'),
@@ -432,11 +490,29 @@ connection_stats = [
     TxnStat('txn_checkpoint_time_recent', 'transaction checkpoint most recent time (msecs)', 'no_clear,no_scale'),
     TxnStat('txn_checkpoint_time_total', 'transaction checkpoint total time (msecs)', 'no_clear,no_scale'),
     TxnStat('txn_commit', 'transactions committed'),
+    TxnStat('txn_commit_queue_empty', 'commit timestamp queue insert to empty'),
+    TxnStat('txn_commit_queue_head', 'commit timestamp queue inserts to head'),
+    TxnStat('txn_commit_queue_inserts', 'commit timestamp queue inserts total'),
+    TxnStat('txn_commit_queue_len', 'commit timestamp queue length'),
     TxnStat('txn_fail_cache', 'transaction failures due to cache overflow'),
     TxnStat('txn_pinned_checkpoint_range', 'transaction range of IDs currently pinned by a checkpoint', 'no_clear,no_scale'),
     TxnStat('txn_pinned_range', 'transaction range of IDs currently pinned', 'no_clear,no_scale'),
     TxnStat('txn_pinned_snapshot_range', 'transaction range of IDs currently pinned by named snapshots', 'no_clear,no_scale'),
+    TxnStat('txn_pinned_timestamp', 'transaction range of timestamps currently pinned', 'no_clear,no_scale'),
+    TxnStat('txn_pinned_timestamp_oldest', 'transaction range of timestamps pinned by the oldest timestamp', 'no_clear,no_scale'),
+    TxnStat('txn_query_ts', 'query timestamp calls'),
+    TxnStat('txn_read_queue_empty', 'read timestamp queue insert to empty'),
+    TxnStat('txn_read_queue_head', 'read timestamp queue inserts to head'),
+    TxnStat('txn_read_queue_inserts', 'read timestamp queue inserts total'),
+    TxnStat('txn_read_queue_len', 'read timestamp queue length'),
     TxnStat('txn_rollback', 'transactions rolled back'),
+    TxnStat('txn_set_ts', 'set timestamp calls'),
+    TxnStat('txn_set_ts_commit', 'set timestamp commit calls'),
+    TxnStat('txn_set_ts_commit_upd', 'set timestamp commit updates'),
+    TxnStat('txn_set_ts_oldest', 'set timestamp oldest calls'),
+    TxnStat('txn_set_ts_oldest_upd', 'set timestamp oldest updates'),
+    TxnStat('txn_set_ts_stable', 'set timestamp stable calls'),
+    TxnStat('txn_set_ts_stable_upd', 'set timestamp stable updates'),
     TxnStat('txn_snapshots_created', 'number of named snapshots created'),
     TxnStat('txn_snapshots_dropped', 'number of named snapshots dropped'),
     TxnStat('txn_sync', 'transaction sync calls'),
@@ -447,11 +523,19 @@ connection_stats = [
     ##########################################
     YieldStat('application_cache_time', 'application thread time waiting for cache (usecs)'),
     YieldStat('application_evict_time', 'application thread time evicting (usecs)'),
+    YieldStat('child_modify_blocked_page', 'page reconciliation yielded due to child modification'),
+    YieldStat('conn_close_blocked_lsm', 'connection close yielded for lsm manager shutdown'),
+    YieldStat('dhandle_lock_blocked', 'data handle lock yielded'),
+    YieldStat('log_server_sync_blocked', 'log server sync yielded for log write'),
     YieldStat('page_busy_blocked', 'page acquire busy blocked'),
+    YieldStat('page_del_rollback_blocked', 'page delete rollback time sleeping for state change (usecs)'),
     YieldStat('page_forcible_evict_blocked', 'page acquire eviction blocked'),
+    YieldStat('page_index_slot_ref_blocked', 'get reference for page index and slot time sleeping (usecs)'),
     YieldStat('page_locked_blocked', 'page acquire locked blocked'),
     YieldStat('page_read_blocked', 'page acquire read blocked'),
     YieldStat('page_sleep', 'page acquire time sleeping (usecs)'),
+    YieldStat('tree_descend_blocked', 'tree descend one level yielded for split page index update'),
+    YieldStat('txn_release_blocked', 'connection close blocked waiting for transaction state stabilization'),
 ]
 
 connection_stats = sorted(connection_stats, key=attrgetter('desc'))
@@ -510,11 +594,24 @@ dsrc_stats = [
     CacheStat('cache_eviction_fail', 'data source pages selected for eviction unable to be evicted'),
     CacheStat('cache_eviction_hazard', 'hazard pointer blocked page eviction'),
     CacheStat('cache_eviction_internal', 'internal pages evicted'),
+    CacheStat('cache_eviction_pages_seen', 'pages seen by eviction walk'),
     CacheStat('cache_eviction_split_internal', 'internal pages split during eviction'),
     CacheStat('cache_eviction_split_leaf', 'leaf pages split during eviction'),
+    CacheStat('cache_eviction_target_page_ge128', 'eviction walk target pages histogram - 128 and higher'),
+    CacheStat('cache_eviction_target_page_lt10', 'eviction walk target pages histogram - 0-9'),
+    CacheStat('cache_eviction_target_page_lt32', 'eviction walk target pages histogram - 10-31'),
+    CacheStat('cache_eviction_target_page_lt64', 'eviction walk target pages histogram - 32-63'),
+    CacheStat('cache_eviction_target_page_lt128', 'eviction walk target pages histogram - 64-128'),
+    CacheStat('cache_eviction_walk_from_root', 'eviction walks started from root of tree'),
+    CacheStat('cache_eviction_walk_passes', 'eviction walk passes of a file'),
+    CacheStat('cache_eviction_walk_saved_pos', 'eviction walks started from saved location in tree'),
+    CacheStat('cache_eviction_walks_abandoned', 'eviction walks abandoned'),
+    CacheStat('cache_eviction_walks_ended', 'eviction walks reached end of tree'),
+    CacheStat('cache_eviction_walks_gave_up_no_targets', 'eviction walks gave up because they saw too many pages and found no candidates'),
+    CacheStat('cache_eviction_walks_gave_up_ratio', 'eviction walks gave up because they saw too many pages and found too few candidates'),
+    CacheStat('cache_eviction_walks_stopped', 'eviction walks gave up because they restarted their walk twice'),
     CacheStat('cache_inmem_split', 'in-memory page splits'),
     CacheStat('cache_inmem_splittable', 'in-memory page passed criteria to be split'),
-    CacheStat('cache_overflow_value', 'overflow values cached in memory', 'no_scale'),
     CacheStat('cache_pages_requested', 'pages requested from the cache'),
     CacheStat('cache_read', 'pages read into cache'),
     CacheStat('cache_read_lookaside', 'pages read into cache requiring lookaside entries'),
@@ -526,6 +623,8 @@ dsrc_stats = [
     ##########################################
     # Cache content statistics
     ##########################################
+    CacheWalkStat('cache_state_avg_unvisited_age', 'Average time in cache for pages that have not been visited by the eviction server', 'no_clear,no_scale'),
+    CacheWalkStat('cache_state_avg_visited_age', 'Average time in cache for pages that have been visited by the eviction server', 'no_clear,no_scale'),
     CacheWalkStat('cache_state_avg_written_size', 'Average on-disk page image size seen', 'no_clear,no_scale'),
     CacheWalkStat('cache_state_gen_avg_gap', 'Average difference between current eviction generation when the page was last considered', 'no_clear,no_scale'),
     CacheWalkStat('cache_state_gen_current', 'Current eviction generation', 'no_clear,no_scale'),
@@ -544,6 +643,7 @@ dsrc_stats = [
     CacheWalkStat('cache_state_root_entries', 'Entries in the root page', 'no_clear,no_scale'),
     CacheWalkStat('cache_state_root_size', 'Size of the root page', 'no_clear,no_scale'),
     CacheWalkStat('cache_state_smaller_alloc_size', 'On-disk page image sizes smaller than a single allocation unit', 'no_clear,no_scale'),
+    CacheWalkStat('cache_state_unvisited_count', 'Number of pages never visited by eviction server', 'no_clear,no_scale'),
 
     ##########################################
     # Compression statistics

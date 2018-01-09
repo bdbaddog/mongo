@@ -80,7 +80,8 @@ Status extractMigrationStatusFromCommandResponse(const BSONObj& commandResponse)
 
     if (!commandStatus.isOK()) {
         bool chunkTooBig = false;
-        bsonExtractBooleanFieldWithDefault(commandResponse, kChunkTooBig, false, &chunkTooBig);
+        bsonExtractBooleanFieldWithDefault(commandResponse, kChunkTooBig, false, &chunkTooBig)
+            .transitional_ignore();
         if (chunkTooBig) {
             commandStatus = {ErrorCodes::ChunkTooBig, commandStatus.reason()};
         }
@@ -182,15 +183,15 @@ Status MigrationManager::executeManualMigration(
 
     auto routingInfoStatus =
         Grid::get(opCtx)->catalogCache()->getShardedCollectionRoutingInfoWithRefresh(
-            opCtx, migrateInfo.ns);
+            opCtx, NamespaceString(migrateInfo.ns));
     if (!routingInfoStatus.isOK()) {
         return routingInfoStatus.getStatus();
     }
 
     auto& routingInfo = routingInfoStatus.getValue();
 
-    auto chunk = routingInfo.cm()->findIntersectingChunkWithSimpleCollation(migrateInfo.minKey);
-    invariant(chunk);
+    const auto chunk =
+        routingInfo.cm()->findIntersectingChunkWithSimpleCollation(migrateInfo.minKey);
 
     Status commandStatus = _processRemoteCommandResponse(
         remoteCommandResponse, &statusWithScopedMigrationRequest.getValue());
@@ -219,7 +220,7 @@ void MigrationManager::startRecoveryAndAcquireDistLocks(OperationContext* opCtx)
         _abandonActiveMigrationsAndEnableManager(opCtx);
     });
 
-    auto distLockManager = Grid::get(opCtx)->catalogClient(opCtx)->getDistLockManager();
+    auto distLockManager = Grid::get(opCtx)->catalogClient()->getDistLockManager();
 
     // Load the active migrations from the config.migrations collection.
     auto statusWithMigrationsQueryResponse =
@@ -335,9 +336,8 @@ void MigrationManager::finishRecovery(OperationContext* opCtx,
             auto waitForDelete = migrationType.getWaitForDelete();
             migrateInfos.pop_front();
 
-            auto chunk =
+            const auto chunk =
                 routingInfo.cm()->findIntersectingChunkWithSimpleCollation(migrationInfo.minKey);
-            invariant(chunk);
 
             if (chunk->getShardId() != migrationInfo.from) {
                 // Chunk is no longer on the source shard specified by this migration. Erase the
@@ -357,7 +357,7 @@ void MigrationManager::finishRecovery(OperationContext* opCtx,
 
         // If no migrations were scheduled for this namespace, free the dist lock
         if (!scheduledMigrations) {
-            Grid::get(opCtx)->catalogClient(opCtx)->getDistLockManager()->unlock(
+            Grid::get(opCtx)->catalogClient()->getDistLockManager()->unlock(
                 opCtx, _lockSessionID, nss.ns());
         }
     }
@@ -398,7 +398,7 @@ void MigrationManager::interruptAndDisableMigrations() {
         }
     }
 
-    _checkDrained_inlock();
+    _checkDrained(lock);
 }
 
 void MigrationManager::drainActiveMigrations() {
@@ -469,14 +469,15 @@ shared_ptr<Notification<RemoteCommandResponse>> MigrationManager::_schedule(
 
     auto retVal = migration.completionNotification;
 
-    _schedule_inlock(opCtx, fromHostStatus.getValue(), std::move(migration));
+    _schedule(lock, opCtx, fromHostStatus.getValue(), std::move(migration));
 
     return retVal;
 }
 
-void MigrationManager::_schedule_inlock(OperationContext* opCtx,
-                                        const HostAndPort& targetHost,
-                                        Migration migration) {
+void MigrationManager::_schedule(WithLock lock,
+                                 OperationContext* opCtx,
+                                 const HostAndPort& targetHost,
+                                 Migration migration) {
     executor::TaskExecutor* const executor =
         Grid::get(opCtx)->getExecutorPool()->getFixedExecutor();
 
@@ -488,7 +489,7 @@ void MigrationManager::_schedule_inlock(OperationContext* opCtx,
 
         // Acquire the collection distributed lock (blocking call)
         auto statusWithDistLockHandle =
-            Grid::get(opCtx)->catalogClient(opCtx)->getDistLockManager()->lockWithSessionID(
+            Grid::get(opCtx)->catalogClient()->getDistLockManager()->lockWithSessionID(
                 opCtx,
                 nss.ns(),
                 whyMessage,
@@ -525,7 +526,7 @@ void MigrationManager::_schedule_inlock(OperationContext* opCtx,
                 auto opCtx = cc().makeOperationContext();
 
                 stdx::lock_guard<stdx::mutex> lock(_mutex);
-                _complete_inlock(opCtx.get(), itMigration, args.response);
+                _complete(lock, opCtx.get(), itMigration, args.response);
             });
 
     if (callbackHandleWithStatus.isOK()) {
@@ -533,12 +534,13 @@ void MigrationManager::_schedule_inlock(OperationContext* opCtx,
         return;
     }
 
-    _complete_inlock(opCtx, itMigration, std::move(callbackHandleWithStatus.getStatus()));
+    _complete(lock, opCtx, itMigration, std::move(callbackHandleWithStatus.getStatus()));
 }
 
-void MigrationManager::_complete_inlock(OperationContext* opCtx,
-                                        MigrationsList::iterator itMigration,
-                                        const RemoteCommandResponse& remoteCommandResponse) {
+void MigrationManager::_complete(WithLock lock,
+                                 OperationContext* opCtx,
+                                 MigrationsList::iterator itMigration,
+                                 const RemoteCommandResponse& remoteCommandResponse) {
     const NamespaceString nss(itMigration->nss);
 
     // Make sure to signal the notification last, after the distributed lock is freed, so that we
@@ -553,16 +555,16 @@ void MigrationManager::_complete_inlock(OperationContext* opCtx,
     migrations->erase(itMigration);
 
     if (migrations->empty()) {
-        Grid::get(opCtx)->catalogClient(opCtx)->getDistLockManager()->unlock(
+        Grid::get(opCtx)->catalogClient()->getDistLockManager()->unlock(
             opCtx, _lockSessionID, nss.ns());
         _activeMigrations.erase(it);
-        _checkDrained_inlock();
+        _checkDrained(lock);
     }
 
     notificationToSignal->set(remoteCommandResponse);
 }
 
-void MigrationManager::_checkDrained_inlock() {
+void MigrationManager::_checkDrained(WithLock) {
     if (_state == State::kEnabled || _state == State::kRecovering) {
         return;
     }
@@ -586,7 +588,7 @@ void MigrationManager::_abandonActiveMigrationsAndEnableManager(OperationContext
     }
     invariant(_state == State::kRecovering);
 
-    auto catalogClient = Grid::get(opCtx)->catalogClient(opCtx);
+    auto catalogClient = Grid::get(opCtx)->catalogClient();
 
     // Unlock all balancer distlocks we aren't using anymore.
     auto distLockManager = catalogClient->getDistLockManager();
@@ -594,8 +596,9 @@ void MigrationManager::_abandonActiveMigrationsAndEnableManager(OperationContext
 
     // Clear the config.migrations collection so that those chunks can be scheduled for migration
     // again.
-    catalogClient->removeConfigDocuments(
-        opCtx, MigrationType::ConfigNS, BSONObj(), kMajorityWriteConcern);
+    catalogClient
+        ->removeConfigDocuments(opCtx, MigrationType::ConfigNS, BSONObj(), kMajorityWriteConcern)
+        .transitional_ignore();
 
     _state = State::kEnabled;
     _condVar.notify_all();

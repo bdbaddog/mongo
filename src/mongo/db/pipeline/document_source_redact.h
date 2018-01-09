@@ -40,6 +40,15 @@ public:
     const char* getSourceName() const final;
     boost::intrusive_ptr<DocumentSource> optimize() final;
 
+    StageConstraints constraints(Pipeline::SplitState pipeState) const final {
+        return {StreamType::kStreaming,
+                PositionRequirement::kNone,
+                HostTypeRequirement::kNone,
+                DiskUseRequirement::kNoDiskUse,
+                FacetRequirement::kAllowed,
+                ChangeStreamRequirement::kWhitelist};
+    }
+
     /**
      * Attempts to duplicate the redact-safe portion of a subsequent $match before the $redact
      * stage.

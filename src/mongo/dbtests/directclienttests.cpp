@@ -39,6 +39,7 @@
 #include "mongo/db/json.h"
 #include "mongo/db/lasterror.h"
 #include "mongo/dbtests/dbtests.h"
+#include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/util/timer.h"
 
 namespace DirectClientTests {
@@ -124,7 +125,8 @@ public:
         BSONObj result;
         BSONObj cmdObj = BSON("count"
                               << "");
-        ASSERT_THROWS(client.runCommand("", cmdObj, result), UserException);
+        ASSERT(!client.runCommand("", cmdObj, result)) << result;
+        ASSERT_EQ(getStatusFromCommandResult(result), ErrorCodes::InvalidNamespace);
     }
 };
 
@@ -135,11 +137,9 @@ public:
         OperationContext& opCtx = *opCtxPtr;
         DBDirectClient client(&opCtx);
 
-        unique_ptr<DBClientCursor> cursor = client.query("", Query(), 1);
-        ASSERT(cursor->more());
-        BSONObj result = cursor->next().getOwned();
-        ASSERT(result.hasField("$err"));
-        ASSERT_EQUALS(result["code"].Int(), ErrorCodes::InvalidNamespace);
+        ASSERT_THROWS_CODE(client.query("", Query(), 1)->nextSafe(),
+                           AssertionException,
+                           ErrorCodes::InvalidNamespace);
     }
 };
 
@@ -150,11 +150,8 @@ public:
         OperationContext& opCtx = *opCtxPtr;
         DBDirectClient client(&opCtx);
 
-        unique_ptr<DBClientCursor> cursor = client.getMore("", 1, 1);
-        ASSERT(cursor->more());
-        BSONObj result = cursor->next().getOwned();
-        ASSERT(result.hasField("$err"));
-        ASSERT_EQUALS(result["code"].Int(), ErrorCodes::InvalidNamespace);
+        ASSERT_THROWS_CODE(
+            client.getMore("", 1, 1)->nextSafe(), AssertionException, ErrorCodes::InvalidNamespace);
     }
 };
 

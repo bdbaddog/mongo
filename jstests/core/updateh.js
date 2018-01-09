@@ -23,9 +23,6 @@ assert.writeError(res);
 res = t.update({x: 1}, {$inc: {$z: 1}});  // not ok
 assert.writeError(res);
 
-res = t.update({x: 1}, {$pushAll: {$z: [1, 2, 3]}});  // not ok
-assert.writeError(res);
-
 // Second section
 t.drop();
 
@@ -75,7 +72,7 @@ assert.writeError(res);
 // Test that '$id', '$db', and '$ref' are acceptable field names in
 // the correct case ( subdoc)
 // SERVER-3231
-res = t.update({n: 0}, {$set: {'x.$ref': '1', 'x.$id': 1, 'x.$db': '1'}});
+res = t.update({n: 0}, {$set: {x: {$ref: '1', $id: 1, $db: '1'}}});
 assert.writeOK(res);
 t.save({_id: 0, n: 0});
 

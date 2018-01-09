@@ -28,6 +28,7 @@
 
 #pragma once
 
+#include "mongo/db/pipeline/expression_context.h"
 #include "mongo/db/update/update_node.h"
 
 namespace mongo {
@@ -38,7 +39,7 @@ namespace mongo {
  */
 class UpdateLeafNode : public UpdateNode {
 public:
-    UpdateLeafNode() : UpdateNode(Type::Leaf) {}
+    explicit UpdateLeafNode(Context context = Context::kAll) : UpdateNode(Type::Leaf, context) {}
 
     /**
      * Initializes the leaf node with the value in 'modExpr'. 'modExpr' is a single modifier
@@ -47,11 +48,26 @@ public:
      * root["$set"]["a.b"]. Returns a non-OK status if the value in 'modExpr' is invalid for the
      * type of leaf node. 'modExpr' must not be empty.
      *
-     * Some leaf nodes require a collator during initialization. For example, $pull requires a
-     * collator to construct a MatchExpression that will be used for applying updates across
-     * multiple documents.
+     * Some leaf nodes require an ExpressionContext during initialization. For example, $pull
+     * requires an ExpressionContext to construct a MatchExpression that will be used for applying
+     * updates across multiple documents.
      */
-    virtual Status init(BSONElement modExpr, const CollatorInterface* collator) = 0;
+    virtual Status init(BSONElement modExpr,
+                        const boost::intrusive_ptr<ExpressionContext>& expCtx) = 0;
+
+    /* Check if it would be possible to create the path at 'pathToCreate' but don't actually create
+     * it. If 'element' is not an embedded object or array (e.g., we are trying to create path
+     * "a.b.c" in the document {a: 1}) or 'element' is an array but the first component in
+     * 'pathToCreate' is not an array index (e.g., the path "a.b.c" in the document
+     * {a: [{b: 1}, {b: 2}]}), then this function throws a AssertionException with
+     * ErrorCode::PathNotViable. Otherwise, this function is a no-op.
+     *
+     * With the exception of $unset, update modifiers that do not create nonexistent paths ($pop,
+     * $pull, $pullAll) still generate an error when it is not possible to create the path.
+     */
+    static void checkViability(mutablebson::Element element,
+                               const FieldRef& pathToCreate,
+                               const FieldRef& pathTaken);
 };
 
 }  // namespace mongo

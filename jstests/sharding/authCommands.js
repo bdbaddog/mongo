@@ -3,6 +3,7 @@
  */
 (function() {
     'use strict';
+
     load("jstests/replsets/rslib.js");
 
     var st = new ShardingTest({
@@ -95,20 +96,16 @@
     };
 
     var checkCommandSucceeded = function(db, cmdObj) {
-        print("Running command that should succeed: ");
-        printjson(cmdObj);
-        var resultObj = db.runCommand(cmdObj);
+        print("Running command that should succeed: " + tojson(cmdObj));
+        var resultObj = assert.commandWorked(db.runCommand(cmdObj));
         printjson(resultObj);
-        assert(resultObj.ok);
         return resultObj;
     };
 
     var checkCommandFailed = function(db, cmdObj) {
-        print("Running command that should fail: ");
-        printjson(cmdObj);
-        var resultObj = db.runCommand(cmdObj);
+        print("Running command that should fail: " + tojson(cmdObj));
+        var resultObj = assert.commandFailed(db.runCommand(cmdObj));
         printjson(resultObj);
-        assert(!resultObj.ok);
         return resultObj;
     };
 
@@ -214,7 +211,7 @@
             checkCommandSucceeded(adminDB, {isdbgrid: 1});
             checkCommandSucceeded(adminDB, {ismaster: 1});
             checkCommandSucceeded(adminDB, {split: 'test.foo', find: {i: 1, j: 1}});
-            var chunk = configDB.chunks.findOne({shard: st.rs0.name});
+            var chunk = configDB.chunks.findOne({ns: 'test.foo', shard: st.rs0.name});
             checkCommandSucceeded(
                 adminDB,
                 {moveChunk: 'test.foo', find: chunk.min, to: st.rs1.name, _waitForDelete: true});

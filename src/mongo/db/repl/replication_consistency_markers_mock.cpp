@@ -42,7 +42,7 @@ void ReplicationConsistencyMarkersMock::initializeMinValidDocument(OperationCont
     {
         stdx::lock_guard<stdx::mutex> lock(_minValidBoundariesMutex);
         _minValid = {};
-        _oplogDeleteFromPoint = {};
+        _oplogTruncateAfterPoint = {};
         _appliedThrough = {};
     }
 }
@@ -79,17 +79,20 @@ void ReplicationConsistencyMarkersMock::setMinValidToAtLeast(OperationContext* o
     _minValid = std::max(_minValid, minValid);
 }
 
-void ReplicationConsistencyMarkersMock::setOplogDeleteFromPoint(OperationContext* opCtx,
-                                                                const Timestamp& timestamp) {
+void ReplicationConsistencyMarkersMock::setOplogTruncateAfterPoint(OperationContext* opCtx,
+                                                                   const Timestamp& timestamp) {
     stdx::lock_guard<stdx::mutex> lock(_minValidBoundariesMutex);
-    _oplogDeleteFromPoint = timestamp;
+    _oplogTruncateAfterPoint = timestamp;
 }
 
-Timestamp ReplicationConsistencyMarkersMock::getOplogDeleteFromPoint(
+Timestamp ReplicationConsistencyMarkersMock::getOplogTruncateAfterPoint(
     OperationContext* opCtx) const {
     stdx::lock_guard<stdx::mutex> lock(_minValidBoundariesMutex);
-    return _oplogDeleteFromPoint;
+    return _oplogTruncateAfterPoint;
 }
+
+void ReplicationConsistencyMarkersMock::removeOldOplogDeleteFromPointField(
+    OperationContext* opCtx) {}
 
 void ReplicationConsistencyMarkersMock::setAppliedThrough(OperationContext* opCtx,
                                                           const OpTime& optime) {
@@ -97,9 +100,26 @@ void ReplicationConsistencyMarkersMock::setAppliedThrough(OperationContext* opCt
     _appliedThrough = optime;
 }
 
+void ReplicationConsistencyMarkersMock::clearAppliedThrough(OperationContext* opCtx,
+                                                            const Timestamp& writeTimestamp) {
+    stdx::lock_guard<stdx::mutex> lock(_minValidBoundariesMutex);
+    _appliedThrough = {};
+}
+
 OpTime ReplicationConsistencyMarkersMock::getAppliedThrough(OperationContext* opCtx) const {
     stdx::lock_guard<stdx::mutex> lock(_minValidBoundariesMutex);
     return _appliedThrough;
+}
+
+void ReplicationConsistencyMarkersMock::writeCheckpointTimestamp(OperationContext* opCtx,
+                                                                 const Timestamp& timestamp) {
+    stdx::lock_guard<stdx::mutex> lock(_minValidBoundariesMutex);
+    _checkpointTimestamp = timestamp;
+}
+
+Timestamp ReplicationConsistencyMarkersMock::getCheckpointTimestamp(OperationContext* opCtx) {
+    stdx::lock_guard<stdx::mutex> lock(_minValidBoundariesMutex);
+    return _checkpointTimestamp;
 }
 
 }  // namespace repl

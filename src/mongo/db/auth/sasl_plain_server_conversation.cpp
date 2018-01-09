@@ -50,7 +50,7 @@ StatusWith<bool> SaslPLAINServerConversation::step(StringData inputData, std::st
     // Expecting user input on the form: [authz-id]\0authn-id\0pwd
     std::string input = inputData.toString();
 
-    SecureString pwd = "";
+    SecureAllocatorAuthDomain::SecureString pwd = "";
     try {
         size_t firstNull = inputData.find('\0');
         if (firstNull == std::string::npos) {
@@ -78,25 +78,24 @@ StatusWith<bool> SaslPLAINServerConversation::step(StringData inputData, std::st
                           str::stream()
                               << "SASL authorization identity must match authentication identity");
         }
-        pwd = SecureString(input.substr(secondNull + 1).c_str());
+        pwd = SecureAllocatorAuthDomain::SecureString(input.substr(secondNull + 1).c_str());
         if (pwd->empty()) {
             return Status(ErrorCodes::AuthenticationFailed,
                           str::stream()
                               << "Incorrectly formatted PLAIN client message, empty password");
         }
-    } catch (std::out_of_range& exception) {
+    } catch (std::out_of_range&) {
         return Status(ErrorCodes::AuthenticationFailed,
                       mongoutils::str::stream() << "Incorrectly formatted PLAIN client message");
     }
 
     User* userObj;
     // The authentication database is also the source database for the user.
-    Status status = _saslAuthSession->getAuthorizationSession()
-                        ->getAuthorizationManager()
-                        .acquireUserForInitialAuth(
-                            _saslAuthSession->getOpCtxt(),
-                            UserName(_user, _saslAuthSession->getAuthenticationDatabase()),
-                            &userObj);
+    Status status =
+        _saslAuthSession->getAuthorizationSession()->getAuthorizationManager().acquireUser(
+            _saslAuthSession->getOpCtxt(),
+            UserName(_user, _saslAuthSession->getAuthenticationDatabase()),
+            &userObj);
 
     if (!status.isOK()) {
         return StatusWith<bool>(status);
@@ -107,27 +106,18 @@ StatusWith<bool> SaslPLAINServerConversation::step(StringData inputData, std::st
 
     std::string authDigest = createPasswordDigest(_user, pwd->c_str());
 
-    if (!creds.password.empty()) {
-        // Handle schemaVersion26Final (MONGODB-CR/SCRAM mixed mode)
-        if (authDigest != creds.password) {
-            return StatusWith<bool>(ErrorCodes::AuthenticationFailed,
-                                    mongoutils::str::stream() << "Incorrect user name or password");
-        }
-    } else {
-        // Handle schemaVersion28SCRAM (SCRAM only mode)
-        std::string decodedSalt = base64::decode(creds.scram.salt);
-        scram::SCRAMSecrets secrets = scram::generateSecrets(scram::SCRAMPresecrets(
-            authDigest,
-            std::vector<std::uint8_t>(reinterpret_cast<const std::uint8_t*>(decodedSalt.c_str()),
-                                      reinterpret_cast<const std::uint8_t*>(decodedSalt.c_str()) +
-                                          16),
-            creds.scram.iterationCount));
-        if (creds.scram.storedKey !=
-            base64::encode(reinterpret_cast<const char*>(secrets->storedKey.data()),
-                           secrets->storedKey.size())) {
-            return StatusWith<bool>(ErrorCodes::AuthenticationFailed,
-                                    mongoutils::str::stream() << "Incorrect user name or password");
-        }
+    // Handle schemaVersion28SCRAM (SCRAM only mode)
+    std::string decodedSalt = base64::decode(creds.scram.salt);
+    scram::SCRAMSecrets secrets = scram::generateSecrets(scram::SCRAMPresecrets(
+        authDigest,
+        std::vector<std::uint8_t>(reinterpret_cast<const std::uint8_t*>(decodedSalt.c_str()),
+                                  reinterpret_cast<const std::uint8_t*>(decodedSalt.c_str()) + 16),
+        creds.scram.iterationCount));
+    if (creds.scram.storedKey !=
+        base64::encode(reinterpret_cast<const char*>(secrets->storedKey.data()),
+                       secrets->storedKey.size())) {
+        return StatusWith<bool>(ErrorCodes::AuthenticationFailed,
+                                mongoutils::str::stream() << "Incorrect user name or password");
     }
 
     *outputData = "";

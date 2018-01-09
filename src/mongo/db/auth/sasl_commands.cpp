@@ -42,7 +42,6 @@
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/auth/authz_manager_external_state_mock.h"
 #include "mongo/db/auth/authz_session_external_state_mock.h"
-#include "mongo/db/auth/mongo_authentication_session.h"
 #include "mongo/db/auth/sasl_authentication_session.h"
 #include "mongo/db/auth/sasl_options.h"
 #include "mongo/db/client.h"
@@ -62,7 +61,7 @@ using std::stringstream;
 
 const bool autoAuthorizeDefault = true;
 
-class CmdSaslStart : public Command {
+class CmdSaslStart : public BasicCommand {
 public:
     CmdSaslStart();
     virtual ~CmdSaslStart();
@@ -76,7 +75,6 @@ public:
     virtual bool run(OperationContext* opCtx,
                      const std::string& db,
                      const BSONObj& cmdObj,
-                     std::string& ignored,
                      BSONObjBuilder& result);
 
     virtual void help(stringstream& help) const;
@@ -86,12 +84,12 @@ public:
     virtual bool slaveOk() const {
         return true;
     }
-    virtual bool requiresAuth() {
+    bool requiresAuth() const override {
         return false;
     }
 };
 
-class CmdSaslContinue : public Command {
+class CmdSaslContinue : public BasicCommand {
 public:
     CmdSaslContinue();
     virtual ~CmdSaslContinue();
@@ -103,7 +101,6 @@ public:
     virtual bool run(OperationContext* opCtx,
                      const std::string& db,
                      const BSONObj& cmdObj,
-                     std::string& ignored,
                      BSONObjBuilder& result);
 
     virtual void help(stringstream& help) const;
@@ -113,7 +110,7 @@ public:
     virtual bool slaveOk() const {
         return true;
     }
-    virtual bool requiresAuth() {
+    bool requiresAuth() const override {
         return false;
     }
 };
@@ -183,7 +180,7 @@ Status doSaslStep(const Client* client,
 
         sleepmillis(saslGlobalParams.authFailedDelay.load());
         // All the client needs to know is that authentication has failed.
-        return Status(ErrorCodes::AuthenticationFailed, "Authentication failed.");
+        return AuthorizationManager::authenticationFailedStatus;
     }
 
     status = buildResponse(session, responsePayload, type, result);
@@ -254,7 +251,7 @@ Status doSaslContinue(const Client* client,
     return doSaslStep(client, session, cmdObj, result);
 }
 
-CmdSaslStart::CmdSaslStart() : Command(saslStartCommandName) {}
+CmdSaslStart::CmdSaslStart() : BasicCommand(saslStartCommandName) {}
 CmdSaslStart::~CmdSaslStart() {}
 
 void CmdSaslStart::help(std::stringstream& os) const {
@@ -264,14 +261,13 @@ void CmdSaslStart::help(std::stringstream& os) const {
 void CmdSaslStart::redactForLogging(mutablebson::Document* cmdObj) {
     mutablebson::Element element = mutablebson::findFirstChildNamed(cmdObj->root(), "payload");
     if (element.ok()) {
-        element.setValueString("xxx");
+        element.setValueString("xxx").transitional_ignore();
     }
 }
 
 bool CmdSaslStart::run(OperationContext* opCtx,
                        const std::string& db,
                        const BSONObj& cmdObj,
-                       std::string& ignored,
                        BSONObjBuilder& result) {
     Client* client = Client::getCurrent();
     AuthenticationSession::set(client, std::unique_ptr<AuthenticationSession>());
@@ -302,7 +298,7 @@ bool CmdSaslStart::run(OperationContext* opCtx,
     return status.isOK();
 }
 
-CmdSaslContinue::CmdSaslContinue() : Command(saslContinueCommandName) {}
+CmdSaslContinue::CmdSaslContinue() : BasicCommand(saslContinueCommandName) {}
 CmdSaslContinue::~CmdSaslContinue() {}
 
 void CmdSaslContinue::help(std::stringstream& os) const {
@@ -312,7 +308,6 @@ void CmdSaslContinue::help(std::stringstream& os) const {
 bool CmdSaslContinue::run(OperationContext* opCtx,
                           const std::string& db,
                           const BSONObj& cmdObj,
-                          std::string& ignored,
                           BSONObjBuilder& result) {
     Client* client = Client::getCurrent();
     std::unique_ptr<AuthenticationSession> sessionGuard;
@@ -355,18 +350,8 @@ bool CmdSaslContinue::run(OperationContext* opCtx,
 // The CyrusSaslCommands Enterprise initializer is dependent on PreSaslCommands
 MONGO_INITIALIZER_WITH_PREREQUISITES(PreSaslCommands, ("NativeSaslServerCore"))
 (InitializerContext*) {
-    if (!sequenceContains(saslGlobalParams.authenticationMechanisms, "MONGODB-CR"))
-        CmdAuthenticate::disableAuthMechanism("MONGODB-CR");
-
     if (!sequenceContains(saslGlobalParams.authenticationMechanisms, "MONGODB-X509"))
         CmdAuthenticate::disableAuthMechanism("MONGODB-X509");
-
-    // For backwards compatibility, in 3.0 we are letting MONGODB-CR imply general
-    // challenge-response auth and hence SCRAM-SHA-1 is enabled by either specifying
-    // SCRAM-SHA-1 or MONGODB-CR in the authenticationMechanism server parameter.
-    if (!sequenceContains(saslGlobalParams.authenticationMechanisms, "SCRAM-SHA-1") &&
-        sequenceContains(saslGlobalParams.authenticationMechanisms, "MONGODB-CR"))
-        saslGlobalParams.authenticationMechanisms.push_back("SCRAM-SHA-1");
 
     return Status::OK();
 }

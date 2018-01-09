@@ -40,9 +40,9 @@ namespace {
 
 using std::vector;
 
-class DBStatsCmd : public Command {
+class DBStatsCmd : public ErrmsgCommandDeprecated {
 public:
-    DBStatsCmd() : Command("dbStats", "dbstats") {}
+    DBStatsCmd() : ErrmsgCommandDeprecated("dbStats", "dbstats") {}
 
     bool slaveOk() const override {
         return true;
@@ -63,16 +63,18 @@ public:
         return false;
     }
 
-    bool run(OperationContext* opCtx,
-             const std::string& dbName,
-             const BSONObj& cmdObj,
-             std::string& errmsg,
-             BSONObjBuilder& output) override {
-        auto shardResponses =
-            uassertStatusOK(scatterGather(opCtx,
-                                          dbName,
-                                          filterCommandRequestForPassthrough(cmdObj),
-                                          ReadPreferenceSetting::get(opCtx)));
+    bool errmsgRun(OperationContext* opCtx,
+                   const std::string& dbName,
+                   const BSONObj& cmdObj,
+                   std::string& errmsg,
+                   BSONObjBuilder& output) override {
+        auto shardResponses = uassertStatusOK(
+            scatterGatherUnversionedTargetAllShards(opCtx,
+                                                    dbName,
+                                                    boost::none,
+                                                    filterCommandRequestForPassthrough(cmdObj),
+                                                    ReadPreferenceSetting::get(opCtx),
+                                                    Shard::RetryPolicy::kIdempotent));
         if (!appendRawResponses(opCtx, &errmsg, &output, shardResponses)) {
             return false;
         }

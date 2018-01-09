@@ -32,6 +32,7 @@
 
 #include "mongo/db/exec/index_scan.h"
 
+#include "mongo/db/catalog/index_catalog.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/exec/filter.h"
 #include "mongo/db/exec/scoped_timer.h"
@@ -146,7 +147,7 @@ PlanStage::StageState IndexScan::doWork(WorkingSetID* out) {
             case HIT_END:
                 return PlanStage::IS_EOF;
         }
-    } catch (const WriteConflictException& wce) {
+    } catch (const WriteConflictException&) {
         *out = WorkingSet::INVALID_ID;
         return PlanStage::NEED_YIELD;
     }

@@ -32,12 +32,14 @@
  */
 #include "mongo/base/status.h"
 #include "mongo/bson/mutable/document.h"
+#include "mongo/crypto/mechanism_scram.h"
 #include "mongo/db/auth/action_set.h"
 #include "mongo/db/auth/action_type.h"
 #include "mongo/db/auth/authorization_manager.h"
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/auth/authz_manager_external_state_mock.h"
 #include "mongo/db/auth/authz_session_external_state_mock.h"
+#include "mongo/db/auth/sasl_options.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_context_noop.h"
@@ -175,10 +177,14 @@ public:
         authzManager = stdx::make_unique<AuthorizationManager>(std::move(localExternalState));
         externalState->setAuthorizationManager(authzManager.get());
         authzManager->setAuthEnabled(true);
+
+        credentials = BSON("SCRAM-SHA-1" << scram::generateCredentials(
+                               "password", saslGlobalParams.scramIterationCount.load()));
     }
 
     std::unique_ptr<AuthorizationManager> authzManager;
     AuthzManagerExternalStateMock* externalState;
+    BSONObj credentials;
 };
 
 TEST_F(AuthorizationManagerTest, testAcquireV2User) {
@@ -192,8 +198,7 @@ TEST_F(AuthorizationManagerTest, testAcquireV2User) {
                                                           << "db"
                                                           << "test"
                                                           << "credentials"
-                                                          << BSON("MONGODB-CR"
-                                                                  << "password")
+                                                          << credentials
                                                           << "roles"
                                                           << BSON_ARRAY(BSON("role"
                                                                              << "read"
@@ -208,8 +213,7 @@ TEST_F(AuthorizationManagerTest, testAcquireV2User) {
                                                           << "db"
                                                           << "admin"
                                                           << "credentials"
-                                                          << BSON("MONGODB-CR"
-                                                                  << "password")
+                                                          << credentials
                                                           << "roles"
                                                           << BSON_ARRAY(BSON("role"
                                                                              << "clusterAdmin"
@@ -218,7 +222,7 @@ TEST_F(AuthorizationManagerTest, testAcquireV2User) {
                                                      BSONObj()));
 
     User* v2read;
-    ASSERT_OK(authzManager->acquireUserForInitialAuth(&opCtx, UserName("v2read", "test"), &v2read));
+    ASSERT_OK(authzManager->acquireUser(&opCtx, UserName("v2read", "test"), &v2read));
     ASSERT_EQUALS(UserName("v2read", "test"), v2read->getName());
     ASSERT(v2read->isValid());
     ASSERT_EQUALS(1U, v2read->getRefCount());
@@ -232,8 +236,7 @@ TEST_F(AuthorizationManagerTest, testAcquireV2User) {
     authzManager->releaseUser(v2read);
 
     User* v2cluster;
-    ASSERT_OK(authzManager->acquireUserForInitialAuth(
-        &opCtx, UserName("v2cluster", "admin"), &v2cluster));
+    ASSERT_OK(authzManager->acquireUser(&opCtx, UserName("v2cluster", "admin"), &v2cluster));
     ASSERT_EQUALS(UserName("v2cluster", "admin"), v2cluster->getName());
     ASSERT(v2cluster->isValid());
     ASSERT_EQUALS(1U, v2cluster->getRefCount());
@@ -258,8 +261,8 @@ TEST_F(AuthorizationManagerTest, testLocalX509Authorization) {
     ServiceContext::UniqueOperationContext opCtx = client->makeOperationContext();
 
     User* x509User;
-    ASSERT_OK(authzManager->acquireUserForInitialAuth(
-        opCtx.get(), UserName("CN=mongodb.com", "$external"), &x509User));
+    ASSERT_OK(
+        authzManager->acquireUser(opCtx.get(), UserName("CN=mongodb.com", "$external"), &x509User));
     ASSERT(x509User->isValid());
 
     stdx::unordered_set<RoleName> expectedRoles{RoleName("read", "test"),
@@ -292,8 +295,8 @@ TEST_F(AuthorizationManagerTest, testLocalX509AuthorizationInvalidUser) {
     ServiceContext::UniqueOperationContext opCtx = client->makeOperationContext();
 
     User* x509User;
-    ASSERT_NOT_OK(authzManager->acquireUserForInitialAuth(
-        opCtx.get(), UserName("CN=10gen.com", "$external"), &x509User));
+    ASSERT_NOT_OK(
+        authzManager->acquireUser(opCtx.get(), UserName("CN=10gen.com", "$external"), &x509User));
 }
 
 TEST_F(AuthorizationManagerTest, testLocalX509AuthenticationNoAuthorization) {
@@ -305,8 +308,8 @@ TEST_F(AuthorizationManagerTest, testLocalX509AuthenticationNoAuthorization) {
     ServiceContext::UniqueOperationContext opCtx = client->makeOperationContext();
 
     User* x509User;
-    ASSERT_NOT_OK(authzManager->acquireUserForInitialAuth(
-        opCtx.get(), UserName("CN=mongodb.com", "$external"), &x509User));
+    ASSERT_NOT_OK(
+        authzManager->acquireUser(opCtx.get(), UserName("CN=mongodb.com", "$external"), &x509User));
 }
 
 /**
@@ -375,36 +378,34 @@ public:
 TEST_F(AuthorizationManagerTest, testAcquireV2UserWithUnrecognizedActions) {
     OperationContextNoop opCtx;
 
-    ASSERT_OK(
-        externalState->insertPrivilegeDocument(&opCtx,
-                                               BSON("_id"
-                                                    << "admin.myUser"
-                                                    << "user"
-                                                    << "myUser"
-                                                    << "db"
-                                                    << "test"
-                                                    << "credentials"
-                                                    << BSON("MONGODB-CR"
-                                                            << "password")
-                                                    << "roles"
-                                                    << BSON_ARRAY(BSON("role"
-                                                                       << "myRole"
-                                                                       << "db"
-                                                                       << "test"))
-                                                    << "inheritedPrivileges"
-                                                    << BSON_ARRAY(BSON(
-                                                           "resource" << BSON("db"
-                                                                              << "test"
-                                                                              << "collection"
-                                                                              << "")
-                                                                      << "actions"
-                                                                      << BSON_ARRAY("find"
-                                                                                    << "fakeAction"
-                                                                                    << "insert")))),
-                                               BSONObj()));
+    ASSERT_OK(externalState->insertPrivilegeDocument(
+        &opCtx,
+        BSON("_id"
+             << "admin.myUser"
+             << "user"
+             << "myUser"
+             << "db"
+             << "test"
+             << "credentials"
+             << credentials
+             << "roles"
+             << BSON_ARRAY(BSON("role"
+                                << "myRole"
+                                << "db"
+                                << "test"))
+             << "inheritedPrivileges"
+             << BSON_ARRAY(BSON("resource" << BSON("db"
+                                                   << "test"
+                                                   << "collection"
+                                                   << "")
+                                           << "actions"
+                                           << BSON_ARRAY("find"
+                                                         << "fakeAction"
+                                                         << "insert")))),
+        BSONObj()));
 
     User* myUser;
-    ASSERT_OK(authzManager->acquireUserForInitialAuth(&opCtx, UserName("myUser", "test"), &myUser));
+    ASSERT_OK(authzManager->acquireUser(&opCtx, UserName("myUser", "test"), &myUser));
     ASSERT_EQUALS(UserName("myUser", "test"), myUser->getName());
     ASSERT(myUser->isValid());
     ASSERT_EQUALS(1U, myUser->getRefCount());

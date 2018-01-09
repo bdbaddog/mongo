@@ -32,6 +32,7 @@
 #include "mongo/db/catalog/database.h"
 #include "mongo/db/client.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
+#include "mongo/db/repl/optime.h"
 #include "mongo/stdx/memory.h"
 
 namespace mongo {
@@ -45,7 +46,7 @@ const char* OplogStart::kStageType = "OPLOG_START";
 // Does not take ownership.
 OplogStart::OplogStart(OperationContext* opCtx,
                        const Collection* collection,
-                       MatchExpression* filter,
+                       Timestamp timestamp,
                        WorkingSet* ws)
     : PlanStage(kStageType, opCtx),
       _needInit(true),
@@ -54,7 +55,8 @@ OplogStart::OplogStart(OperationContext* opCtx,
       _done(false),
       _collection(collection),
       _workingSet(ws),
-      _filter(filter) {}
+      _filterBSON(BSON("$lte" << timestamp)),
+      _filter(repl::OpTime::kTimestampFieldName, _filterBSON.firstElement()) {}
 
 PlanStage::StageState OplogStart::doWork(WorkingSetID* out) {
     // We do our (heavy) init in a work(), where work is expected.
@@ -80,7 +82,7 @@ PlanStage::StageState OplogStart::doWork(WorkingSetID* out) {
         try {
             // If this throws WCE, it leave us in a state were the next call to work will retry.
             switchToExtentHopping();
-        } catch (const WriteConflictException& wce) {
+        } catch (const WriteConflictException&) {
             _subIterators.clear();
             *out = WorkingSet::INVALID_ID;
             return NEED_YIELD;
@@ -97,12 +99,11 @@ PlanStage::StageState OplogStart::workExtentHopping(WorkingSetID* out) {
         return PlanStage::IS_EOF;
     }
 
-    // we work from the back to the front since the back has the newest data.
+    // We work from the back to the front since the back has the newest data.
     try {
-        // TODO: should we ever check fetcherForNext()?
         if (auto record = _subIterators.back()->next()) {
             BSONObj obj = record->data.releaseToBson();
-            if (!_filter->matchesBSON(obj)) {
+            if (_filter.matchesBSON(obj)) {
                 _done = true;
                 WorkingSetID id = _workingSet->allocate();
                 WorkingSetMember* member = _workingSet->get(id);
@@ -113,7 +114,7 @@ PlanStage::StageState OplogStart::workExtentHopping(WorkingSetID* out) {
                 return PlanStage::ADVANCED;
             }
         }
-    } catch (const WriteConflictException& wce) {
+    } catch (const WriteConflictException&) {
         *out = WorkingSet::INVALID_ID;
         return PlanStage::NEED_YIELD;
     }
@@ -151,7 +152,7 @@ PlanStage::StageState OplogStart::workBackwardsScan(WorkingSetID* out) {
     verify(member->hasObj());
     verify(member->hasRecordId());
 
-    if (!_filter->matchesBSON(member->obj.value())) {
+    if (_filter.matchesBSON(member->obj.value())) {
         _done = true;
         // RecordId is returned in *out.
         return PlanStage::ADVANCED;

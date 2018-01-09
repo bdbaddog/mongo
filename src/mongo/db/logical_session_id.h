@@ -37,87 +37,87 @@
 
 namespace mongo {
 
+using TxnNumber = std::int64_t;
+using StmtId = std::int32_t;
+
+// Default value for unassigned statementId.
+const StmtId kUninitializedStmtId = -1;
+
+// Used as a substitute statementId for oplog entries that were truncated and lost.
+const StmtId kIncompleteHistoryStmtId = -2;
+
+const TxnNumber kUninitializedTxnNumber = -1;
+
 class BSONObjBuilder;
+class OperationContext;
 
-/**
- * A 128-bit identifier for a logical session.
- */
-class LogicalSessionId : public Logical_session_id {
-public:
-    friend class Logical_session_id;
-    friend class Logical_session_record;
+const Minutes kLogicalSessionDefaultTimeout = Minutes(30);
+extern int localLogicalSessionTimeoutMinutes;
 
-    /**
-     * Create and return a new LogicalSessionId with a random UUID.
-     */
-    static LogicalSessionId gen();
+inline bool operator==(const LogicalSessionId& lhs, const LogicalSessionId& rhs) {
+    auto makeEqualityLens = [](const auto& lsid) { return std::tie(lsid.getId(), lsid.getUid()); };
 
-    /**
-     * If the given string represents a valid LogicalSessionId, constructs and returns,
-     * the id, otherwise returns an error.
-     */
-    static StatusWith<LogicalSessionId> parse(const std::string& s);
+    return makeEqualityLens(lhs) == makeEqualityLens(rhs);
+}
 
-    /**
-     * Constructs a new LogicalSessionId out of a BSONObj. For IDL.
-     */
-    static LogicalSessionId parse(const BSONObj& doc);
+inline bool operator!=(const LogicalSessionId& lhs, const LogicalSessionId& rhs) {
+    return !(lhs == rhs);
+}
 
-    /**
-     * Returns a string representation of this session id.
-     */
-    std::string toString() const;
+inline bool operator==(const LogicalSessionRecord& lhs, const LogicalSessionRecord& rhs) {
+    return lhs.getId() == rhs.getId();
+}
 
-    /**
-     * Serialize this object to BSON.
-     */
-    BSONObj toBSON() const;
+inline bool operator!=(const LogicalSessionRecord& lhs, const LogicalSessionRecord& rhs) {
+    return !(lhs == rhs);
+}
 
-    inline bool operator==(const LogicalSessionId& rhs) const {
-        return getId() == rhs.getId();
+LogicalSessionId makeLogicalSessionIdForTest();
+
+LogicalSessionRecord makeLogicalSessionRecordForTest();
+
+struct LogicalSessionIdHash {
+    std::size_t operator()(const LogicalSessionId& lsid) const {
+        return _hasher(lsid.getId());
     }
-
-    inline bool operator!=(const LogicalSessionId& rhs) const {
-        return !(*this == rhs);
-    }
-
-    /**
-     * Custom hasher so LogicalSessionIds can be used in unordered data structures.
-     *
-     * ex: std::unordered_set<LogicalSessionId, LogicalSessionId::Hash> lsidSet;
-     */
-    struct Hash {
-        std::size_t operator()(const LogicalSessionId& lsid) const {
-            return _hasher(lsid.getId());
-        }
-
-    private:
-        UUID::Hash _hasher;
-    };
-
-    /**
-     * This constructor exists for IDL only.
-     */
-    LogicalSessionId();
 
 private:
-    /**
-     * Construct a LogicalSessionId from a UUID.
-     */
-    LogicalSessionId(UUID id);
+    UUID::Hash _hasher;
 };
 
+struct LogicalSessionRecordHash {
+    std::size_t operator()(const LogicalSessionRecord& lsid) const {
+        return _hasher(lsid.getId().getId());
+    }
+
+private:
+    UUID::Hash _hasher;
+};
+
+
 inline std::ostream& operator<<(std::ostream& s, const LogicalSessionId& lsid) {
-    return (s << lsid.toString());
+    return (s << lsid.getId() << " - " << lsid.getUid());
 }
 
 inline StringBuilder& operator<<(StringBuilder& s, const LogicalSessionId& lsid) {
-    return (s << lsid.toString());
+    return (s << lsid.getId().toString() << " - " << lsid.getUid().toString());
+}
+
+inline std::ostream& operator<<(std::ostream& s, const LogicalSessionFromClient& lsid) {
+    return (s << lsid.getId() << " - " << (lsid.getUid() ? lsid.getUid()->toString() : ""));
+}
+
+inline StringBuilder& operator<<(StringBuilder& s, const LogicalSessionFromClient& lsid) {
+    return (s << lsid.getId() << " - " << (lsid.getUid() ? lsid.getUid()->toString() : ""));
 }
 
 /**
  * An alias for sets of session ids.
  */
-using LogicalSessionIdSet = stdx::unordered_set<LogicalSessionId, LogicalSessionId::Hash>;
+using LogicalSessionIdSet = stdx::unordered_set<LogicalSessionId, LogicalSessionIdHash>;
+using LogicalSessionRecordSet = stdx::unordered_set<LogicalSessionRecord, LogicalSessionRecordHash>;
+
+template <typename T>
+using LogicalSessionIdMap = stdx::unordered_map<LogicalSessionId, T, LogicalSessionIdHash>;
 
 }  // namespace mongo

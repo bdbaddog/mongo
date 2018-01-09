@@ -34,7 +34,7 @@
 #include <utility>
 
 #include "mongo/base/data_range_cursor.h"
-#include "mongo/base/data_type_string_data.h"
+#include "mongo/base/data_type.h"
 #include "mongo/base/data_type_terminated.h"
 #include "mongo/base/data_type_validated.h"
 #include "mongo/bson/simple_bsonobj_comparator.h"
@@ -105,8 +105,7 @@ ParsedOpCommand ParsedOpCommand::parse(const Message& message) {
 OpMsgRequest opMsgRequestFromCommandRequest(const Message& message) {
     auto parsed = ParsedOpCommand::parse(message);
 
-    BSONObjBuilder bodyBuilder;
-    bodyBuilder.appendElements(parsed.body);
+    BSONObjBuilder bodyBuilder(std::move(parsed.body));
 
     // OP_COMMAND is only used when communicating with 3.4 nodes and they serialize their metadata
     // fields differently. We do all up-conversion here so that the rest of the code only has to

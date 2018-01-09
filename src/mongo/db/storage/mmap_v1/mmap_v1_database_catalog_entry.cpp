@@ -191,8 +191,7 @@ MMAPV1DatabaseCatalogEntry::MMAPV1DatabaseCatalogEntry(OperationContext* opCtx,
         _init(opCtx);
     } catch (const DBException& dbe) {
         warning() << "database " << path << " " << name
-                  << " could not be opened due to DBException " << dbe.getCode() << ": "
-                  << dbe.what();
+                  << " could not be opened due to DBException " << dbe.code() << ": " << dbe.what();
         throw;
     } catch (const std::exception& e) {
         warning() << "database " << path << " " << name << " could not be opened " << e.what();
@@ -290,9 +289,9 @@ Status MMAPV1DatabaseCatalogEntry::renameCollection(OperationContext* opCtx,
             }
             newIndexSpec = b.obj();
         }
-
+        // TODO SERVER-30638: using timestamp 0 for these inserts.
         StatusWith<RecordId> newIndexSpecLoc = systemIndexRecordStore->insertRecord(
-            opCtx, newIndexSpec.objdata(), newIndexSpec.objsize(), false);
+            opCtx, newIndexSpec.objdata(), newIndexSpec.objsize(), Timestamp(), false);
         if (!newIndexSpecLoc.isOK())
             return newIndexSpecLoc.getStatus();
 
@@ -848,8 +847,9 @@ RecordId MMAPV1DatabaseCatalogEntry::_addNamespaceToNamespaceCollection(Operatio
 
     RecordStoreV1Base* rs = _getNamespaceRecordStore();
     invariant(rs);
-
-    StatusWith<RecordId> loc = rs->insertRecord(opCtx, obj.objdata(), obj.objsize(), false);
+    // TODO SERVER-30638: using timestamp 0 for these inserts.
+    StatusWith<RecordId> loc =
+        rs->insertRecord(opCtx, obj.objdata(), obj.objsize(), Timestamp(), false);
     massertStatusOK(loc.getStatus());
     return loc.getValue();
 }

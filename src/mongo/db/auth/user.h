@@ -31,9 +31,9 @@
 #include <vector>
 
 #include "mongo/base/disallow_copying.h"
-#include "mongo/bson/oid.h"
 #include "mongo/db/auth/privilege.h"
 #include "mongo/db/auth/resource_pattern.h"
+#include "mongo/db/auth/restriction_set.h"
 #include "mongo/db/auth/role_name.h"
 #include "mongo/db/auth/user_name.h"
 #include "mongo/platform/atomic_word.h"
@@ -67,11 +67,21 @@ public:
         std::string salt;
         std::string serverKey;
         std::string storedKey;
+
+        bool isValid() const {
+            // 160bit -> 20octets -> * 4/3 -> 26.667 -> padded to 28
+            const size_t kEncodedSHA1Length = 28;
+            // 128bit -> 16octets -> * 4/3 -> 21.333 -> padded to 24
+            const size_t kEncodedSaltLength = 24;
+
+            return (salt.size() == kEncodedSaltLength) && base64::validate(salt) &&
+                (serverKey.size() == kEncodedSHA1Length) && base64::validate(serverKey) &&
+                (storedKey.size() == kEncodedSHA1Length) && base64::validate(storedKey);
+        }
     };
     struct CredentialData {
-        CredentialData() : password(""), scram(), isExternal(false) {}
+        CredentialData() : scram(), isExternal(false) {}
 
-        std::string password;
         SCRAMCredentials scram;
         bool isExternal;
     };
@@ -87,9 +97,9 @@ public:
     const UserName& getName() const;
 
     /**
-     * Returns the user's id.
+     * Returns a digest of the user's identity
      */
-    const boost::optional<OID>& getID() const;
+    const SHA256Block& getDigest() const;
 
     /**
      * Returns an iterator over the names of the user's direct roles
@@ -136,17 +146,7 @@ public:
      */
     uint32_t getRefCount() const;
 
-    /**
-     * Clones this user into a new, valid User object with refcount of 0.
-     */
-    User* clone() const;
-
     // Mutators below.  Mutation functions should *only* be called by the AuthorizationManager
-
-    /**
-     * Set the id for this user.
-     */
-    void setID(boost::optional<OID> id);
 
     /**
      * Sets this user's authentication credentials.
@@ -190,6 +190,19 @@ public:
     void addPrivileges(const PrivilegeVector& privileges);
 
     /**
+     * Replaces any existing authentication restrictions with "restrictions".
+     */
+    void setRestrictions(RestrictionDocuments restrictions) &;
+
+    /**
+     * Gets any set authentication restrictions.
+     */
+    const RestrictionDocuments& getRestrictions() const& noexcept {
+        return _restrictions;
+    }
+    void getRestrictions() && = delete;
+
+    /**
      * Marks this instance of the User object as invalid, most likely because information about
      * the user has been updated and needs to be reloaded from the AuthorizationManager.
      *
@@ -217,11 +230,8 @@ public:
 private:
     UserName _name;
 
-    // An id for this user. We use this to identify different "generations" of the same username
-    // (ie a user "Lily" is dropped and then added). This field is optional to facilitate the
-    // upgrade path from 3.4 to 3.6. When comparing User documents' generations, we consider
-    // an unset _id field to be a distinct value that will fail to compare to any other id value.
-    boost::optional<OID> _id;
+    // Digest of the full username
+    SHA256Block _digest;
 
     // Maps resource name to privilege on that resource
     ResourcePrivilegeMap _privileges;
@@ -234,6 +244,9 @@ private:
 
     // Credential information.
     CredentialData _credentials;
+
+    // Restrictions which must be met by a Client in order to authenticate as this user.
+    RestrictionDocuments _restrictions;
 
     // _refCount and _isInvalidated are modified exclusively by the AuthorizationManager
     // _isInvalidated can be read by any consumer of User, but _refCount can only be

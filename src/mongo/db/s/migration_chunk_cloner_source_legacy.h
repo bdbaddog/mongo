@@ -35,8 +35,10 @@
 #include "mongo/client/connection_string.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/query/plan_executor.h"
+#include "mongo/db/repl/optime.h"
 #include "mongo/db/s/migration_chunk_cloner_source.h"
 #include "mongo/db/s/migration_session_id.h"
+#include "mongo/db/s/session_catalog_migration_source.h"
 #include "mongo/s/move_chunk_request.h"
 #include "mongo/s/shard_key_pattern.h"
 #include "mongo/stdx/memory.h"
@@ -70,13 +72,21 @@ public:
 
     void cancelClone(OperationContext* opCtx) override;
 
-    bool isDocumentInMigratingChunk(OperationContext* opCtx, const BSONObj& doc) override;
+    bool isDocumentInMigratingChunk(const BSONObj& doc) override;
 
-    void onInsertOp(OperationContext* opCtx, const BSONObj& insertedDoc) override;
+    void onInsertOp(OperationContext* opCtx,
+                    const BSONObj& insertedDoc,
+                    const repl::OpTime& opTime) override;
 
-    void onUpdateOp(OperationContext* opCtx, const BSONObj& updatedDoc) override;
+    void onUpdateOp(OperationContext* opCtx,
+                    const BSONObj& updatedDoc,
+                    const repl::OpTime& opTime,
+                    const repl::OpTime& prePostImageOpTime) override;
 
-    void onDeleteOp(OperationContext* opCtx, const BSONObj& deletedDocId) override;
+    void onDeleteOp(OperationContext* opCtx,
+                    const BSONObj& deletedDocId,
+                    const repl::OpTime& opTime,
+                    const repl::OpTime& preImageOpTime) override;
 
     // Legacy cloner specific functionality
 
@@ -120,6 +130,14 @@ public:
      * NOTE: Must be called with the collection lock held in at least IS mode.
      */
     Status nextModsBatch(OperationContext* opCtx, Database* db, BSONObjBuilder* builder);
+
+    /**
+     * Appends to the buffer oplogs that contain session information for this migration.
+     * If this function returns a valid OpTime, this means that the oplog appended are
+     * not guaranteed to be majority committed and the caller has to use wait for the
+     * returned opTime to be majority committed.
+     */
+    repl::OpTime nextSessionMigrationBatch(OperationContext* opCtx, BSONArrayBuilder* arrBuilder);
 
 private:
     friend class DeleteNotificationStage;
@@ -182,6 +200,8 @@ private:
     // Registered deletion notifications plan executor, which will listen for document deletions
     // during the cloning stage
     std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> _deleteNotifyExec;
+
+    std::unique_ptr<SessionCatalogMigrationSource> _sessionCatalogSource;
 
     // Protects the entries below
     stdx::mutex _mutex;

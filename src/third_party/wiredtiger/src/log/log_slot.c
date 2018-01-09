@@ -1,5 +1,5 @@
 /*-
- * Copyright (c) 2014-2017 MongoDB, Inc.
+ * Copyright (c) 2014-2018 MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -31,7 +31,7 @@ __log_slot_dump(WT_SESSION_IMPL *session)
 			earliest = i;
 		__wt_errx(session, "Slot %d:", i);
 		__wt_errx(session, "    State: %" PRIx64 " Flags: %" PRIx32,
-		    slot->slot_state, slot->flags);
+		    (uint64_t)slot->slot_state, slot->flags);
 		__wt_errx(session, "    Start LSN: %" PRIu32 "/%" PRIu32,
 		    slot->slot_start_lsn.l.file, slot->slot_start_lsn.l.offset);
 		__wt_errx(session, "    End  LSN: %" PRIu32 "/%" PRIu32,
@@ -100,15 +100,15 @@ __log_slot_close(
 	WT_LOG *log;
 	int64_t end_offset, new_state, old_state;
 #ifdef	HAVE_DIAGNOSTIC
-	struct timespec begin, now;
+	uint64_t time_start, time_stop;
 	int count;
 #endif
 
+	*releasep = false;
+
 	WT_ASSERT(session, F_ISSET(session, WT_SESSION_LOCKED_SLOT));
-	WT_ASSERT(session, releasep != NULL);
 	conn = S2C(session);
 	log = conn->log;
-	*releasep = 0;
 	if (slot == NULL)
 		return (WT_NOTFOUND);
 retry:
@@ -133,7 +133,8 @@ retry:
 	/*
 	 * If someone completely processed this slot, we're done.
 	 */
-	if (FLD64_ISSET((uint64_t)slot->slot_state, WT_LOG_SLOT_RESERVED)) {
+	if (FLD_LOG_SLOT_ISSET(
+	    (uint64_t)slot->slot_state, WT_LOG_SLOT_RESERVED)) {
 		WT_STAT_CONN_INCR(session, log_slot_close_race);
 		return (WT_NOTFOUND);
 	}
@@ -149,7 +150,7 @@ retry:
 	 */
 	WT_STAT_CONN_INCR(session, log_slot_closes);
 	if (WT_LOG_SLOT_DONE(new_state))
-		*releasep = 1;
+		*releasep = true;
 	slot->slot_end_lsn = slot->slot_start_lsn;
 	/*
 	 * A thread setting the unbuffered flag sets the unbuffered size after
@@ -160,7 +161,7 @@ retry:
 	 */
 #ifdef	HAVE_DIAGNOSTIC
 	count = 0;
-	__wt_epoch(session, &begin);
+	time_start = __wt_rdtsc(session);
 #endif
 	if (WT_LOG_SLOT_UNBUFFERED_ISSET(old_state)) {
 		while (slot->slot_unbuffered == 0) {
@@ -169,13 +170,14 @@ retry:
 #ifdef	HAVE_DIAGNOSTIC
 			++count;
 			if (count > WT_MILLION) {
-				__wt_epoch(session, &now);
-				if (WT_TIMEDIFF_SEC(now, begin) > 10) {
+				time_stop = __wt_rdtsc(session);
+				if (WT_TSCDIFF_SEC(
+				    time_stop, time_start) > 10) {
 					__wt_errx(session, "SLOT_CLOSE: Slot %"
 					PRIu32 " Timeout unbuffered, state 0x%"
-					PRIx64 " unbuffered %" PRIu64,
+					PRIx64 " unbuffered %" PRId64,
 					(uint32_t)(slot - &log->slot_pool[0]),
-					slot->slot_state,
+					(uint64_t)slot->slot_state,
 					slot->slot_unbuffered);
 					__log_slot_dump(session);
 					__wt_abort(session);
@@ -211,7 +213,7 @@ __log_slot_new(WT_SESSION_IMPL *session)
 	WT_LOGSLOT *slot;
 	int32_t i, pool_i;
 #ifdef	HAVE_DIAGNOSTIC
-	struct timespec begin, now;
+	uint64_t time_start, time_stop;
 	int count;
 #endif
 
@@ -229,7 +231,7 @@ __log_slot_new(WT_SESSION_IMPL *session)
 
 #ifdef	HAVE_DIAGNOSTIC
 	count = 0;
-	__wt_epoch(session, &begin);
+	time_start = __wt_rdtsc(session);
 #endif
 	/*
 	 * Keep trying until we can find a free slot.
@@ -238,6 +240,7 @@ __log_slot_new(WT_SESSION_IMPL *session)
 		/*
 		 * Rotate among the slots to lessen collisions.
 		 */
+		WT_RET(WT_SESSION_CHECK_PANIC(session));
 		for (i = 0, pool_i = log->pool_index; i < WT_SLOT_POOL;
 		    i++, pool_i++) {
 			if (pool_i >= WT_SLOT_POOL)
@@ -268,8 +271,8 @@ __log_slot_new(WT_SESSION_IMPL *session)
 #ifdef	HAVE_DIAGNOSTIC
 		++count;
 		if (count > WT_MILLION) {
-			__wt_epoch(session, &now);
-			if (WT_TIMEDIFF_SEC(now, begin) > 10) {
+			time_stop = __wt_rdtsc(session);
+			if (WT_TSCDIFF_SEC(time_stop, time_start) > 10) {
 				__wt_errx(session,
 				    "SLOT_NEW: Timeout free slot");
 				__log_slot_dump(session);
@@ -293,8 +296,8 @@ __log_slot_switch_internal(
 	WT_DECL_RET;
 	WT_LOG *log;
 	WT_LOGSLOT *slot;
-	bool free_slot, release;
 	uint32_t joined;
+	bool free_slot, release;
 
 	log = S2C(session)->log;
 	release = false;
@@ -314,7 +317,7 @@ __log_slot_switch_internal(
 	 * because the slot could be part of an unbuffered operation.
 	 */
 	joined = WT_LOG_SLOT_JOINED(slot->slot_state);
-	if (joined == 0 && forced) {
+	if (joined == 0 && forced && !F_ISSET(log, WT_LOG_FORCE_NEWFILE)) {
 		WT_STAT_CONN_INCR(session, log_force_write_skip);
 		if (did_work != NULL)
 			*did_work = false;
@@ -393,6 +396,9 @@ __wt_log_slot_switch(WT_SESSION_IMPL *session,
 			WT_STAT_CONN_INCR(session, log_slot_switch_busy);
 			__wt_yield();
 		}
+		WT_RET(WT_SESSION_CHECK_PANIC(session));
+		if (F_ISSET(S2C(session), WT_CONN_CLOSING))
+			break;
 	} while (F_ISSET(myslot, WT_MYSLOT_CLOSE) || (retry && ret == EBUSY));
 	return (ret);
 }
@@ -478,7 +484,7 @@ __wt_log_slot_destroy(WT_SESSION_IMPL *session)
 	 */
 	for (i = 0; i < WT_SLOT_POOL; i++) {
 		slot = &log->slot_pool[i];
-		if (!FLD64_ISSET(
+		if (!FLD_LOG_SLOT_ISSET(
 		    (uint64_t)slot->slot_state, WT_LOG_SLOT_RESERVED)) {
 			rel = WT_LOG_SLOT_RELEASED_BUFFERED(slot->slot_state);
 			if (rel != 0)
@@ -499,17 +505,17 @@ void
 __wt_log_slot_join(WT_SESSION_IMPL *session, uint64_t mysize,
     uint32_t flags, WT_MYSLOT *myslot)
 {
-	struct timespec start, stop;
 	WT_CONNECTION_IMPL *conn;
 	WT_LOG *log;
 	WT_LOGSLOT *slot;
-	uint64_t usecs;
+	uint64_t time_start, time_stop, usecs;
 	int64_t flag_state, new_state, old_state, released;
 	int32_t join_offset, new_join, wait_cnt;
 	bool closed, diag_yield, raced, slept, unbuffered, yielded;
 
 	conn = S2C(session);
 	log = conn->log;
+	time_start = time_stop = 0;
 
 	WT_ASSERT(session, !F_ISSET(session, WT_SESSION_LOCKED_SLOT));
 	WT_ASSERT(session, mysize != 0);
@@ -571,7 +577,7 @@ __wt_log_slot_join(WT_SESSION_IMPL *session, uint64_t mysize,
 			++wait_cnt;
 		}
 		if (!yielded)
-			__wt_epoch(session, &start);
+			time_start = __wt_rdtsc(session);
 		yielded = true;
 		/*
 		 * The slot is no longer open or we lost the race to
@@ -592,8 +598,8 @@ __wt_log_slot_join(WT_SESSION_IMPL *session, uint64_t mysize,
 		WT_STAT_CONN_INCR(session, log_slot_immediate);
 	else {
 		WT_STAT_CONN_INCR(session, log_slot_yield);
-		__wt_epoch(session, &stop);
-		usecs = WT_TIMEDIFF_US(stop, start);
+		time_stop = __wt_rdtsc(session);
+		usecs = WT_TSCDIFF_US(time_stop, time_start);
 		WT_STAT_CONN_INCRV(session, log_slot_yield_duration, usecs);
 		if (closed)
 			WT_STAT_CONN_INCR(session, log_slot_yield_close);

@@ -19,7 +19,6 @@ from ..fixtures import interface as fixture
 from ..fixtures import replicaset
 from ..testcases import interface as testcase
 from ... import errors
-from ... import utils
 
 
 class PeriodicKillSecondaries(interface.CustomBehavior):
@@ -31,19 +30,18 @@ class PeriodicKillSecondaries(interface.CustomBehavior):
 
     DEFAULT_PERIOD_SECS = 30
 
-    def __init__(self, hook_logger, fixture, period_secs=DEFAULT_PERIOD_SECS):
-        if not isinstance(fixture, replicaset.ReplicaSetFixture):
-            raise TypeError("%s either does not support replication or does not support writing to"
-                            " its oplog early"
-                            % (fixture.__class__.__name__))
+    def __init__(self, hook_logger, rs_fixture, period_secs=DEFAULT_PERIOD_SECS):
+        if not isinstance(rs_fixture, replicaset.ReplicaSetFixture):
+            raise TypeError("{} either does not support replication or does not support writing to"
+                            " its oplog early".format(rs_fixture.__class__.__name__))
 
-        if fixture.num_nodes <= 1:
+        if rs_fixture.num_nodes <= 1:
             raise ValueError("PeriodicKillSecondaries requires the replica set to contain at least"
                              " one secondary")
 
         description = ("PeriodicKillSecondaries (kills the secondary after running tests for a"
                        " configurable period of time)")
-        interface.CustomBehavior.__init__(self, hook_logger, fixture, description)
+        interface.CustomBehavior.__init__(self, hook_logger, rs_fixture, description)
 
         self._period_secs = period_secs
         self._start_time = None
@@ -59,20 +57,10 @@ class PeriodicKillSecondaries(interface.CustomBehavior):
             # The "rsSyncApplyStop" failpoint is already enabled.
             return
 
-        # Enable the "rsSyncApplyStop" failpoint on each of the secondaries to prevent them from
-        # applying any oplog entries while the test is running.
         for secondary in self.fixture.get_secondaries():
-            client = utils.new_mongo_client(port=secondary.port)
-            try:
-                client.admin.command(bson.SON([
-                    ("configureFailPoint", "rsSyncApplyStop"),
-                    ("mode", "alwaysOn")]))
-            except pymongo.errors.OperationFailure as err:
-                self.logger.exception(
-                    "Unable to disable oplog application on the mongod on port %d", secondary.port)
-                raise errors.ServerFailure(
-                    "Unable to disable oplog application on the mongod on port %d: %s"
-                    % (secondary.port, err.args[0]))
+            # Enable the "rsSyncApplyStop" failpoint on the secondary to prevent them from
+            # applying any oplog entries while the test is running.
+            self._enable_rssyncapplystop(secondary)
 
         self._start_time = time.time()
 
@@ -91,7 +79,7 @@ class PeriodicKillSecondaries(interface.CustomBehavior):
         self.hook_test_case = testcase.TestCase(
             self.logger,
             "Hook",
-            "%s:%s" % (self._last_test_name, self.logger_name))
+            "{}:{}".format(self._last_test_name, self.logger_name))
         interface.CustomBehavior.start_dynamic_test(self.hook_test_case, test_report)
 
         try:
@@ -127,19 +115,7 @@ class PeriodicKillSecondaries(interface.CustomBehavior):
         for secondary in self.fixture.get_secondaries():
             # Disable the "rsSyncApplyStop" failpoint on the secondary to have it resume applying
             # oplog entries.
-            for secondary in self.fixture.get_secondaries():
-                client = utils.new_mongo_client(port=secondary.port)
-                try:
-                    client.admin.command(bson.SON([
-                        ("configureFailPoint", "rsSyncApplyStop"),
-                        ("mode", "off")]))
-                except pymongo.errors.OperationFailure as err:
-                    self.logger.exception(
-                        "Unable to re-enable oplog application on the mongod on port %d",
-                        secondary.port)
-                    raise errors.ServerFailure(
-                        "Unable to re-enable oplog application on the mongod on port %d: %s"
-                        % (secondary.port, err.args[0]))
+            self._disable_rssyncapplystop(secondary)
 
             # Wait a little bit for the secondary to start apply oplog entries so that we are more
             # likely to kill the mongod process while it is partway into applying a batch.
@@ -149,12 +125,11 @@ class PeriodicKillSecondaries(interface.CustomBehavior):
             # we still detect some cases in which the secondary has already crashed.
             if not secondary.is_running():
                 raise errors.ServerFailure(
-                    "mongod on port %d was expected to be running in"
-                    " PeriodicKillSecondaries.after_test(), but wasn't."
-                    % (secondary.port))
+                    "mongod on port {} was expected to be running in"
+                    " PeriodicKillSecondaries.after_test(), but wasn't.".format(secondary.port))
 
             self.hook_test_case.logger.info(
-                "Killing the secondary on port %d..." % (secondary.port))
+                "Killing the secondary on port %d...", secondary.port)
             secondary.mongod.stop(kill=True)
 
         # Teardown may or may not be considered a success as a result of killing a secondary, so we
@@ -179,7 +154,8 @@ class PeriodicKillSecondaries(interface.CustomBehavior):
             teardown_success = secondary.teardown()
             if not teardown_success:
                 raise errors.ServerFailure(
-                    "%s did not exit cleanly after reconciling the end of its oplog" % (secondary))
+                    "{} did not exit cleanly after reconciling the end of its oplog".format(
+                        secondary))
 
         self.hook_test_case.logger.info(
             "Starting the fixture back up again with its data files intact...")
@@ -217,8 +193,7 @@ class PeriodicKillSecondaries(interface.CustomBehavior):
         teardown_success = self.fixture.teardown()
         if not teardown_success:
             raise errors.ServerFailure(
-                "%s did not exit cleanly after verifying data consistency"
-                % (self.fixture))
+                "{} did not exit cleanly after verifying data consistency".format(self.fixture))
 
         self.hook_test_case.logger.info("Starting the fixture back up again...")
         self.fixture.setup()
@@ -232,70 +207,157 @@ class PeriodicKillSecondaries(interface.CustomBehavior):
             secondary.setup()
             secondary.await_ready()
 
-            client = utils.new_mongo_client(port=secondary.port)
+            client = secondary.mongo_client()
             minvalid_doc = client.local["replset.minvalid"].find_one()
+            oplog_truncate_after_doc = client.local["replset.oplogTruncateAfterPoint"].find_one()
+            checkpoint_timestamp_doc = client.local["replset.checkpointTimestamp"].find_one()
 
             latest_oplog_doc = client.local["oplog.rs"].find_one(
                 sort=[("$natural", pymongo.DESCENDING)])
 
+            null_ts = bson.Timestamp(0, 0)
+
+            # The oplog could be empty during initial sync. If so, we default it to null.
+            latest_oplog_entry_ts = null_ts
+            if latest_oplog_doc is not None:
+                latest_oplog_entry_ts = latest_oplog_doc.get("ts")
+                if latest_oplog_entry_ts is None:
+                    raise errors.ServerFailure("Latest oplog entry had no 'ts' field: {}".format(
+                        latest_oplog_doc))
+
+            # The "oplogTruncateAfterPoint" document may not exist at startup. If so, we default
+            # it to null.
+            oplog_truncate_after_ts = null_ts
+            if oplog_truncate_after_doc is not None:
+                oplog_truncate_after_ts = oplog_truncate_after_doc.get(
+                    "oplogTruncateAfterPoint", null_ts)
+
+            # The "checkpointTimestamp" document may not exist at startup. If so, we default
+            # it to null.
+            checkpoint_timestamp = null_ts
+            if checkpoint_timestamp_doc is not None:
+                checkpoint_timestamp = checkpoint_timestamp_doc.get("checkpointTimestamp")
+                if checkpoint_timestamp is None:
+                    raise errors.ServerFailure(
+                        "Checkpoint timestamp document had no 'checkpointTimestamp'"
+                        "field: {}".format(checkpoint_timestamp_doc))
+
+            # checkpointTimestamp <= top of oplog
+            # If the oplog is empty, the checkpoint timestamp should also be null.
+            if not checkpoint_timestamp <= latest_oplog_entry_ts:
+                raise errors.ServerFailure(
+                    "The condition checkpointTimestamp <= top of oplog ({} <= {}) doesn't hold:"
+                    " checkpointTimestamp document={}, latest oplog entry={}".format(
+                        checkpoint_timestamp, latest_oplog_entry_ts, checkpoint_timestamp_doc,
+                        latest_oplog_doc))
+
             if minvalid_doc is not None:
-                # Check the invariants 'begin <= minValid', 'minValid <= oplogDeletePoint', and
-                # 'minValid <= top of oplog' before the secondary has reconciled the end of its
-                # oplog.
-                null_ts = bson.Timestamp(0, 0)
-                begin_ts = minvalid_doc.get("begin", {}).get("ts", null_ts)
-                minvalid_ts = minvalid_doc.get("ts", begin_ts)
-                oplog_delete_point_ts = minvalid_doc.get("oplogDeleteFromPoint", minvalid_ts)
+                applied_through_ts = minvalid_doc.get("begin", {}).get("ts", null_ts)
+                minvalid_ts = minvalid_doc.get("ts", null_ts)
+
+                # The "appliedThrough" value should always equal the "checkpointTimestamp".
+                # The writes to "appliedThrough" are given the timestamp of the end of the batch,
+                # and batch boundaries are the only valid timestamps in which we could take
+                # checkpoints, so if you see a non-null applied through in a stable checkpoint it
+                # must be at the same timestamp as the checkpoint.
+                if (checkpoint_timestamp != null_ts
+                        and applied_through_ts != null_ts
+                        and (not checkpoint_timestamp == applied_through_ts)):
+                    raise errors.ServerFailure(
+                        "The condition checkpointTimestamp ({}) == appliedThrough ({})"
+                        " doesn't hold: minValid document={},"
+                        " checkpointTimestamp document={}, last oplog entry={}".format(
+                            checkpoint_timestamp, applied_through_ts, minvalid_doc,
+                            checkpoint_timestamp_doc, latest_oplog_doc))
+
+                if applied_through_ts == null_ts:
+                    # We clear "appliedThrough" to represent having applied through the top of the
+                    # oplog in PRIMARY state or immediately after "rollback via refetch".
+                    # If we are using a storage engine that supports "recover to a checkpoint,"
+                    # then we will have a "checkpointTimestamp" and we should use that as our
+                    # "appliedThrough" (similarly to why we assert their equality above).
+                    # If both are null, then we are in PRIMARY state on a storage engine that does
+                    # not support "recover to a checkpoint" or in RECOVERING immediately after
+                    # "rollback via refetch". Since we do not update "minValid" in PRIMARY state,
+                    # we leave "appliedThrough" as null so that the invariants below hold, rather
+                    # than substituting the latest oplog entry for the "appliedThrough" value.
+                    applied_through_ts = checkpoint_timestamp
 
                 if minvalid_ts == null_ts:
                     # The server treats the "ts" field in the minValid document as missing when its
                     # value is the null timestamp.
-                    minvalid_ts = begin_ts
+                    minvalid_ts = applied_through_ts
 
-                if oplog_delete_point_ts == null_ts:
-                    # The server treats the "oplogDeleteFromPoint" field as missing when its value
-                    # is the null timestamp.
-                    oplog_delete_point_ts = minvalid_ts
+                if latest_oplog_entry_ts == null_ts:
+                    # If the oplog is empty, we treat the "minValid" as the latest oplog entry.
+                    latest_oplog_entry_ts = minvalid_ts
 
-                latest_oplog_entry_ts = latest_oplog_doc.get("ts", oplog_delete_point_ts)
+                if oplog_truncate_after_ts == null_ts:
+                    # The server treats the "oplogTruncateAfterPoint" field as missing when its
+                    # value is the null timestamp. When it is null, the oplog is complete and
+                    # should not be truncated, so it is effectively the top of the oplog.
+                    oplog_truncate_after_ts = latest_oplog_entry_ts
 
-                if not begin_ts <= minvalid_ts:
+                # Check the ordering invariants before the secondary has reconciled the end of
+                # its oplog.
+                # The "oplogTruncateAfterPoint" is set to the first timestamp of each batch of
+                # oplog entries before they are written to the oplog. Thus, it can be ahead
+                # of the top of the oplog before any oplog entries are written, and behind it
+                # after some are written. Thus, we cannot compare it to the top of the oplog.
+
+                # appliedThrough <= minValid
+                # appliedThrough represents the end of the previous batch, so it is always the
+                # earliest.
+                if not applied_through_ts <= minvalid_ts:
                     raise errors.ServerFailure(
-                        "The condition begin <= minValid (%s <= %s) doesn't hold: minValid"
-                        " document=%s, latest oplog entry=%s"
-                        % (begin_ts, minvalid_ts, minvalid_doc, latest_oplog_doc))
+                        "The condition appliedThrough <= minValid ({} <= {}) doesn't hold: minValid"
+                        " document={}, latest oplog entry={}".format(
+                            applied_through_ts, minvalid_ts, minvalid_doc, latest_oplog_doc))
 
-                if not minvalid_ts <= oplog_delete_point_ts:
+                # minValid <= oplogTruncateAfterPoint
+                # This is true because this hook is never run after a rollback. Thus, we only
+                # move "minValid" to the end of each batch after the batch is written to the oplog.
+                # We reset the "oplogTruncateAfterPoint" to null before we move "minValid" from
+                # the end of the previous batch to the end of the current batch. Thus "minValid"
+                # must be less than or equal to the "oplogTruncateAfterPoint".
+                if not minvalid_ts <= oplog_truncate_after_ts:
                     raise errors.ServerFailure(
-                        "The condition minValid <= oplogDeletePoint (%s <= %s) doesn't hold:"
-                        " minValid document=%s, latest oplog entry=%s"
-                        % (minvalid_ts, oplog_delete_point_ts, minvalid_doc, latest_oplog_doc))
+                        "The condition minValid <= oplogTruncateAfterPoint ({} <= {}) doesn't"
+                        " hold: minValid document={}, oplogTruncateAfterPoint document={},"
+                        " latest oplog entry={}".format(
+                            minvalid_ts, oplog_truncate_after_ts, minvalid_doc,
+                            oplog_truncate_after_doc, latest_oplog_doc))
 
+                # minvalid <= latest oplog entry
+                # "minValid" is set to the end of a batch after the batch is written to the oplog.
+                # Thus it is always less than or equal to the top of the oplog.
                 if not minvalid_ts <= latest_oplog_entry_ts:
                     raise errors.ServerFailure(
-                        "The condition minValid <= top of oplog (%s <= %s) doesn't hold: minValid"
-                        " document=%s, latest oplog entry=%s"
-                        % (minvalid_ts, latest_oplog_entry_ts, minvalid_doc, latest_oplog_doc))
+                        "The condition minValid <= top of oplog ({} <= {}) doesn't"
+                        " hold: minValid document={}, latest oplog entry={}".format(
+                            minvalid_ts, latest_oplog_entry_ts, minvalid_doc,
+                            latest_oplog_doc))
 
             teardown_success = secondary.teardown()
             if not teardown_success:
                 raise errors.ServerFailure(
-                    "%s did not exit cleanly after being started up as a standalone" % (secondary))
+                    "{} did not exit cleanly after being started up as a standalone".format(
+                        secondary))
         except pymongo.errors.OperationFailure as err:
             self.hook_test_case.logger.exception(
-                "Failed to read the minValid document or the latest oplog entry from the mongod on"
-                " port %d",
-                secondary.port)
+                "Failed to read the minValid document, the oplogTruncateAfterPoint document,"
+                " the checkpointTimestamp document, or the latest oplog entry from the mongod on"
+                " port %d", secondary.port)
             raise errors.ServerFailure(
-                "Failed to read the minValid document or the latest oplog entry from the mongod on"
-                " port %d: %s"
-                % (secondary.port, err.args[0]))
+                "Failed to read the minValid document, the oplogTruncateAfterPoint document,"
+                " the checkpointTimestamp document, or the latest oplog entry from the mongod on"
+                " port {}: {}".format(secondary.port, err.args[0]))
         finally:
             # Set the secondary's options back to their original values.
             secondary.mongod_options["replSet"] = replset_name
 
     def _await_secondary_state(self, secondary):
-        client = utils.new_mongo_client(port=secondary.port)
+        client = secondary.mongo_client()
         try:
             client.admin.command(bson.SON([
                 ("replSetTest", 1),
@@ -307,5 +369,36 @@ class PeriodicKillSecondaries(interface.CustomBehavior):
                 secondary.port,
                 fixture.ReplFixture.AWAIT_REPL_TIMEOUT_MINS * 60)
             raise errors.ServerFailure(
-                "mongod on port %d failed to reach state SECONDARY after %d seconds: %s"
-                % (secondary.port, fixture.ReplFixture.AWAIT_REPL_TIMEOUT_MINS * 60, err.args[0]))
+                "mongod on port {} failed to reach state SECONDARY after {} seconds: {}".format(
+                    secondary.port, fixture.ReplFixture.AWAIT_REPL_TIMEOUT_MINS * 60, err.args[0]))
+
+    def _enable_rssyncapplystop(self, secondary):
+        # Enable the "rsSyncApplyStop" failpoint on the secondary to prevent them from
+        # applying any oplog entries while the test is running.
+        client = secondary.mongo_client()
+        try:
+            client.admin.command(bson.SON([
+                ("configureFailPoint", "rsSyncApplyStop"),
+                ("mode", "alwaysOn")]))
+        except pymongo.errors.OperationFailure as err:
+            self.logger.exception(
+                "Unable to disable oplog application on the mongod on port %d", secondary.port)
+            raise errors.ServerFailure(
+                "Unable to disable oplog application on the mongod on port {}: {}".format(
+                    secondary.port, err.args[0]))
+
+    def _disable_rssyncapplystop(self, secondary):
+        # Disable the "rsSyncApplyStop" failpoint on the secondary to have it resume applying
+        # oplog entries.
+        client = secondary.mongo_client()
+        try:
+            client.admin.command(bson.SON([
+                ("configureFailPoint", "rsSyncApplyStop"),
+                ("mode", "off")]))
+        except pymongo.errors.OperationFailure as err:
+            self.logger.exception(
+                "Unable to re-enable oplog application on the mongod on port %d",
+                secondary.port)
+            raise errors.ServerFailure(
+                "Unable to re-enable oplog application on the mongod on port {}: {}".format(
+                    secondary.port, err.args[0]))

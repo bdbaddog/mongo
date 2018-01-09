@@ -34,17 +34,19 @@
 
 namespace mongo {
 
-RouterStageLimit::RouterStageLimit(std::unique_ptr<RouterExecStage> child, long long limit)
-    : RouterExecStage(std::move(child)), _limit(limit) {
+RouterStageLimit::RouterStageLimit(OperationContext* opCtx,
+                                   std::unique_ptr<RouterExecStage> child,
+                                   long long limit)
+    : RouterExecStage(opCtx, std::move(child)), _limit(limit) {
     invariant(limit > 0);
 }
 
-StatusWith<ClusterQueryResult> RouterStageLimit::next(OperationContext* opCtx) {
+StatusWith<ClusterQueryResult> RouterStageLimit::next(RouterExecStage::ExecContext execContext) {
     if (_returnedSoFar >= _limit) {
         return {ClusterQueryResult()};
     }
 
-    auto childResult = getChildStage()->next(opCtx);
+    auto childResult = getChildStage()->next(execContext);
     if (!childResult.isOK()) {
         return childResult;
     }
@@ -53,18 +55,6 @@ StatusWith<ClusterQueryResult> RouterStageLimit::next(OperationContext* opCtx) {
         ++_returnedSoFar;
     }
     return childResult;
-}
-
-void RouterStageLimit::kill(OperationContext* opCtx) {
-    getChildStage()->kill(opCtx);
-}
-
-bool RouterStageLimit::remotesExhausted() {
-    return getChildStage()->remotesExhausted();
-}
-
-Status RouterStageLimit::setAwaitDataTimeout(Milliseconds awaitDataTimeout) {
-    return getChildStage()->setAwaitDataTimeout(awaitDataTimeout);
 }
 
 }  // namespace mongo

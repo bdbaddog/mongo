@@ -43,7 +43,7 @@
 namespace mongo {
 
 const std::string ChunkType::ConfigNS = "config.chunks";
-const std::string ChunkType::ShardNSPrefix = "config.chunks.";
+const std::string ChunkType::ShardNSPrefix = "config.cache.chunks.";
 
 const BSONField<std::string> ChunkType::name("_id");
 const BSONField<BSONObj> ChunkType::minShardID("_id");
@@ -52,8 +52,8 @@ const BSONField<BSONObj> ChunkType::min("min");
 const BSONField<BSONObj> ChunkType::max("max");
 const BSONField<std::string> ChunkType::shard("shard");
 const BSONField<bool> ChunkType::jumbo("jumbo");
-const BSONField<Date_t> ChunkType::DEPRECATED_lastmod("lastmod");
-const BSONField<OID> ChunkType::DEPRECATED_epoch("lastmodEpoch");
+const BSONField<Date_t> ChunkType::lastmod("lastmod");
+const BSONField<OID> ChunkType::epoch("lastmodEpoch");
 
 namespace {
 
@@ -271,7 +271,8 @@ StatusWith<ChunkType> ChunkType::fromShardBSON(const BSONObj& source, const OID&
     }
 
     {
-        auto statusWithChunkVersion = ChunkVersion::parseFromBSONAndSetEpoch(source, epoch);
+        auto statusWithChunkVersion =
+            ChunkVersion::parseFromBSONWithFieldAndSetEpoch(source, lastmod.name(), epoch);
         if (!statusWithChunkVersion.isOK()) {
             return statusWithChunkVersion.getStatus();
         }
@@ -290,7 +291,7 @@ BSONObj ChunkType::toShardBSON() const {
     builder.append(minShardID.name(), getMin());
     builder.append(max.name(), getMax());
     builder.append(shard.name(), getShard().toString());
-    builder.appendTimestamp(DEPRECATED_lastmod.name(), _version->toLong());
+    builder.appendTimestamp(lastmod.name(), _version->toLong());
     return builder.obj();
 }
 

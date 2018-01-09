@@ -101,26 +101,9 @@ env.Library(
     target='uuid',
     source=[
         'uuid.cpp',
-        'namespace_uuid_cache.cpp',
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/base',
-        '$BUILD_DIR/mongo/db/catalog/collection',
-        '$BUILD_DIR/mongo/util/decorable',
-        '$BUILD_DIR/third_party/murmurhash3/murmurhash3',
-    ],
-)
-
-env.Library(
-    target='uuid_catalog',
-    source=[
-        'uuid_catalog.cpp'
-    ],
-    LIBDEPS=[
-        'uuid',
-        '$BUILD_DIR/mongo/base',
-        '$BUILD_DIR/mongo/db/catalog/collection',
-        '$BUILD_DIR/mongo/db/namespace_string',
         '$BUILD_DIR/mongo/util/decorable',
         '$BUILD_DIR/third_party/murmurhash3/murmurhash3',
     ],
@@ -136,28 +119,6 @@ env.CppUnitTest(
         'uuid',
     ],
 )
-
-env.CppUnitTest(
-    target='namespace_uuid_cache_test',
-    source=[
-        'namespace_uuid_cache_test.cpp'
-    ],
-    LIBDEPS=[
-        'uuid',
-    ],
-)
-
-env.CppUnitTest(
-    target='uuid_catalog_test',
-    source=[
-        'uuid_catalog_test.cpp',
-        ],
-    LIBDEPS=[
-        'uuid_catalog',
-        'uuid',
-        '$BUILD_DIR/mongo/db/service_context',
-        ]
-    )
 
 env.Library(
     target='summation',
@@ -334,6 +295,7 @@ env.Library(
     ],
     LIBDEPS=[
         "$BUILD_DIR/mongo/base",
+        "$BUILD_DIR/mongo/db/service_context",
         "$BUILD_DIR/third_party/shim_asio",
         "$BUILD_DIR/mongo/executor/async_timer_asio",
         "periodic_runner",
@@ -346,8 +308,9 @@ env.CppUnitTest(
         "periodic_runner_asio_test.cpp",
     ],
     LIBDEPS=[
-        "periodic_runner_asio",
+        '$BUILD_DIR/mongo/db/service_context_noop_init',
         "$BUILD_DIR/mongo/executor/async_timer_mock",
+        "periodic_runner_asio",
     ],
 )
 
@@ -416,12 +379,20 @@ if env['MONGO_ALLOCATOR'] == 'tcmalloc':
             '$BUILD_DIR/mongo/db/server_parameters',
             '$BUILD_DIR/mongo/util/net/network',
         ],
+        LIBDEPS_DEPENDENTS=[
+            '$BUILD_DIR/mongo/mongodmain',
+        ],
         PROGDEPS_DEPENDENTS=[
-            '$BUILD_DIR/mongo/mongod',
             '$BUILD_DIR/mongo/mongos',
         ],
     )
 
+env.Library(
+    target='winutil',
+    source=[
+        'winutil.cpp',
+    ],
+)
 
 env.Library(
     target='ntservice',
@@ -522,6 +493,25 @@ env.Library(
     LIBDEPS=[
         "$BUILD_DIR/mongo/base",
     ],
+)
+
+env.Library(
+    target='dns_query',
+    source=[
+        'dns_query.cpp',
+    ],
+    LIBDEPS_PRIVATE=[
+        "$BUILD_DIR/mongo/base",
+    ],
+)
+
+env.CppUnitTest(
+    target='dns_query_test',
+    source=['dns_query_test.cpp'],
+    LIBDEPS=[
+        'dns_query',
+        "$BUILD_DIR/mongo/base",
+    ]
 )
 
 env.Library(
@@ -645,6 +635,16 @@ env.CppUnitTest(
     LIBDEPS=[
         '$BUILD_DIR/mongo/base',
     ]
+)
+
+env.CppUnitTest(
+    target='base64_test',
+    source=[
+        'base64_test.cpp',
+    ],
+    LIBDEPS=[
+        '$BUILD_DIR/mongo/base',
+    ],
 )
 
 if env.TargetOSIs('linux'):

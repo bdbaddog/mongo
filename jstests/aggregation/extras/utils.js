@@ -266,14 +266,14 @@ function assertErrorCode(coll, pipe, code, errmsg) {
     var cursorRes = coll.runCommand("aggregate", cmd);
     if (cursorRes.ok) {
         var followupBatchSize = 0;  // default
-        var cursor = new DBCommandCursor(coll.getMongo(), cursorRes, followupBatchSize);
+        var cursor = new DBCommandCursor(coll.getDB(), cursorRes, followupBatchSize);
 
         var error = assert.throws(function() {
             cursor.itcount();
         }, [], "expected error: " + code);
 
-        assert.eq(error.code, code);
+        assert.eq(error.code, code, tojson(error));
     } else {
-        assert.eq(cursorRes.code, code);
+        assert.eq(cursorRes.code, code, tojson(cursorRes));
     }
 }

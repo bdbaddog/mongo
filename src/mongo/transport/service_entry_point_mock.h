@@ -65,6 +65,16 @@ public:
      */
     void startSession(transport::SessionHandle session) override;
 
+    void endAllSessions(transport::Session::TagMask tags) override;
+
+    bool shutdown(Milliseconds timeout) override {
+        return true;
+    }
+
+    Stats sessionStats() const override;
+
+    size_t numOpenSessions() const override;
+
     DbResponse handleRequest(OperationContext* opCtx, const Message& request) override;
 
 private:

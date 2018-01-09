@@ -288,7 +288,7 @@ public:
         // Since appendVertexNeighbors(level, output) requires level < hash.getBits(),
         // we have to start to find documents at most GeoHash::kMaxBits - 1. Thus the finest
         // search area is 16 * finest cell area at GeoHash::kMaxBits.
-        _currentLevel = std::max(0u, hashParams.bits - 1u);
+        _currentLevel = std::max(0, hashParams.bits - 1);
     }
 
     PlanStage::StageState work(OperationContext* opCtx,
@@ -505,15 +505,13 @@ namespace {
 class TwoDPtInAnnulusExpression : public LeafMatchExpression {
 public:
     TwoDPtInAnnulusExpression(const R2Annulus& annulus, StringData twoDPath)
-        : LeafMatchExpression(INTERNAL_2D_POINT_IN_ANNULUS), _annulus(annulus) {
-        setPath(twoDPath);
-    }
+        : LeafMatchExpression(INTERNAL_2D_POINT_IN_ANNULUS, twoDPath), _annulus(annulus) {}
 
     void serialize(BSONObjBuilder* out) const final {
         out->append("TwoDPtInAnnulusExpression", true);
     }
 
-    bool matchesSingleElement(const BSONElement& e) const final {
+    bool matchesSingleElement(const BSONElement& e, MatchDetails* details = nullptr) const final {
         if (!e.isABSONObj())
             return false;
 
@@ -543,6 +541,10 @@ public:
     }
 
 private:
+    ExpressionOptimizerFunc getOptimizer() const final {
+        return [](std::unique_ptr<MatchExpression> expression) { return expression; };
+    }
+
     R2Annulus _annulus;
 };
 
@@ -726,7 +728,7 @@ StatusWith<NearStage::CoveredInterval*>  //
 
     // These parameters are stored by the index, and so must be ok
     GeoHashConverter::Parameters hashParams;
-    GeoHashConverter::parseParameters(_twoDIndex->infoObj(), &hashParams);
+    GeoHashConverter::parseParameters(_twoDIndex->infoObj(), &hashParams).transitional_ignore();
 
     // 2D indexes support covered search over additional fields they contain
     IndexScan* scan = new IndexScan(opCtx, scanParams, workingSet, _nearParams.filter);

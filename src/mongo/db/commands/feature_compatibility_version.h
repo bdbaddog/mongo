@@ -53,56 +53,111 @@ public:
     static constexpr StringData kDatabase = "admin"_sd;
     static constexpr StringData kParameterName = "featureCompatibilityVersion"_sd;
     static constexpr StringData kVersionField = "version"_sd;
+    static constexpr StringData kTargetVersionField = "targetVersion"_sd;
+
+    /**
+     * Should be taken in exclusive mode by any operations that should not run while
+     * setFeatureCompatibilityVersion is running.
+     */
+    static Lock::ResourceMutex fcvLock;
 
     /**
      * Parses the featureCompatibilityVersion document from admin.system.version, and returns the
-     * version.
+     * state represented by the combination of the targetVersion and version.
      */
     static StatusWith<ServerGlobalParams::FeatureCompatibility::Version> parse(
         const BSONObj& featureCompatibilityVersionDoc);
 
     static StringData toString(ServerGlobalParams::FeatureCompatibility::Version version) {
         switch (version) {
-            case ServerGlobalParams::FeatureCompatibility::Version::k36:
+            case ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo36:
                 return FeatureCompatibilityVersionCommandParser::kVersion36;
-            case ServerGlobalParams::FeatureCompatibility::Version::k34:
+            case ServerGlobalParams::FeatureCompatibility::Version::kFullyDowngradedTo34:
                 return FeatureCompatibilityVersionCommandParser::kVersion34;
+            case ServerGlobalParams::FeatureCompatibility::Version::kUpgradingTo36:
+                return FeatureCompatibilityVersionCommandParser::kVersionUpgradingTo36;
+            case ServerGlobalParams::FeatureCompatibility::Version::kDowngradingTo34:
+                return FeatureCompatibilityVersionCommandParser::kVersionDowngradingTo34;
+            case ServerGlobalParams::FeatureCompatibility::Version::kUnsetDefault34Behavior:
+                return FeatureCompatibilityVersionCommandParser::kVersionUnset;
             default:
                 MONGO_UNREACHABLE;
         }
     }
 
     /**
-     * Sets the minimum allowed version in the cluster, which determines what features are
-     * available.
-     * 'version' should be '3.4' or '3.6'.
+     * Records intent to perform a 3.4 -> 3.6 upgrade by updating the on-disk feature
+     * compatibility version document to have 'version'=3.4, 'targetVersion'=3.6.
+     * Should be called before schemas are modified.
      */
-    static void set(OperationContext* opCtx, StringData version);
+    static void setTargetUpgrade(OperationContext* opCtx);
 
     /**
-     * If there are no non-local databases and we are not running with --shardsvr, set
-     * featureCompatibilityVersion to the latest value.
+     * Records intent to perform a 3.6 -> 3.4 downgrade by updating the on-disk feature
+     * compatibility version document to have 'version'=3.4, 'targetVersion'=3.4.
+     * Should be called before schemas are modified.
+     */
+    static void setTargetDowngrade(OperationContext* opCtx);
+
+    /**
+     * Records the completion of a 3.4 <-> 3.6 upgrade or downgrade by updating the on-disk
+     * feature compatibility version document to have 'version'=version and unsetting the
+     * 'targetVersion' field.
+     * Should be called after schemas are modified.
+     */
+    static void unsetTargetUpgradeOrDowngrade(OperationContext* opCtx, StringData version);
+
+    /**
+     * If there are no non-local databases, store the featureCompatibilityVersion document. If we
+     * are not running with --shardsvr, set the version to be the upgrade value. If we are running
+     * with --shardsvr, set the version to be the downgrade value.
      */
     static void setIfCleanStartup(OperationContext* opCtx,
                                   repl::StorageInterface* storageInterface);
 
     /**
-     * Examines a document inserted or updated in admin.system.version. If it is the
-     * featureCompatibilityVersion document, validates the document and updates the server
-     * parameter.
+     * Returns true if the server is on a clean startup. A clean startup means there are no
+     * databases on disk besides the local database.
      */
-    static void onInsertOrUpdate(const BSONObj& doc);
+    static bool isCleanStartUp();
+
+    /**
+     * Examines a document inserted or updated in admin.system.version. If it is the
+     * featureCompatibilityVersion document, validates the document and on commit, updates
+     * the server parameter.
+     */
+    static void onInsertOrUpdate(OperationContext* opCtx, const BSONObj& doc);
 
     /**
      * Examines the _id of a document removed from admin.system.version. If it is the
-     * featureCompatibilityVersion document, resets the server parameter to its default value.
+     * featureCompatibilityVersion document, resets the server parameter to its default value
+     * on commit.
      */
-    static void onDelete(const BSONObj& doc);
+    static void onDelete(OperationContext* opCtx, const BSONObj& doc);
 
     /**
-     * Resets the server parameter to its default value.
+     * Resets the server parameter to its default value on commit.
      */
-    static void onDropCollection();
+    static void onDropCollection(OperationContext* opCtx);
+
+    /**
+     * Sets the server's outgoing and incomingInternalClient minWireVersions according to the
+     * current featureCompatibilityVersion value.
+     */
+    static void updateMinWireVersion();
+
+private:
+    /**
+     * Validate version. Uasserts if invalid.
+     */
+    static void _validateVersion(StringData version);
+
+    /**
+     * Build update command.
+     */
+    typedef stdx::function<void(BSONObjBuilder)> UpdateBuilder;
+    static void _runUpdateCommand(OperationContext* opCtx, UpdateBuilder callback);
 };
+
 
 }  // namespace mongo

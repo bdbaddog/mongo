@@ -63,7 +63,8 @@ SocketException::SocketException(Type t,
                                  const std::string& server,
                                  int code,
                                  const std::string& extra)
-    : DBException(std::string("socket exception [") + getStringType(t) + "] for " + server, code),
+    : DBException(Status(ErrorCodes::Error(code),
+                         std::string("socket exception [") + getStringType(t) + "] for " + server)),
       _type(t),
       _server(server),
       _extra(extra) {}
@@ -75,7 +76,7 @@ bool SocketException::shouldPrint() const {
 
 std::string SocketException::toString() const {
     std::stringstream ss;
-    ss << _ei.code << " socket exception [" << getStringType(_type) << "] ";
+    ss << codeString() << " socket exception [" << getStringType(_type) << "] ";
 
     if (_server.size())
         ss << "server [" << _server << "] ";

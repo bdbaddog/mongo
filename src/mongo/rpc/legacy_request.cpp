@@ -30,6 +30,7 @@
 
 #include <utility>
 
+#include "mongo/client/dbclientinterface.h"
 #include "mongo/db/dbmessage.h"
 #include "mongo/rpc/legacy_request.h"
 #include "mongo/rpc/metadata.h"
@@ -43,19 +44,25 @@ OpMsgRequest opMsgRequestFromLegacyRequest(const Message& message) {
     QueryMessage qm(dbm);
     NamespaceString ns(qm.ns);
 
+    if (qm.queryOptions & QueryOption_Exhaust) {
+        uasserted(18527,
+                  str::stream() << "The 'exhaust' OP_QUERY flag is invalid for commands: "
+                                << ns.ns()
+                                << " "
+                                << qm.query.toString());
+    }
+
     uassert(40473,
             str::stream() << "Trying to handle namespace " << qm.ns << " as a command",
             ns.isCommand());
 
     uassert(16979,
-            str::stream() << "bad numberToReturn (" << qm.ntoreturn
+            str::stream() << "Bad numberToReturn (" << qm.ntoreturn
                           << ") for $cmd type ns - can only be 1 or -1",
             qm.ntoreturn == 1 || qm.ntoreturn == -1);
 
-    auto bodyAndMetadata = rpc::upconvertRequestMetadata(qm.query, qm.queryOptions);
-
-    return OpMsgRequest::fromDBAndBody(
-        ns.db(), std::get<0>(bodyAndMetadata), std::get<1>(bodyAndMetadata));
+    return rpc::upconvertRequest(
+        ns.db(), qm.query.shareOwnershipWith(message.sharedBuffer()), qm.queryOptions);
 }
 
 }  // namespace rpc

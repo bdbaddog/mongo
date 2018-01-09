@@ -56,15 +56,75 @@ function getPlanStage(root, stage) {
 }
 
 /**
+ * Given the root stage of explain's JSON representation of a query plan ('root'), returns true if
+ * the query planner reports at least one rejected alternative plan, and false otherwise.
+ */
+function hasRejectedPlans(root) {
+    function sectionHasRejectedPlans(explainSection) {
+        assert(explainSection.hasOwnProperty("rejectedPlans"), tojson(explainSection));
+        return explainSection.rejectedPlans.length !== 0;
+    }
+
+    function cursorStageHasRejectedPlans(cursorStage) {
+        assert(cursorStage.hasOwnProperty("$cursor"), tojson(cursorStage));
+        assert(cursorStage.$cursor.hasOwnProperty("queryPlanner"), tojson(cursorStage));
+        return sectionHasRejectedPlans(cursorStage.$cursor.queryPlanner);
+    }
+
+    if (root.hasOwnProperty("shards")) {
+        // This is a sharded agg explain.
+        const cursorStages = getAggPlanStages(root, "$cursor");
+        assert(cursorStages.length !== 0, "Did not find any $cursor stages in sharded agg explain");
+        return cursorStages.find((cursorStage) => cursorStageHasRejectedPlans(cursorStage)) !==
+            undefined;
+    } else if (root.hasOwnProperty("stages")) {
+        // This is an agg explain.
+        const cursorStages = getAggPlanStages(root, "$cursor");
+        return cursorStages.find((cursorStage) => cursorStageHasRejectedPlans(cursorStage)) !==
+            undefined;
+    } else {
+        // This is some sort of query explain.
+        assert(root.hasOwnProperty("queryPlanner"), tojson(root));
+        assert(root.queryPlanner.hasOwnProperty("winningPlan"), tojson(root));
+        if (!root.queryPlanner.winningPlan.hasOwnProperty("shards")) {
+            // This is an unsharded explain.
+            return sectionHasRejectedPlans(root.queryPlanner);
+        }
+        // This is a sharded explain. Each entry in the shards array contains a 'winningPlan' and
+        // 'rejectedPlans'.
+        return root.queryPlanner.winningPlan.shards.find(
+                   (shard) => sectionHasRejectedPlans(shard)) !== undefined;
+    }
+}
+
+/**
  * Given the root stage of agg explain's JSON representation of a query plan ('root'), returns all
- * subdocuments whose stage is 'stage'. Returns an empty array if the plan does not have the
- * requested stage. Asserts that agg explain structure matches expected format.
+ * subdocuments whose stage is 'stage'. This can either be an agg stage name like "$cursor" or
+ * "$sort", or a query stage name like "IXSCAN" or "SORT".
+ *
+ * Returns an empty array if the plan does not have the requested stage. Asserts that agg explain
+ * structure matches expected format.
  */
 function getAggPlanStages(root, stage) {
     let results = [];
 
+    function getDocumentSources(docSourceArray) {
+        let results = [];
+        for (let i = 0; i < docSourceArray.length; i++) {
+            let properties = Object.getOwnPropertyNames(docSourceArray[i]);
+            assert.eq(1, properties.length);
+            if (properties[0] === stage) {
+                results.push(docSourceArray[i]);
+            }
+        }
+        return results;
+    }
+
     if (root.hasOwnProperty("stages")) {
         assert(root.stages.constructor === Array);
+
+        results = results.concat(getDocumentSources(root.stages));
+
         assert(root.stages[0].hasOwnProperty("$cursor"));
         assert(root.stages[0].$cursor.hasOwnProperty("queryPlanner"));
         assert(root.stages[0].$cursor.queryPlanner.hasOwnProperty("winningPlan"));
@@ -75,6 +135,9 @@ function getAggPlanStages(root, stage) {
     if (root.hasOwnProperty("shards")) {
         for (let elem in root.shards) {
             assert(root.shards[elem].stages.constructor === Array);
+
+            results = results.concat(getDocumentSources(root.shards[elem].stages));
+
             assert(root.shards[elem].stages[0].hasOwnProperty("$cursor"));
             assert(root.shards[elem].stages[0].$cursor.hasOwnProperty("queryPlanner"));
             assert(root.shards[elem].stages[0].$cursor.queryPlanner.hasOwnProperty("winningPlan"));
@@ -103,6 +166,14 @@ function getAggPlanStage(root, stage) {
                       tojson(planStageList));
         return planStageList[0];
     }
+}
+
+/**
+ * Given the root stage of agg explain's JSON representation of a query plan ('root'), returns
+ * whether the plan as stage called 'stage'.
+ */
+function aggPlanHasStage(root, stage) {
+    return getAggPlanStage(root, stage) !== null;
 }
 
 /**

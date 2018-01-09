@@ -1,3 +1,9 @@
+/**
+ * This test is labeled resource intensive because its total io_write is 95MB compared to a median
+ * of 5MB across all sharding tests in wiredTiger. Its total io_write is 1086MB compared to a median
+ * of 135MB in mmapv1.
+ * @tags: [resource_intensive]
+ */
 (function() {
     "use strict";
 
@@ -31,11 +37,8 @@
 
     assert.eq(40, coll.count(), "prep1");
 
-    printjson(coll.stats());
-
-    admin.printShardingStatus();
-
-    admin.runCommand({shardcollection: "" + coll, key: {_id: 1}});
+    assert.commandWorked(admin.runCommand({shardcollection: "" + coll, key: {_id: 1}}));
+    st.printShardingStatus();
 
     assert.lt(
         5, mongos.getDB("config").chunks.find({ns: "test.stuff"}).count(), "not enough chunks");
@@ -56,5 +59,4 @@
     }, "never migrated", 10 * 60 * 1000, 1000);
 
     st.stop();
-
 })();

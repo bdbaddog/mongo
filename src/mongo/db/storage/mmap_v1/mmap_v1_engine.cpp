@@ -1,5 +1,3 @@
-// mmap_v1_engine.cpp
-
 /**
 *    Copyright (C) 2014 MongoDB Inc.
 *
@@ -36,6 +34,10 @@
 #include <boost/filesystem/path.hpp>
 #include <fstream>
 
+#ifdef __linux__
+#include <sys/sysmacros.h>
+#endif
+
 #include "mongo/db/client.h"
 #include "mongo/db/mongod_options.h"
 #include "mongo/db/operation_context.h"
@@ -61,8 +63,6 @@ using std::ifstream;
 using std::string;
 using std::stringstream;
 using std::vector;
-
-MMAPV1Options mmapv1GlobalOptions;
 
 namespace {
 
@@ -407,4 +407,4 @@ void MMAPV1Engine::cleanShutdown() {
 void MMAPV1Engine::setJournalListener(JournalListener* jl) {
     dur::setJournalListener(jl);
 }
-}  // namespace
+}  // namespace mongo

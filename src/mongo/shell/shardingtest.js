@@ -17,6 +17,9 @@
  *     mongos {number|Object|Array.<Object>}: number of mongos or mongos
  *       configuration object(s)(*). @see MongoRunner.runMongos
  *
+ *     mongosWaitsForKeys {boolean}: if true, wait for mongos to discover keys from the config
+ *       server and to start sending cluster times.
+ *
  *     rs {Object|Array.<Object>}: replica set configuration object. Can
  *       contain:
  *       {
@@ -65,11 +68,16 @@
  *          Can be used to specify options that are common all mongos.
  *       enableBalancer {boolean} : if true, enable the balancer
  *       enableAutoSplit {boolean} : if true, enable autosplitting; else, default to the
- * enableBalancer setting
+ *          enableBalancer setting
  *       manualAddShard {boolean}: shards will not be added if true.
  *
  *       useBridge {boolean}: If true, then a mongobridge process is started for each node in the
  *          sharded cluster. Defaults to false.
+ *
+ *       causallyConsistent {boolean}: Specifies whether the connections to the replica set nodes
+ *          should be created with the 'causal consistency' flag enabled, which means they will
+ *          gossip the cluster time and add readConcern afterClusterTime where applicable.
+ *          Defaults to false.
  *
  *       bridgeOptions {Object}: Options to apply to all mongobridge processes. Defaults to {}.
  *
@@ -369,6 +377,8 @@ var ShardingTest = function(params) {
     };
 
     this.stop = function(opts) {
+        this.checkUUIDsConsistentAcrossCluster();
+
         for (var i = 0; i < this._mongos.length; i++) {
             this.stopMongos(i, opts);
         }
@@ -660,21 +670,13 @@ var ShardingTest = function(params) {
             this.s.adminCommand({enableSharding: dbName});
         }
 
-        var result = this.s.adminCommand({shardcollection: c, key: key});
-        if (!result.ok) {
-            printjson(result);
-            assert(false);
-        }
+        var result = assert.commandWorked(this.s.adminCommand({shardcollection: c, key: key}));
 
         if (split == false) {
             return;
         }
 
-        result = this.s.adminCommand({split: c, middle: split});
-        if (!result.ok) {
-            printjson(result);
-            assert(false);
-        }
+        result = assert.commandWorked(this.s.adminCommand({split: c, middle: split}));
 
         if (move == false) {
             return;
@@ -691,8 +693,7 @@ var ShardingTest = function(params) {
             sleep(5 * 1000);
         }
 
-        printjson(result);
-        assert(result.ok);
+        assert.commandWorked(result);
     };
 
     /**
@@ -1083,6 +1084,7 @@ var ShardingTest = function(params) {
     otherParams.useHostname = otherParams.useHostname == undefined ? true : otherParams.useHostname;
     otherParams.useBridge = otherParams.useBridge || false;
     otherParams.bridgeOptions = otherParams.bridgeOptions || {};
+    otherParams.causallyConsistent = otherParams.causallyConsistent || false;
 
     if (jsTestOptions().networkMessageCompressors) {
         otherParams.bridgeOptions["networkMessageCompressors"] =
@@ -1096,12 +1098,6 @@ var ShardingTest = function(params) {
     this._otherParams = otherParams;
 
     var pathOpts = {testName: testName};
-
-    for (var k in otherParams) {
-        if (k.startsWith("rs") && otherParams[k] != undefined) {
-            break;
-        }
-    }
 
     this._connections = [];
     this._rs = [];
@@ -1147,6 +1143,7 @@ var ShardingTest = function(params) {
                 bridgeOptions: otherParams.bridgeOptions,
                 keyFile: keyFile,
                 protocolVersion: protocolVersion,
+                waitForKeys: false,
                 settings: rsSettings
             });
 
@@ -1269,6 +1266,7 @@ var ShardingTest = function(params) {
         useBridge: otherParams.useBridge,
         bridgeOptions: otherParams.bridgeOptions,
         keyFile: keyFile,
+        waitForKeys: false,
         name: testName + "-configRS",
     };
 
@@ -1411,6 +1409,10 @@ var ShardingTest = function(params) {
             throw new Error("Failed to start mongos " + i);
         }
 
+        if (otherParams.causallyConsistent) {
+            conn.setCausalConsistency(true);
+        }
+
         if (otherParams.useBridge) {
             bridge.connectToBridge();
             this._mongos.push(bridge);
@@ -1472,4 +1474,39 @@ var ShardingTest = function(params) {
         jsTest.authenticateNodes(this._configServers);
         jsTest.authenticateNodes(this._mongos);
     }
+
+    // Mongos does not block for keys from the config servers at startup, so it may not initially
+    // return cluster times. If mongosWaitsForKeys is set, block until all mongos servers have found
+    // the keys and begun to send cluster times. Retry every 500 milliseconds and timeout after 60
+    // seconds.
+    if (params.mongosWaitsForKeys) {
+        assert.soon(function() {
+            for (let i = 0; i < numMongos; i++) {
+                const res = self._mongos[i].adminCommand({isMaster: 1});
+                if (!res.hasOwnProperty("$clusterTime")) {
+                    print("Waiting for mongos #" + i + " to start sending cluster times.");
+                    return false;
+                }
+            }
+            return true;
+        }, "waiting for all mongos servers to return cluster times", 60 * 1000, 500);
+    }
+
+    // Ensure that the sessions collection exists so jstests can run things with
+    // logical sessions and test them. We do this by forcing an immediate cache refresh
+    // on the config server, which auto-shards the collection for the cluster.
+    var lastStableBinVersion = MongoRunner.getBinVersionFor('last-stable');
+    if ((!otherParams.configOptions) ||
+        (otherParams.configOptions && !otherParams.configOptions.binVersion) ||
+        (otherParams.configOptions && otherParams.configOptions.binVersion &&
+         MongoRunner.areBinVersionsTheSame(
+             lastStableBinVersion,
+             MongoRunner.getBinVersionFor(otherParams.configOptions.binVersion)))) {
+        this.configRS.getPrimary().getDB("admin").runCommand({refreshLogicalSessionCacheNow: 1});
+    }
+
 };
+
+// Stub for a hook to check that collection UUIDs are consistent across shards and the config
+// server.
+ShardingTest.prototype.checkUUIDsConsistentAcrossCluster = function() {};

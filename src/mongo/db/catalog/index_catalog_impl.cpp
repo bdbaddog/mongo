@@ -55,7 +55,6 @@
 #include "mongo/db/jsobj.h"
 #include "mongo/db/keypattern.h"
 #include "mongo/db/matcher/expression.h"
-#include "mongo/db/matcher/extensions_callback_disallow_extensions.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/ops/delete.h"
 #include "mongo/db/query/collation/collation_spec.h"
@@ -432,7 +431,7 @@ void IndexCatalogImpl::IndexBuildBlock::fail() {
     invariant(entry == _entry);
 
     if (entry) {
-        IndexCatalogImpl::_dropIndex(_catalog, _opCtx, entry);
+        IndexCatalogImpl::_dropIndex(_catalog, _opCtx, entry).transitional_ignore();
     } else {
         IndexCatalog::_deleteIndexFromDisk(_catalog, _opCtx, _indexName, _indexNamespace);
     }
@@ -460,7 +459,6 @@ void IndexCatalogImpl::IndexBuildBlock::success() {
         // and no one can try to read this index before we set the visibility.
         auto replCoord = repl::ReplicationCoordinator::get(opCtx);
         auto snapshotName = replCoord->reserveSnapshotName(opCtx);
-        replCoord->forceSnapshotCreation();  // Ensures a newer snapshot gets created even if idle.
         entry->setMinimumVisibleSnapshot(snapshotName);
 
         // TODO remove this once SERVER-20439 is implemented. It is a stopgap solution for
@@ -590,12 +588,17 @@ Status IndexCatalogImpl::_isSpecOk(OperationContext* opCtx, const BSONObj& spec)
     if (name.empty())
         return Status(ErrorCodes::CannotCreateIndex, "index name cannot be empty");
 
-    const std::string indexNamespace = IndexDescriptor::makeIndexNamespace(nss.ns(), name);
-    if (indexNamespace.length() > NamespaceString::MaxNsLen)
-        return Status(ErrorCodes::CannotCreateIndex,
-                      str::stream() << "namespace name generated from index name \""
-                                    << indexNamespace
-                                    << "\" is too long (127 byte max)");
+    // Drop pending collections are internal to the server and will not be exported to another
+    // storage engine. The indexes contained in these collections are not subject to the same
+    // namespace length constraints as the ones in created by users.
+    if (!nss.isDropPendingNamespace()) {
+        auto indexNamespace = IndexDescriptor::makeIndexNamespace(nss.ns(), name);
+        if (indexNamespace.length() > NamespaceString::MaxNsLen)
+            return Status(ErrorCodes::CannotCreateIndex,
+                          str::stream() << "namespace name generated from index name \""
+                                        << indexNamespace
+                                        << "\" is too long (127 byte max)");
+    }
 
     const BSONObj key = spec.getObjectField("key");
     const Status keyStatus = index_key_validate::validateKeyPattern(key, indexVersion);
@@ -662,8 +665,19 @@ Status IndexCatalogImpl::_isSpecOk(OperationContext* opCtx, const BSONObj& spec)
         }
 
         // The collator must outlive the constructed MatchExpression.
-        StatusWithMatchExpression statusWithMatcher = MatchExpressionParser::parse(
-            filterElement.Obj(), ExtensionsCallbackDisallowExtensions(), collator.get());
+        boost::intrusive_ptr<ExpressionContext> expCtx(
+            new ExpressionContext(opCtx, collator.get()));
+
+        // Parsing the partial filter expression is not expected to fail here since the
+        // expression would have been successfully parsed upstream during index creation. However,
+        // filters that were allowed in partial filter expressions prior to 3.6 may be present in
+        // the index catalog and must also successfully parse (e.g., partial index filters with the
+        // $isolated/$atomic option).
+        StatusWithMatchExpression statusWithMatcher =
+            MatchExpressionParser::parse(filterElement.Obj(),
+                                         std::move(expCtx),
+                                         ExtensionsCallbackNoop(),
+                                         MatchExpressionParser::kIsolated);
         if (!statusWithMatcher.isOK()) {
             return statusWithMatcher.getStatus();
         }
@@ -720,10 +734,9 @@ Status IndexCatalogImpl::_isSpecOk(OperationContext* opCtx, const BSONObj& spec)
                       "Please remove the field or include valid options.");
     }
     Status storageEngineStatus =
-        validateStorageOptions(storageEngineOptions,
-                               stdx::bind(&StorageEngine::Factory::validateIndexStorageOptions,
-                                          stdx::placeholders::_1,
-                                          stdx::placeholders::_2));
+        validateStorageOptions(storageEngineOptions, [](const auto& x, const auto& y) {
+            return x->validateIndexStorageOptions(y);
+        });
     if (!storageEngineStatus.isOK()) {
         return storageEngineStatus;
     }
@@ -890,7 +903,7 @@ void IndexCatalogImpl::dropAllIndexes(OperationContext* opCtx,
         LOG(1) << "\t dropAllIndexes dropping: " << desc->toString();
         IndexCatalogEntry* entry = _entries.find(desc);
         invariant(entry);
-        _dropIndex(opCtx, entry);
+        _dropIndex(opCtx, entry).transitional_ignore();
 
         if (droppedIndexes != nullptr) {
             droppedIndexes->emplace(desc->indexName(), desc->infoObj());
@@ -950,7 +963,6 @@ public:
         // Ban reading from this collection on committed reads on snapshots before now.
         auto replCoord = repl::ReplicationCoordinator::get(_opCtx);
         auto snapshotName = replCoord->reserveSnapshotName(_opCtx);
-        replCoord->forceSnapshotCreation();  // Ensures a newer snapshot gets created even if idle.
         _collection->setMinimumVisibleSnapshot(snapshotName);
 
         delete _entry;
@@ -1403,7 +1415,7 @@ void IndexCatalogImpl::unindexRecord(OperationContext* opCtx,
 
         // If it's a background index, we DO NOT want to log anything.
         bool logIfError = entry->isReady(opCtx) ? !noWarn : false;
-        _unindexRecord(opCtx, entry, obj, loc, logIfError, keysDeletedOut);
+        _unindexRecord(opCtx, entry, obj, loc, logIfError, keysDeletedOut).transitional_ignore();
     }
 }
 

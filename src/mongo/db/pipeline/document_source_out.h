@@ -32,9 +32,9 @@
 
 namespace mongo {
 
-class DocumentSourceOut final : public DocumentSourceNeedsMongod, public SplittableDocumentSource {
+class DocumentSourceOut final : public DocumentSource, public SplittableDocumentSource {
 public:
-    static std::unique_ptr<LiteParsedDocumentSourceOneForeignCollection> liteParse(
+    static std::unique_ptr<LiteParsedDocumentSourceForeignCollections> liteParse(
         const AggregationRequest& request, const BSONElement& spec);
 
     // virtuals from DocumentSource
@@ -43,16 +43,21 @@ public:
     const char* getSourceName() const final;
     Value serialize(boost::optional<ExplainOptions::Verbosity> explain = boost::none) const final;
     GetDepsReturn getDependencies(DepsTracker* deps) const final;
-    bool needsPrimaryShard() const final {
-        return true;
+
+    StageConstraints constraints(Pipeline::SplitState pipeState) const final {
+        return {StreamType::kStreaming,
+                PositionRequirement::kLast,
+                HostTypeRequirement::kPrimaryShard,
+                DiskUseRequirement::kWritesPersistentData,
+                FacetRequirement::kNotAllowed};
     }
 
     // Virtuals for SplittableDocumentSource
     boost::intrusive_ptr<DocumentSource> getShardSource() final {
         return NULL;
     }
-    boost::intrusive_ptr<DocumentSource> getMergeSource() final {
-        return this;
+    std::list<boost::intrusive_ptr<DocumentSource>> getMergeSources() final {
+        return {this};
     }
 
     const NamespaceString& getOutputNs() const {

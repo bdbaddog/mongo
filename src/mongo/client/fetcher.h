@@ -47,12 +47,10 @@
 #include "mongo/util/net/hostandport.h"
 
 namespace mongo {
-namespace {
-using executor::RemoteCommandRequest;
-}
 
 class Fetcher {
     MONGO_DISALLOW_COPYING(Fetcher);
+    using RemoteCommandRequest = executor::RemoteCommandRequest;
 
 public:
     /**
@@ -129,7 +127,8 @@ public:
             const BSONObj& cmdObj,
             const CallbackFn& work,
             const BSONObj& metadata = ReadPreferenceSetting::secondaryPreferredMetadata(),
-            Milliseconds timeout = RemoteCommandRequest::kNoTimeout,
+            Milliseconds findNetworkTimeout = RemoteCommandRequest::kNoTimeout,
+            Milliseconds getMoreNetworkTimeout = RemoteCommandRequest::kNoTimeout,
             std::unique_ptr<RemoteCommandRetryScheduler::RetryPolicy> firstCommandRetryPolicy =
                 RemoteCommandRetryScheduler::makeNoRetryPolicy());
 
@@ -149,11 +148,6 @@ public:
      * Returns metadata object sent in remote commands.
      */
     BSONObj getMetadataObject() const;
-
-    /**
-     * Returns timeout for remote commands to complete.
-     */
-    Milliseconds getTimeout() const;
 
     /**
      * Returns diagnostic information.
@@ -259,7 +253,8 @@ private:
     executor::TaskExecutor::CallbackHandle _getMoreCallbackHandle;
 
     // Socket timeout
-    Milliseconds _timeout;
+    Milliseconds _findNetworkTimeout;
+    Milliseconds _getMoreNetworkTimeout;
 
     // First remote command scheduler.
     RemoteCommandRetryScheduler _firstRemoteCommandScheduler;

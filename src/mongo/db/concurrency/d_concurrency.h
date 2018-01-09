@@ -83,8 +83,17 @@ public:
             lock(mode);
         }
 
+        ResourceLock(ResourceLock&& otherLock)
+            : _rid(otherLock._rid), _locker(otherLock._locker), _result(otherLock._result) {
+            // Mark as moved so the destructor doesn't invalidate the newly-
+            // constructed lock.
+            otherLock._result = LOCK_INVALID;
+        }
+
         ~ResourceLock() {
-            unlock();
+            if (isLocked()) {
+                unlock();
+            }
         }
 
         void lock(LockMode mode);
@@ -174,10 +183,14 @@ public:
         class EnqueueOnly {};
 
         GlobalLock(OperationContext* opCtx, LockMode lockMode, unsigned timeoutMs);
+        GlobalLock(GlobalLock&&);
 
         /**
          * Enqueues lock but does not block on lock acquisition.
          * Call waitForLock() to complete locking process.
+         *
+         * Does not set that the global lock was taken on the GlobalLockAcquisitionTracker. Call
+         * waitForLock to do so.
          */
         GlobalLock(OperationContext* opCtx,
                    LockMode lockMode,
@@ -185,14 +198,17 @@ public:
                    EnqueueOnly enqueueOnly);
 
         ~GlobalLock() {
-            _unlock();
-            if (!_opCtx->lockState()->isLocked()) {
-                _opCtx->recoveryUnit()->abandonSnapshot();
+            if (_result != LOCK_INVALID) {
+                if (isLocked() && _isOutermostLock) {
+                    _opCtx->recoveryUnit()->abandonSnapshot();
+                }
+                _unlock();
             }
         }
 
         /**
-         * Waits for lock to be granted.
+         * Waits for lock to be granted. Sets that the global lock was taken on the
+         * GlobalLockAcquisitionTracker.
          */
         void waitForLock(unsigned timeoutMs);
 
@@ -207,6 +223,7 @@ public:
         OperationContext* const _opCtx;
         LockResult _result;
         ResourceLock _pbwm;
+        const bool _isOutermostLock;
     };
 
 
@@ -263,6 +280,7 @@ public:
     class DBLock {
     public:
         DBLock(OperationContext* opCtx, StringData db, LockMode mode);
+        DBLock(DBLock&&);
         ~DBLock();
 
         /**
@@ -363,11 +381,4 @@ public:
         const bool _orginalShouldConflict;
     };
 };
-
-/**
- * Takes a lock on resourceCappedInFlight in MODE_IX which will be held until the end of your
- * WUOW. This ensures that a MODE_X lock on this resource will wait for all in-flight capped
- * inserts to either commit or rollback and block new ones from starting.
- */
-void synchronizeOnCappedInFlightResource(Locker* opCtx, const NamespaceString& cappedNs);
 }

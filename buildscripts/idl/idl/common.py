@@ -26,11 +26,18 @@ from typing import Mapping
 
 COMMAND_NAMESPACE_CONCATENATE_WITH_DB = "concatenate_with_db"
 COMMAND_NAMESPACE_IGNORED = "ignored"
+COMMAND_NAMESPACE_TYPE = "type"
 
 
 def title_case(name):
     # type: (unicode) -> unicode
     """Return a CapitalCased version of a string."""
+
+    # Only capitalize the last part of a fully-qualified name
+    pos = name.rfind("::")
+    if pos > -1:
+        return name[:pos + 2] + name[pos + 2:pos + 3].upper() + name[pos + 3:]
+
     return name[0:1].upper() + name[1:]
 
 
@@ -40,12 +47,31 @@ def camel_case(name):
     return name[0:1].lower() + name[1:]
 
 
+def qualify_cpp_name(cpp_namespace, cpp_type_name):
+    # type: (unicode, unicode) -> unicode
+    """Preprend a type name with a C++ namespace if cpp_namespace is not None."""
+    if cpp_namespace:
+        return cpp_namespace + "::" + cpp_type_name
+
+    return cpp_type_name
+
+
+def _escape_template_string(template):
+    # type: (unicode) -> unicode
+    """Escape the '$' in template strings unless followed by '{'."""
+    # See https://docs.python.org/2/library/string.html#template-strings
+    template = template.replace('${', '#{')
+    template = template.replace('$', '$$')
+    return template.replace('#{', '${')
+
+
 def template_format(template, template_params=None):
     # type: (unicode, Mapping[unicode,unicode]) -> unicode
     """Write a template to the stream."""
     # Ignore the types since we use unicode literals and this expects str but works fine with
     # unicode.
     # See https://docs.python.org/2/library/string.html#template-strings
+    template = _escape_template_string(template)
     return string.Template(template).substitute(template_params)  # type: ignore
 
 
@@ -55,6 +81,7 @@ def template_args(template, **kwargs):
     # Ignore the types since we use unicode literals and this expects str but works fine with
     # unicode.
     # See https://docs.python.org/2/library/string.html#template-strings
+    template = _escape_template_string(template)
     return string.Template(template).substitute(kwargs)  # type: ignore
 
 

@@ -48,9 +48,9 @@ using EventHandle = executor::TaskExecutor::EventHandle;
 using RemoteCommandCallbackArgs = executor::TaskExecutor::RemoteCommandCallbackArgs;
 using RemoteCommandCallbackFn = executor::TaskExecutor::RemoteCommandCallbackFn;
 
-ScatterGatherRunner::ScatterGatherRunner(ScatterGatherAlgorithm* algorithm,
+ScatterGatherRunner::ScatterGatherRunner(std::shared_ptr<ScatterGatherAlgorithm> algorithm,
                                          executor::TaskExecutor* executor)
-    : _executor(executor), _impl(std::make_shared<RunnerImpl>(algorithm, executor)) {}
+    : _executor(executor), _impl(std::make_shared<RunnerImpl>(std::move(algorithm), executor)) {}
 
 Status ScatterGatherRunner::run() {
     auto finishEvh = start();
@@ -79,9 +79,9 @@ void ScatterGatherRunner::cancel() {
 /**
  * Scatter gather runner implementation.
  */
-ScatterGatherRunner::RunnerImpl::RunnerImpl(ScatterGatherAlgorithm* algorithm,
+ScatterGatherRunner::RunnerImpl::RunnerImpl(std::shared_ptr<ScatterGatherAlgorithm> algorithm,
                                             executor::TaskExecutor* executor)
-    : _executor(executor), _algorithm(algorithm) {}
+    : _executor(executor), _algorithm(std::move(algorithm)) {}
 
 StatusWith<EventHandle> ScatterGatherRunner::RunnerImpl::start(
     const RemoteCommandCallbackFn processResponseCB) {
@@ -152,10 +152,9 @@ void ScatterGatherRunner::RunnerImpl::processResponse(
 
 void ScatterGatherRunner::RunnerImpl::_signalSufficientResponsesReceived() {
     if (_sufficientResponsesReceived.isValid()) {
-        std::for_each(
-            _callbacks.begin(),
-            _callbacks.end(),
-            stdx::bind(&executor::TaskExecutor::cancel, _executor, stdx::placeholders::_1));
+        for (const CallbackHandle& cbh : _callbacks) {
+            _executor->cancel(cbh);
+        };
         // Clear _callbacks to break the cycle of shared_ptr.
         _callbacks.clear();
         _executor->signalEvent(_sufficientResponsesReceived);

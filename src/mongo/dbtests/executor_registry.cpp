@@ -43,7 +43,6 @@
 #include "mongo/db/exec/plan_stage.h"
 #include "mongo/db/json.h"
 #include "mongo/db/matcher/expression_parser.h"
-#include "mongo/db/matcher/extensions_callback_disallow_extensions.h"
 #include "mongo/db/query/plan_executor.h"
 #include "mongo/db/service_context.h"
 #include "mongo/dbtests/dbtests.h"
@@ -78,8 +77,7 @@ public:
 
         // Create a plan executor to hold it
         auto qr = stdx::make_unique<QueryRequest>(nss);
-        auto statusWithCQ = CanonicalQuery::canonicalize(
-            &_opCtx, std::move(qr), ExtensionsCallbackDisallowExtensions());
+        auto statusWithCQ = CanonicalQuery::canonicalize(&_opCtx, std::move(qr));
         ASSERT_OK(statusWithCQ.getStatus());
         std::unique_ptr<CanonicalQuery> cq = std::move(statusWithCQ.getValue());
 
@@ -139,7 +137,7 @@ public:
         // At this point, we're done yielding.  We recover our lock.
 
         // And clean up anything that happened before.
-        exec->restoreState();
+        ASSERT_OK(exec->restoreState());
 
         // Make sure that the PlanExecutor moved forward over the deleted data.  We don't see
         // foo==10
@@ -166,14 +164,12 @@ public:
             ASSERT_EQUALS(i, obj["foo"].numberInt());
         }
 
-        // Save state and register.
         exec->saveState();
 
         // Drop a collection that's not ours.
         _client.dropCollection("unittests.someboguscollection");
 
-        // Unregister and restore state.
-        exec->restoreState();
+        ASSERT_OK(exec->restoreState());
 
         ASSERT_EQUALS(PlanExecutor::ADVANCED, exec->getNext(&obj, NULL));
         ASSERT_EQUALS(10, obj["foo"].numberInt());
@@ -182,10 +178,7 @@ public:
 
         _client.dropCollection(nss.ns());
 
-        exec->restoreState();
-
-        // PlanExecutor was killed.
-        ASSERT_EQUALS(PlanExecutor::DEAD, exec->getNext(&obj, NULL));
+        ASSERT_EQUALS(ErrorCodes::QueryPlanKilled, exec->restoreState());
     }
 };
 
@@ -206,8 +199,7 @@ public:
 
         exec->saveState();
         _client.dropIndexes(nss.ns());
-        exec->restoreState();
-        ASSERT_EQUALS(PlanExecutor::DEAD, exec->getNext(&obj, NULL));
+        ASSERT_EQUALS(ErrorCodes::QueryPlanKilled, exec->restoreState());
     }
 };
 
@@ -228,8 +220,7 @@ public:
 
         exec->saveState();
         _client.dropIndex(nss.ns(), BSON("foo" << 1));
-        exec->restoreState();
-        ASSERT_EQUALS(PlanExecutor::DEAD, exec->getNext(&obj, NULL));
+        ASSERT_EQUALS(ErrorCodes::QueryPlanKilled, exec->restoreState());
     }
 };
 
@@ -253,7 +244,7 @@ public:
         _ctx.reset();
         _client.dropDatabase("somesillydb");
         _ctx.reset(new OldClientWriteContext(&_opCtx, nss.ns()));
-        exec->restoreState();
+        ASSERT_OK(exec->restoreState());
 
         ASSERT_EQUALS(PlanExecutor::ADVANCED, exec->getNext(&obj, NULL));
         ASSERT_EQUALS(10, obj["foo"].numberInt());
@@ -264,11 +255,7 @@ public:
         _ctx.reset();
         _client.dropDatabase("unittests");
         _ctx.reset(new OldClientWriteContext(&_opCtx, nss.ns()));
-        exec->restoreState();
-        _ctx.reset();
-
-        // PlanExecutor was killed.
-        ASSERT_EQUALS(PlanExecutor::DEAD, exec->getNext(&obj, NULL));
+        ASSERT_EQUALS(ErrorCodes::QueryPlanKilled, exec->restoreState());
     }
 };
 

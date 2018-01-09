@@ -50,8 +50,6 @@ using std::string;
 
 namespace repl {
 
-const BSONObj reverseNaturalObj = BSON("$natural" << -1);
-
 bool replAuthenticate(DBClientBase* conn) {
     if (isInternalAuthSet())
         return conn->authenticateInternalUser();
@@ -68,6 +66,9 @@ OplogReader::OplogReader() {
 
     /* TODO: slaveOk maybe shouldn't use? */
     _tailingQueryOptions |= QueryOption_AwaitData;
+
+    // Currently find command doesn't do the cursor tracking that master-slave relies on.
+    _tailingQueryOptions |= DBClientCursor::QueryOptionLocal_forceOpQuery;
 }
 
 bool OplogReader::connect(const HostAndPort& host) {

@@ -26,6 +26,7 @@ env.Library(
         '$BUILD_DIR/mongo/db/index_names',
         '$BUILD_DIR/mongo/db/namespace_string',
         '$BUILD_DIR/mongo/db/storage/bson_collection_catalog_entry',
+        '$BUILD_DIR/mongo/db/catalog/uuid_catalog',
         'kv_prefix',
         ],
     )
@@ -86,7 +87,7 @@ env.Library(
     source=[
         'kv_catalog_feature_tracker_test.cpp',
         'kv_engine_test_harness.cpp',
-        'kv_engine_test_snapshots.cpp',
+        'kv_engine_test_timestamps.cpp',
         ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/db/service_context',
@@ -125,3 +126,21 @@ env.CppUnitTest(
         '$BUILD_DIR/mongo/db/storage/ephemeral_for_test/ephemeral_for_test_record_store',
         ]
     )
+
+env.CppUnitTest(
+    target='kv_storage_engine_test',
+    source=[
+        'kv_storage_engine_test.cpp',
+    ],
+    LIBDEPS=[
+        '$BUILD_DIR/mongo/db/catalog/collection_options',
+        '$BUILD_DIR/mongo/db/namespace_string',
+        '$BUILD_DIR/mongo/db/repair_database',
+        '$BUILD_DIR/mongo/db/repl/replmocks',
+        '$BUILD_DIR/mongo/db/serveronly',
+        '$BUILD_DIR/mongo/db/service_context_d_test_fixture',
+        '$BUILD_DIR/mongo/db/storage/ephemeral_for_test/storage_ephemeral_for_test_core',
+        'kv_engine',
+        'kv_engine_mock',
+    ],
+)

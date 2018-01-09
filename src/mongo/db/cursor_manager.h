@@ -28,12 +28,17 @@
 
 #pragma once
 
+#include <utility>
+
 #include "mongo/db/catalog/util/partitioned.h"
 #include "mongo/db/clientcursor.h"
 #include "mongo/db/cursor_id.h"
+#include "mongo/db/generic_cursor.h"
 #include "mongo/db/invalidation_type.h"
+#include "mongo/db/kill_sessions.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/record_id.h"
+#include "mongo/db/session_killer.h"
 #include "mongo/platform/unordered_map.h"
 #include "mongo/platform/unordered_set.h"
 #include "mongo/stdx/unordered_set.h"
@@ -75,8 +80,6 @@ class PlanExecutor;
  */
 class CursorManager {
 public:
-    // The number of minutes a cursor is allowed to be idle before timing out.
-    static constexpr Minutes kDefaultCursorTimeoutMinutes{10};
     using RegistrationToken = Partitioned<unordered_set<PlanExecutor*>>::PartitionId;
 
     /**
@@ -84,6 +87,19 @@ public:
      * all collection-level cursor managers to the given set of lsids.
      */
     static void appendAllActiveSessions(OperationContext* opCtx, LogicalSessionIdSet* lsids);
+
+    /**
+     * Returns a list of GenericCursors for all cursors on the global cursor manager and across all
+     * collection-level cursor maangers.
+     */
+    static std::vector<GenericCursor> getAllCursors(OperationContext* opCtx);
+
+    /**
+     * Kills cursors with matching logical sessions. Returns a pair with the overall
+     * Status of the operation and the number of cursors successfully killed.
+     */
+    static std::pair<Status, int> killCursorsWithMatchingSessions(
+        OperationContext* opCtx, const SessionKiller::Matcher& matcher);
 
     CursorManager(NamespaceString nss);
 
@@ -147,11 +163,14 @@ public:
      * Returns ErrorCodes::CursorNotFound if the cursor does not exist or
      * ErrorCodes::QueryPlanKilled if the cursor was killed in between uses.
      *
-     * Throws a UserException if the cursor is already pinned. Callers need not specially handle
-     * this error, as it should only happen if a misbehaving client attempts to simultaneously issue
-     * two operations against the same cursor id.
+     * Throws a AssertionException if the cursor is already pinned. Callers need not specially
+     * handle this error, as it should only happen if a misbehaving client attempts to
+     * simultaneously issue two operations against the same cursor id.
      */
-    StatusWith<ClientCursorPin> pinCursor(OperationContext* opCtx, CursorId id);
+    enum AuthCheck { kCheckSession = true, kNoCheckSession = false };
+    StatusWith<ClientCursorPin> pinCursor(OperationContext* opCtx,
+                                          CursorId id,
+                                          AuthCheck checkSessionAuth = kCheckSession);
 
     /**
      * Returns an OK status if the cursor was successfully erased.
@@ -169,6 +188,11 @@ public:
      * Appends sessions that have open cursors in this cursor manager to the given set of lsids.
      */
     void appendActiveSessions(LogicalSessionIdSet* lsids) const;
+
+    /**
+     * Appends all active cursors in this cursor manager to the output vector.
+     */
+    void appendActiveCursors(std::vector<GenericCursor>* cursors) const;
 
     /*
      * Returns a list of all open cursors for the given session.
@@ -205,6 +229,15 @@ public:
      * managers. Returns the number of cursors that were timed out.
      */
     static std::size_t timeoutCursorsGlobal(OperationContext* opCtx, Date_t now);
+
+    /**
+     * Locate the correct cursor manager for a given cursorId and execute the provided callback.
+     * Returns ErrorCodes::CursorNotFound if cursorId does not exist.
+     */
+    static Status withCursorManager(OperationContext* opCtx,
+                                    CursorId id,
+                                    const NamespaceString& nss,
+                                    stdx::function<Status(CursorManager*)> callback);
 
 private:
     static constexpr int kNumPartitions = 16;

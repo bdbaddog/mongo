@@ -73,6 +73,7 @@
 #include "mongo/stdx/thread.h"
 #include "mongo/util/exit.h"
 #include "mongo/util/log.h"
+#include "mongo/util/net/sock.h"
 #include "mongo/util/quick_exit.h"
 
 using std::cout;
@@ -96,7 +97,7 @@ const int restartSyncAfterSleep = 1;
 }  // namespace
 
 void pretouchOperation(OperationContext* opCtx, const BSONObj& op);
-void pretouchN(vector<BSONObj>&, unsigned a, unsigned b);
+void pretouchN(const vector<BSONObj>&, unsigned a, unsigned b);
 
 /* if 1 sync() is running */
 AtomicInt32 syncing(0);
@@ -170,7 +171,7 @@ BSONObj ReplSource::jsobj() {
 
     BSONObjBuilder dbsNextPassBuilder;
     int n = 0;
-    for (set<string>::iterator i = addDbNextPass.begin(); i != addDbNextPass.end(); i++) {
+    for (set<std::string>::iterator i = addDbNextPass.begin(); i != addDbNextPass.end(); i++) {
         n++;
         dbsNextPassBuilder.appendBool(*i, 1);
     }
@@ -179,7 +180,8 @@ BSONObj ReplSource::jsobj() {
 
     BSONObjBuilder incompleteCloneDbsBuilder;
     n = 0;
-    for (set<string>::iterator i = incompleteCloneDbs.begin(); i != incompleteCloneDbs.end(); i++) {
+    for (set<std::string>::iterator i = incompleteCloneDbs.begin(); i != incompleteCloneDbs.end();
+         i++) {
         n++;
         incompleteCloneDbsBuilder.appendBool(*i, 1);
     }
@@ -190,7 +192,7 @@ BSONObj ReplSource::jsobj() {
 }
 
 void ReplSource::ensureMe(OperationContext* opCtx) {
-    string myname = getHostName();
+    std::string myname = getHostName();
 
     // local.me is an identifier for a server for getLastError w:2+
     bool exists = Helpers::getSingleton(opCtx, "local.me", _me);
@@ -357,12 +359,12 @@ void ReplSource::forceResyncDead(OperationContext* opCtx, const char* requester)
     replAllDead = 0;
 }
 
-class HandshakeCmd : public Command {
+class HandshakeCmd : public BasicCommand {
 public:
     void help(stringstream& h) const {
         h << "internal";
     }
-    HandshakeCmd() : Command("handshake") {}
+    HandshakeCmd() : BasicCommand("handshake") {}
     virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
         return false;
     }
@@ -381,9 +383,8 @@ public:
     }
 
     virtual bool run(OperationContext* opCtx,
-                     const string& ns,
+                     const std::string& ns,
                      const BSONObj& cmdObj,
-                     string& errmsg,
                      BSONObjBuilder& result) {
         HandshakeArgs handshake;
         Status status = handshake.initialize(cmdObj);
@@ -400,7 +401,7 @@ public:
 } handshakeCmd;
 
 bool replHandshake(DBClientConnection* conn, const OID& myRID) {
-    string myname = getHostName();
+    std::string myname = getHostName();
 
     BSONObjBuilder cmd;
     cmd.append("handshake", myRID);
@@ -439,7 +440,7 @@ void ReplSource::forceResync(OperationContext* opCtx, const char* requester) {
         if (!_connect(&oplogReader,
                       HostAndPort(hostName),
                       getGlobalReplicationCoordinator()->getMyRID())) {
-            msgassertedNoTrace(14051, "unable to connect to resync");
+            msgasserted(14051, "unable to connect to resync");
         }
         bool ok = oplogReader.conn()->runCommand(
             "admin", BSON("listDatabases" << 1), info, QueryOption_SlaveOk);
@@ -451,7 +452,7 @@ void ReplSource::forceResync(OperationContext* opCtx, const char* requester) {
         BSONElement e = i.next();
         if (e.eoo())
             break;
-        string name = e.embeddedObject().getField("name").valuestr();
+        std::string name = e.embeddedObject().getField("name").valuestr();
         if (!e.embeddedObject().getBoolField("empty")) {
             if (name != "local") {
                 if (only.empty() || only == name) {
@@ -482,7 +483,7 @@ Status ReplSource::_updateIfDoneWithInitialSync() {
     return Status::OK();
 }
 
-void ReplSource::resyncDrop(OperationContext* opCtx, const string& dbName) {
+void ReplSource::resyncDrop(OperationContext* opCtx, const std::string& dbName) {
     log() << "resync: dropping database " << dbName;
     invariant(opCtx->lockState()->isW());
 
@@ -532,13 +533,13 @@ void ReplSource::resync(OperationContext* opCtx, const std::string& dbName) {
 
 static DatabaseIgnorer ___databaseIgnorer;
 
-void DatabaseIgnorer::doIgnoreUntilAfter(const string& db, const Timestamp& futureOplogTime) {
+void DatabaseIgnorer::doIgnoreUntilAfter(const std::string& db, const Timestamp& futureOplogTime) {
     if (futureOplogTime > _ignores[db]) {
         _ignores[db] = futureOplogTime;
     }
 }
 
-bool DatabaseIgnorer::ignoreAt(const string& db, const Timestamp& currentOplogTime) {
+bool DatabaseIgnorer::ignoreAt(const std::string& db, const Timestamp& currentOplogTime) {
     if (_ignores[db].isNull()) {
         return false;
     }
@@ -628,7 +629,7 @@ bool ReplSource::handleDuplicateDbName(OperationContext* opCtx,
 
     // The database is present on the master and no conflicting databases
     // are present on the master.  Drop any local conflicts.
-    for (set<string>::const_iterator i = duplicates.begin(); i != duplicates.end(); ++i) {
+    for (set<std::string>::const_iterator i = duplicates.begin(); i != duplicates.end(); ++i) {
         ___databaseIgnorer.doIgnoreUntilAfter(*i, lastTime);
         incompleteCloneDbs.erase(*i);
         addDbNextPass.erase(*i);
@@ -645,17 +646,9 @@ bool ReplSource::handleDuplicateDbName(OperationContext* opCtx,
 
 void ReplSource::applyCommand(OperationContext* opCtx, const BSONObj& op) {
     try {
-        Status status = applyCommand_inlock(opCtx, op, true);
-        if (!status.isOK()) {
-            SyncTail sync(nullptr, SyncTail::MultiSyncApplyFunc());
-            sync.setHostname(hostName);
-            if (sync.shouldRetry(opCtx, op)) {
-                uassert(28639,
-                        "Failure retrying initial sync update",
-                        applyCommand_inlock(opCtx, op, true).isOK());
-            }
-        }
-    } catch (UserException& e) {
+        Status status = applyCommand_inlock(opCtx, op, OplogApplication::Mode::kMasterSlave);
+        uassert(28639, "Failure applying initial sync command", status.isOK());
+    } catch (AssertionException& e) {
         log() << "sync: caught user assertion " << redact(e) << " while applying op: " << redact(op)
               << endl;
         ;
@@ -668,17 +661,22 @@ void ReplSource::applyCommand(OperationContext* opCtx, const BSONObj& op) {
 
 void ReplSource::applyOperation(OperationContext* opCtx, Database* db, const BSONObj& op) {
     try {
-        Status status = applyOperation_inlock(opCtx, db, op);
+        Status status =
+            applyOperation_inlock(opCtx, db, op, false, OplogApplication::Mode::kMasterSlave);
         if (!status.isOK()) {
+            uassert(15914,
+                    "Failure applying initial sync operation",
+                    status == ErrorCodes::UpdateOperationFailed);
+
+            // In initial sync, update operations can cause documents to be missed during
+            // collection cloning. As a result, it is possible that a document that we need to
+            // update is not present locally. In that case we fetch the document from the
+            // sync source.
             SyncTail sync(nullptr, SyncTail::MultiSyncApplyFunc());
             sync.setHostname(hostName);
-            if (sync.shouldRetry(opCtx, op)) {
-                uassert(15914,
-                        "Failure retrying initial sync update",
-                        applyOperation_inlock(opCtx, db, op).isOK());
-            }
+            sync.fetchAndInsertMissingDocument(opCtx, op);
         }
-    } catch (UserException& e) {
+    } catch (AssertionException& e) {
         log() << "sync: caught user assertion " << redact(e) << " while applying op: " << redact(op)
               << endl;
         ;
@@ -753,7 +751,7 @@ void ReplSource::_sync_pullOpLog_applyOperation(OperationContext* opCtx,
                     unsigned b = a + m - 1;  // v[a..b]
                     if (b >= v.size())
                         b = v.size() - 1;
-                    tp->schedule(pretouchN, v, a, b);
+                    tp->schedule([&v, a, b] { pretouchN(v, a, b); });
                     DEV cout << "pretouch task: " << a << ".." << b << endl;
                     a += m;
                 }
@@ -827,10 +825,10 @@ void ReplSource::_sync_pullOpLog_applyOperation(OperationContext* opCtx,
 }
 
 void ReplSource::syncToTailOfRemoteLog() {
-    string _ns = ns();
+    std::string _ns = ns();
     BSONObjBuilder b;
     if (!only.empty()) {
-        b.appendRegex("ns", string("^") + pcrecpp::RE::QuoteMeta(only));
+        b.appendRegex("ns", std::string("^") + pcrecpp::RE::QuoteMeta(only));
     }
     BSONObj last = oplogReader.findOne(_ns.c_str(), Query(b.done()).sort(BSON("$natural" << -1)));
     if (!last.isEmpty()) {
@@ -878,8 +876,8 @@ public:
 */
 int ReplSource::_sync_pullOpLog(OperationContext* opCtx, int& nApplied) {
     int okResultCode = restartSyncAfterSleep;
-    string ns = string("local.oplog.$") + sourceName();
-    LOG(2) << "sync_pullOpLog " << ns << " syncedTo:" << syncedTo.toStringLong() << '\n';
+    std::string ns = std::string("local.oplog.$") + sourceName();
+    LOG(2) << "sync_pullOpLog " << ns << " syncedTo:" << syncedTo << '\n';
 
     bool tailing = true;
     oplogReader.tailCheck();
@@ -898,7 +896,7 @@ int ReplSource::_sync_pullOpLog(OperationContext* opCtx, int& nApplied) {
                 BSONElement e = i.next();
                 if (e.eoo())
                     break;
-                string name = e.embeddedObject().getField("name").valuestr();
+                std::string name = e.embeddedObject().getField("name").valuestr();
                 if (!e.embeddedObject().getBoolField("empty")) {
                     if (name != "local") {
                         if (only.empty() || only == name) {
@@ -921,7 +919,7 @@ int ReplSource::_sync_pullOpLog(OperationContext* opCtx, int& nApplied) {
         if (!only.empty()) {
             // note we may here skip a LOT of data table scanning, a lot of work for the master.
             // maybe append "\\." here?
-            query.appendRegex("ns", string("^") + pcrecpp::RE::QuoteMeta(only));
+            query.appendRegex("ns", std::string("^") + pcrecpp::RE::QuoteMeta(only));
         }
         BSONObj queryObj = query.done();
         // e.g. queryObj = { ts: { $gte: syncedTo } }
@@ -940,7 +938,7 @@ int ReplSource::_sync_pullOpLog(OperationContext* opCtx, int& nApplied) {
 
     // show any deferred database creates from a previous pass
     {
-        set<string>::iterator i = addDbNextPass.begin();
+        set<std::string>::iterator i = addDbNextPass.begin();
         if (i != addDbNextPass.end()) {
             BSONObjBuilder b;
             b.append("ns", *i + '.');
@@ -983,7 +981,7 @@ int ReplSource::_sync_pullOpLog(OperationContext* opCtx, int& nApplied) {
         BSONObj op = oplogReader.nextSafe();
         BSONElement ts = op.getField("ts");
         if (ts.type() != Date && ts.type() != bsonTimestamp) {
-            string err = op.getStringField("$err");
+            std::string err = op.getStringField("$err");
             if (!err.empty()) {
                 // 13051 is "tailable cursor requested on non capped collection"
                 if (op.getIntField("code") == 13051) {
@@ -1007,16 +1005,15 @@ int ReplSource::_sync_pullOpLog(OperationContext* opCtx, int& nApplied) {
         if (tailing) {
             if (!(syncedTo < nextOpTime)) {
                 warning() << "ASSERTION failed : syncedTo < nextOpTime" << endl;
-                log() << "syncTo:     " << syncedTo.toStringLong() << endl;
-                log() << "nextOpTime: " << nextOpTime.toStringLong() << endl;
+                log() << "syncTo:     " << syncedTo << endl;
+                log() << "nextOpTime: " << nextOpTime << endl;
                 verify(false);
             }
             oplogReader.putBack(op);          // op will be processed in the loop below
             nextOpTime = Timestamp();         // will reread the op below
         } else if (nextOpTime != syncedTo) {  // didn't get what we queried for - error
-            log() << "nextOpTime " << nextOpTime.toStringLong() << ' '
-                  << ((nextOpTime < syncedTo) ? "<??" : ">") << " syncedTo "
-                  << syncedTo.toStringLong() << '\n'
+            log() << "nextOpTime " << nextOpTime << ' ' << ((nextOpTime < syncedTo) ? "<??" : ">")
+                  << " syncedTo " << syncedTo << '\n'
                   << "time diff: " << (nextOpTime.getSecs() - syncedTo.getSecs()) << "sec\n"
                   << "tailing: " << tailing << '\n'
                   << "data too stale, halting replication" << endl;
@@ -1058,7 +1055,7 @@ int ReplSource::_sync_pullOpLog(OperationContext* opCtx, int& nApplied) {
                 // can't update local log ts since there are pending operations from our peer
                 save(opCtx);
                 log() << "checkpoint applied " << n << " operations" << endl;
-                log() << "syncedTo: " << syncedTo.toStringLong() << endl;
+                log() << "syncedTo: " << syncedTo << endl;
                 saveLast = time(0);
                 n = 0;
             }
@@ -1082,8 +1079,8 @@ int ReplSource::_sync_pullOpLog(OperationContext* opCtx, int& nApplied) {
                 if (!(last < nextOpTime)) {
                     log() << "sync error: last applied optime at slave >= nextOpTime from master"
                           << endl;
-                    log() << " last:       " << last.toStringLong() << endl;
-                    log() << " nextOpTime: " << nextOpTime.toStringLong() << endl;
+                    log() << " last:       " << last << endl;
+                    log() << " nextOpTime: " << nextOpTime << endl;
                     log() << " halting replication" << endl;
                     replInfo = replAllDead = "sync error last >= nextOpTime";
                     uassert(
@@ -1105,7 +1102,7 @@ int ReplSource::_sync_pullOpLog(OperationContext* opCtx, int& nApplied) {
                         save(opCtx);
                     }
                     log() << "applied " << n << " operations" << endl;
-                    log() << "syncedTo: " << syncedTo.toStringLong() << endl;
+                    log() << "syncedTo: " << syncedTo << endl;
                     log() << "waiting until: " << _sleepAdviceTime << " to continue" << endl;
                     return okResultCode;
                 }
@@ -1148,7 +1145,7 @@ int ReplSource::sync(OperationContext* opCtx, int& nApplied) {
 
     // FIXME Handle cases where this db isn't on default port, or default port is spec'd in
     // hostName.
-    if ((string("localhost") == hostName || string("127.0.0.1") == hostName) &&
+    if ((std::string("localhost") == hostName || std::string("127.0.0.1") == hostName) &&
         serverGlobalParams.port == ServerGlobalParams::DefaultDBPort) {
         log() << "can't sync from self (localhost). sources configuration may be wrong." << endl;
         sleepsecs(5);
@@ -1214,14 +1211,6 @@ int _replMain(OperationContext* opCtx, ReplSource::SourceVector& sources, int& n
         } catch (const SyncException&) {
             log() << "caught SyncException" << endl;
             return 10;
-        } catch (AssertionException& e) {
-            if (e.severe()) {
-                log() << "replMain AssertionException " << redact(e) << endl;
-                return 60;
-            } else {
-                log() << "AssertionException " << redact(e) << endl;
-            }
-            replInfo = "replMain caught AssertionException";
         } catch (const DBException& e) {
             log() << "DBException " << redact(e) << endl;
             replInfo = "replMain caught DBException";
@@ -1288,7 +1277,7 @@ static void replMain(OperationContext* opCtx) {
         if (s) {
             stringstream ss;
             ss << "sleep " << s << " sec before next pass";
-            string msg = ss.str();
+            std::string msg = ss.str();
             if (!serverGlobalParams.quiet.load())
                 log() << msg << endl;
             ReplInfo r(msg.c_str());
@@ -1388,7 +1377,7 @@ void startMasterSlave(OperationContext* opCtx) {
 }
 int _dummy_z;
 
-void pretouchN(vector<BSONObj>& v, unsigned a, unsigned b) {
+void pretouchN(const std::vector<BSONObj>& v, unsigned a, unsigned b) {
     Client::initThreadIfNotAlready("pretouchN");
 
     const ServiceContext::UniqueOperationContext opCtxPtr = cc().makeOperationContext();

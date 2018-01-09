@@ -57,6 +57,8 @@ def indent_text(count, unindented_text):
 class TestBinder(testcase.IDLTestcase):
     """Test cases for the IDL binder."""
 
+    # pylint: disable=too-many-public-methods
+
     def test_empty(self):
         # type: () -> None
         """Test an empty document works."""
@@ -738,6 +740,35 @@ class TestBinder(testcase.IDLTestcase):
                             default: 42
             """), idl.errors.ERROR_ID_BAD_BINDATA_DEFAULT)
 
+        # Test default and optional for the same field
+        self.assert_bind_fail(test_preamble + textwrap.dedent("""
+            structs:
+                foo:
+                    description: foo
+                    strict: true
+                    fields:
+                        foo:
+                            type: string
+                            default: 42
+                            optional: true
+            """), idl.errors.ERROR_ID_ILLEGAL_FIELD_DEFAULT_AND_OPTIONAL)
+
+        # Test duplicate comparison order
+        self.assert_bind_fail(test_preamble + textwrap.dedent("""
+        structs:
+            foo:
+                description: foo
+                strict: false
+                generate_comparison_operators: true
+                fields:
+                    foo:
+                        type: string
+                        comparison_order: 1
+                    bar:
+                        type: string
+                        comparison_order: 1
+            """), idl.errors.ERROR_ID_IS_DUPLICATE_COMPARISON_ORDER)
+
     def test_ignored_field_negative(self):
         # type: () -> None
         """Test that if a field is marked as ignored, no other properties are set."""
@@ -790,7 +821,7 @@ class TestBinder(testcase.IDLTestcase):
                 description: foo
                 strict: false
                 chained_types:
-                    - foo1
+                    foo1: alias
         """))
 
     def test_chained_type_negative(self):
@@ -805,8 +836,6 @@ class TestBinder(testcase.IDLTestcase):
                 bson_serialization_type: string
                 serializer: foo
                 deserializer: foo
-                default: foo
-
 
             foo1:
                 description: foo
@@ -814,7 +843,6 @@ class TestBinder(testcase.IDLTestcase):
                 bson_serialization_type: chain
                 serializer: foo
                 deserializer: foo
-                default: foo
 
         """)
 
@@ -825,7 +853,7 @@ class TestBinder(testcase.IDLTestcase):
                 description: foo
                 strict: true
                 chained_types:
-                    - foo1
+                    foo1: alias
         """), idl.errors.ERROR_ID_CHAINED_NO_TYPE_STRICT)
 
         # Non-'any' type as chained type
@@ -835,19 +863,8 @@ class TestBinder(testcase.IDLTestcase):
                 description: foo
                 strict: false
                 chained_types:
-                    - string
+                    string: alias
         """), idl.errors.ERROR_ID_CHAINED_TYPE_WRONG_BSON_TYPE)
-
-        # Duplicate chained types
-        self.assert_bind_fail(test_preamble + textwrap.dedent("""
-        structs:
-            bar1:
-                description: foo
-                strict: false
-                chained_types:
-                    - foo1
-                    - foo1
-        """), idl.errors.ERROR_ID_CHAINED_DUPLICATE_FIELD)
 
         # Chaining and fields only with same name
         self.assert_bind_fail(test_preamble + textwrap.dedent("""
@@ -856,7 +873,7 @@ class TestBinder(testcase.IDLTestcase):
                 description: foo
                 strict: false
                 chained_types:
-                    - foo1
+                    foo1: alias
                 fields:
                     foo1: string
         """), idl.errors.ERROR_ID_CHAINED_DUPLICATE_FIELD)
@@ -868,10 +885,31 @@ class TestBinder(testcase.IDLTestcase):
                 description: foo
                 strict: false
                 chained_types:
-                    - foobar1
+                    foobar1: alias
                 fields:
                     foo1: string
         """), idl.errors.ERROR_ID_UNKNOWN_TYPE)
+
+        # A regular field as a chained type
+        self.assert_bind_fail(test_preamble + textwrap.dedent("""
+        structs:
+            bar1:
+                description: foo
+                strict: false
+                fields:
+                    foo1: string
+                    foo2: foobar1
+        """), idl.errors.ERROR_ID_UNKNOWN_TYPE)
+
+        # Array of chained types
+        self.assert_bind_fail(test_preamble + textwrap.dedent("""
+        structs:
+            bar1:
+                description: foo
+                strict: true
+                fields:
+                    field1: array<foo1>
+        """), idl.errors.ERROR_ID_NO_ARRAY_OF_CHAIN)
 
     def test_chained_struct_positive(self):
         # type: () -> None
@@ -901,7 +939,7 @@ class TestBinder(testcase.IDLTestcase):
                 description: foo
                 strict: false
                 chained_types:
-                    - foo1
+                    foo1: alias
 
             chained2:
                 description: foo
@@ -917,7 +955,7 @@ class TestBinder(testcase.IDLTestcase):
                 description: foo
                 strict: true
                 chained_structs:
-                    - chained2
+                    chained2: alias
         """)))
 
         # Chaining struct's fields and explicit fields
@@ -927,7 +965,7 @@ class TestBinder(testcase.IDLTestcase):
                 description: foo
                 strict: true
                 chained_structs:
-                    - chained2
+                    chained2: alias
                 fields:
                     str1: string
         """)))
@@ -939,9 +977,9 @@ class TestBinder(testcase.IDLTestcase):
                 description: foo
                 strict: false
                 chained_types:
-                    - foo1
+                    foo1: alias
                 chained_structs:
-                    - chained2
+                    chained2: alias
                 fields:
                     str1: string
         """)))
@@ -953,9 +991,47 @@ class TestBinder(testcase.IDLTestcase):
                 description: foo
                 strict: false
                 chained_structs:
-                    - chained2
+                    chained2: alias
                 fields:
                     foo1: string
+        """)))
+
+        # Inline Chained struct with strict true
+        self.assert_bind(test_preamble + indent_text(1,
+                                                     textwrap.dedent("""
+            bar1:
+                description: foo
+                strict: true
+                fields:
+                    field1: string
+
+            foobar:
+                description: foo
+                strict: false
+                inline_chained_structs: true
+                chained_structs:
+                    bar1: alias
+                fields:
+                    f1: string
+
+        """)))
+
+        # Inline Chained struct with strict true and inline_chained_structs defaulted
+        self.assert_bind(test_preamble + indent_text(1,
+                                                     textwrap.dedent("""
+            bar1:
+                description: foo
+                strict: true
+                fields:
+                    field1: string
+
+            foobar:
+                description: foo
+                strict: false
+                chained_structs:
+                    bar1: alias
+                fields:
+                    f1: string
         """)))
 
     def test_chained_struct_negative(self):
@@ -1002,7 +1078,7 @@ class TestBinder(testcase.IDLTestcase):
                 description: foo
                 strict: true
                 chained_structs:
-                    - foobar1
+                    foobar1: alias
         """)), idl.errors.ERROR_ID_UNKNOWN_TYPE)
 
         # Type as chained struct
@@ -1012,7 +1088,7 @@ class TestBinder(testcase.IDLTestcase):
                 description: foo
                 strict: true
                 chained_structs:
-                    - foo1
+                    foo1: alias
         """)), idl.errors.ERROR_ID_CHAINED_STRUCT_NOT_FOUND)
 
         # Struct as chained type
@@ -1022,7 +1098,7 @@ class TestBinder(testcase.IDLTestcase):
                 description: foo
                 strict: false
                 chained_types:
-                    - chained
+                    chained: alias
         """)), idl.errors.ERROR_ID_CHAINED_TYPE_NOT_FOUND)
 
         # Duplicated field names across chained struct's fields and fields
@@ -1032,7 +1108,7 @@ class TestBinder(testcase.IDLTestcase):
                 description: foo
                 strict: false
                 chained_structs:
-                    - chained
+                    chained: alias
                 fields:
                     field1: string
         """)), idl.errors.ERROR_ID_CHAINED_DUPLICATE_FIELD)
@@ -1044,19 +1120,8 @@ class TestBinder(testcase.IDLTestcase):
                 description: foo
                 strict: false
                 chained_structs:
-                    - chained
-                    - chained2
-        """)), idl.errors.ERROR_ID_CHAINED_DUPLICATE_FIELD)
-
-        # Duplicate chained structs
-        self.assert_bind_fail(test_preamble + indent_text(1,
-                                                          textwrap.dedent("""
-            bar1:
-                description: foo
-                strict: true
-                chained_structs:
-                    - chained
-                    - chained
+                    chained: alias
+                    chained2: alias
         """)), idl.errors.ERROR_ID_CHAINED_DUPLICATE_FIELD)
 
         # Chained struct with strict true
@@ -1071,8 +1136,9 @@ class TestBinder(testcase.IDLTestcase):
             foobar:
                 description: foo
                 strict: false
+                inline_chained_structs: false
                 chained_structs:
-                    - bar1
+                    bar1: alias
                 fields:
                     f1: string
 
@@ -1085,13 +1151,13 @@ class TestBinder(testcase.IDLTestcase):
                 description: foo
                 strict: false
                 chained_structs:
-                    - chained
+                    chained: alias
 
             foobar:
                 description: foo
                 strict: false
                 chained_structs:
-                    - bar1
+                    bar1: alias
                 fields:
                     f1: string
 
@@ -1104,13 +1170,13 @@ class TestBinder(testcase.IDLTestcase):
                 description: foo
                 strict: false
                 chained_types:
-                    - foo1
+                    foo1: alias
 
             foobar:
                 description: foo
                 strict: false
                 chained_structs:
-                    - bar1
+                    bar1: alias
                 fields:
                     f1: bar1
 
@@ -1260,13 +1326,13 @@ class TestBinder(testcase.IDLTestcase):
         """)
 
         self.assert_bind(test_preamble + textwrap.dedent("""
-            commands: 
+            commands:
                 foo:
                     description: foo
                     namespace: ignored
                     strict: true
                     fields:
-                        foo: string
+                        foo1: string
             """))
 
     def test_command_negative(self):
@@ -1287,12 +1353,12 @@ class TestBinder(testcase.IDLTestcase):
 
         # Commands cannot be fields in other commands
         self.assert_bind_fail(test_preamble + textwrap.dedent("""
-            commands: 
+            commands:
                 foo:
                     description: foo
                     namespace: ignored
                     fields:
-                        foo: string
+                        foo1: string
 
                 bar:
                     description: foo
@@ -1303,12 +1369,12 @@ class TestBinder(testcase.IDLTestcase):
 
         # Commands cannot be fields in structs
         self.assert_bind_fail(test_preamble + textwrap.dedent("""
-            commands: 
+            commands:
                 foo:
                     description: foo
                     namespace: ignored
                     fields:
-                        foo: string
+                        foo1: string
 
             structs:
                 bar:
@@ -1316,6 +1382,215 @@ class TestBinder(testcase.IDLTestcase):
                     fields:
                         foo: foo
             """), idl.errors.ERROR_ID_FIELD_NO_COMMAND)
+
+        # Commands cannot have a field as the same name
+        self.assert_bind_fail(test_preamble + textwrap.dedent("""
+            commands:
+                foo:
+                    description: foo
+                    namespace: ignored
+                    fields:
+                        foo: string
+            """), idl.errors.ERROR_ID_COMMAND_DUPLICATES_FIELD)
+
+    def test_command_doc_sequence_positive(self):
+        # type: () -> None
+        """Positive supports_doc_sequence tests."""
+        # pylint: disable=invalid-name
+
+        # Setup some common types
+        test_preamble = textwrap.dedent("""
+        types:
+            object:
+                description: foo
+                cpp_type: foo
+                bson_serialization_type: object
+                serializer: foo
+                deserializer: foo
+
+            string:
+                description: foo
+                cpp_type: foo
+                bson_serialization_type: string
+                serializer: foo
+                deserializer: foo
+
+        structs:
+            foo_struct:
+                description: foo
+                strict: true
+                fields:
+                    foo: object
+        """)
+
+        self.assert_bind(test_preamble + textwrap.dedent("""
+            commands:
+                foo:
+                    description: foo
+                    namespace: ignored
+                    fields:
+                        foo1:
+                            type: array<object>
+                            supports_doc_sequence: true
+            """))
+
+        self.assert_bind(test_preamble + textwrap.dedent("""
+            commands:
+                foo:
+                    description: foo
+                    namespace: ignored
+                    fields:
+                        foo1:
+                            type: array<foo_struct>
+                            supports_doc_sequence: true
+            """))
+
+    def test_command_doc_sequence_negative(self):
+        # type: () -> None
+        """Negative supports_doc_sequence tests."""
+        # pylint: disable=invalid-name
+
+        # Setup some common types
+        test_preamble = textwrap.dedent("""
+        types:
+            object:
+                description: foo
+                cpp_type: foo
+                bson_serialization_type: object
+                serializer: foo
+                deserializer: foo
+
+            string:
+                description: foo
+                cpp_type: foo
+                bson_serialization_type: string
+                serializer: foo
+                deserializer: foo
+
+            any_type:
+                description: foo
+                cpp_type: foo
+                bson_serialization_type: any
+                serializer: foo
+                deserializer: foo
+        """)
+
+        test_preamble2 = test_preamble + textwrap.dedent("""
+        structs:
+            foo_struct:
+                description: foo
+                strict: true
+                fields:
+                    foo: object
+        """)
+
+        # A struct
+        self.assert_bind_fail(test_preamble + textwrap.dedent("""
+            structs:
+                foo:
+                    description: foo
+                    fields:
+                        foo:
+                            type: array<object>
+                            supports_doc_sequence: true
+            """), idl.errors.ERROR_ID_STRUCT_NO_DOC_SEQUENCE)
+
+        # A non-array type
+        self.assert_bind_fail(test_preamble + textwrap.dedent("""
+            commands:
+                foo:
+                    description: foo
+                    namespace: ignored
+                    fields:
+                        foo:
+                            type: object
+                            supports_doc_sequence: true
+            """), idl.errors.ERROR_ID_NO_DOC_SEQUENCE_FOR_NON_ARRAY)
+
+        # An array of a scalar
+        self.assert_bind_fail(test_preamble2 + textwrap.dedent("""
+            commands:
+                foo:
+                    description: foo
+                    namespace: ignored
+                    fields:
+                        foo1:
+                            type: array<string>
+                            supports_doc_sequence: true
+            """), idl.errors.ERROR_ID_NO_DOC_SEQUENCE_FOR_NON_OBJECT)
+
+        # An array of 'any'
+        self.assert_bind_fail(test_preamble2 + textwrap.dedent("""
+            commands:
+                foo:
+                    description: foo
+                    namespace: ignored
+                    fields:
+                        foo1:
+                            type: array<string>
+                            supports_doc_sequence: true
+            """), idl.errors.ERROR_ID_NO_DOC_SEQUENCE_FOR_NON_OBJECT)
+
+    def test_command_type_positive(self):
+        # type: () -> None
+        """Positive command custom type test cases."""
+        test_preamble = textwrap.dedent("""
+        types:
+            string:
+                description: foo
+                cpp_type: foo
+                bson_serialization_type: string
+                serializer: foo
+                deserializer: foo
+        """)
+
+        # string
+        self.assert_bind(test_preamble + textwrap.dedent("""
+        commands:
+            foo:
+                description: foo
+                strict: true
+                namespace: type
+                type: string
+                fields:
+                    field1: string
+            """))
+
+        # array of string
+        self.assert_bind(test_preamble + textwrap.dedent("""
+        commands:
+            foo:
+                description: foo
+                strict: true
+                namespace: type
+                type: array<string>
+                fields:
+                    field1: string
+            """))
+
+    def test_command_type_negative(self):
+        # type: () -> None
+        """Negative command type test cases."""
+        test_preamble = textwrap.dedent("""
+        types:
+            string:
+                description: foo
+                cpp_type: foo
+                bson_serialization_type: string
+                serializer: foo
+                deserializer: foo
+        """)
+
+        # supports_doc_sequence must be a bool
+        self.assert_bind_fail(test_preamble + textwrap.dedent("""
+        commands:
+            foo:
+                description: foo
+                namespace: type
+                type: int
+                fields:
+                    field1: string
+            """), idl.errors.ERROR_ID_UNKNOWN_TYPE)
 
 
 if __name__ == '__main__':

@@ -29,6 +29,7 @@
 #pragma once
 
 #include <string>
+#include <vector>
 
 #include "mongo/base/disallow_copying.h"
 #include "mongo/base/string_data.h"
@@ -52,6 +53,12 @@ class IDLParserErrorContext {
     MONGO_DISALLOW_COPYING(IDLParserErrorContext);
 
 public:
+    /**
+     * String constants for well-known IDL fields.
+     */
+    static constexpr auto kOpMsgDollarDB = "$db"_sd;
+    static constexpr auto kOpMsgDollarDBDefault = "admin"_sd;
+
     IDLParserErrorContext(StringData fieldName) : _currentField(fieldName), _predecessor(nullptr) {}
 
     IDLParserErrorContext(StringData fieldName, const IDLParserErrorContext* predecessor)
@@ -65,7 +72,13 @@ public:
      * processed.
      * Throws an exception if the BSON element's type is wrong.
      */
-    bool checkAndAssertType(const BSONElement& element, BSONType type) const;
+    bool checkAndAssertType(const BSONElement& element, BSONType type) const {
+        if (MONGO_likely(element.type() == type)) {
+            return true;
+        }
+
+        return checkAndAssertTypeSlowPath(element, type);
+    }
 
     /**
      * Check that BSON element is a bin data type, and has the specified bin data subtype, or
@@ -76,7 +89,13 @@ public:
      * processed.
      * Throws an exception if the BSON element's type is wrong.
      */
-    bool checkAndAssertBinDataType(const BSONElement& element, BinDataType type) const;
+    bool checkAndAssertBinDataType(const BSONElement& element, BinDataType type) const {
+        if (MONGO_likely(element.type() == BinData && element.binDataType() == type)) {
+            return true;
+        }
+
+        return checkAndAssertBinDataTypeSlowPath(element, type);
+    }
 
     /**
      * Check that BSON element is one of a given type or whether the field should be skipped.
@@ -92,6 +111,11 @@ public:
      * Throw an error message about the BSONElement being a duplicate field.
      */
     MONGO_COMPILER_NORETURN void throwDuplicateField(const BSONElement& element) const;
+
+    /**
+     * Throw an error message about the BSONElement being a duplicate field.
+     */
+    MONGO_COMPILER_NORETURN void throwDuplicateField(StringData fieldName) const;
 
     /**
      * Throw an error message about the required field missing from the document.
@@ -125,6 +149,14 @@ public:
      */
     static NamespaceString parseNSCollectionRequired(StringData dbName, const BSONElement& element);
 
+    /**
+     * Take all the well known command generic arguments from commandPassthroughFields, but ignore
+     * fields that are already part of the command and append the rest to builder.
+     */
+    static void appendGenericCommandArguments(const BSONObj& commandPassthroughFields,
+                                              const std::vector<StringData>& knownFields,
+                                              BSONObjBuilder* builder);
+
 private:
     /**
      * See comment on getElementPath below.
@@ -136,6 +168,16 @@ private:
      * grandchild field that has an error, this will return "grandparent.parent.child".
      */
     std::string getElementPath(StringData fieldName) const;
+
+    /**
+     * See comment on checkAndAssertType.
+     */
+    bool checkAndAssertTypeSlowPath(const BSONElement& element, BSONType type) const;
+
+    /**
+    * See comment on checkAndAssertBinDataType.
+    */
+    bool checkAndAssertBinDataTypeSlowPath(const BSONElement& element, BinDataType type) const;
 
 private:
     // Name of the current field that is being parsed.

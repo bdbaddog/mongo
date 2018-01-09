@@ -36,26 +36,68 @@
 
 namespace mongo {
 
+namespace {
+using EventHandle = executor::TaskExecutor::EventHandle;
+}  // namespace
+
 /**
- * Draws results from the AsyncShardResultsMerger, which is the underlying source of the stream of
- * merged documents manipulated by the MergerPlanStage pipeline. Used to present a stream of
- * documents merged from the shards to the stages later in the pipeline.
+ * Draws results from the AsyncResultsMerger, which is the underlying source of the stream of merged
+ * documents manipulated by the RouterExecStage pipeline. Used to present a stream of documents
+ * merged from the shards to the stages later in the pipeline.
  */
 class RouterStageMerge final : public RouterExecStage {
 public:
-    RouterStageMerge(executor::TaskExecutor* executor, ClusterClientCursorParams* params);
+    RouterStageMerge(OperationContext* opCtx,
+                     executor::TaskExecutor* executor,
+                     ClusterClientCursorParams* params);
 
-    StatusWith<ClusterQueryResult> next(OperationContext* opCtx) final;
+    StatusWith<ClusterQueryResult> next(ExecContext) final;
 
     void kill(OperationContext* opCtx) final;
 
     bool remotesExhausted() final;
 
-    Status setAwaitDataTimeout(Milliseconds awaitDataTimeout) final;
+    /**
+     * Adds the cursors in 'newShards' to those being merged by the ARM.
+     */
+    void addNewShardCursors(std::vector<ClusterClientCursorParams::RemoteCursor>&& newShards);
+
+protected:
+    Status doSetAwaitDataTimeout(Milliseconds awaitDataTimeout) final;
+
+    void doReattachToOperationContext() override {
+        _arm.reattachToOperationContext(getOpCtx());
+    }
+
+    virtual void doDetachFromOperationContext() {
+        _arm.detachFromOperationContext();
+    }
 
 private:
+    /**
+     * Returns the next document received by the ARM, blocking indefinitely until we either have a
+     * new result or exhaust the remote cursors.
+     */
+    StatusWith<ClusterQueryResult> blockForNextNoTimeout(ExecContext execCtx);
+
+    /**
+     * Awaits the next result from the ARM up to a specified time limit. If this is the user's
+     * initial find or we have already obtained at least one result for this batch, this method
+     * returns EOF immediately rather than blocking.
+     */
+    StatusWith<ClusterQueryResult> awaitNextWithTimeout(ExecContext execCtx);
+
+    /**
+     * Returns the next event to wait upon - either a new event from the ARM, or a valid preceding
+     * event which we scheduled during the previous call to next().
+     */
+    StatusWith<EventHandle> getNextEvent();
+
     // Not owned here.
     executor::TaskExecutor* _executor;
+    EventHandle _leftoverEventFromLastTimeout;
+
+    ClusterClientCursorParams* _params;
 
     // Schedules remote work and merges results from 'remotes'.
     AsyncResultsMerger _arm;

@@ -16,13 +16,23 @@ load("jstests/aggregation/extras/utils.js");  // For assertErrorCode.
         return 0;
     }
 
+    function generateNestedPipeline(foreignCollName, numLevels) {
+        let pipeline = [{"$lookup": {pipeline: [], from: foreignCollName, as: "same"}}];
+
+        for (let level = 1; level < numLevels; level++) {
+            pipeline = [{"$lookup": {pipeline: pipeline, from: foreignCollName, as: "same"}}];
+        }
+
+        return pipeline;
+    }
+
     // Helper for testing that pipeline returns correct set of results.
     function testPipeline(pipeline, expectedResult, collection) {
         assert.eq(collection.aggregate(pipeline).toArray().sort(compareId),
                   expectedResult.sort(compareId));
     }
 
-    function runTest(coll, from) {
+    function runTest(coll, from, thirdColl, fourthColl) {
         var db = null;  // Using the db variable is banned in this function.
 
         assert.writeOK(coll.insert({_id: 0, a: 1}));
@@ -453,7 +463,7 @@ load("jstests/aggregation/extras/utils.js");  // For assertErrorCode.
         assert.writeOK(from.insert({_id: 2}));
         assert.writeOK(from.insert({_id: 3}));
 
-        // Basic non-equi theta join.
+        // Basic non-equi theta join via $project.
         pipeline = [
             {
               $lookup: {
@@ -482,6 +492,90 @@ load("jstests/aggregation/extras/utils.js");  // For assertErrorCode.
                   }
               ]
             }
+        ];
+        testPipeline(pipeline, expectedResults, coll);
+
+        // Basic non-equi theta join via $match.
+        pipeline = [
+            {
+              $lookup: {
+                  let : {var1: "$_id"},
+                  pipeline: [
+                      {$match: {$expr: {$lt: ["$_id", "$$var1"]}}},
+                  ],
+                  from: "from",
+                  as: "c",
+              }
+            },
+        ];
+
+        expectedResults = [
+            {"_id": 1, x: 1, "c": []},
+            {"_id": 2, x: 2, "c": [{"_id": 1}]},
+            {
+              "_id": 3,
+              x: 3,
+              "c": [
+                  {"_id": 1},
+                  {
+                    "_id": 2,
+                  }
+              ]
+            }
+        ];
+        testPipeline(pipeline, expectedResults, coll);
+
+        // Multi-level join using $match.
+        pipeline = [
+            {
+              $lookup: {
+                  let : {var1: "$_id"},
+                  pipeline: [
+                      {$match: {$expr: {$eq: ["$_id", "$$var1"]}}},
+                      {
+                        $lookup: {
+                            let : {var2: "$_id"},
+                            pipeline: [
+                                {$match: {$expr: {$gt: ["$_id", "$$var2"]}}},
+                            ],
+                            from: "from",
+                            as: "d"
+                        }
+                      },
+                  ],
+                  from: "from",
+                  as: "c",
+              }
+            },
+        ];
+
+        expectedResults = [
+            {"_id": 1, "x": 1, "c": [{"_id": 1, "d": [{"_id": 2}, {"_id": 3}]}]},
+            {"_id": 2, "x": 2, "c": [{"_id": 2, "d": [{"_id": 3}]}]},
+            {"_id": 3, "x": 3, "c": [{"_id": 3, "d": []}]}
+        ];
+        testPipeline(pipeline, expectedResults, coll);
+
+        // Equijoin with $match that can't be delegated to the query subsystem.
+        pipeline = [
+            {
+              $lookup: {
+                  let : {var1: "$x"},
+                  pipeline: [
+                      {$addFields: {newField: 2}},
+                      {$match: {$expr: {$eq: ["$newField", "$$var1"]}}},
+                      {$project: {newField: 0}}
+                  ],
+                  from: "from",
+                  as: "c",
+              }
+            },
+        ];
+
+        expectedResults = [
+            {"_id": 1, "x": 1, "c": []},
+            {"_id": 2, "x": 2, "c": [{"_id": 1}, {"_id": 2}, {"_id": 3}]},
+            {"_id": 3, "x": 3, "c": []}
         ];
         testPipeline(pipeline, expectedResults, coll);
 
@@ -559,6 +653,62 @@ load("jstests/aggregation/extras/utils.js");  // For assertErrorCode.
         ];
         testPipeline(pipeline, expectedResults, coll);
 
+        // 'let' defined variables are available to all nested sub-pipelines.
+        pipeline = [
+            {$match: {_id: 1}},
+            {
+              $lookup: {
+                  let : {var1: "ABC", var2: "123"},
+                  pipeline: [
+                      {$match: {_id: 1}},
+                      {
+                        $lookup: {
+                            pipeline: [
+                                {$match: {_id: 2}},
+                                {$addFields: {letVar1: "$$var1"}},
+                                {
+                                  $lookup: {
+                                      let : {var3: "XYZ"},
+                                      pipeline: [{
+                                          $addFields: {
+                                              mergedLetVars:
+                                                  {$concat: ["$$var1", "$$var2", "$$var3"]}
+                                          }
+                                      }],
+                                      from: "from",
+                                      as: "join3"
+                                  }
+                                },
+                            ],
+                            from: "from",
+                            as: "join2"
+                        }
+                      },
+                  ],
+                  from: "from",
+                  as: "join1",
+              }
+            }
+        ];
+
+        expectedResults = [{
+            "_id": 1,
+            "x": 1,
+            "join1": [{
+                "_id": 1,
+                "join2": [{
+                    "_id": 2,
+                    "letVar1": "ABC",
+                    "join3": [
+                        {"_id": 1, "mergedLetVars": "ABC123XYZ"},
+                        {"_id": 2, "mergedLetVars": "ABC123XYZ"},
+                        {"_id": 3, "mergedLetVars": "ABC123XYZ"}
+                    ]
+                }]
+            }]
+        }];
+        testPipeline(pipeline, expectedResults, coll);
+
         // 'let' variable shadowed by foreign pipeline variable.
         pipeline = [
             {$match: {_id: 2}},
@@ -566,7 +716,24 @@ load("jstests/aggregation/extras/utils.js");  // For assertErrorCode.
               $lookup: {
                   let : {var1: "$_id"},
                   pipeline: [
-                      {$project: {shadowedVar: {$let: {vars: {var1: "$_id"}, in : "$$var1"}}}},
+                      {
+                        $project: {
+                            shadowedVar: {$let: {vars: {var1: "abc"}, in : "$$var1"}},
+                            originalVar: "$$var1"
+                        }
+                      },
+                      {
+                        $lookup: {
+                            pipeline: [{
+                                $project: {
+                                    shadowedVar: {$let: {vars: {var1: "xyz"}, in : "$$var1"}},
+                                    originalVar: "$$var1"
+                                }
+                            }],
+                            from: "from",
+                            as: "d"
+                        }
+                      }
                   ],
                   from: "from",
                   as: "c",
@@ -578,9 +745,36 @@ load("jstests/aggregation/extras/utils.js");  // For assertErrorCode.
             "_id": 2,
             "x": 2,
             "c": [
-                {"_id": 1, "shadowedVar": 1},
-                {"_id": 2, "shadowedVar": 2},
-                {"_id": 3, "shadowedVar": 3}
+                {
+                  "_id": 1,
+                  "shadowedVar": "abc",
+                  "originalVar": 2,
+                  "d": [
+                      {"_id": 1, "shadowedVar": "xyz", "originalVar": 2},
+                      {"_id": 2, "shadowedVar": "xyz", "originalVar": 2},
+                      {"_id": 3, "shadowedVar": "xyz", "originalVar": 2}
+                  ]
+                },
+                {
+                  "_id": 2,
+                  "shadowedVar": "abc",
+                  "originalVar": 2,
+                  "d": [
+                      {"_id": 1, "shadowedVar": "xyz", "originalVar": 2},
+                      {"_id": 2, "shadowedVar": "xyz", "originalVar": 2},
+                      {"_id": 3, "shadowedVar": "xyz", "originalVar": 2}
+                  ]
+                },
+                {
+                  "_id": 3,
+                  "shadowedVar": "abc",
+                  "originalVar": 2,
+                  "d": [
+                      {"_id": 1, "shadowedVar": "xyz", "originalVar": 2},
+                      {"_id": 2, "shadowedVar": "xyz", "originalVar": 2},
+                      {"_id": 3, "shadowedVar": "xyz", "originalVar": 2}
+                  ]
+                }
             ]
         }];
         testPipeline(pipeline, expectedResults, coll);
@@ -596,6 +790,220 @@ load("jstests/aggregation/extras/utils.js");  // For assertErrorCode.
                            }
                         }],
                         17276);
+
+        // The dotted path offset of a non-object variable is equivalent referencing an undefined
+        // field.
+        pipeline = [
+            {
+              $lookup: {
+                  let : {var1: "$x"},
+                  pipeline: [
+                      {
+                        $match: {
+                            $expr: {
+                                $eq: [
+                                    "FIELD-IS-NULL",
+                                    {$ifNull: ["$$var1.y.z", "FIELD-IS-NULL"]}
+                                ]
+                            }
+                        }
+                      },
+                  ],
+                  from: "from",
+                  as: "as",
+              }
+            },
+            {$project: {_id: 0}}
+        ];
+
+        expectedResults = [
+            {"x": 1, "as": [{"_id": 1}, {"_id": 2}, {"_id": 3}]},
+            {"x": 2, "as": [{"_id": 1}, {"_id": 2}, {"_id": 3}]},
+            {"x": 3, "as": [{"_id": 1}, {"_id": 2}, {"_id": 3}]}
+        ];
+        testPipeline(pipeline, expectedResults, coll);
+
+        // Comparison where a 'let' variable references an array.
+        coll.drop();
+        assert.writeOK(coll.insert({x: [1, 2, 3]}));
+
+        pipeline = [
+            {
+              $lookup: {
+                  let : {var1: "$x"},
+                  pipeline: [
+                      {$match: {$expr: {$eq: ["$$var1", [1, 2, 3]]}}},
+                  ],
+                  from: "from",
+                  as: "as",
+              }
+            },
+            {$project: {_id: 0}}
+        ];
+
+        expectedResults = [{"x": [1, 2, 3], "as": [{"_id": 1}, {"_id": 2}, {"_id": 3}]}];
+        testPipeline(pipeline, expectedResults, coll);
+
+        //
+        // Pipeline syntax with nested object.
+        //
+        coll.drop();
+        assert.writeOK(coll.insert({x: {y: {z: 10}}}));
+
+        // Subfields of 'let' variables can be referenced via dotted path.
+        pipeline = [
+            {
+              $lookup: {
+                  let : {var1: "$x"},
+                  pipeline: [
+                      {$project: {z: "$$var1.y.z"}},
+                  ],
+                  from: "from",
+                  as: "as",
+              }
+            },
+            {$project: {_id: 0}}
+        ];
+
+        expectedResults = [{
+            "x": {"y": {"z": 10}},
+            "as": [{"_id": 1, "z": 10}, {"_id": 2, "z": 10}, {"_id": 3, "z": 10}]
+        }];
+        testPipeline(pipeline, expectedResults, coll);
+
+        // 'let' variable with dotted field path off of $$ROOT.
+        pipeline = [
+            {
+              $lookup: {
+                  let : {var1: "$$ROOT.x.y.z"},
+                  pipeline:
+                      [{$match: {$expr: {$eq: ["$$var1", "$$ROOT.x.y.z"]}}}, {$project: {_id: 0}}],
+                  from: "lookUp",
+                  as: "as",
+              }
+            },
+            {$project: {_id: 0}}
+        ];
+
+        expectedResults = [{"x": {"y": {"z": 10}}, "as": [{"x": {"y": {"z": 10}}}]}];
+        testPipeline(pipeline, expectedResults, coll);
+
+        // 'let' variable with dotted field path off of $$CURRENT.
+        pipeline = [
+            {
+              $lookup: {
+                  let : {var1: "$$CURRENT.x.y.z"},
+                  pipeline: [
+                      {$match: {$expr: {$eq: ["$$var1", "$$CURRENT.x.y.z"]}}},
+                      {$project: {_id: 0}}
+                  ],
+                  from: "lookUp",
+                  as: "as",
+              }
+            },
+            {$project: {_id: 0}}
+        ];
+
+        expectedResults = [{"x": {"y": {"z": 10}}, "as": [{"x": {"y": {"z": 10}}}]}];
+        testPipeline(pipeline, expectedResults, coll);
+
+        //
+        // Pipeline syntax with nested $lookup.
+        //
+        coll.drop();
+        assert.writeOK(coll.insert({_id: 1, w: 1}));
+        assert.writeOK(coll.insert({_id: 2, w: 2}));
+        assert.writeOK(coll.insert({_id: 3, w: 3}));
+
+        from.drop();
+        assert.writeOK(from.insert({_id: 1, x: 1}));
+        assert.writeOK(from.insert({_id: 2, x: 2}));
+        assert.writeOK(from.insert({_id: 3, x: 3}));
+
+        thirdColl.drop();
+        assert.writeOK(thirdColl.insert({_id: 1, y: 1}));
+        assert.writeOK(thirdColl.insert({_id: 2, y: 2}));
+        assert.writeOK(thirdColl.insert({_id: 3, y: 3}));
+
+        fourthColl.drop();
+        assert.writeOK(fourthColl.insert({_id: 1, z: 1}));
+        assert.writeOK(fourthColl.insert({_id: 2, z: 2}));
+        assert.writeOK(fourthColl.insert({_id: 3, z: 3}));
+
+        // Nested $lookup pipeline.
+        pipeline = [
+            {$match: {_id: 1}},
+            {
+              $lookup: {
+                  pipeline: [
+                      {$match: {_id: 2}},
+                      {
+                        $lookup: {
+                            pipeline: [
+                                {$match: {_id: 3}},
+                                {
+                                  $lookup: {
+                                      pipeline: [
+                                          {$match: {_id: 1}},
+                                      ],
+                                      from: "fourthColl",
+                                      as: "thirdLookup"
+                                  }
+                                },
+                            ],
+                            from: "thirdColl",
+                            as: "secondLookup"
+                        }
+                      },
+                  ],
+                  from: "from",
+                  as: "firstLookup",
+              }
+            }
+        ];
+
+        expectedResults = [{
+            "_id": 1,
+            "w": 1,
+            "firstLookup": [{
+                "_id": 2,
+                x: 2, "secondLookup": [{"_id": 3, y: 3, "thirdLookup": [{_id: 1, z: 1}]}]
+            }]
+        }];
+        testPipeline(pipeline, expectedResults, coll);
+
+        // Deeply nested $lookup pipeline. Confirm that we can execute an aggregation with nested
+        // $lookup sub-pipelines up to the maximum depth, but not beyond.
+        let nestedPipeline = generateNestedPipeline("lookup", 20);
+        assert.commandWorked(coll.getDB().runCommand(
+            {aggregate: coll.getName(), pipeline: nestedPipeline, cursor: {}}));
+
+        nestedPipeline = generateNestedPipeline("lookup", 21);
+        assertErrorCode(coll, nestedPipeline, ErrorCodes.MaxSubPipelineDepthExceeded);
+
+        // Confirm that maximum $lookup sub-pipeline depth is respected when aggregating views whose
+        // combined nesting depth exceeds the limit.
+        nestedPipeline = generateNestedPipeline("lookup", 10);
+        coll.getDB().view1.drop();
+        assert.commandWorked(
+            coll.getDB().runCommand({create: "view1", viewOn: "lookup", pipeline: nestedPipeline}));
+
+        nestedPipeline = generateNestedPipeline("view1", 10);
+        coll.getDB().view2.drop();
+        assert.commandWorked(
+            coll.getDB().runCommand({create: "view2", viewOn: "view1", pipeline: nestedPipeline}));
+
+        // Confirm that a composite sub-pipeline depth of 20 is allowed.
+        assert.commandWorked(
+            coll.getDB().runCommand({aggregate: "view2", pipeline: [], cursor: {}}));
+
+        const pipelineWhichExceedsNestingLimit = generateNestedPipeline("view2", 1);
+        coll.getDB().view3.drop();
+        assert.commandWorked(coll.getDB().runCommand(
+            {create: "view3", viewOn: "view2", pipeline: pipelineWhichExceedsNestingLimit}));
+
+        // Confirm that a composite sub-pipeline depth greater than 20 fails.
+        assertErrorCode(coll.getDB().view3, [], ErrorCodes.MaxSubPipelineDepthExceeded);
 
         //
         // Error cases.
@@ -657,9 +1065,9 @@ load("jstests/aggregation/extras/utils.js");  // For assertErrorCode.
 
         // 'pipeline' and 'let' must be of expected type.
         assertErrorCode(
-            coll, [{$lookup: {pipeline: 1, from: "from", as: "as"}}], ErrorCodes.FailedToParse);
+            coll, [{$lookup: {pipeline: 1, from: "from", as: "as"}}], ErrorCodes.TypeMismatch);
         assertErrorCode(
-            coll, [{$lookup: {pipeline: {}, from: "from", as: "as"}}], ErrorCodes.FailedToParse);
+            coll, [{$lookup: {pipeline: {}, from: "from", as: "as"}}], ErrorCodes.TypeMismatch);
         assertErrorCode(coll,
                         [{$lookup: {let : 1, pipeline: [], from: "from", as: "as"}}],
                         ErrorCodes.FailedToParse);
@@ -678,20 +1086,40 @@ load("jstests/aggregation/extras/utils.js");  // For assertErrorCode.
     // Run tests on single node.
     db.lookUp.drop();
     db.from.drop();
-    runTest(db.lookUp, db.from);
+    db.thirdColl.drop();
+    db.fourthColl.drop();
+    runTest(db.lookUp, db.from, db.thirdColl, db.fourthColl);
 
     // Run tests in a sharded environment.
     var sharded = new ShardingTest({shards: 2, mongos: 1});
     assert(sharded.adminCommand({enableSharding: "test"}));
     sharded.getDB('test').lookUp.drop();
     sharded.getDB('test').from.drop();
+    sharded.getDB('test').thirdColl.drop();
+    sharded.getDB('test').fourthColl.drop();
     assert(sharded.adminCommand({shardCollection: "test.lookUp", key: {_id: 'hashed'}}));
-    runTest(sharded.getDB('test').lookUp, sharded.getDB('test').from);
+    runTest(sharded.getDB('test').lookUp,
+            sharded.getDB('test').from,
+            sharded.getDB('test').thirdColl,
+            sharded.getDB('test').fourthColl);
 
     // An error is thrown if the from collection is sharded.
     assert(sharded.adminCommand({shardCollection: "test.from", key: {_id: 1}}));
     assertErrorCode(sharded.getDB('test').lookUp,
                     [{$lookup: {localField: "a", foreignField: "b", from: "from", as: "same"}}],
                     28769);
+
+    // An error is thrown if nested $lookup from collection is sharded.
+    assert(sharded.adminCommand({shardCollection: "test.fourthColl", key: {_id: 1}}));
+    assertErrorCode(sharded.getDB('test').lookUp,
+                    [{
+                       $lookup: {
+                           pipeline: [{$lookup: {pipeline: [], from: "fourthColl", as: "same"}}],
+                           from: "thirdColl",
+                           as: "same"
+                       }
+                    }],
+                    28769);
+
     sharded.stop();
 }());

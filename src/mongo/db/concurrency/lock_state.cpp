@@ -37,6 +37,7 @@
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/service_context.h"
 #include "mongo/platform/compiler.h"
+#include "mongo/stdx/new.h"
 #include "mongo/util/background.h"
 #include "mongo/util/concurrency/ticketholder.h"
 #include "mongo/util/debug_util.h"
@@ -86,7 +87,7 @@ public:
 private:
     // This alignment is a best effort approach to ensure that each partition falls on a
     // separate page/cache line in order to avoid false sharing.
-    struct MONGO_COMPILER_ALIGN_TYPE(128) AlignedLockStats {
+    struct alignas(stdx::hardware_destructive_interference_size) AlignedLockStats {
         AtomicLockStats stats;
     };
 
@@ -504,6 +505,8 @@ bool LockerImpl<IsForMMAPV1>::isCollectionLockedForMode(StringData ns, LockMode 
     const ResourceId resIdDb(RESOURCE_DATABASE, nss.db());
 
     LockMode dbMode = getLockMode(resIdDb);
+    if (!shouldConflictWithSecondaryBatchApplication())
+        return true;
 
     switch (dbMode) {
         case MODE_NONE:
@@ -782,7 +785,10 @@ LockResult LockerImpl<IsForMMAPV1>::lockComplete(ResourceId resId,
         }
     }
 
-    // Cleanup the state, since this is an unused lock now
+    // Cleanup the state, since this is an unused lock now.
+    // Note: in case of the _notify object returning LOCK_TIMEOUT, it is possible to find that the
+    // lock was still granted after all, but we don't try to take advantage of that and will return
+    // a timeout.
     if (result != LOCK_OK) {
         LockRequestsMap::Iterator it = _requests.find(resId);
         _unlockImpl(&it);
@@ -837,6 +843,11 @@ LockMode LockerImpl<IsForMMAPV1>::_getModeForMMAPV1FlushLock() const {
     }
 }
 
+template <bool IsForMMAPV1>
+bool LockerImpl<IsForMMAPV1>::isGlobalLockedRecursively() {
+    auto globalLockRequest = _requests.find(resourceIdGlobal);
+    return !globalLockRequest.finished() && globalLockRequest->recursiveCount > 1;
+}
 
 //
 // Auto classes
@@ -961,9 +972,5 @@ const ResourceId resourceIdOplog = ResourceId(RESOURCE_COLLECTION, StringData("l
 const ResourceId resourceIdAdminDB = ResourceId(RESOURCE_DATABASE, StringData("admin"));
 const ResourceId resourceIdParallelBatchWriterMode =
     ResourceId(RESOURCE_GLOBAL, ResourceId::SINGLETON_PARALLEL_BATCH_WRITER_MODE);
-const ResourceId resourceCappedInFlightForLocalDb =
-    ResourceId(RESOURCE_METADATA, ResourceId::SINGLETON_CAPPED_IN_FLIGHT_LOCAL_DB);
-const ResourceId resourceCappedInFlightForOtherDb =
-    ResourceId(RESOURCE_METADATA, ResourceId::SINGLETON_CAPPED_IN_FLIGHT_OTHER_DB);
 
 }  // namespace mongo

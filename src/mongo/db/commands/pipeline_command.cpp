@@ -44,9 +44,9 @@ bool isMergePipeline(const std::vector<BSONObj>& pipeline) {
     return pipeline[0].hasField("$mergeCursors");
 }
 
-class PipelineCommand : public Command {
+class PipelineCommand : public BasicCommand {
 public:
-    PipelineCommand() : Command("aggregate") {}
+    PipelineCommand() : BasicCommand("aggregate") {}
 
     void help(std::stringstream& help) const override {
         help << "Runs the aggregation command. See http://dochub.mongodb.org/core/aggregation for "
@@ -65,7 +65,8 @@ public:
         return true;
     }
 
-    bool supportsReadConcern(const std::string& dbName, const BSONObj& cmdObj) const override {
+    bool supportsNonLocalReadConcern(const std::string& dbName,
+                                     const BSONObj& cmdObj) const override {
         return !AggregationRequest::parseNs(dbName, cmdObj).isCollectionlessAggregateNS();
     }
 
@@ -77,13 +78,12 @@ public:
                                const std::string& dbname,
                                const BSONObj& cmdObj) override {
         const NamespaceString nss(AggregationRequest::parseNs(dbname, cmdObj));
-        return AuthorizationSession::get(client)->checkAuthForAggregate(nss, cmdObj);
+        return AuthorizationSession::get(client)->checkAuthForAggregate(nss, cmdObj, false);
     }
 
     bool run(OperationContext* opCtx,
              const std::string& dbname,
              const BSONObj& cmdObj,
-             std::string& errmsg,
              BSONObjBuilder& result) override {
         const auto aggregationRequest =
             uassertStatusOK(AggregationRequest::parseFromBSON(dbname, cmdObj, boost::none));

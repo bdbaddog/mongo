@@ -32,6 +32,7 @@
 #include "mongo/base/string_data.h"
 #include "mongo/db/pipeline/value_internal.h"
 #include "mongo/platform/unordered_set.h"
+#include "mongo/util/uuid.h"
 
 namespace mongo {
 class BSONElement;
@@ -116,6 +117,12 @@ public:
     explicit Value(const MinKeyLabeler&) : _storage(MinKey) {}        // MINKEY
     explicit Value(const MaxKeyLabeler&) : _storage(MaxKey) {}        // MAXKEY
     explicit Value(const Date_t& date) : _storage(Date, date.toMillisSinceEpoch()) {}
+    explicit Value(const UUID& uuid)
+        : _storage(BinData,
+                   BSONBinData(uuid.toCDR().data(), uuid.toCDR().length(), BinDataType::newUUID)) {}
+
+    explicit Value(const char*) = delete;  // Use StringData instead to prevent accidentally
+                                           // terminating the string at the first null byte.
 
     // TODO: add an unsafe version that can share storage with the BSONElement
     /// Deep-convert from BSONElement to Value
@@ -184,6 +191,9 @@ public:
     std::string getCode() const;
     int getInt() const;
     long long getLong() const;
+    UUID getUuid() const;
+    // The returned BSONBinData remains owned by this Value.
+    BSONBinData getBinData() const;
     const std::vector<Value>& getArray() const {
         return _storage.getArray();
     }
@@ -197,8 +207,8 @@ public:
 
     /**
      * Recursively serializes this value as a field in the object in 'builder' with the field name
-     * 'fieldName'. This function throws a UserException if the recursion exceeds the server's BSON
-     * depth limit.
+     * 'fieldName'. This function throws a AssertionException if the recursion exceeds the server's
+     * BSON depth limit.
      */
     void addToBsonObj(BSONObjBuilder* builder,
                       StringData fieldName,
@@ -206,7 +216,7 @@ public:
 
     /**
      * Recursively serializes this value as an element in the array in 'builder'. This function
-     * throws a UserException if the recursion exceeds the server's BSON depth limit.
+     * throws a AssertionException if the recursion exceeds the server's BSON depth limit.
      */
     void addToBsonArray(BSONArrayBuilder* builder, size_t recursionLevel = 1) const;
 
@@ -325,6 +335,11 @@ public:
         return *this;
     }
 
+    /// Members to support parsing/deserialization from IDL generated code.
+    void serializeForIDL(StringData fieldName, BSONObjBuilder* builder) const;
+    void serializeForIDL(BSONArrayBuilder* builder) const;
+    static Value deserializeForIDL(const BSONElement& element);
+
 private:
     /** This is a "honeypot" to prevent unexpected implicit conversions to the accepted argument
      *  types. bool is especially bad since without this it will accept any pointer.
@@ -440,5 +455,17 @@ inline long long Value::getLong() const {
 
     verify(type == NumberLong);
     return _storage.longValue;
+}
+
+inline UUID Value::getUuid() const {
+    verify(_storage.binDataType() == BinDataType::newUUID);
+    auto stringData = _storage.getString();
+    return UUID::fromCDR({stringData.rawData(), stringData.size()});
+}
+
+inline BSONBinData Value::getBinData() const {
+    verify(getType() == BinData);
+    auto stringData = _storage.getString();
+    return BSONBinData(stringData.rawData(), stringData.size(), _storage.binDataType());
 }
 };

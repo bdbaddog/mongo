@@ -36,6 +36,8 @@
 
 #include "mongo/base/disallow_copying.h"
 #include "mongo/base/string_data.h"
+#include "mongo/bson/timestamp.h"
+#include "mongo/db/catalog/collection.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/query/index_bounds.h"
 #include "mongo/db/repl/collection_bulk_loader.h"
@@ -49,6 +51,11 @@ struct CollectionOptions;
 class OperationContext;
 
 namespace repl {
+
+struct TimestampedBSONObj {
+    BSONObj obj;
+    Timestamp timestamp;
+};
 
 /**
  * Storage interface used by the replication system to interact with storage.
@@ -77,11 +84,26 @@ public:
     virtual ~StorageInterface() = default;
 
     /**
-     * Rollback ID is an increasing counter of how many rollbacks have occurred on this server.
+     * Rollback ID is an increasing counter of how many rollbacks have occurred on this server. It
+     * is initialized with a value of 1, and should increase by exactly 1 every time a rollback
+     * occurs.
+     */
+
+    /**
+     * Return the current value of the rollback ID.
      */
     virtual StatusWith<int> getRollbackID(OperationContext* opCtx) = 0;
-    virtual Status initializeRollbackID(OperationContext* opCtx) = 0;
-    virtual Status incrementRollbackID(OperationContext* opCtx) = 0;
+
+    /**
+     * Initialize the rollback ID to 1. Returns the value of the initialized rollback ID if
+     * successful.
+     */
+    virtual StatusWith<int> initializeRollbackID(OperationContext* opCtx) = 0;
+
+    /**
+     * Increments the current rollback ID. Returns the new value of the rollback ID if successful.
+     */
+    virtual StatusWith<int> incrementRollbackID(OperationContext* opCtx) = 0;
 
 
     // Collection creation and population for initial sync.
@@ -97,22 +119,24 @@ public:
         const std::vector<BSONObj>& secondaryIndexSpecs) = 0;
 
     /**
-     * Inserts a document into a collection.
+     * Inserts a document with a timestamp into a collection.
      *
      * NOTE: If the collection doesn't exist, it will not be created, and instead
      * an error is returned.
      */
     virtual Status insertDocument(OperationContext* opCtx,
                                   const NamespaceString& nss,
-                                  const BSONObj& doc) = 0;
+                                  const TimestampedBSONObj& doc,
+                                  long long term) = 0;
 
     /**
-     * Inserts the given documents into the collection.
+     * Inserts the given documents, with associated timestamps and statement id's, into the
+     * collection.
      * It is an error to call this function with an empty set of documents.
      */
     virtual Status insertDocuments(OperationContext* opCtx,
                                    const NamespaceString& nss,
-                                   const std::vector<BSONObj>& docs) = 0;
+                                   const std::vector<InsertStatement>& docs) = 0;
 
     /**
      * Creates the initial oplog, errors if it exists.
@@ -136,9 +160,14 @@ public:
                                     const CollectionOptions& options) = 0;
 
     /**
-     * Drops a collection, like the oplog.
+     * Drops a collection.
      */
     virtual Status dropCollection(OperationContext* opCtx, const NamespaceString& nss) = 0;
+
+    /**
+     * Truncates a collection.
+     */
+    virtual Status truncateCollection(OperationContext* opCtx, const NamespaceString& nss) = 0;
 
     /**
      * Renames a collection from the "fromNS" to the "toNS". Fails if the new collection already
@@ -210,15 +239,28 @@ public:
      * Updates a singleton document in a collection. Upserts the document if it does not exist. If
      * the document is upserted and no '_id' is provided, one will be generated.
      * If the collection has more than 1 document, the update will only be performed on the first
-     * one found.
+     * one found. The upsert is performed at the given timestamp.
      * Returns 'NamespaceNotFound' if the collection does not exist. This does not implicitly
      * create the collection so that the caller can create the collection with any collection
      * options they want (ex: capped, temp, collation, etc.).
      */
     virtual Status putSingleton(OperationContext* opCtx,
                                 const NamespaceString& nss,
-                                const BSONObj& update) = 0;
+                                const TimestampedBSONObj& update) = 0;
 
+    /**
+     * Updates a singleton document in a collection. Never upsert.
+     *
+     * If the collection has more than 1 document, the update will only be performed on the first
+     * one found. The update is performed at the given timestamp.
+     * Returns 'NamespaceNotFound' if the collection does not exist. This does not implicitly
+     * create the collection so that the caller can create the collection with any collection
+     * options they want (ex: capped, temp, collation, etc.).
+     */
+    virtual Status updateSingleton(OperationContext* opCtx,
+                                   const NamespaceString& nss,
+                                   const BSONObj& query,
+                                   const TimestampedBSONObj& update) = 0;
 
     /**
      * Finds a single document in the collection referenced by the specified _id.
@@ -274,6 +316,48 @@ public:
      */
     virtual StatusWith<CollectionCount> getCollectionCount(OperationContext* opCtx,
                                                            const NamespaceString& nss) = 0;
+
+    /**
+     * Returns the UUID of the collection specified by nss, if such a UUID exists.
+     */
+    virtual StatusWith<OptionalCollectionUUID> getCollectionUUID(OperationContext* opCtx,
+                                                                 const NamespaceString& nss) = 0;
+
+    /**
+     * Adds UUIDs for non-replicated collections. To be called only at the end of initial
+     * sync and only if the admin.system.version collection has a UUID.
+     */
+    virtual Status upgradeUUIDSchemaVersionNonReplicated(OperationContext* opCtx) = 0;
+
+    /**
+     * Sets the highest timestamp at which the storage engine is allowed to take a checkpoint.
+     * This timestamp can never decrease, and thus should be a timestamp that can never roll back.
+     */
+    virtual void setStableTimestamp(ServiceContext* serviceCtx, Timestamp snapshotName) = 0;
+
+    /**
+     * Tells the storage engine the timestamp of the data at startup. This is necessary because
+     * timestamps are not persisted in the storage layer.
+     */
+    virtual void setInitialDataTimestamp(ServiceContext* serviceCtx, Timestamp snapshotName) = 0;
+
+    /**
+     * Reverts the state of all database data to the last stable timestamp.
+     *
+     * The "local" database is exempt and none of its state should be reverted except for
+     * "local.replset.minvalid" and "local.replset.checkpointTimestamp" which should be reverted to
+     * the last stable timestamp.
+     *
+     * The 'stable' timestamp is set by calling StorageInterface::setStableTimestamp.
+     */
+    virtual Status recoverToStableTimestamp(ServiceContext* serviceCtx) = 0;
+
+    /**
+     * Waits for oplog writes to be visible in the oplog.
+     * This function is used to ensure tests do not fail due to initial sync receiving an empty
+     * batch.
+     */
+    virtual void waitForAllEarlierOplogWritesToBeVisible(OperationContext* opCtx) = 0;
 };
 
 }  // namespace repl

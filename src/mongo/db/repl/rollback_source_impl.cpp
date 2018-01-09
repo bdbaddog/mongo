@@ -53,6 +53,11 @@ const OplogInterface& RollbackSourceImpl::getOplog() const {
     return _oplog;
 }
 
+const HostAndPort& RollbackSourceImpl::getSource() const {
+    return _source;
+}
+
+
 int RollbackSourceImpl::getRollbackId() const {
     bo info;
     _getConnection()->simpleCommand("admin", &info, "replSetGetRBID");
@@ -68,21 +73,43 @@ BSONObj RollbackSourceImpl::findOne(const NamespaceString& nss, const BSONObj& f
     return _getConnection()->findOne(nss.toString(), filter, NULL, QueryOption_SlaveOk).getOwned();
 }
 
+std::pair<BSONObj, NamespaceString> RollbackSourceImpl::findOneByUUID(const std::string& db,
+                                                                      UUID uuid,
+                                                                      const BSONObj& filter) const {
+    return _getConnection()->findOneByUUID(db, uuid, filter);
+}
+
 void RollbackSourceImpl::copyCollectionFromRemote(OperationContext* opCtx,
                                                   const NamespaceString& nss) const {
     std::string errmsg;
-    std::unique_ptr<DBClientConnection> tmpConn(new DBClientConnection());
+    auto tmpConn = stdx::make_unique<DBClientConnection>();
     uassert(15908,
             errmsg,
             tmpConn->connect(_source, StringData(), errmsg) && replAuthenticate(tmpConn.get()));
 
     // cloner owns _conn in unique_ptr
     Cloner cloner;
-    cloner.setConnection(tmpConn.release());
+    cloner.setConnection(std::move(tmpConn));
     uassert(15909,
             str::stream() << "replSet rollback error resyncing collection " << nss.ns() << ' '
                           << errmsg,
-            cloner.copyCollection(opCtx, nss.ns(), BSONObj(), errmsg, true));
+            cloner.copyCollection(
+                opCtx, nss.ns(), BSONObj(), errmsg, true, CollectionOptions::parseForStorage));
+}
+
+StatusWith<BSONObj> RollbackSourceImpl::getCollectionInfoByUUID(const std::string& db,
+                                                                const UUID& uuid) const {
+    std::list<BSONObj> info = _getConnection()->getCollectionInfos(db, BSON("info.uuid" << uuid));
+    if (info.empty()) {
+        return StatusWith<BSONObj>(ErrorCodes::NoSuchKey,
+                                   str::stream()
+                                       << "No collection info found for collection with uuid: "
+                                       << uuid.toString()
+                                       << " in db: "
+                                       << db);
+    }
+    invariant(info.size() == 1U);
+    return info.front();
 }
 
 StatusWith<BSONObj> RollbackSourceImpl::getCollectionInfo(const NamespaceString& nss) const {

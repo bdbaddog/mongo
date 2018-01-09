@@ -30,6 +30,7 @@
 
 #include "mongo/db/curop.h"
 #include "mongo/db/jsobj.h"
+#include "mongo/db/logical_session_id.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/query/explain.h"
 #include "mongo/util/mongoutils/str.h"
@@ -61,6 +62,7 @@ public:
           _upsert(false),
           _multi(false),
           _fromMigration(false),
+          _fromOplogApplication(false),
           _lifecycle(NULL),
           _isExplain(false),
           _returnDocs(ReturnDocOption::RETURN_NONE),
@@ -153,6 +155,14 @@ public:
         return _fromMigration;
     }
 
+    inline void setFromOplogApplication(bool value = true) {
+        _fromOplogApplication = value;
+    }
+
+    bool isFromOplogApplication() const {
+        return _fromOplogApplication;
+    }
+
     inline void setLifecycle(UpdateLifecycle* value) {
         _lifecycle = value;
     }
@@ -193,6 +203,14 @@ public:
         return _yieldPolicy;
     }
 
+    inline void setStmtId(StmtId stmtId) {
+        _stmtId = std::move(stmtId);
+    }
+
+    inline StmtId getStmtId() const {
+        return _stmtId;
+    }
+
     const std::string toString() const {
         StringBuilder builder;
         builder << " query: " << _query;
@@ -200,6 +218,7 @@ public:
         builder << " sort: " << _sort;
         builder << " collation: " << _collation;
         builder << " updates: " << _updates;
+        builder << " stmtId: " << _stmtId;
 
         builder << " arrayFilters: [";
         bool first = true;
@@ -216,6 +235,7 @@ public:
         builder << " upsert: " << _upsert;
         builder << " multi: " << _multi;
         builder << " fromMigration: " << _fromMigration;
+        builder << " fromOplogApplication: " << _fromOplogApplication;
         builder << " isExplain: " << _isExplain;
         return builder.str();
     }
@@ -241,6 +261,9 @@ private:
     // Filters to specify which array elements should be updated.
     std::vector<BSONObj> _arrayFilters;
 
+    // The statement id of this request.
+    StmtId _stmtId = kUninitializedStmtId;
+
     // Flags controlling the update.
 
     // God bypasses _id checking and index generation. It is only used on behalf of system
@@ -255,6 +278,9 @@ private:
 
     // True if this update is on behalf of a chunk migration.
     bool _fromMigration;
+
+    // True if this update was triggered by the application of an oplog entry.
+    bool _fromOplogApplication;
 
     // The lifecycle data, and events used during the update request.
     UpdateLifecycle* _lifecycle;

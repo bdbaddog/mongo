@@ -49,61 +49,75 @@ namespace parsed_aggregation_projection {
 using TransformerType =
     DocumentSourceSingleDocumentTransformation::TransformerInterface::TransformerType;
 
+using expression::isPathPrefixOf;
+
 //
 // ProjectionSpecValidator
 //
 
-Status ProjectionSpecValidator::validate(const BSONObj& spec) {
-    return ProjectionSpecValidator(spec).validate();
-}
-
-Status ProjectionSpecValidator::ensurePathDoesNotConflictOrThrow(StringData path) {
-    for (auto&& seenPath : _seenPaths) {
-        if ((path == seenPath) || (expression::isPathPrefixOf(path, seenPath)) ||
-            (expression::isPathPrefixOf(seenPath, path))) {
-            return Status(ErrorCodes::FailedToParse,
-                          str::stream() << "specification contains two conflicting paths. "
-                                           "Cannot specify both '"
-                                        << path
-                                        << "' and '"
-                                        << seenPath
-                                        << "': "
-                                        << _rawObj.toString(),
-                          40176);
-        }
+void ProjectionSpecValidator::uassertValid(const BSONObj& spec, StringData stageName) {
+    try {
+        ProjectionSpecValidator(spec).validate();
+    } catch (DBException& ex) {
+        ex.addContext("Invalid " + stageName.toString());
+        throw;
     }
-    _seenPaths.emplace_back(path.toString());
-    return Status::OK();
 }
 
-Status ProjectionSpecValidator::validate() {
+void ProjectionSpecValidator::ensurePathDoesNotConflictOrThrow(const std::string& path) {
+    auto result = _seenPaths.emplace(path);
+    auto pos = result.first;
+
+    // Check whether the path was a duplicate of an existing path.
+    auto conflictingPath = boost::make_optional(!result.second, *pos);
+
+    // Check whether the preceding path prefixes this path.
+    if (!conflictingPath && pos != _seenPaths.begin()) {
+        conflictingPath =
+            boost::make_optional(isPathPrefixOf(*std::prev(pos), path), *std::prev(pos));
+    }
+
+    // Check whether this path prefixes the subsequent path.
+    if (!conflictingPath && std::next(pos) != _seenPaths.end()) {
+        conflictingPath =
+            boost::make_optional(isPathPrefixOf(path, *std::next(pos)), *std::next(pos));
+    }
+
+    uassert(40176,
+            str::stream() << "specification contains two conflicting paths. "
+                             "Cannot specify both '"
+                          << path
+                          << "' and '"
+                          << *conflictingPath
+                          << "': "
+                          << _rawObj.toString(),
+            !conflictingPath);
+}
+
+void ProjectionSpecValidator::validate() {
     if (_rawObj.isEmpty()) {
-        return Status(
-            ErrorCodes::FailedToParse, "specification must have at least one field", 40177);
+        uasserted(40177, "specification must have at least one field");
     }
     for (auto&& elem : _rawObj) {
-        Status status = parseElement(elem, FieldPath(elem.fieldName()));
-        if (!status.isOK())
-            return status;
+        parseElement(elem, FieldPath(elem.fieldName()));
     }
-    return Status::OK();
 }
 
-Status ProjectionSpecValidator::parseElement(const BSONElement& elem, const FieldPath& pathToElem) {
+void ProjectionSpecValidator::parseElement(const BSONElement& elem, const FieldPath& pathToElem) {
     if (elem.type() == BSONType::Object) {
-        return parseNestedObject(elem.Obj(), pathToElem);
+        parseNestedObject(elem.Obj(), pathToElem);
+    } else {
+        ensurePathDoesNotConflictOrThrow(pathToElem.fullPath());
     }
-    return ensurePathDoesNotConflictOrThrow(pathToElem.fullPath());
 }
 
-Status ProjectionSpecValidator::parseNestedObject(const BSONObj& thisLevelSpec,
-                                                  const FieldPath& prefix) {
+void ProjectionSpecValidator::parseNestedObject(const BSONObj& thisLevelSpec,
+                                                const FieldPath& prefix) {
     if (thisLevelSpec.isEmpty()) {
-        return Status(ErrorCodes::FailedToParse,
-                      str::stream()
-                          << "an empty object is not a valid value. Found empty object at path "
-                          << prefix.fullPath(),
-                      40180);
+        uasserted(
+            40180,
+            str::stream() << "an empty object is not a valid value. Found empty object at path "
+                          << prefix.fullPath());
     }
     for (auto&& elem : thisLevelSpec) {
         auto fieldName = elem.fieldNameStringData();
@@ -112,34 +126,26 @@ Status ProjectionSpecValidator::parseNestedObject(const BSONObj& thisLevelSpec,
             // into an Expression later, but for now, just track that the prefix has been
             // specified and skip it.
             if (thisLevelSpec.nFields() != 1) {
-                return Status(ErrorCodes::FailedToParse,
-                              str::stream() << "an expression specification must contain exactly "
-                                               "one field, the name of the expression. Found "
-                                            << thisLevelSpec.nFields()
-                                            << " fields in "
-                                            << thisLevelSpec.toString()
-                                            << ", while parsing object "
-                                            << _rawObj.toString(),
-                              40181);
+                uasserted(40181,
+                          str::stream() << "an expression specification must contain exactly "
+                                           "one field, the name of the expression. Found "
+                                        << thisLevelSpec.nFields()
+                                        << " fields in "
+                                        << thisLevelSpec.toString()
+                                        << ", while parsing object "
+                                        << _rawObj.toString());
             }
-            Status status = ensurePathDoesNotConflictOrThrow(prefix.fullPath());
-            if (!status.isOK())
-                return status;
+            ensurePathDoesNotConflictOrThrow(prefix.fullPath());
             continue;
         }
         if (fieldName.find('.') != std::string::npos) {
-            return Status(ErrorCodes::FailedToParse,
-                          str::stream() << "cannot use dotted field name '" << fieldName
-                                        << "' in a sub object: "
-                                        << _rawObj.toString(),
-                          40183);
+            uasserted(40183,
+                      str::stream() << "cannot use dotted field name '" << fieldName
+                                    << "' in a sub object: "
+                                    << _rawObj.toString());
         }
-        Status status =
-            parseElement(elem, FieldPath::getFullyQualifiedPath(prefix.fullPath(), fieldName));
-        if (!status.isOK())
-            return status;
+        parseElement(elem, FieldPath::getFullyQualifiedPath(prefix.fullPath(), fieldName));
     }
-    return Status::OK();
 }
 
 namespace {
@@ -197,7 +203,7 @@ private:
      * Delegates to parseSubObject() if 'elem' is an object. Otherwise updates '_parsedType' if
      * appropriate.
      *
-     * Throws a UserException if this element represents a mix of projection types.
+     * Throws a AssertionException if this element represents a mix of projection types.
      */
     void parseElement(const BSONElement& elem, const FieldPath& pathToElem) {
         if (elem.type() == BSONType::Object) {
@@ -239,7 +245,7 @@ private:
     /**
      * Traverses 'thisLevelSpec', parsing each element in turn.
      *
-     * Throws a UserException if 'thisLevelSpec' represents an invalid mix of projections.
+     * Throws a AssertionException if 'thisLevelSpec' represents an invalid mix of projections.
      */
     void parseNestedObject(const BSONObj& thisLevelSpec, const FieldPath& prefix) {
 
@@ -279,11 +285,7 @@ std::unique_ptr<ParsedAggregationProjection> ParsedAggregationProjection::create
     // Check that the specification was valid. Status returned is unspecific because validate()
     // is used by the $addFields stage as well as $project.
     // If there was an error, uassert with a $project-specific message.
-    Status status = ProjectionSpecValidator::validate(spec);
-    if (!status.isOK()) {
-        uasserted(status.location(),
-                  str::stream() << "Invalid $project specification: " << status.reason());
-    }
+    ProjectionSpecValidator::uassertValid(spec, "$project");
 
     // Check for any conflicting specifications, and determine the type of the projection.
     auto projectionType = ProjectTypeParser::parse(spec);

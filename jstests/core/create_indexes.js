@@ -152,4 +152,14 @@
                        {indexes: [{key: {e: 1}, name: 'e_1', 'v': 1, 'invalidField': 1}]});
     assert.commandFailedWithCode(res, ErrorCodes.InvalidIndexSpecificationOption);
 
+    // Test that index creation fails with an index named '*'.
+    res = t.runCommand('createIndexes', {indexes: [{key: {star: 1}, name: '*'}]});
+    assert.commandFailedWithCode(res, ErrorCodes.BadValue);
+
+    // Test that user is not allowed to create indexes in config.transactions.
+    var configDB = db.getSiblingDB('config');
+    res = configDB.runCommand(
+        {createIndexes: 'transactions', indexes: [{key: {star: 1}, name: 'star'}]});
+    assert.commandFailedWithCode(res, ErrorCodes.IllegalOperation);
+
 }());

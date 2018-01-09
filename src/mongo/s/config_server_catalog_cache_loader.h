@@ -44,6 +44,8 @@ public:
     void initializeReplicaSetRole(bool isPrimary) override;
     void onStepDown() override;
     void onStepUp() override;
+    void notifyOfCollectionVersionUpdate(const NamespaceString& nss) override;
+    void waitForCollectionFlush(OperationContext* opCtx, const NamespaceString& nss) override;
 
     std::shared_ptr<Notification<void>> getChunksSince(
         const NamespaceString& nss,

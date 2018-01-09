@@ -32,7 +32,7 @@
 #include "mongo/db/pipeline/document.h"
 #include "mongo/db/pipeline/document_source_current_op.h"
 #include "mongo/db/pipeline/document_value_test_util.h"
-#include "mongo/db/pipeline/stub_mongod_interface.h"
+#include "mongo/db/pipeline/stub_mongo_process_interface.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/mongoutils/str.h"
@@ -55,17 +55,19 @@ public:
 };
 
 /**
- * A MongodInterface used for testing which returns artificial currentOp entries.
+ * A MongoProcessInterface used for testing which returns artificial currentOp entries.
  */
-class MockMongodImplementation final : public StubMongodInterface {
+class MockMongoInterface final : public StubMongoProcessInterface {
 public:
-    MockMongodImplementation(std::vector<BSONObj> ops, bool hasShardName = true)
+    MockMongoInterface(std::vector<BSONObj> ops, bool hasShardName = true)
         : _ops(std::move(ops)), _hasShardName(hasShardName) {}
 
-    MockMongodImplementation(bool hasShardName = true) : _hasShardName(hasShardName) {}
+    MockMongoInterface(bool hasShardName = true) : _hasShardName(hasShardName) {}
 
-    std::vector<BSONObj> getCurrentOps(CurrentOpConnectionsMode connMode,
-                                       CurrentOpUserMode userMode) const {
+    std::vector<BSONObj> getCurrentOps(OperationContext* opCtx,
+                                       CurrentOpConnectionsMode connMode,
+                                       CurrentOpUserMode userMode,
+                                       CurrentOpTruncateMode truncateMode) const {
         return _ops;
     }
 
@@ -85,7 +87,7 @@ private:
 TEST_F(DocumentSourceCurrentOpTest, ShouldFailToParseIfSpecIsNotObject) {
     const auto specObj = fromjson("{$currentOp:1}");
     ASSERT_THROWS_CODE(DocumentSourceCurrentOp::createFromBson(specObj.firstElement(), getExpCtx()),
-                       UserException,
+                       AssertionException,
                        ErrorCodes::FailedToParse);
 }
 
@@ -93,7 +95,7 @@ TEST_F(DocumentSourceCurrentOpTest, ShouldFailToParseIfNotRunOnAdmin) {
     const auto specObj = fromjson("{$currentOp:{}}");
     getExpCtx()->ns = NamespaceString::makeCollectionlessAggregateNSS("foo");
     ASSERT_THROWS_CODE(DocumentSourceCurrentOp::createFromBson(specObj.firstElement(), getExpCtx()),
-                       UserException,
+                       AssertionException,
                        ErrorCodes::InvalidNamespace);
 }
 
@@ -101,33 +103,41 @@ TEST_F(DocumentSourceCurrentOpTest, ShouldFailToParseIfNotRunWithAggregateOne) {
     const auto specObj = fromjson("{$currentOp:{}}");
     getExpCtx()->ns = NamespaceString("admin.foo");
     ASSERT_THROWS_CODE(DocumentSourceCurrentOp::createFromBson(specObj.firstElement(), getExpCtx()),
-                       UserException,
+                       AssertionException,
                        ErrorCodes::InvalidNamespace);
 }
 
 TEST_F(DocumentSourceCurrentOpTest, ShouldFailToParseIdleConnectionsIfNotBoolean) {
     const auto specObj = fromjson("{$currentOp:{idleConnections:1}}");
     ASSERT_THROWS_CODE(DocumentSourceCurrentOp::createFromBson(specObj.firstElement(), getExpCtx()),
-                       UserException,
+                       AssertionException,
                        ErrorCodes::FailedToParse);
 }
 
 TEST_F(DocumentSourceCurrentOpTest, ShouldFailToParseAllUsersIfNotBoolean) {
     const auto specObj = fromjson("{$currentOp:{allUsers:1}}");
     ASSERT_THROWS_CODE(DocumentSourceCurrentOp::createFromBson(specObj.firstElement(), getExpCtx()),
-                       UserException,
+                       AssertionException,
+                       ErrorCodes::FailedToParse);
+}
+
+TEST_F(DocumentSourceCurrentOpTest, ShouldFailToParseTruncateOpsIfNotBoolean) {
+    const auto specObj = fromjson("{$currentOp:{truncateOps:1}}");
+    ASSERT_THROWS_CODE(DocumentSourceCurrentOp::createFromBson(specObj.firstElement(), getExpCtx()),
+                       AssertionException,
                        ErrorCodes::FailedToParse);
 }
 
 TEST_F(DocumentSourceCurrentOpTest, ShouldFailToParseIfUnrecognisedParameterSpecified) {
     const auto specObj = fromjson("{$currentOp:{foo:true}}");
     ASSERT_THROWS_CODE(DocumentSourceCurrentOp::createFromBson(specObj.firstElement(), getExpCtx()),
-                       UserException,
+                       AssertionException,
                        ErrorCodes::FailedToParse);
 }
 
 TEST_F(DocumentSourceCurrentOpTest, ShouldParseAndSerializeTrueOptionalArguments) {
-    const auto specObj = fromjson("{$currentOp:{idleConnections:true, allUsers:true}}");
+    const auto specObj =
+        fromjson("{$currentOp:{idleConnections:true, allUsers:true, truncateOps:true}}");
 
     const auto parsed =
         DocumentSourceCurrentOp::createFromBson(specObj.firstElement(), getExpCtx());
@@ -135,21 +145,24 @@ TEST_F(DocumentSourceCurrentOpTest, ShouldParseAndSerializeTrueOptionalArguments
     const auto currentOp = static_cast<DocumentSourceCurrentOp*>(parsed.get());
 
     const auto expectedOutput =
-        Document{{"$currentOp", Document{{"idleConnections", true}, {"allUsers", true}}}};
+        Document{{"$currentOp",
+                  Document{{"idleConnections", true}, {"allUsers", true}, {"truncateOps", true}}}};
 
     ASSERT_DOCUMENT_EQ(currentOp->serialize().getDocument(), expectedOutput);
 }
 
 TEST_F(DocumentSourceCurrentOpTest, ShouldParseAndSerializeFalseOptionalArguments) {
-    const auto specObj = fromjson("{$currentOp:{idleConnections:false, allUsers:false}}");
+    const auto specObj =
+        fromjson("{$currentOp:{idleConnections:false, allUsers:false, truncateOps:false}}");
 
     const auto parsed =
         DocumentSourceCurrentOp::createFromBson(specObj.firstElement(), getExpCtx());
 
     const auto currentOp = static_cast<DocumentSourceCurrentOp*>(parsed.get());
 
-    const auto expectedOutput =
-        Document{{"$currentOp", Document{{"idleConnections", false}, {"allUsers", false}}}};
+    const auto expectedOutput = Document{
+        {"$currentOp",
+         Document{{"idleConnections", false}, {"allUsers", false}, {"truncateOps", false}}}};
 
     ASSERT_DOCUMENT_EQ(currentOp->serialize().getDocument(), expectedOutput);
 }
@@ -162,31 +175,33 @@ TEST_F(DocumentSourceCurrentOpTest, ShouldSerializeOmittedOptionalArgumentsAsDef
 
     const auto currentOp = static_cast<DocumentSourceCurrentOp*>(parsed.get());
 
-    const auto expectedOutput =
-        Document{{"$currentOp", Document{{"idleConnections", false}, {"allUsers", false}}}};
+    const auto expectedOutput = Document{
+        {"$currentOp",
+         Document{{"idleConnections", false}, {"allUsers", false}, {"truncateOps", false}}}};
 
     ASSERT_DOCUMENT_EQ(currentOp->serialize().getDocument(), expectedOutput);
 }
 
 TEST_F(DocumentSourceCurrentOpTest, ShouldReturnEOFImmediatelyIfNoCurrentOps) {
+    getExpCtx()->mongoProcessInterface = std::make_shared<MockMongoInterface>();
+
     const auto currentOp = DocumentSourceCurrentOp::create(getExpCtx());
-    const auto mongod = std::make_shared<MockMongodImplementation>();
-    currentOp->injectMongodInterface(mongod);
 
     ASSERT(currentOp->getNext().isEOF());
 }
 
-TEST_F(DocumentSourceCurrentOpTest, ShouldModifyOpIDAndClientFieldNameInShardedContext) {
-    getExpCtx()->inShard = true;
+TEST_F(DocumentSourceCurrentOpTest,
+       ShouldAddShardNameModifyOpIDAndClientFieldNameInShardedContext) {
+    getExpCtx()->fromMongos = true;
 
     std::vector<BSONObj> ops{fromjson("{ client: '192.168.1.10:50844', opid: 430 }")};
-    const auto mongod = std::make_shared<MockMongodImplementation>(ops);
+    getExpCtx()->mongoProcessInterface = std::make_shared<MockMongoInterface>(ops);
 
     const auto currentOp = DocumentSourceCurrentOp::create(getExpCtx());
-    currentOp->injectMongodInterface(mongod);
 
     const auto expectedOutput =
-        Document{{"client_s", std::string("192.168.1.10:50844")},
+        Document{{"shard", kMockShardName},
+                 {"client_s", std::string("192.168.1.10:50844")},
                  {"opid", std::string(str::stream() << kMockShardName << ":430")}};
 
     ASSERT_DOCUMENT_EQ(currentOp->getNext().getDocument(), expectedOutput);
@@ -194,13 +209,12 @@ TEST_F(DocumentSourceCurrentOpTest, ShouldModifyOpIDAndClientFieldNameInShardedC
 
 TEST_F(DocumentSourceCurrentOpTest,
        ShouldReturnOpIDAndClientFieldNameUnmodifiedWhenNotInShardedContext) {
-    getExpCtx()->inShard = false;
+    getExpCtx()->fromMongos = false;
 
     std::vector<BSONObj> ops{fromjson("{ client: '192.168.1.10:50844', opid: 430 }")};
-    const auto mongod = std::make_shared<MockMongodImplementation>(ops);
+    getExpCtx()->mongoProcessInterface = std::make_shared<MockMongoInterface>(ops);
 
     const auto currentOp = DocumentSourceCurrentOp::create(getExpCtx());
-    currentOp->injectMongodInterface(mongod);
 
     const auto expectedOutput =
         Document{{"client", std::string("192.168.1.10:50844")}, {"opid", 430}};
@@ -209,26 +223,24 @@ TEST_F(DocumentSourceCurrentOpTest,
 }
 
 TEST_F(DocumentSourceCurrentOpTest, ShouldFailIfNoShardNameAvailableForShardedRequest) {
-    getExpCtx()->inShard = true;
+    getExpCtx()->fromMongos = true;
 
-    const auto mongod = std::make_shared<MockMongodImplementation>(false);
+    getExpCtx()->mongoProcessInterface = std::make_shared<MockMongoInterface>(false);
 
     const auto currentOp = DocumentSourceCurrentOp::create(getExpCtx());
-    currentOp->injectMongodInterface(mongod);
 
-    ASSERT_THROWS_CODE(currentOp->getNext(), UserException, 40465);
+    ASSERT_THROWS_CODE(currentOp->getNext(), AssertionException, 40465);
 }
 
 TEST_F(DocumentSourceCurrentOpTest, ShouldFailIfOpIDIsNonNumericWhenModifyingInShardedContext) {
-    getExpCtx()->inShard = true;
+    getExpCtx()->fromMongos = true;
 
     std::vector<BSONObj> ops{fromjson("{ client: '192.168.1.10:50844', opid: 'string' }")};
-    const auto mongod = std::make_shared<MockMongodImplementation>(ops);
+    getExpCtx()->mongoProcessInterface = std::make_shared<MockMongoInterface>(ops);
 
     const auto currentOp = DocumentSourceCurrentOp::create(getExpCtx());
-    currentOp->injectMongodInterface(mongod);
 
-    ASSERT_THROWS_CODE(currentOp->getNext(), UserException, ErrorCodes::TypeMismatch);
+    ASSERT_THROWS_CODE(currentOp->getNext(), AssertionException, ErrorCodes::TypeMismatch);
 }
 
 }  // namespace

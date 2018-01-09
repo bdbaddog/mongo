@@ -35,6 +35,7 @@
 #include "mongo/db/repl/replication_consistency_markers_impl.h"
 #include "mongo/db/repl/replication_coordinator_external_state_impl.h"
 #include "mongo/db/repl/replication_process.h"
+#include "mongo/db/repl/replication_recovery.h"
 #include "mongo/db/repl/storage_interface_mock.h"
 #include "mongo/db/service_context.h"
 #include "mongo/unittest/unittest.h"
@@ -53,9 +54,12 @@ protected:
         _storageInterface = stdx::make_unique<repl::StorageInterfaceMock>();
         _dropPendingCollectionReaper =
             stdx::make_unique<repl::DropPendingCollectionReaper>(_storageInterface.get());
+        auto consistencyMarkers =
+            stdx::make_unique<repl::ReplicationConsistencyMarkersImpl>(_storageInterface.get());
+        auto recovery = stdx::make_unique<repl::ReplicationRecoveryImpl>(_storageInterface.get(),
+                                                                         consistencyMarkers.get());
         _replicationProcess = stdx::make_unique<repl::ReplicationProcess>(
-            _storageInterface.get(),
-            stdx::make_unique<repl::ReplicationConsistencyMarkersImpl>(_storageInterface.get()));
+            _storageInterface.get(), std::move(consistencyMarkers), std::move(recovery));
         _replCoordExternalState = stdx::make_unique<repl::ReplicationCoordinatorExternalStateImpl>(
             opCtx->getServiceContext(),
             _dropPendingCollectionReaper.get(),
@@ -93,14 +97,16 @@ TEST_F(ReplicaSetTest, ReplCoordExternalStateStoresLastVoteWithNewTerm) {
     auto opCtx = makeOpCtx();
     auto replCoordExternalState = getReplCoordExternalState();
 
-    replCoordExternalState->storeLocalLastVoteDocument(opCtx.get(), repl::LastVote{2, 1});
+    replCoordExternalState->storeLocalLastVoteDocument(opCtx.get(), repl::LastVote{2, 1})
+        .transitional_ignore();
 
     auto lastVote = replCoordExternalState->loadLocalLastVoteDocument(opCtx.get());
     ASSERT_OK(lastVote.getStatus());
     ASSERT_EQ(lastVote.getValue().getTerm(), 2);
     ASSERT_EQ(lastVote.getValue().getCandidateIndex(), 1);
 
-    replCoordExternalState->storeLocalLastVoteDocument(opCtx.get(), repl::LastVote{3, 1});
+    replCoordExternalState->storeLocalLastVoteDocument(opCtx.get(), repl::LastVote{3, 1})
+        .transitional_ignore();
 
     lastVote = replCoordExternalState->loadLocalLastVoteDocument(opCtx.get());
     ASSERT_OK(lastVote.getStatus());
@@ -112,14 +118,16 @@ TEST_F(ReplicaSetTest, ReplCoordExternalStateDoesNotStoreLastVoteWithOldTerm) {
     auto opCtx = makeOpCtx();
     auto replCoordExternalState = getReplCoordExternalState();
 
-    replCoordExternalState->storeLocalLastVoteDocument(opCtx.get(), repl::LastVote{2, 1});
+    replCoordExternalState->storeLocalLastVoteDocument(opCtx.get(), repl::LastVote{2, 1})
+        .transitional_ignore();
 
     auto lastVote = replCoordExternalState->loadLocalLastVoteDocument(opCtx.get());
     ASSERT_OK(lastVote.getStatus());
     ASSERT_EQ(lastVote.getValue().getTerm(), 2);
     ASSERT_EQ(lastVote.getValue().getCandidateIndex(), 1);
 
-    replCoordExternalState->storeLocalLastVoteDocument(opCtx.get(), repl::LastVote{1, 1});
+    replCoordExternalState->storeLocalLastVoteDocument(opCtx.get(), repl::LastVote{1, 1})
+        .transitional_ignore();
 
     lastVote = replCoordExternalState->loadLocalLastVoteDocument(opCtx.get());
     ASSERT_OK(lastVote.getStatus());
@@ -131,14 +139,16 @@ TEST_F(ReplicaSetTest, ReplCoordExternalStateDoesNotStoreLastVoteWithEqualTerm) 
     auto opCtx = makeOpCtx();
     auto replCoordExternalState = getReplCoordExternalState();
 
-    replCoordExternalState->storeLocalLastVoteDocument(opCtx.get(), repl::LastVote{2, 1});
+    replCoordExternalState->storeLocalLastVoteDocument(opCtx.get(), repl::LastVote{2, 1})
+        .transitional_ignore();
 
     auto lastVote = replCoordExternalState->loadLocalLastVoteDocument(opCtx.get());
     ASSERT_OK(lastVote.getStatus());
     ASSERT_EQ(lastVote.getValue().getTerm(), 2);
     ASSERT_EQ(lastVote.getValue().getCandidateIndex(), 1);
 
-    replCoordExternalState->storeLocalLastVoteDocument(opCtx.get(), repl::LastVote{2, 2});
+    replCoordExternalState->storeLocalLastVoteDocument(opCtx.get(), repl::LastVote{2, 2})
+        .transitional_ignore();
 
     lastVote = replCoordExternalState->loadLocalLastVoteDocument(opCtx.get());
     ASSERT_OK(lastVote.getStatus());

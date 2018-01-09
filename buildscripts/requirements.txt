@@ -1,3 +1,4 @@
+jira == 1.0.10
 pyyaml == 3.11
 unittest-xml-reporting == 2.1.0
 # Linters
@@ -9,3 +10,5 @@ pylint == 1.6.5
 pydocstyle == 1.1.1
 # resmoke.py
 -r resmokelib/requirements.txt
+# generate_error_codes.py
+cheetah3 == 3.0.0; python_version < "3"

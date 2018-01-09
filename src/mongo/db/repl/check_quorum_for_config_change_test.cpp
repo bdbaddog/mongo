@@ -34,7 +34,7 @@
 #include "mongo/db/jsobj.h"
 #include "mongo/db/repl/check_quorum_for_config_change.h"
 #include "mongo/db/repl/repl_set_config.h"
-#include "mongo/db/repl/repl_set_heartbeat_args.h"
+#include "mongo/db/repl/repl_set_heartbeat_args_v1.h"
 #include "mongo/db/repl/repl_set_heartbeat_response.h"
 #include "mongo/executor/network_interface_mock.h"
 #include "mongo/executor/thread_pool_task_executor_test_fixture.h"
@@ -97,7 +97,7 @@ void CheckQuorumTest::startQuorumCheck(const ReplSetConfig& config, int myIndex)
     ASSERT_FALSE(_quorumCheckThread);
     _isQuorumCheckDone = false;
     _quorumCheckThread.reset(
-        new stdx::thread(stdx::bind(&CheckQuorumTest::_runQuorumCheck, this, config, myIndex)));
+        new stdx::thread([this, config, myIndex] { _runQuorumCheck(config, myIndex); }));
 }
 
 Status CheckQuorumTest::waitForQuorumCheck() {
@@ -120,14 +120,14 @@ void CheckQuorumTest::_runQuorumCheck(const ReplSetConfig& config, int myIndex) 
 class CheckQuorumForInitiate : public CheckQuorumTest {
 private:
     virtual Status _runQuorumCheckImpl(const ReplSetConfig& config, int myIndex) {
-        return checkQuorumForInitiate(&getExecutor(), config, myIndex);
+        return checkQuorumForInitiate(&getExecutor(), config, myIndex, 0);
     }
 };
 
 class CheckQuorumForReconfig : public CheckQuorumTest {
 protected:
     virtual Status _runQuorumCheckImpl(const ReplSetConfig& config, int myIndex) {
-        return checkQuorumForReconfig(&getExecutor(), config, myIndex);
+        return checkQuorumForReconfig(&getExecutor(), config, myIndex, 0);
     }
 };
 
@@ -207,13 +207,15 @@ TEST_F(CheckQuorumForInitiate, QuorumCheckFailedDueToSeveralDownNodes) {
 
 const BSONObj makeHeartbeatRequest(const ReplSetConfig& rsConfig, int myConfigIndex) {
     const MemberConfig& myConfig = rsConfig.getMemberAt(myConfigIndex);
-    ReplSetHeartbeatArgs hbArgs;
+    ReplSetHeartbeatArgsV1 hbArgs;
     hbArgs.setSetName(rsConfig.getReplSetName());
-    hbArgs.setProtocolVersion(1);
     hbArgs.setConfigVersion(rsConfig.getConfigVersion());
-    hbArgs.setCheckEmpty(rsConfig.getConfigVersion() == 1);
+    if (rsConfig.getConfigVersion() == 1) {
+        hbArgs.setCheckEmpty();
+    }
     hbArgs.setSenderHost(myConfig.getHostAndPort());
     hbArgs.setSenderId(myConfig.getId());
+    hbArgs.setTerm(0);
     return hbArgs.toBSON();
 }
 
@@ -442,7 +444,7 @@ TEST_F(CheckQuorumForInitiate, QuorumCheckFailedDueToSetIdMismatch) {
                                           rpc::ReplSetMetadata::kNoPrimary,
                                           -1);
             BSONObjBuilder metadataBuilder;
-            metadata.writeToMetadata(&metadataBuilder);
+            metadata.writeToMetadata(&metadataBuilder).transitional_ignore();
 
             getNet()->scheduleResponse(
                 noi,

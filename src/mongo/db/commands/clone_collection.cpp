@@ -59,9 +59,9 @@ using std::string;
 using std::stringstream;
 using std::endl;
 
-class CmdCloneCollection : public Command {
+class CmdCloneCollection : public ErrmsgCommandDeprecated {
 public:
-    CmdCloneCollection() : Command("cloneCollection") {}
+    CmdCloneCollection() : ErrmsgCommandDeprecated("cloneCollection") {}
 
     virtual bool slaveOk() const {
         return false;
@@ -103,11 +103,11 @@ public:
                 "is placed at the same db.collection (namespace) as the source.\n";
     }
 
-    virtual bool run(OperationContext* opCtx,
-                     const string& dbname,
-                     const BSONObj& cmdObj,
-                     string& errmsg,
-                     BSONObjBuilder& result) {
+    virtual bool errmsgRun(OperationContext* opCtx,
+                           const string& dbname,
+                           const BSONObj& cmdObj,
+                           string& errmsg,
+                           BSONObjBuilder& result) {
         boost::optional<DisableDocumentValidation> maybeDisableValidation;
         if (shouldBypassDocumentValidationForCommand(cmdObj))
             maybeDisableValidation.emplace(opCtx);
@@ -144,14 +144,14 @@ public:
               << (copyIndexes ? "" : ", not copying indexes");
 
         Cloner cloner;
-        unique_ptr<DBClientConnection> myconn;
-        myconn.reset(new DBClientConnection());
+        auto myconn = stdx::make_unique<DBClientConnection>();
         if (!myconn->connect(HostAndPort(fromhost), StringData(), errmsg))
             return false;
 
-        cloner.setConnection(myconn.release());
+        cloner.setConnection(std::move(myconn));
 
-        return cloner.copyCollection(opCtx, collection, query, errmsg, copyIndexes);
+        return cloner.copyCollection(
+            opCtx, collection, query, errmsg, copyIndexes, CollectionOptions::parseForCommand);
     }
 
 } cmdCloneCollection;

@@ -30,53 +30,60 @@
 
 #include "mongo/db/update/unset_node.h"
 
+#include "mongo/db/update/storage_validation.h"
+
 namespace mongo {
 
-Status UnsetNode::init(BSONElement modExpr, const CollatorInterface* collator) {
+Status UnsetNode::init(BSONElement modExpr, const boost::intrusive_ptr<ExpressionContext>& expCtx) {
     // Note that we don't need to store modExpr, because $unset does not do anything with its value.
     invariant(modExpr.ok());
     return Status::OK();
 }
 
-void UnsetNode::apply(mutablebson::Element element,
-                      FieldRef* pathToCreate,
-                      FieldRef* pathTaken,
-                      StringData matchedField,
-                      bool fromReplication,
-                      const UpdateIndexData* indexData,
-                      LogBuilder* logBuilder,
-                      bool* indexesAffected,
-                      bool* noop) const {
-    *indexesAffected = false;
-    *noop = false;
+ModifierNode::ModifyResult UnsetNode::updateExistingElement(
+    mutablebson::Element* element, std::shared_ptr<FieldRef> elementPath) const {
+    auto parent = element->parent();
 
-    if (!pathToCreate->empty()) {
-        // A non-empty "pathToCreate" implies that our search did not find the field that we wanted
-        // to delete. We employ a simple and efficient strategy for deleting fields that don't yet
-        // exist.
-        *noop = true;
-        return;
-    }
-
-    // Determine if indexes are affected.
-    if (indexData && indexData->mightBeIndexed(pathTaken->dottedField())) {
-        *indexesAffected = true;
-    }
-
-    auto parent = element.parent();
     invariant(parent.ok());
     if (!parent.isType(BSONType::Array)) {
-        invariantOK(element.remove());
+        invariantOK(element->remove());
     } else {
         // Special case: An $unset on an array element sets it to null instead of removing it from
         // the array.
-        invariantOK(element.setValueNull());
+        invariantOK(element->setValueNull());
     }
 
-    // Log the unset.
-    if (logBuilder) {
-        uassertStatusOK(logBuilder->addToUnsets(pathTaken->dottedField()));
+    return ModifyResult::kNormalUpdate;
+}
+
+void UnsetNode::validateUpdate(mutablebson::ConstElement updatedElement,
+                               mutablebson::ConstElement leftSibling,
+                               mutablebson::ConstElement rightSibling,
+                               std::uint32_t recursionLevel,
+                               ModifyResult modifyResult) const {
+    invariant(modifyResult == ModifyResult::kNormalUpdate);
+
+    // We only need to check the left and right sibling to see if the removed element was part of a
+    // now invalid DBRef.
+    const bool doRecursiveCheck = false;
+    const uint32_t recursionLevelForCheck = 0;
+
+    if (leftSibling.ok()) {
+        storage_validation::storageValid(leftSibling, doRecursiveCheck, recursionLevelForCheck);
     }
+
+    if (rightSibling.ok()) {
+        storage_validation::storageValid(rightSibling, doRecursiveCheck, recursionLevelForCheck);
+    }
+}
+
+void UnsetNode::logUpdate(LogBuilder* logBuilder,
+                          StringData pathTaken,
+                          mutablebson::Element element,
+                          ModifyResult modifyResult) const {
+    invariant(logBuilder);
+    invariant(modifyResult == ModifyResult::kNormalUpdate);
+    uassertStatusOK(logBuilder->addToUnsets(pathTaken));
 }
 
 }  // namespace mongo

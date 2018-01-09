@@ -41,7 +41,6 @@
 #include "mongo/db/query/index_bounds_builder.h"
 #include "mongo/db/query/query_planner.h"
 #include "mongo/db/query/query_planner_common.h"
-#include "mongo/s/grid.h"
 #include "mongo/util/log.h"
 
 namespace mongo {
@@ -51,7 +50,7 @@ namespace {
 AtomicUInt32 nextCMSequenceNumber(0);
 
 void checkAllElementsAreOfType(BSONType type, const BSONObj& o) {
-    for (const auto&& element : o) {
+    for (auto&& element : o) {
         uassert(ErrorCodes::ConflictingOperationInProgress,
                 str::stream() << "Not all elements of " << o << " are of type " << typeName(type),
                 element.type() == type);
@@ -61,6 +60,7 @@ void checkAllElementsAreOfType(BSONType type, const BSONObj& o) {
 }  // namespace
 
 ChunkManager::ChunkManager(NamespaceString nss,
+                           boost::optional<UUID> uuid,
                            KeyPattern shardKeyPattern,
                            std::unique_ptr<CollatorInterface> defaultCollator,
                            bool unique,
@@ -68,14 +68,13 @@ ChunkManager::ChunkManager(NamespaceString nss,
                            ChunkVersion collectionVersion)
     : _sequenceNumber(nextCMSequenceNumber.addAndFetch(1)),
       _nss(std::move(nss)),
+      _uuid(uuid),
       _shardKeyPattern(shardKeyPattern),
       _defaultCollator(std::move(defaultCollator)),
       _unique(unique),
       _chunkMap(std::move(chunkMap)),
       _chunkMapViews(_constructChunkMapViews(collectionVersion.epoch(), _chunkMap)),
       _collectionVersion(collectionVersion) {}
-
-ChunkManager::~ChunkManager() = default;
 
 std::shared_ptr<Chunk> ChunkManager::findIntersectingChunk(const BSONObj& shardKey,
                                                            const BSONObj& collation) const {
@@ -116,13 +115,13 @@ void ChunkManager::getShardIdsForQuery(OperationContext* opCtx,
         qr->setCollation(_defaultCollator->getSpec().toBSON());
     }
 
-    std::unique_ptr<CanonicalQuery> cq = uassertStatusOK(
-        CanonicalQuery::canonicalize(opCtx, std::move(qr), ExtensionsCallbackNoop()));
-
-    // Query validation
-    if (QueryPlannerCommon::hasNode(cq->root(), MatchExpression::GEO_NEAR)) {
-        uasserted(13501, "use geoNear command rather than $near query");
-    }
+    const boost::intrusive_ptr<ExpressionContext> expCtx;
+    auto cq = uassertStatusOK(
+        CanonicalQuery::canonicalize(opCtx,
+                                     std::move(qr),
+                                     expCtx,
+                                     ExtensionsCallbackNoop(),
+                                     MatchExpressionParser::kAllowAllSpecialFeatures));
 
     // Fast path for targeting equalities on the shard key.
     auto shardKeyToFind = _shardKeyPattern.extractShardKeyFromQuery(*cq);
@@ -208,6 +207,13 @@ IndexBounds ChunkManager::getIndexBoundsForQuery(const BSONObj& key,
     if (QueryPlannerCommon::hasNode(canonicalQuery.root(), MatchExpression::TEXT)) {
         IndexBounds bounds;
         IndexBoundsBuilder::allValuesBounds(key, &bounds);  // [minKey, maxKey]
+        return bounds;
+    }
+
+    // Similarly, ignore GEO_NEAR queries in planning, since we do not have geo indexes on mongos.
+    if (QueryPlannerCommon::hasNode(canonicalQuery.root(), MatchExpression::GEO_NEAR)) {
+        IndexBounds bounds;
+        IndexBoundsBuilder::allValuesBounds(key, &bounds);
         return bounds;
     }
 
@@ -342,7 +348,6 @@ std::string ChunkManager::toString() const {
 
 ChunkManager::ChunkMapViews ChunkManager::_constructChunkMapViews(const OID& epoch,
                                                                   const ChunkMap& chunkMap) {
-    invariant(!chunkMap.empty());
 
     ChunkRangeMap chunkRangeMap =
         SimpleBSONObjComparator::kInstance.makeBSONObjIndexedMap<ShardAndChunkRange>();
@@ -384,14 +389,17 @@ ChunkManager::ChunkMapViews ChunkManager::_constructChunkMapViews(const OID& epo
         const BSONObj rangeMin = firstChunkInRange->getMin();
         const BSONObj rangeMax = rangeLast->second->getMax();
 
-        const auto insertResult = chunkRangeMap.insert(std::make_pair(
-            rangeMax, ShardAndChunkRange{{rangeMin, rangeMax}, firstChunkInRange->getShardId()}));
+        const auto oldSize = chunkRangeMap.size();
+        const auto insertIterator = chunkRangeMap.insert(
+            chunkRangeMap.end(),
+            std::make_pair(
+                rangeMax,
+                ShardAndChunkRange{{rangeMin, rangeMax}, firstChunkInRange->getShardId()}));
         uassert(ErrorCodes::ConflictingOperationInProgress,
                 str::stream() << "Metadata contains two chunks with the same max value "
                               << rangeMax,
-                insertResult.second);
+                oldSize + 1 == chunkRangeMap.size());
 
-        const auto& insertIterator = insertResult.first;
 
         if (insertIterator != chunkRangeMap.begin()) {
             // Make sure there are no gaps in the ranges
@@ -409,13 +417,89 @@ ChunkManager::ChunkMapViews ChunkManager::_constructChunkMapViews(const OID& epo
         invariant(maxShardVersion.isSet());
     }
 
-    invariant(!chunkRangeMap.empty());
-    invariant(!shardVersions.empty());
+    if (!chunkMap.empty()) {
+        invariant(!chunkRangeMap.empty());
+        invariant(!shardVersions.empty());
 
-    checkAllElementsAreOfType(MinKey, chunkRangeMap.begin()->second.min());
-    checkAllElementsAreOfType(MaxKey, chunkRangeMap.rbegin()->first);
+        checkAllElementsAreOfType(MinKey, chunkRangeMap.begin()->second.min());
+        checkAllElementsAreOfType(MaxKey, chunkRangeMap.rbegin()->first);
+    }
 
     return {std::move(chunkRangeMap), std::move(shardVersions)};
 }
 
+std::shared_ptr<ChunkManager> ChunkManager::makeNew(
+    NamespaceString nss,
+    boost::optional<UUID> uuid,
+    KeyPattern shardKeyPattern,
+    std::unique_ptr<CollatorInterface> defaultCollator,
+    bool unique,
+    OID epoch,
+    const std::vector<ChunkType>& chunks) {
+
+    return ChunkManager(
+               std::move(nss),
+               uuid,
+               std::move(shardKeyPattern),
+               std::move(defaultCollator),
+               std::move(unique),
+               SimpleBSONObjComparator::kInstance.makeBSONObjIndexedMap<std::shared_ptr<Chunk>>(),
+               {0, 0, epoch})
+        .makeUpdated(chunks);
+}
+
+std::shared_ptr<ChunkManager> ChunkManager::makeUpdated(
+    const std::vector<ChunkType>& changedChunks) {
+    const auto startingCollectionVersion = getVersion();
+    auto chunkMap = _chunkMap;
+
+    ChunkVersion collectionVersion = startingCollectionVersion;
+    for (const auto& chunk : changedChunks) {
+        const auto& chunkVersion = chunk.getVersion();
+
+        uassert(ErrorCodes::ConflictingOperationInProgress,
+                str::stream() << "Chunk " << chunk.genID(getns(), chunk.getMin())
+                              << " has epoch different from that of the collection "
+                              << chunkVersion.epoch(),
+                collectionVersion.epoch() == chunkVersion.epoch());
+
+        // Chunks must always come in incrementally sorted order
+        invariant(chunkVersion >= collectionVersion);
+        collectionVersion = chunkVersion;
+
+        // Returns the first chunk with a max key that is > min - implies that the chunk overlaps
+        // min
+        const auto low = chunkMap.upper_bound(chunk.getMin());
+
+        // Returns the first chunk with a max key that is > max - implies that the next chunk cannot
+        // not overlap max
+        const auto high = chunkMap.upper_bound(chunk.getMax());
+
+        // Erase all chunks from the map, which overlap the chunk we got from the persistent store
+        chunkMap.erase(low, high);
+
+        // Insert only the chunk itself
+        chunkMap.insert(std::make_pair(chunk.getMax(), std::make_shared<Chunk>(chunk)));
+    }
+
+    // If at least one diff was applied, the metadata is correct, but it might not have changed so
+    // in this case there is no need to recreate the chunk manager.
+    //
+    // NOTE: In addition to the above statement, it is also important that we return the same chunk
+    // manager object, because the write commands' code relies on changes of the chunk manager's
+    // sequence number to detect batch writes not making progress because of chunks moving across
+    // shards too frequently.
+    if (collectionVersion == startingCollectionVersion) {
+        return shared_from_this();
+    }
+
+    return std::shared_ptr<ChunkManager>(
+        new ChunkManager(_nss,
+                         _uuid,
+                         KeyPattern(getShardKeyPattern().getKeyPattern()),
+                         CollatorInterface::cloneCollator(getDefaultCollator()),
+                         isUnique(),
+                         std::move(chunkMap),
+                         collectionVersion));
+}
 }  // namespace mongo

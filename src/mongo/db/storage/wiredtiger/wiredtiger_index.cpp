@@ -41,6 +41,8 @@
 #include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/json.h"
+#include "mongo/db/mongod_options.h"
+#include "mongo/db/repl/repl_settings.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/storage/key_string.h"
 #include "mongo/db/storage/storage_options.h"
@@ -217,6 +219,15 @@ StatusWith<std::string> WiredTigerIndex::generateCreateString(const std::string&
        << "formatVersion=" << keyStringVersion << ',' << "infoObj=" << desc.infoObj().jsonString()
        << "),";
 
+    const bool keepOldLoggingSettings = true;
+    if (keepOldLoggingSettings ||
+        WiredTigerUtil::useTableLogging(NamespaceString(desc.parentNS()),
+                                        getGlobalReplSettings().usingReplSets())) {
+        ss << "log=(enabled=true)";
+    } else {
+        ss << "log=(enabled=false)";
+    }
+
     LOG(3) << "index create string: " << ss.ss.str();
     return StatusWith<std::string>(ss);
 }
@@ -234,7 +245,8 @@ int WiredTigerIndex::Create(OperationContext* opCtx,
 WiredTigerIndex::WiredTigerIndex(OperationContext* ctx,
                                  const std::string& uri,
                                  const IndexDescriptor* desc,
-                                 KVPrefix prefix)
+                                 KVPrefix prefix,
+                                 bool isReadOnly)
     : _ordering(Ordering::make(desc->keyPattern())),
       _uri(uri),
       _tableId(WiredTigerSession::genTableId()),
@@ -244,18 +256,27 @@ WiredTigerIndex::WiredTigerIndex(OperationContext* ctx,
     auto version = WiredTigerUtil::checkApplicationMetadataFormatVersion(
         ctx, uri, kMinimumIndexVersion, kMaximumIndexVersion);
     if (!version.isOK()) {
-        str::stream ss;
         Status versionStatus = version.getStatus();
-        ss << versionStatus.reason() << " Index: {name: " << desc->indexName()
-           << ", ns: " << desc->parentNS() << "} - version too new for this mongod."
-           << " See http://dochub.mongodb.org/core/3.4-index-downgrade for detailed"
-           << " instructions on how to handle this error.";
         Status indexVersionStatus(
-            ErrorCodes::UnsupportedFormat, ss.ss.str(), versionStatus.location());
+            ErrorCodes::UnsupportedFormat,
+            str::stream() << versionStatus.reason() << " Index: {name: " << desc->indexName()
+                          << ", ns: "
+                          << desc->parentNS()
+                          << "} - version too new for this mongod."
+                          << " See http://dochub.mongodb.org/core/3.4-index-downgrade for detailed"
+                          << " instructions on how to handle this error.");
         fassertFailedWithStatusNoTrace(28579, indexVersionStatus);
     }
     _keyStringVersion =
         version.getValue() == kKeyStringV1Version ? KeyString::Version::V1 : KeyString::Version::V0;
+
+    if (!isReadOnly) {
+        uassertStatusOK(WiredTigerUtil::setTableLogging(
+            ctx,
+            uri,
+            WiredTigerUtil::useTableLogging(NamespaceString(desc->parentNS()),
+                                            getGlobalReplSettings().usingReplSets())));
+    }
 }
 
 Status WiredTigerIndex::insert(OperationContext* opCtx,
@@ -357,7 +378,7 @@ bool WiredTigerIndex::appendCustomStats(OperationContext* opCtx,
         output->append("type", type);
     }
 
-    WiredTigerSession* session = WiredTigerRecoveryUnit::get(opCtx)->getSession(opCtx);
+    WiredTigerSession* session = WiredTigerRecoveryUnit::get(opCtx)->getSession();
     WT_SESSION* s = session->getSession();
     Status status =
         WiredTigerUtil::exportTableToBSON(s, "statistics:" + uri(), "statistics=(fast)", output);
@@ -414,7 +435,7 @@ Status WiredTigerIndex::touch(OperationContext* opCtx) const {
 
 long long WiredTigerIndex::getSpaceUsedBytes(OperationContext* opCtx) const {
     auto ru = WiredTigerRecoveryUnit::get(opCtx);
-    WiredTigerSession* session = ru->getSession(opCtx);
+    WiredTigerSession* session = ru->getSession();
 
     if (ru->getSessionCache()->isEphemeral()) {
         // For ephemeral case, use cursor statistics
@@ -486,7 +507,7 @@ Status WiredTigerIndex::initAsEmpty(OperationContext* opCtx) {
 Status WiredTigerIndex::compact(OperationContext* opCtx) {
     WiredTigerSessionCache* cache = WiredTigerRecoveryUnit::get(opCtx)->getSessionCache();
     if (!cache->isEphemeral()) {
-        WT_SESSION* s = WiredTigerRecoveryUnit::get(opCtx)->getSession(opCtx)->getSession();
+        WT_SESSION* s = WiredTigerRecoveryUnit::get(opCtx)->getSession()->getSession();
         opCtx->recoveryUnit()->abandonSnapshot();
         int ret = s->compact(s, uri().c_str(), "timeout=0");
         invariantWTOK(ret);
@@ -516,8 +537,8 @@ protected:
     WT_CURSOR* openBulkCursor(WiredTigerIndex* idx) {
         // Open cursors can cause bulk open_cursor to fail with EBUSY.
         // TODO any other cases that could cause EBUSY?
-        WiredTigerSession* outerSession = WiredTigerRecoveryUnit::get(_opCtx)->getSession(_opCtx);
-        outerSession->closeAllCursors();
+        WiredTigerSession* outerSession = WiredTigerRecoveryUnit::get(_opCtx)->getSession();
+        outerSession->closeAllCursors(idx->uri());
 
         // Not using cursor cache since we need to set "bulk".
         WT_CURSOR* cursor;
@@ -770,7 +791,7 @@ public:
         try {
             if (_cursor)
                 _cursor->reset();
-        } catch (const WriteConflictException& wce) {
+        } catch (const WriteConflictException&) {
             // Ignore since this is only called when we are about to kill our transaction
             // anyway.
         }
@@ -790,7 +811,7 @@ public:
         }
 
         // Ensure an active session exists, so any restored cursors will bind to it
-        invariant(WiredTigerRecoveryUnit::get(_opCtx)->getSession(_opCtx) == _cursor->getSession());
+        invariant(WiredTigerRecoveryUnit::get(_opCtx)->getSession() == _cursor->getSession());
 
         if (!_eof) {
             // Unique indices *don't* include the record id in their KeyStrings. If we seek to the
@@ -891,11 +912,16 @@ protected:
     void advanceWTCursor() {
         WT_CURSOR* c = _cursor->get();
         int ret = WT_READ_CHECK(_forward ? c->next(c) : c->prev(c));
-        if (ret == WT_NOTFOUND || hasWrongPrefix(c)) {
+        if (ret == WT_NOTFOUND) {
             _cursorAtEof = true;
             return;
         }
         invariantWTOK(ret);
+        if (hasWrongPrefix(c)) {
+            _cursorAtEof = true;
+            return;
+        }
+
         _cursorAtEof = false;
     }
 
@@ -1081,8 +1107,9 @@ public:
 WiredTigerIndexUnique::WiredTigerIndexUnique(OperationContext* ctx,
                                              const std::string& uri,
                                              const IndexDescriptor* desc,
-                                             KVPrefix prefix)
-    : WiredTigerIndex(ctx, uri, desc, prefix), _partial(desc->isPartial()) {}
+                                             KVPrefix prefix,
+                                             bool isReadOnly)
+    : WiredTigerIndex(ctx, uri, desc, prefix, isReadOnly), _partial(desc->isPartial()) {}
 
 std::unique_ptr<SortedDataInterface::Cursor> WiredTigerIndexUnique::newCursor(
     OperationContext* opCtx, bool forward) const {
@@ -1186,6 +1213,7 @@ void WiredTigerIndexUnique::_unindex(WT_CURSOR* c,
                 triggerWriteConflictAtPoint(c);
                 return;
             }
+            invariantWTOK(ret);
             WT_ITEM value;
             invariantWTOK(c->get_value(c, &value));
             BufReader br(value.data, value.size);
@@ -1267,8 +1295,9 @@ void WiredTigerIndexUnique::_unindex(WT_CURSOR* c,
 WiredTigerIndexStandard::WiredTigerIndexStandard(OperationContext* ctx,
                                                  const std::string& uri,
                                                  const IndexDescriptor* desc,
-                                                 KVPrefix prefix)
-    : WiredTigerIndex(ctx, uri, desc, prefix) {}
+                                                 KVPrefix prefix,
+                                                 bool isReadOnly)
+    : WiredTigerIndex(ctx, uri, desc, prefix, isReadOnly) {}
 
 std::unique_ptr<SortedDataInterface::Cursor> WiredTigerIndexStandard::newCursor(
     OperationContext* opCtx, bool forward) const {

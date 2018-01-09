@@ -98,15 +98,38 @@ void Variables::uassertValidNameForUserRead(StringData varName) {
     }
 }
 
-void Variables::setValue(Id id, const Value& value) {
+void Variables::setValue(Id id, const Value& value, bool isConstant) {
     uassert(17199, "can't use Variables::setValue to set a reserved builtin variable", id >= 0);
 
     const auto idAsSizeT = static_cast<size_t>(id);
     if (idAsSizeT >= _valueList.size()) {
         _valueList.resize(idAsSizeT + 1);
+    } else {
+        // If a value has already been set for 'id', and that value was marked as constant, then it
+        // is illegal to modify.
+        invariant(!_valueList[idAsSizeT].isConstant);
     }
 
-    _valueList[id] = value;
+    _valueList[idAsSizeT] = ValueAndState(value, isConstant);
+}
+
+void Variables::setValue(Variables::Id id, const Value& value) {
+    const bool isConstant = false;
+    setValue(id, value, isConstant);
+}
+
+void Variables::setConstantValue(Variables::Id id, const Value& value) {
+    const bool isConstant = true;
+    setValue(id, value, isConstant);
+}
+
+Value Variables::getUserDefinedValue(Variables::Id id) const {
+    invariant(isUserDefinedVariable(id));
+
+    uassert(40434,
+            str::stream() << "Requesting Variables::getValue with an out of range id: " << id,
+            static_cast<size_t>(id) < _valueList.size());
+    return _valueList[id].value;
 }
 
 Value Variables::getValue(Id id, const Document& root) const {
@@ -122,10 +145,7 @@ Value Variables::getValue(Id id, const Document& root) const {
         }
     }
 
-    uassert(40434,
-            str::stream() << "Requesting Variables::getValue with an out of range id: " << id,
-            static_cast<size_t>(id) < _valueList.size());
-    return _valueList[id];
+    return getUserDefinedValue(id);
 }
 
 Document Variables::getDocument(Id id, const Document& root) const {
@@ -148,7 +168,9 @@ Variables::Id VariablesParseState::defineVariable(StringData name) {
             Variables::kBuiltinVarNameToId.find(name) == Variables::kBuiltinVarNameToId.end());
 
     Variables::Id id = _idGenerator->generateId();
-    _variables[name] = id;
+    invariant(id > _lastSeen);
+
+    _variables[name] = _lastSeen = id;
     return id;
 }
 
@@ -169,5 +191,15 @@ Variables::Id VariablesParseState::getVariable(StringData name) const {
     // than CURRENT. If this is CURRENT, then we treat it as equivalent to ROOT.
     uassert(17276, str::stream() << "Use of undefined variable: " << name, name == "CURRENT");
     return Variables::kRootId;
+}
+
+std::set<Variables::Id> VariablesParseState::getDefinedVariableIDs() const {
+    std::set<Variables::Id> ids;
+
+    for (auto&& keyId : _variables) {
+        ids.insert(keyId.second);
+    }
+
+    return ids;
 }
 }

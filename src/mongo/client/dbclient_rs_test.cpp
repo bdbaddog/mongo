@@ -31,11 +31,14 @@
  * the DBClientReplicaSet talks to, so the tests only covers the client side logic.
  */
 
+#include "mongo/platform/basic.h"
+
 #include <map>
 #include <memory>
 #include <string>
 #include <vector>
 
+#include "mongo/base/init.h"
 #include "mongo/base/string_data.h"
 #include "mongo/client/connpool.h"
 #include "mongo/client/dbclient_rs.h"
@@ -57,6 +60,11 @@ using std::pair;
 using std::string;
 using std::unique_ptr;
 using std::vector;
+
+MONGO_INITIALIZER(DisableReplicaSetMonitorRefreshRetries)(InitializerContext*) {
+    ReplicaSetMonitor::disableRefreshRetries_forTest();
+    return Status::OK();
+}
 
 /**
  * Constructs a metadata object containing the passed server selection metadata.
@@ -100,8 +108,8 @@ void assertOneOfNodesSelected(MockReplicaSet* replSet,
     bool secondaryOk = (rp != ReadPreference::PrimaryOnly);
     auto tagSet = secondaryOk ? TagSet() : TagSet::primaryOnly();
     // We need the command to be a "SecOk command"
-    auto res = replConn.runCommandWithMetadata(
-        "foo", "dbStats", makeMetadata(rp, tagSet), BSON("dbStats" << 1));
+    auto res = replConn.runCommand(
+        OpMsgRequest::fromDBAndBody("foo", BSON("dbStats" << 1), makeMetadata(rp, tagSet)));
     stdx::unordered_set<HostAndPort> hostSet;
     for (const auto& hostName : hostNames) {
         hostSet.emplace(hostName);
@@ -227,8 +235,8 @@ void assertRunCommandWithReadPrefThrows(MockReplicaSet* replSet, ReadPreference 
     TagSet ts = isPrimaryOnly ? TagSet::primaryOnly() : TagSet();
 
     DBClientReplicaSet replConn(replSet->getSetName(), replSet->getHosts(), StringData());
-    ASSERT_THROWS(replConn.runCommandWithMetadata(
-                      "foo", "whoami", makeMetadata(rp, ts), BSON("dbStats" << 1)),
+    ASSERT_THROWS(replConn.runCommand(OpMsgRequest::fromDBAndBody(
+                      "foo", BSON("dbStats" << 1), makeMetadata(rp, ts))),
                   AssertionException);
 }
 

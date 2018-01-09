@@ -17,7 +17,7 @@ var DB;
     };
 
     DB.prototype.getSiblingDB = function(name) {
-        return this.getMongo().getDB(name);
+        return this.getSession().getDatabase(name);
     };
 
     DB.prototype.getSisterDB = DB.prototype.getSiblingDB;
@@ -66,21 +66,47 @@ var DB;
         return cmdObjWithReadPref;
     };
 
-    // if someone passes i.e. runCommand("foo", {bar: "baz"}
-    // we merge it in to runCommand({foo: 1, bar: "baz"}
-    // this helper abstracts that logic.
-    DB.prototype._mergeCommandOptions = function(commandName, extraKeys) {
+    /**
+     * If someone passes i.e. runCommand("foo", {bar: "baz"}), we merge it in to
+     * runCommand({foo: 1, bar: "baz"}).
+     * If we already have a command object in the first argument, we ensure that the second
+     * argument 'extraKeys' is either null or an empty object. This prevents users from accidentally
+     * calling runCommand({foo: 1}, {bar: 1}) and expecting the final command invocation to be
+     * runCommand({foo: 1, bar: 1}).
+     * This helper abstracts that logic.
+     */
+    DB.prototype._mergeCommandOptions = function(obj, extraKeys) {
         "use strict";
+
+        if (typeof(obj) === "object") {
+            if (Object.keys(extraKeys || {}).length > 0) {
+                throw Error("Unexpected second argument to DB.runCommand(): (type: " +
+                            typeof(extraKeys) + "): " + tojson(extraKeys));
+            }
+            return obj;
+        } else if (typeof(obj) !== "string") {
+            throw Error("First argument to DB.runCommand() must be either an object or a string: " +
+                        "(type: " + typeof(obj) + "): " + tojson(obj));
+        }
+
+        var commandName = obj;
         var mergedCmdObj = {};
         mergedCmdObj[commandName] = 1;
 
-        if (typeof(extraKeys) === "object") {
+        if (!extraKeys) {
+            return mergedCmdObj;
+        } else if (typeof(extraKeys) === "object") {
             // this will traverse the prototype chain of extra, but keeping
             // to maintain legacy behavior
             for (var key in extraKeys) {
                 mergedCmdObj[key] = extraKeys[key];
             }
+        } else {
+            throw Error("Second argument to DB.runCommand(" + commandName +
+                        ") must be an object: (type: " + typeof(extraKeys) + "): " +
+                        tojson(extraKeys));
         }
+
         return mergedCmdObj;
     };
 
@@ -91,31 +117,41 @@ var DB;
 
         // Support users who call this function with a string commandName, e.g.
         // db.runReadCommand("commandName", {arg1: "value", arg2: "value"}).
-        var mergedObj = (typeof(obj) === "string") ? this._mergeCommandOptions(obj, extra) : obj;
-        var cmdObjWithReadPref =
-            this._attachReadPreferenceToCommand(mergedObj, this.getMongo().getReadPref());
+        obj = this._mergeCommandOptions(obj, extra);
+        queryOptions = queryOptions !== undefined ? queryOptions : this.getQueryOptions();
 
-        var options =
-            (typeof(queryOptions) !== "undefined") ? queryOptions : this.getQueryOptions();
-        var readPrefMode = this.getMongo().getReadPrefMode();
+        {
+            const session = this.getSession();
 
-        // Set slaveOk if readPrefMode has been explicitly set with a readPreference other than
-        // primary.
-        if (!!readPrefMode && readPrefMode !== "primary") {
-            options |= 4;
+            const readPreference = session._serverSession.client.getReadPreference(session);
+            if (readPreference !== null) {
+                obj = this._attachReadPreferenceToCommand(obj, readPreference);
+
+                if (readPreference.mode !== "primary") {
+                    // Set slaveOk if readPrefMode has been explicitly set with a readPreference
+                    // other than primary.
+                    queryOptions |= 4;
+                }
+            }
         }
 
         // The 'extra' parameter is not used as we have already created a merged command object.
-        return this.runCommand(cmdObjWithReadPref, null, options);
+        return this.runCommand(obj, null, queryOptions);
     };
 
     // runCommand uses this impl to actually execute the command
     DB.prototype._runCommandImpl = function(name, obj, options) {
-        return this.getMongo().runCommand(name, obj, options);
+        const session = this.getSession();
+        return session._getSessionAwareClient().runCommand(session, name, obj, options);
     };
 
     DB.prototype.runCommand = function(obj, extra, queryOptions) {
-        var mergedObj = (typeof(obj) === "string") ? this._mergeCommandOptions(obj, extra) : obj;
+        "use strict";
+
+        // Support users who call this function with a string commandName, e.g.
+        // db.runCommand("commandName", {arg1: "value", arg2: "value"}).
+        var mergedObj = this._mergeCommandOptions(obj, extra);
+
         // if options were passed (i.e. because they were overridden on a collection), use them.
         // Otherwise use getQueryOptions.
         var options =
@@ -135,9 +171,10 @@ var DB;
         }
     };
 
-    DB.prototype.runCommandWithMetadata = function(commandName, commandArgs, metadata) {
-        return this.getMongo().runCommandWithMetadata(
-            this._name, commandName, metadata, commandArgs);
+    DB.prototype.runCommandWithMetadata = function(commandArgs, metadata) {
+        const session = this.getSession();
+        return session._getSessionAwareClient().runCommandWithMetadata(
+            session, this._name, metadata, commandArgs);
     };
 
     DB.prototype._dbCommand = DB.prototype.runCommand;
@@ -150,6 +187,97 @@ var DB;
     };
 
     DB.prototype._adminCommand = DB.prototype.adminCommand;  // alias old name
+
+    DB.prototype._runAggregate = function(cmdObj, aggregateOptions) {
+        assert(cmdObj.pipeline instanceof Array, "cmdObj must contain a 'pipeline' array");
+        assert(cmdObj.aggregate !== undefined, "cmdObj must contain 'aggregate' field");
+        assert(aggregateOptions === undefined || aggregateOptions instanceof Object,
+               "'aggregateOptions' argument must be an object");
+
+        // Make a copy of the initial command object, i.e. {aggregate: x, pipeline: [...]}.
+        cmdObj = Object.extend({}, cmdObj);
+
+        // Make a copy of the aggregation options.
+        let optcpy = Object.extend({}, (aggregateOptions || {}));
+
+        if ('batchSize' in optcpy) {
+            if (optcpy.cursor == null) {
+                optcpy.cursor = {};
+            }
+
+            optcpy.cursor.batchSize = optcpy['batchSize'];
+            delete optcpy['batchSize'];
+        } else if ('useCursor' in optcpy) {
+            if (optcpy.cursor == null) {
+                optcpy.cursor = {};
+            }
+
+            delete optcpy['useCursor'];
+        }
+
+        const maxAwaitTimeMS = optcpy.maxAwaitTimeMS;
+        delete optcpy.maxAwaitTimeMS;
+
+        // Reassign the cleaned-up options.
+        aggregateOptions = optcpy;
+
+        // Add the options to the command object.
+        Object.extend(cmdObj, aggregateOptions);
+
+        if (!('cursor' in cmdObj)) {
+            cmdObj.cursor = {};
+        }
+
+        const pipeline = cmdObj.pipeline;
+
+        // Check whether the pipeline has an $out stage. If not, we may run on a Secondary and
+        // should attach a readPreference.
+        const hasOutStage =
+            pipeline.length >= 1 && pipeline[pipeline.length - 1].hasOwnProperty("$out");
+
+        const doAgg = function(cmdObj) {
+            return hasOutStage ? this.runCommand(cmdObj) : this.runReadCommand(cmdObj);
+        }.bind(this);
+
+        const res = doAgg(cmdObj);
+
+        if (!res.ok && (res.code == 17020 || res.errmsg == "unrecognized field \"cursor") &&
+            !("cursor" in aggregateOptions)) {
+            // If the command failed because cursors aren't supported and the user didn't explicitly
+            // request a cursor, try again without requesting a cursor.
+            delete cmdObj.cursor;
+
+            res = doAgg(cmdObj);
+
+            if ('result' in res && !("cursor" in res)) {
+                // convert old-style output to cursor-style output
+                res.cursor = {ns: '', id: NumberLong(0)};
+                res.cursor.firstBatch = res.result;
+                delete res.result;
+            }
+        }
+
+        assert.commandWorked(res, "aggregate failed");
+
+        if ("cursor" in res) {
+            let batchSizeValue = undefined;
+
+            if (cmdObj["cursor"]["batchSize"] > 0) {
+                batchSizeValue = cmdObj["cursor"]["batchSize"];
+            }
+
+            return new DBCommandCursor(this, res, batchSizeValue, maxAwaitTimeMS);
+        }
+
+        return res;
+    };
+
+    DB.prototype.aggregate = function(pipeline, aggregateOptions) {
+        assert(pipeline instanceof Array, "pipeline argument must be an array");
+        const cmdObj = this._mergeCommandOptions("aggregate", {pipeline: pipeline});
+
+        return this._runAggregate(cmdObj, (aggregateOptions || {}));
+    };
 
     /**
       Create a new collection in the database.  Normally, collection creation is automatic.  You
@@ -197,10 +325,8 @@ var DB;
         var options = opt || {};
 
         // We have special handling for the 'flags' field, and provide sugar for specific flags. If
-        // the
-        // user specifies any flags we send the field in the command. Otherwise, we leave it blank
-        // and
-        // use the server's defaults.
+        // the user specifies any flags we send the field in the command. Otherwise, we leave it
+        // blank and use the server's defaults.
         var sendFlags = false;
         var flags = 0;
         if (options.usePowerOf2Sizes != undefined) {
@@ -430,12 +556,13 @@ var DB;
 
         // Use the copyDatabase native helper for SCRAM-SHA-1
         if (mechanism == "SCRAM-SHA-1") {
+            // TODO SERVER-30886: Add session support for Mongo.prototype.copyDatabaseWithSCRAM().
             return this.getMongo().copyDatabaseWithSCRAM(
                 fromdb, todb, fromhost, username, password, slaveOk);
         }
 
         // Fall back to MONGODB-CR
-        var n = this._adminCommand({copydbgetnonce: 1, fromhost: fromhost});
+        var n = assert.commandWorked(this._adminCommand({copydbgetnonce: 1, fromhost: fromhost}));
         return this._adminCommand({
             copydb: 1,
             fromhost: fromhost,
@@ -460,13 +587,15 @@ var DB;
     DB.prototype.help = function() {
         print("DB methods:");
         print(
-            "\tdb.adminCommand(nameOrDocument) - switches to 'admin' db, and runs command [ just calls db.runCommand(...) ]");
+            "\tdb.adminCommand(nameOrDocument) - switches to 'admin' db, and runs command [just calls db.runCommand(...)]");
+        print(
+            "\tdb.aggregate([pipeline], {options}) - performs a collectionless aggregation on this database; returns a cursor");
         print("\tdb.auth(username, password)");
         print("\tdb.cloneDatabase(fromhost)");
         print("\tdb.commandHelp(name) returns the help for the command");
         print("\tdb.copyDatabase(fromdb, todb, fromhost)");
-        print("\tdb.createCollection(name, { size : ..., capped : ..., max : ... } )");
-        print("\tdb.createView(name, viewOn, [ { $operator: {...}}, ... ], { viewOptions } )");
+        print("\tdb.createCollection(name, {size: ..., capped: ..., max: ...})");
+        print("\tdb.createView(name, viewOn, [{$operator: {...}}, ...], {viewOptions})");
         print("\tdb.createUser(userDocument)");
         print("\tdb.currentOp() displays currently executing operations in the db");
         print("\tdb.dropDatabase()");
@@ -505,14 +634,14 @@ var DB;
         print("\tdb.repairDatabase()");
         print("\tdb.resetError()");
         print(
-            "\tdb.runCommand(cmdObj) run a database command.  if cmdObj is a string, turns it into { cmdObj : 1 }");
+            "\tdb.runCommand(cmdObj) run a database command.  if cmdObj is a string, turns it into {cmdObj: 1}");
         print("\tdb.serverStatus()");
         print("\tdb.setLogLevel(level,<component>)");
         print("\tdb.setProfilingLevel(level,slowms) 0=off 1=slow 2=all");
         print(
-            "\tdb.setWriteConcern( <write concern doc> ) - sets the write concern for writes to the db");
+            "\tdb.setWriteConcern(<write concern doc>) - sets the write concern for writes to the db");
         print(
-            "\tdb.unsetWriteConcern( <write concern doc> ) - unsets the write concern for writes to the db");
+            "\tdb.unsetWriteConcern(<write concern doc>) - unsets the write concern for writes to the db");
         print("\tdb.setVerboseShell(flag) display extra information in shell output");
         print("\tdb.shutdownServer()");
         print("\tdb.stats()");
@@ -812,7 +941,7 @@ var DB;
             throw _getErrorWithCode(res, "listCollections failed: " + tojson(res));
         }
 
-        return new DBCommandCursor(res._mongo, res).toArray().sort(compareOn("name"));
+        return new DBCommandCursor(this, res).toArray().sort(compareOn("name"));
     };
 
     /**
@@ -869,12 +998,13 @@ var DB;
         var res = this.adminCommand(commandObj);
         if (commandUnsupported(res)) {
             // always send legacy currentOp with default (null) read preference (SERVER-17951)
-            var _readPref = this.getMongo().getReadPrefMode();
+            const session = this.getSession();
+            const readPreference = session.getOptions().getReadPreference();
             try {
-                this.getMongo().setReadPref(null);
+                session.getOptions().setReadPreference(null);
                 res = this.getSiblingDB("admin").$cmd.sys.inprog.findOne(q);
             } finally {
-                this.getMongo().setReadPref(_readPref);
+                session.getOptions().setReadPreference(readPreference);
             }
         }
         return res;
@@ -887,12 +1017,13 @@ var DB;
         var res = this.adminCommand({'killOp': 1, 'op': op});
         if (commandUnsupported(res)) {
             // fall back for old servers
-            var _readPref = this.getMongo().getReadPrefMode();
+            const session = this.getSession();
+            const readPreference = session.getOptions().getReadPreference();
             try {
-                this.getMongo().setReadPref(null);
+                session.getOptions().setReadPreference(null);
                 res = this.getSiblingDB("admin").$cmd.sys.killop.findOne({'op': op});
             } finally {
-                this.getMongo().setReadPref(_readPref);
+                session.getOptions().setReadPreference(readPreference);
             }
         }
         return res;
@@ -1177,12 +1308,13 @@ var DB;
     DB.prototype.fsyncUnlock = function() {
         var res = this.adminCommand({fsyncUnlock: 1});
         if (commandUnsupported(res)) {
-            var _readPref = this.getMongo().getReadPrefMode();
+            const session = this.getSession();
+            const readPreference = session.getOptions().getReadPreference();
             try {
-                this.getMongo().setReadPref(null);
+                session.getOptions().setReadPreference(null);
                 res = this.getSiblingDB("admin").$cmd.sys.unlock.findOne();
             } finally {
-                this.getMongo().setReadPref(_readPref);
+                session.getOptions().setReadPreference(readPreference);
             }
         }
         return res;
@@ -1269,6 +1401,14 @@ var DB;
 
     DB.prototype.createUser = function(userObj, writeConcern) {
         var name = userObj["user"];
+        if (name === undefined) {
+            throw Error("no 'user' field provided to 'createUser' function");
+        }
+
+        if (userObj["createUser"] !== undefined) {
+            throw Error("calling 'createUser' function with 'createUser' field is disallowed");
+        }
+
         var cmdObj = {createUser: name};
         cmdObj = Object.extend(cmdObj, userObj);
         delete cmdObj["user"];
@@ -1352,6 +1492,7 @@ var DB;
     };
 
     DB.prototype.logout = function() {
+        // Logging out doesn't require a session since it manipulates connection state.
         return this.getMongo().logout(this.getName());
     };
 
@@ -1427,11 +1568,6 @@ var DB;
         if (this._defaultAuthenticationMechanism != null)
             return this._defaultAuthenticationMechanism;
 
-        // Use MONGODB-CR for v2.6 and earlier.
-        maxWireVersion = this.isMaster().maxWireVersion;
-        if (maxWireVersion == undefined || maxWireVersion < 3) {
-            return "MONGODB-CR";
-        }
         return "SCRAM-SHA-1";
     };
 
@@ -1462,6 +1598,7 @@ var DB;
             params.serviceName = this._defaultGssapiServiceName;
         }
 
+        // Logging in doesn't require a session since it manipulates connection state.
         params.db = this.getName();
         var good = this.getMongo().auth(params);
         if (good) {
@@ -1691,10 +1828,10 @@ var DB;
         if (this._writeConcern)
             return this._writeConcern;
 
-        if (this._mongo.getWriteConcern())
-            return this._mongo.getWriteConcern();
-
-        return null;
+        {
+            const session = this.getSession();
+            return session._serverSession.client.getWriteConcern(session);
+        }
     };
 
     DB.prototype.unsetWriteConcern = function() {
@@ -1702,11 +1839,24 @@ var DB;
     };
 
     DB.prototype.getLogComponents = function() {
-        return this.getMongo().getLogComponents();
+        return this.getMongo().getLogComponents(this.getSession());
     };
 
     DB.prototype.setLogLevel = function(logLevel, component) {
-        return this.getMongo().setLogLevel(logLevel, component);
+        return this.getMongo().setLogLevel(logLevel, component, this.getSession());
     };
+
+    // Writing `this.hasOwnProperty` would cause DB.prototype.getCollection() to be called since the
+    // DB's getProperty() handler in C++ takes precedence when a property isn't defined on the DB
+    // instance directly. The "hasOwnProperty" property is defined on Object.prototype, so we must
+    // resort to using the function explicitly ourselves.
+    (function(hasOwnProperty) {
+        DB.prototype.getSession = function() {
+            if (!hasOwnProperty.call(this, "_session")) {
+                this._session = this.getMongo()._getDefaultSession();
+            }
+            return this._session;
+        };
+    })(Object.prototype.hasOwnProperty);
 
 }());

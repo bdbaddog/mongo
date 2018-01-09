@@ -69,9 +69,11 @@ public:
     static void set(ServiceContext* service,
                     std::unique_ptr<DropPendingCollectionReaper> storageInterface);
 
-    // Container type for drop-pending namespaces. We use a map so that we can order the namespaces
-    // by drop optime.
-    using DropPendingNamespaces = std::map<OpTime, NamespaceString>;
+    // Container type for drop-pending namespaces. We use a multimap so that we can order the
+    // namespaces by drop optime. Additionally, it is possible for certain user operations (such
+    // as renameCollection across databases) to generate more than one drop-pending namespace for
+    // the same drop optime.
+    using DropPendingNamespaces = std::multimap<OpTime, NamespaceString>;
 
     explicit DropPendingCollectionReaper(StorageInterface* storageInterface);
     virtual ~DropPendingCollectionReaper() = default;
@@ -95,6 +97,19 @@ public:
      * optimes more recent than 'opTime'.
      */
     void dropCollectionsOlderThan(OperationContext* opCtx, const OpTime& opTime);
+
+    /**
+     * Renames the drop-pending namespace at the specified optime back to the provided name.
+     * There can only be one matching collection per database and at most two entries per optime
+     * (due to renameCollection across databases).
+     * We cannot reconstruct the original namespace so we must get it passed in. It accepts the
+     * fully qualified namespace so that we can locate the correct entry by optime and database.
+     * This function also removes the entry from '_dropPendingNamespaces'.
+     * This function returns false if there is no drop-pending collection at the specified optime.
+     */
+    bool rollBackDropPendingCollection(OperationContext* opCtx,
+                                       const OpTime& opTime,
+                                       const NamespaceString& collectionNamespace);
 
 private:
     // All member variables are labeled with one of the following codes indicating the

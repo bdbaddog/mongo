@@ -52,7 +52,8 @@ namespace mongo {
 
 void ServiceContextMongoDTest::setUp() {
     Client::initThread(getThreadName());
-    ServiceContext* serviceContext = getServiceContext();
+
+    auto const serviceContext = getServiceContext();
 
     auto logicalClock = stdx::make_unique<LogicalClock>(serviceContext);
     LogicalClock::set(serviceContext, std::move(logicalClock));
@@ -64,7 +65,8 @@ void ServiceContextMongoDTest::setUp() {
         storageGlobalParams.dbpath = tempDir.path();
         storageGlobalParams.engine = "ephemeralForTest";
         storageGlobalParams.engineSetByUser = true;
-        checked_cast<ServiceContextMongoD*>(getGlobalServiceContext())->createLockFile();
+
+        checked_cast<ServiceContextMongoD*>(serviceContext)->createLockFile();
         serviceContext->initializeGlobalStorageEngine();
         serviceContext->setOpObserver(stdx::make_unique<OpObserverNoop>());
     }
@@ -91,11 +93,10 @@ void ServiceContextMongoDTest::_dropAllDBs(OperationContext* opCtx) {
     AutoGetDb autoDBLocal(opCtx, "local", MODE_X);
     const auto localDB = autoDBLocal.getDb();
     if (localDB) {
-        MONGO_WRITE_CONFLICT_RETRY_LOOP_BEGIN {
+        writeConflictRetry(opCtx, "_dropAllDBs", "local", [&] {
             // Do not wrap in a WriteUnitOfWork until SERVER-17103 is addressed.
             autoDBLocal.getDb()->dropDatabase(opCtx, localDB);
-        }
-        MONGO_WRITE_CONFLICT_RETRY_LOOP_END(opCtx, "_dropAllDBs", "local");
+        });
     }
 
     // dropAllDatabasesExceptLocal() does not close empty databases. However the holder still

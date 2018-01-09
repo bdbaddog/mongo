@@ -110,7 +110,7 @@ DocumentSource::GetNextResult DocumentSourceGroup::getNextSpilled() {
         _firstPartOfNextGroup = _sorterIterator->next();
     }
 
-    return makeDocument(_currentId, _currentAccumulators, pExpCtx->inShard);
+    return makeDocument(_currentId, _currentAccumulators, pExpCtx->needsMerge);
 }
 
 DocumentSource::GetNextResult DocumentSourceGroup::getNextStandard() {
@@ -118,7 +118,7 @@ DocumentSource::GetNextResult DocumentSourceGroup::getNextStandard() {
     if (_groups->empty())
         return GetNextResult::makeEOF();
 
-    Document out = makeDocument(groupsIterator->first, groupsIterator->second, pExpCtx->inShard);
+    Document out = makeDocument(groupsIterator->first, groupsIterator->second, pExpCtx->needsMerge);
 
     if (++groupsIterator == _groups->end())
         dispose();
@@ -158,7 +158,7 @@ DocumentSource::GetNextResult DocumentSourceGroup::getNextStreaming() {
         id = computeId(*_firstDocOfNextGroup);
     } while (pExpCtx->getValueComparator().evaluate(_currentId == id));
 
-    Document out = makeDocument(_currentId, _currentAccumulators, pExpCtx->inShard);
+    Document out = makeDocument(_currentId, _currentAccumulators, pExpCtx->needsMerge);
     _currentId = std::move(id);
 
     return std::move(out);
@@ -266,7 +266,7 @@ DocumentSourceGroup::DocumentSourceGroup(const intrusive_ptr<ExpressionContext>&
       _initialized(false),
       _groups(pExpCtx->getValueComparator().makeUnorderedValueMap<Accumulators>()),
       _spilled(false),
-      _extSortAllowed(pExpCtx->extSortAllowed && !pExpCtx->inRouter) {}
+      _allowDiskUse(pExpCtx->allowDiskUse && !pExpCtx->inMongos) {}
 
 void DocumentSourceGroup::addAccumulator(AccumulationStatement accumulationStatement) {
     _accumulatedFields.push_back(accumulationStatement);
@@ -485,7 +485,7 @@ DocumentSource::GetNextResult DocumentSourceGroup::initialize() {
             uassert(16945,
                     "Exceeded memory limit for $group, but didn't allow external sort."
                     " Pass allowDiskUse:true to opt in.",
-                    _extSortAllowed);
+                    _allowDiskUse);
             _sortedFiles.push_back(spill());
             _memoryUsageBytes = 0;
         }
@@ -530,8 +530,8 @@ DocumentSource::GetNextResult DocumentSourceGroup::initialize() {
         if (kDebugBuild && !storageGlobalParams.readOnly) {
             // In debug mode, spill every time we have a duplicate id to stress merge logic.
             if (!inserted &&                 // is a dup
-                !pExpCtx->inRouter &&        // can't spill to disk in router
-                !_extSortAllowed &&          // don't change behavior when testing external sort
+                !pExpCtx->inMongos &&        // can't spill to disk in mongos
+                !_allowDiskUse &&            // don't change behavior when testing external sort
                 _sortedFiles.size() < 20) {  // don't open too many FDs
 
                 _sortedFiles.push_back(spill());
@@ -832,7 +832,7 @@ intrusive_ptr<DocumentSource> DocumentSourceGroup::getShardSource() {
     return this;  // No modifications necessary when on shard
 }
 
-intrusive_ptr<DocumentSource> DocumentSourceGroup::getMergeSource() {
+std::list<intrusive_ptr<DocumentSource>> DocumentSourceGroup::getMergeSources() {
     intrusive_ptr<DocumentSourceGroup> pMerger(new DocumentSourceGroup(pExpCtx));
     pMerger->setDoingMerge(true);
 
@@ -851,7 +851,7 @@ intrusive_ptr<DocumentSource> DocumentSourceGroup::getMergeSource() {
         pMerger->addAccumulator(copiedAccumuledField);
     }
 
-    return pMerger;
+    return {pMerger};
 }
 }
 

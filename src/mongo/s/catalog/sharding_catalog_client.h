@@ -56,6 +56,7 @@ class DatabaseType;
 class LogicalTime;
 class NamespaceString;
 class OperationContext;
+class ShardingCatalogManager;
 class ShardKeyPattern;
 class ShardRegistry;
 class ShardType;
@@ -68,16 +69,6 @@ class VersionType;
 namespace executor {
 struct ConnectionPoolStats;
 }
-
-/**
- * Used to indicate to the caller of the removeShard method whether draining of chunks for
- * a particular shard has started, is ongoing, or has been completed.
- */
-enum ShardDrainingStatus {
-    STARTED,
-    ONGOING,
-    COMPLETED,
-};
 
 /**
  * Abstracts reads of the sharding catalog metadata.
@@ -93,9 +84,15 @@ enum ShardDrainingStatus {
 class ShardingCatalogClient {
     MONGO_DISALLOW_COPYING(ShardingCatalogClient);
 
+    // Allows ShardingCatalogManager to access _exhaustiveFindOnConfig
+    friend class ShardingCatalogManager;
+
 public:
     // Constant to use for configuration data majority writes
     static const WriteConcernOptions kMajorityWriteConcern;
+
+    // Constant to use for configuration data local writes
+    static const WriteConcernOptions kLocalWriteConcern;
 
     virtual ~ShardingCatalogClient() = default;
 
@@ -104,62 +101,12 @@ public:
      * has been installed into the global 'grid' object. Implementations do not need to guarantee
      * thread safety so callers should employ proper synchronization when calling this method.
      */
-    virtual Status startup() = 0;
+    virtual void startup() = 0;
 
     /**
      * Performs necessary cleanup when shutting down cleanly.
      */
     virtual void shutDown(OperationContext* opCtx) = 0;
-
-    /**
-     * Creates a new database or updates the sharding status for an existing one. Cannot be
-     * used for the admin/config/local DBs, which should not be created or sharded manually
-     * anyways.
-     *
-     * Returns Status::OK on success or any error code indicating the failure. These are some
-     * of the known failures:
-     *  - DatabaseDifferCase - database already exists, but with a different case
-     *  - ShardNotFound - could not find a shard to place the DB on
-     */
-    virtual Status enableSharding(OperationContext* opCtx, const std::string& dbName) = 0;
-
-    /**
-     * Shards a collection. Assumes that the database is enabled for sharding.
-     *
-     * @param ns: namespace of collection to shard
-     * @param fieldsAndOrder: shardKey pattern
-     * @param defaultCollation: the default collation for the collection, to be written to
-     *     config.collections. If empty, the collection default collation is simple binary
-     *     comparison. Note the the shard key collation will always be simple binary comparison,
-     *     even if the collection default collation is non-simple.
-     * @param unique: if true, ensure underlying index enforces a unique constraint.
-     * @param initPoints: create chunks based on a set of specified split points.
-     * @param initShardIds: If non-empty, specifies the set of shards to assign chunks between.
-     *     Otherwise all chunks will be assigned to the primary shard for the database.
-     *
-     * WARNING: It's not completely safe to place initial chunks onto non-primary
-     *          shards using this method because a conflict may result if multiple map-reduce
-     *          operations are writing to the same output collection, for instance.
-     *
-     */
-    virtual Status shardCollection(OperationContext* opCtx,
-                                   const std::string& ns,
-                                   const ShardKeyPattern& fieldsAndOrder,
-                                   const BSONObj& defaultCollation,
-                                   bool unique,
-                                   const std::vector<BSONObj>& initPoints,
-                                   const std::set<ShardId>& initShardIds) = 0;
-
-    /**
-     * Tries to remove a shard. To completely remove a shard from a sharded cluster,
-     * the data residing in that shard must be moved to the remaining shards in the
-     * cluster by "draining" chunks from that shard.
-     *
-     * Because of the asynchronous nature of the draining mechanism, this method returns
-     * the current draining status. See ShardDrainingStatus enum definition for more details.
-     */
-    virtual StatusWith<ShardDrainingStatus> removeShard(OperationContext* opCtx,
-                                                        const ShardId& name) = 0;
 
     /**
      * Updates or creates the metadata for a given database.
@@ -178,8 +125,10 @@ public:
      * the failure. These are some of the known failures:
      *  - NamespaceNotFound - database does not exist
      */
-    virtual StatusWith<repl::OpTimeWith<DatabaseType>> getDatabase(OperationContext* opCtx,
-                                                                   const std::string& dbName) = 0;
+    virtual StatusWith<repl::OpTimeWith<DatabaseType>> getDatabase(
+        OperationContext* opCtx,
+        const std::string& dbName,
+        repl::ReadConcernLevel readConcernLevel) = 0;
 
     /**
      * Retrieves the metadata for a given collection, if it exists.
@@ -192,24 +141,24 @@ public:
      *  - NamespaceNotFound - collection does not exist
      */
     virtual StatusWith<repl::OpTimeWith<CollectionType>> getCollection(
-        OperationContext* opCtx, const std::string& collNs) = 0;
+        OperationContext* opCtx,
+        const std::string& collNs,
+        repl::ReadConcernLevel readConcernLevel = repl::ReadConcernLevel::kMajorityReadConcern) = 0;
 
     /**
      * Retrieves all collections undera specified database (or in the system).
      *
      * @param dbName an optional database name. Must be nullptr or non-empty. If nullptr is
      *      specified, all collections on the system are returned.
-     * @param collections variable to receive the set of collections.
      * @param optime an out parameter that will contain the opTime of the config server.
      *      Can be null. Note that collections can be fetched in multiple batches and each batch
      *      can have a unique opTime. This opTime will be the one from the last batch.
      *
-     * Returns a !OK status if an error occurs.
+     * Returns the set of collections, or a !OK status if an error occurs.
      */
-    virtual Status getCollections(OperationContext* opCtx,
-                                  const std::string* dbName,
-                                  std::vector<CollectionType>* collections,
-                                  repl::OpTime* optime) = 0;
+    virtual StatusWith<std::vector<CollectionType>> getCollections(OperationContext* opCtx,
+                                                                   const std::string* dbName,
+                                                                   repl::OpTime* optime) = 0;
 
     /**
      * Drops the specified collection from the collection metadata store.
@@ -218,16 +167,18 @@ public:
      * some of the known failures:
      *  - NamespaceNotFound - collection does not exist
      */
-    virtual Status dropCollection(OperationContext* opCtx, const NamespaceString& ns) = 0;
+    virtual Status dropCollection(
+        OperationContext* opCtx,
+        const NamespaceString& ns,
+        repl::ReadConcernLevel readConcernLevel = repl::ReadConcernLevel::kMajorityReadConcern) = 0;
 
     /**
      * Retrieves all databases for a shard.
      *
      * Returns a !OK status if an error occurs.
      */
-    virtual Status getDatabasesForShard(OperationContext* opCtx,
-                                        const ShardId& shardId,
-                                        std::vector<std::string>* dbs) = 0;
+    virtual StatusWith<std::vector<std::string>> getDatabasesForShard(OperationContext* opCtx,
+                                                                      const ShardId& shardId) = 0;
 
     /**
      * Gets the requested number of chunks (of type ChunkType) that satisfy a query.
@@ -235,28 +186,27 @@ public:
      * @param filter The query to filter out the results.
      * @param sort Fields to use for sorting the results. Pass empty BSON object for no sort.
      * @param limit The number of chunk entries to return. Pass boost::none for no limit.
-     * @param chunks Vector entry to receive the results
      * @param optime an out parameter that will contain the opTime of the config server.
      *      Can be null. Note that chunks can be fetched in multiple batches and each batch
      *      can have a unique opTime. This opTime will be the one from the last batch.
      * @param readConcern The readConcern to use while querying for chunks.
      *
-     * Returns a !OK status if an error occurs.
+     * Returns a vector of ChunkTypes, or a !OK status if an error occurs.
      */
-    virtual Status getChunks(OperationContext* opCtx,
-                             const BSONObj& filter,
-                             const BSONObj& sort,
-                             boost::optional<int> limit,
-                             std::vector<ChunkType>* chunks,
-                             repl::OpTime* opTime,
-                             repl::ReadConcernLevel readConcern) = 0;
+    virtual StatusWith<std::vector<ChunkType>> getChunks(OperationContext* opCtx,
+                                                         const BSONObj& filter,
+                                                         const BSONObj& sort,
+                                                         boost::optional<int> limit,
+                                                         repl::OpTime* opTime,
+                                                         repl::ReadConcernLevel readConcern) = 0;
 
     /**
      * Retrieves all tags for the specified collection.
+     *
+     * Returns a !OK status if an error occurs.
      */
-    virtual Status getTagsForCollection(OperationContext* opCtx,
-                                        const std::string& collectionNs,
-                                        std::vector<TagsType>* tags) = 0;
+    virtual StatusWith<std::vector<TagsType>> getTagsForCollection(
+        OperationContext* opCtx, const std::string& collectionNs) = 0;
 
     /**
      * Retrieves all shards in this sharded cluster.
@@ -291,7 +241,7 @@ public:
 
     /**
      * Applies oplog entries to the config servers.
-     * Used by mergeChunk, splitChunk, and moveChunk commands.
+     * Used by mergeChunk and splitChunk commands.
      *
      * @param updateOps: documents to write to the chunks collection.
      * @param preCondition: preconditions for applying documents.
@@ -375,20 +325,6 @@ public:
                                          BatchedCommandResponse* response) = 0;
 
     /**
-     * Creates a new database entry for the specified database name in the configuration
-     * metadata and sets the specified shard as primary.
-     *
-     * @param dbName name of the database (case sensitive)
-     *
-     * Returns Status::OK on success or any error code indicating the failure. These are some
-     * of the known failures:
-     *  - NamespaceExists - database already exists
-     *  - DatabaseDifferCase - database already exists, but with a different case
-     *  - ShardNotFound - could not find a shard to place the DB on
-     */
-    virtual Status createDatabase(OperationContext* opCtx, const std::string& dbName) = 0;
-
-    /**
      * Directly inserts a document in the specified namespace on the config server. The document
      * must have an _id index. Must only be used for insertions in the 'config' database.
      *
@@ -432,15 +368,6 @@ public:
                                          const WriteConcernOptions& writeConcern) = 0;
 
     /**
-     * Appends the information about the config and admin databases in the config server with the
-     * format for listDatabases, based on the listDatabases command parameters in
-     * 'listDatabasesCmd'.
-     */
-    virtual Status appendInfoForConfigServerDatabases(OperationContext* opCtx,
-                                                      const BSONObj& listDatabasesCmd,
-                                                      BSONArrayBuilder* builder) = 0;
-
-    /**
      * Obtains a reference to the distributed lock manager instance to use for synchronizing
      * system-wide changes.
      *
@@ -451,6 +378,16 @@ public:
 
 protected:
     ShardingCatalogClient() = default;
+
+private:
+    virtual StatusWith<repl::OpTimeWith<std::vector<BSONObj>>> _exhaustiveFindOnConfig(
+        OperationContext* opCtx,
+        const ReadPreferenceSetting& readPref,
+        const repl::ReadConcernLevel& readConcern,
+        const NamespaceString& nss,
+        const BSONObj& query,
+        const BSONObj& sort,
+        boost::optional<long long> limit) = 0;
 };
 
 }  // namespace mongo

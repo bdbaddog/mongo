@@ -1,5 +1,5 @@
 /*-
- * Public Domain 2014-2017 MongoDB, Inc.
+ * Public Domain 2014-2018 MongoDB, Inc.
  * Public Domain 2008-2014 WiredTiger, Inc.
  *
  * This is free and unencumbered software released into the public domain.
@@ -50,8 +50,8 @@ void
 fop_start(u_int nthreads)
 {
 	struct timeval start, stop;
-	double seconds;
 	wt_thread_t *tids;
+	double seconds;
 	u_int i;
 
 	tids = NULL; /* Silence GCC 4.1 warning. */
@@ -161,7 +161,7 @@ print_stats(u_int nthreads)
 	s = run_stats;
 	for (id = 0; id < nthreads; ++id, ++s)
 		printf(
-		    "%2d:"
+		    "%2u:"
 		    "\t" "bulk %3d, checkpoint %3d, create %3d, cursor %3d,\n"
 		    "\t" "drop %3d, rebalance %3d, upgrade %3d, verify %3d\n",
 		    id, s->bulk + s->bulk_unique, s->ckpt,

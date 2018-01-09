@@ -54,11 +54,11 @@ const char kTermField[] = "term";
 /**
  * Implements the find command on mongos.
  */
-class ClusterFindCmd : public Command {
+class ClusterFindCmd : public BasicCommand {
     MONGO_DISALLOW_COPYING(ClusterFindCmd);
 
 public:
-    ClusterFindCmd() : Command("find") {}
+    ClusterFindCmd() : BasicCommand("find") {}
 
 
     virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
@@ -152,7 +152,6 @@ public:
     bool run(OperationContext* opCtx,
              const std::string& dbname,
              const BSONObj& cmdObj,
-             std::string& errmsg,
              BSONObjBuilder& result) final {
         // We count find command as a query op.
         globalOpCounters.gotQuery();
@@ -165,8 +164,12 @@ public:
             return appendCommandStatus(result, qr.getStatus());
         }
 
-        auto cq =
-            CanonicalQuery::canonicalize(opCtx, std::move(qr.getValue()), ExtensionsCallbackNoop());
+        const boost::intrusive_ptr<ExpressionContext> expCtx;
+        auto cq = CanonicalQuery::canonicalize(opCtx,
+                                               std::move(qr.getValue()),
+                                               expCtx,
+                                               ExtensionsCallbackNoop(),
+                                               MatchExpressionParser::kAllowAllSpecialFeatures);
         if (!cq.isOK()) {
             return appendCommandStatus(result, cq.getStatus());
         }

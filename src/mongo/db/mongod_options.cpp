@@ -40,7 +40,6 @@
 #include "mongo/bson/util/builder.h"
 #include "mongo/config.h"
 #include "mongo/db/db.h"
-#include "mongo/db/diag_log.h"
 #include "mongo/db/repl/repl_settings.h"
 #include "mongo/db/server_options.h"
 #include "mongo/db/server_options_helpers.h"
@@ -50,6 +49,7 @@
 #include "mongo/util/mongoutils/str.h"
 #include "mongo/util/net/ssl_options.h"
 #include "mongo/util/options_parser/startup_options.h"
+#include "mongo/util/stringutils.h"
 #include "mongo/util/version.h"
 
 namespace mongo {
@@ -99,6 +99,15 @@ Status addMongodOptions(moe::OptionSection* options) {
         .setSources(moe::SourceAllLegacy)
         .incompatibleWith("noauth");
 
+    // IP Whitelisting Options
+    general_options
+        .addOptionChaining("security.clusterIpSourceWhitelist",
+                           "clusterIpSourceWhitelist",
+                           moe::StringVector,
+                           "Network CIDR specification of permitted origin for `__system` access.")
+        .composing();
+
+
     // Way to enable or disable auth in JSON Config
     general_options
         .addOptionChaining(
@@ -121,12 +130,6 @@ Status addMongodOptions(moe::OptionSection* options) {
         .setSources(moe::SourceYAMLConfig);
 
     // Diagnostic Options
-
-    general_options
-        .addOptionChaining(
-            "diaglog", "diaglog", moe::Int, "DEPRECATED: 0=off 1=W 2=R 3=both 7=W+some reads")
-        .hidden()
-        .setSources(moe::SourceAllLegacy);
 
     general_options
         .addOptionChaining("operationProfiling.slowOpThresholdMs",
@@ -201,11 +204,13 @@ Status addMongodOptions(moe::OptionSection* options) {
         .setSources(moe::SourceAll)
         .hidden();
 
-    storage_options.addOptionChaining("storage.groupCollections",
-                                      "groupCollections",
-                                      moe::Switch,
-                                      "group collections - if true the storage engine may group "
-                                      "collections within a database into a shared record store.");
+    storage_options
+        .addOptionChaining("storage.groupCollections",
+                           "groupCollections",
+                           moe::Switch,
+                           "group collections - if true the storage engine may group "
+                           "collections within a database into a shared record store.")
+        .hidden();
 
     general_options
         .addOptionChaining("noIndexBuildRetry",
@@ -432,10 +437,15 @@ Status addMongodOptions(moe::OptionSection* options) {
                            "specify index prefetching behavior (if secondary) [none|_id_only|all]")
         .format("(:?none)|(:?_id_only)|(:?all)", "(none/_id_only/all)");
 
-    rs_options.addOptionChaining("replication.enableMajorityReadConcern",
-                                 "enableMajorityReadConcern",
-                                 moe::Switch,
-                                 "enables majority readConcern");
+    // `enableMajorityReadConcern` is always enabled starting in 3.6, regardless of user
+    // settings. We're leaving the option in to not break existing deployment scripts. A warning
+    // will appear if explicitly set to false.
+    rs_options
+        .addOptionChaining("replication.enableMajorityReadConcern",
+                           "enableMajorityReadConcern",
+                           moe::Switch,
+                           "enables majority readConcern")
+        .setDefault(moe::Value(true));
 
     // Sharding Options
 
@@ -512,18 +522,18 @@ Status addMongodOptions(moe::OptionSection* options) {
         .setSources(moe::SourceYAMLConfig);
 
 
-    options->addSection(general_options);
+    options->addSection(general_options).transitional_ignore();
 #if defined(_WIN32)
-    options->addSection(windows_scm_options);
+    options->addSection(windows_scm_options).transitional_ignore();
 #endif
-    options->addSection(replication_options);
-    options->addSection(ms_options);
-    options->addSection(rs_options);
-    options->addSection(sharding_options);
+    options->addSection(replication_options).transitional_ignore();
+    options->addSection(ms_options).transitional_ignore();
+    options->addSection(rs_options).transitional_ignore();
+    options->addSection(sharding_options).transitional_ignore();
 #ifdef MONGO_CONFIG_SSL
-    options->addSection(ssl_options);
+    options->addSection(ssl_options).transitional_ignore();
 #endif
-    options->addSection(storage_options);
+    options->addSection(storage_options).transitional_ignore();
 
     // The following are legacy options that are disallowed in the JSON config file
 
@@ -1044,21 +1054,25 @@ Status storeMongodOptions(const moe::Environment& params) {
     if (params.count("security.javascriptEnabled")) {
         mongodGlobalParams.scriptingEnabled = params["security.javascriptEnabled"].as<bool>();
     }
+
+    if (params.count("security.clusterIpSourceWhitelist")) {
+        mongodGlobalParams.whitelistedClusterNetwork = std::vector<std::string>();
+        for (const std::string& whitelistEntry :
+             params["security.clusterIpSourceWhitelist"].as<std::vector<std::string>>()) {
+            std::vector<std::string> intermediates;
+            splitStringDelim(whitelistEntry, &intermediates, ',');
+            std::copy(intermediates.begin(),
+                      intermediates.end(),
+                      std::back_inserter(*mongodGlobalParams.whitelistedClusterNetwork));
+        }
+    }
+
     if (params.count("storage.mmapv1.preallocDataFiles")) {
         mmapv1GlobalOptions.prealloc = params["storage.mmapv1.preallocDataFiles"].as<bool>();
         cout << "note: noprealloc may hurt performance in many applications" << endl;
     }
     if (params.count("storage.mmapv1.smallFiles")) {
         mmapv1GlobalOptions.smallfiles = params["storage.mmapv1.smallFiles"].as<bool>();
-    }
-    if (params.count("diaglog")) {
-        warning() << "--diaglog is deprecated and will be removed in a future release"
-                  << startupWarningsLog;
-        int x = params["diaglog"].as<int>();
-        if (x < 0 || x > 7) {
-            return Status(ErrorCodes::BadValue, "can't interpret --diaglog setting");
-        }
-        _diaglog.setLevel(x);
     }
 
     if ((params.count("storage.journal.enabled") &&
@@ -1120,8 +1134,11 @@ Status storeMongodOptions(const moe::Environment& params) {
     }
 
     if (params.count("replication.enableMajorityReadConcern")) {
-        replSettings.setMajorityReadConcernEnabled(
-            params["replication.enableMajorityReadConcern"].as<bool>());
+        bool val = params["replication.enableMajorityReadConcern"].as<bool>();
+        if (!val) {
+            warning() << "enableMajorityReadConcern startup parameter was supplied, but its value "
+                         "was ignored; majority read concern cannot be disabled.";
+        }
     }
 
     if (params.count("storage.indexBuildRetry")) {
@@ -1179,7 +1196,7 @@ Status storeMongodOptions(const moe::Environment& params) {
             }
         }
     } else {
-        if (serverGlobalParams.port <= 0 || serverGlobalParams.port > 65535) {
+        if (serverGlobalParams.port < 0 || serverGlobalParams.port > 65535) {
             return Status(ErrorCodes::BadValue, "bad --port number");
         }
     }
@@ -1187,7 +1204,6 @@ Status storeMongodOptions(const moe::Environment& params) {
         auto clusterRoleParam = params["sharding.clusterRole"].as<std::string>();
         if (clusterRoleParam == "configsvr") {
             serverGlobalParams.clusterRole = ClusterRole::ConfigServer;
-            replSettings.setMajorityReadConcernEnabled(true);
 
             // If we haven't explicitly specified a journal option, default journaling to true for
             // the config server role

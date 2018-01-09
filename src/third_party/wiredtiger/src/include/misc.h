@@ -1,5 +1,5 @@
 /*-
- * Copyright (c) 2014-2017 MongoDB, Inc.
+ * Copyright (c) 2014-2018 MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -11,6 +11,7 @@
  * and unused function return values.
  */
 #define	WT_UNUSED(var)		(void)(var)
+#define	WT_NOT_READ(var)	(void)(var)
 #define	WT_IGNORE_RET(call) do {					\
 	int __ignored_ret;						\
 	__ignored_ret = (call);						\
@@ -132,15 +133,13 @@
  * hex constant might be a negative integer), and to ensure the hex constant is
  * the correct size before applying the bitwise not operator.
  */
-#define	FLD_CLR(field, mask)	        ((void)((field) &= ~(uint32_t)(mask)))
-#define	FLD_MASK(field, mask)	        ((field) & (uint32_t)(mask))
+#define	FLD_CLR(field, mask)	        ((void)((field) &= ~(mask)))
+#define	FLD_MASK(field, mask)	        ((field) & (mask))
 #define	FLD_ISSET(field, mask)	        (FLD_MASK(field, mask) != 0)
-#define	FLD64_ISSET(field, mask)	(((field) & (uint64_t)(mask)) != 0)
-#define	FLD_SET(field, mask)	        ((void)((field) |= (uint32_t)(mask)))
+#define	FLD_SET(field, mask)	        ((void)((field) |= (mask)))
 
 #define	F_CLR(p, mask)		        FLD_CLR((p)->flags, mask)
 #define	F_ISSET(p, mask)	        FLD_ISSET((p)->flags, mask)
-#define	F_ISSET_ALL(p, mask)	        (FLD_MASK((p)->flags, mask) == (mask))
 #define	F_MASK(p, mask)	                FLD_MASK((p)->flags, mask)
 #define	F_SET(p, mask)		        FLD_SET((p)->flags, mask)
 
@@ -195,12 +194,8 @@
 } while (0)
 
 /* Verbose messages. */
-#ifdef HAVE_VERBOSE
 #define	WT_VERBOSE_ISSET(session, f)					\
 	(FLD_ISSET(S2C(session)->verbose, f))
-#else
-#define	WT_VERBOSE_ISSET(session, f)	0
-#endif
 
 #define	WT_CLEAR(s)							\
 	memset(&(s), 0, sizeof(s))
@@ -213,6 +208,12 @@
 /* Check if a string matches a prefix, and move past it. */
 #define	WT_PREFIX_SKIP(str, pfx)					\
 	(WT_PREFIX_MATCH(str, pfx) ? ((str) += strlen(pfx), 1) : 0)
+
+/* Assert that a string matches a prefix, and move past it. */
+#define	WT_PREFIX_SKIP_REQUIRED(session, str, pfx) do {			\
+	WT_ASSERT(session, WT_PREFIX_MATCH(str, pfx));			\
+	(str) += strlen(pfx);						\
+} while (0)
 
 /*
  * Check if a variable string equals a constant string.  Inline the common
@@ -249,17 +250,41 @@
 	(dst).size = (src).size;					\
 } while (0)
 
+/* Timestamp type and helper macros. */
+#if WT_TIMESTAMP_SIZE > 0
+#define	HAVE_TIMESTAMPS
+#else
+#undef	HAVE_TIMESTAMPS
+#endif
+
+#ifdef HAVE_TIMESTAMPS
+struct __wt_timestamp_t {
+#if WT_TIMESTAMP_SIZE == 8
+	uint64_t val;
+#else
+	uint8_t ts[WT_TIMESTAMP_SIZE];
+#endif
+};
+typedef struct __wt_timestamp_t wt_timestamp_t;
+#define	WT_DECL_TIMESTAMP(x)	wt_timestamp_t x;
+#define	WT_TIMESTAMP_NULL(x)	(x)
+#else
+typedef void wt_timestamp_t;
+#define	WT_DECL_TIMESTAMP(x)
+#define	WT_TIMESTAMP_NULL(x)	(NULL)
+#endif
+
 /*
  * In diagnostic mode we track the locations from which hazard pointers and
  * scratch buffers were acquired.
  */
 #ifdef HAVE_DIAGNOSTIC
 #define	__wt_scr_alloc(session, size, scratchp)				\
-	__wt_scr_alloc_func(session, size, scratchp, __FILE__, __LINE__)
+	__wt_scr_alloc_func(session, size, scratchp, __func__, __LINE__)
 #define	__wt_page_in(session, ref, flags)				\
-	__wt_page_in_func(session, ref, flags, __FILE__, __LINE__)
+	__wt_page_in_func(session, ref, flags, __func__, __LINE__)
 #define	__wt_page_swap(session, held, want, flags)			\
-	__wt_page_swap_func(session, held, want, flags, __FILE__, __LINE__)
+	__wt_page_swap_func(session, held, want, flags, __func__, __LINE__)
 #else
 #define	__wt_scr_alloc(session, size, scratchp)				\
 	__wt_scr_alloc_func(session, size, scratchp)
@@ -268,6 +293,10 @@
 #define	__wt_page_swap(session, held, want, flags)			\
 	__wt_page_swap_func(session, held, want, flags)
 #endif
+
+/* Called on unexpected code path: locate the failure. */
+#define	__wt_illegal_value(session, msg)				\
+	__wt_illegal_value_func(session, msg, __func__, __LINE__)
 
 /* Random number generator state. */
 union __wt_rand_state {

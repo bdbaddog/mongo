@@ -54,8 +54,7 @@ ShardingConnectionHook::ShardingConnectionHook(bool shardedConnections,
 
 void ShardingConnectionHook::onCreate(DBClientBase* conn) {
     if (conn->type() == ConnectionString::INVALID) {
-        throw UserException(ErrorCodes::BadValue,
-                            str::stream() << "Unrecognized connection string.");
+        uasserted(ErrorCodes::BadValue, str::stream() << "Unrecognized connection string.");
     }
 
     // Authenticate as the first thing we do
@@ -73,9 +72,10 @@ void ShardingConnectionHook::onCreate(DBClientBase* conn) {
     // Delegate the metadata hook logic to the egress hook; use lambdas to pass the arguments in
     // the order expected by the egress hook.
     if (_shardedConnections) {
-        conn->setReplyMetadataReader([this](const BSONObj& metadataObj, StringData target) {
-            return _egressHook->readReplyMetadata(target, metadataObj);
-        });
+        conn->setReplyMetadataReader(
+            [this](OperationContext* opCtx, const BSONObj& metadataObj, StringData target) {
+                return _egressHook->readReplyMetadata(opCtx, target, metadataObj);
+            });
     }
     conn->setRequestMetadataWriter([this](OperationContext* opCtx, BSONObjBuilder* metadataBob) {
         return _egressHook->writeRequestMetadata(opCtx, metadataBob);

@@ -38,6 +38,7 @@
 #include "mongo/db/exec/scoped_timer.h"
 #include "mongo/db/exec/working_set.h"
 #include "mongo/db/exec/working_set_common.h"
+#include "mongo/db/repl/optime.h"
 #include "mongo/db/storage/record_fetcher.h"
 #include "mongo/stdx/memory.h"
 #include "mongo/util/fail_point_service.h"
@@ -66,6 +67,14 @@ CollectionScan::CollectionScan(OperationContext* opCtx,
       _wsidForFetch(_workingSet->allocate()) {
     // Explain reports the direction of the collection scan.
     _specificStats.direction = params.direction;
+    _specificStats.maxTs = params.maxTs;
+    invariant(!_params.shouldTrackLatestOplogTimestamp || _params.collection->ns().isOplog());
+
+    if (params.maxTs) {
+        _endConditionBSON = BSON("$gte" << *(params.maxTs));
+        _endCondition = stdx::make_unique<GTEMatchExpression>(repl::OpTime::kTimestampFieldName,
+                                                              _endConditionBSON.firstElement());
+    }
 }
 
 PlanStage::StageState CollectionScan::doWork(WorkingSetID* out) {
@@ -102,7 +111,10 @@ PlanStage::StageState CollectionScan::doWork(WorkingSetID* out) {
                 // non-tailable scans are the only case where a meaningful EOF will be seen that
                 // might not include writes that finished before the read started. This also must be
                 // done before we create the cursor as that is when we establish the endpoint for
-                // the cursor.
+                // the cursor. Also call abandonSnapshot to make sure that we are using a fresh
+                // storage engine snapshot while waiting. Otherwise, we will end up reading from
+                // the snapshot where the oplog entries are not yet visible even after the wait.
+                getOpCtx()->recoveryUnit()->abandonSnapshot();
                 _params.collection->getRecordStore()->waitForAllEarlierOplogWritesToBeVisible(
                     getOpCtx());
             }
@@ -147,7 +159,7 @@ PlanStage::StageState CollectionScan::doWork(WorkingSetID* out) {
 
             record = _cursor->next();
         }
-    } catch (const WriteConflictException& wce) {
+    } catch (const WriteConflictException&) {
         // Leave us in a state to try again next time.
         if (needToMakeCursor)
             _cursor.reset();
@@ -169,6 +181,13 @@ PlanStage::StageState CollectionScan::doWork(WorkingSetID* out) {
     }
 
     _lastSeenId = record->id;
+    if (_params.shouldTrackLatestOplogTimestamp) {
+        auto status = setLatestOplogEntryTimestamp(*record);
+        if (!status.isOK()) {
+            *out = WorkingSetCommon::allocateStatusMember(_workingSet, status);
+            return PlanStage::FAILURE;
+        }
+    }
 
     WorkingSetID id = _workingSet->allocate();
     WorkingSetMember* member = _workingSet->get(id);
@@ -177,6 +196,19 @@ PlanStage::StageState CollectionScan::doWork(WorkingSetID* out) {
     _workingSet->transitionToRecordIdAndObj(id);
 
     return returnIfMatches(member, id, out);
+}
+
+Status CollectionScan::setLatestOplogEntryTimestamp(const Record& record) {
+    auto tsElem = record.data.toBson()[repl::OpTime::kTimestampFieldName];
+    if (tsElem.type() != BSONType::bsonTimestamp) {
+        Status status(ErrorCodes::InternalError,
+                      str::stream() << "CollectionScan was asked to track latest operation time, "
+                                       "but found a result without a valid 'ts' field: "
+                                    << record.data.toBson().toString());
+        return status;
+    }
+    _latestOplogEntryTimestamp = std::max(_latestOplogEntryTimestamp, tsElem.timestamp());
+    return Status::OK();
 }
 
 PlanStage::StageState CollectionScan::returnIfMatches(WorkingSetMember* member,
@@ -190,6 +222,10 @@ PlanStage::StageState CollectionScan::returnIfMatches(WorkingSetMember* member,
         }
         *out = memberID;
         return PlanStage::ADVANCED;
+    } else if (_endCondition && Filter::passes(member, _endCondition.get())) {
+        _workingSet->free(memberID);
+        _commonStats.isEOF = true;
+        return PlanStage::IS_EOF;
     } else {
         _workingSet->free(memberID);
         return PlanStage::NEED_TIME;

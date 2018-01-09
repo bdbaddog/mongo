@@ -59,6 +59,7 @@
 #include "mongo/scripting/mozjs/object.h"
 #include "mongo/scripting/mozjs/oid.h"
 #include "mongo/scripting/mozjs/regexp.h"
+#include "mongo/scripting/mozjs/session.h"
 #include "mongo/scripting/mozjs/timestamp.h"
 #include "mongo/scripting/mozjs/uri.h"
 #include "mongo/stdx/unordered_set.h"
@@ -288,6 +289,11 @@ public:
     }
 
     template <typename T>
+    typename std::enable_if<std::is_same<T, SessionInfo>::value, WrapType<T>&>::type getProto() {
+        return _sessionProto;
+    }
+
+    template <typename T>
     typename std::enable_if<std::is_same<T, TimestampInfo>::value, WrapType<T>&>::type getProto() {
         return _timestampProto;
     }
@@ -308,6 +314,10 @@ public:
     std::size_t getGeneration() const;
 
     void advanceGeneration() override;
+
+    void requireOwnedObjects() override;
+
+    bool requiresOwnedObjects() const;
 
     JS::HandleId getInternedStringId(InternedString name) {
         return _internedStrings.getInternedString(name);
@@ -341,6 +351,9 @@ public:
     };
 
 private:
+    template <typename ImplScopeFunction>
+    auto _runSafely(ImplScopeFunction&& functionToRun) -> decltype(functionToRun());
+
     void _MozJSCreateFunction(StringData raw, JS::MutableHandleValue fun);
 
     /**
@@ -402,6 +415,7 @@ private:
     Status _status;
     std::string _parentStack;
     std::size_t _generation;
+    bool _requireOwnedObjects;
     bool _hasOutOfMemoryException;
 
     WrapType<BinDataInfo> _binDataProto;
@@ -429,6 +443,7 @@ private:
     WrapType<ObjectInfo> _objectProto;
     WrapType<OIDInfo> _oidProto;
     WrapType<RegExpInfo> _regExpProto;
+    WrapType<SessionInfo> _sessionProto;
     WrapType<TimestampInfo> _timestampProto;
     WrapType<URIInfo> _uriProto;
 };

@@ -1,10 +1,25 @@
 /*-
- * Copyright (c) 2014-2017 MongoDB, Inc.
+ * Copyright (c) 2014-2018 MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
  * See the file LICENSE for redistribution information.
  */
+
+/* AUTOMATIC FLAG VALUE GENERATION START */
+#define	WT_LOGSCAN_FIRST	0x1u
+#define	WT_LOGSCAN_FROM_CKP	0x2u
+#define	WT_LOGSCAN_ONE		0x4u
+#define	WT_LOGSCAN_RECOVER	0x8u
+/* AUTOMATIC FLAG VALUE GENERATION STOP */
+
+/* AUTOMATIC FLAG VALUE GENERATION START */
+#define	WT_LOG_BACKGROUND	0x01u
+#define	WT_LOG_DSYNC		0x02u
+#define	WT_LOG_FLUSH		0x04u
+#define	WT_LOG_FSYNC		0x08u
+#define	WT_LOG_SYNC_ENABLED	0x10u
+/* AUTOMATIC FLAG VALUE GENERATION STOP */
 
 /*
  * WT_LSN --
@@ -42,7 +57,7 @@ union __wt_lsn {
 #define	WT_ZERO_LSN(l)	WT_SET_LSN((l), 0, 0)
 
 /*
- * Initialize LSN is (1,0).  We only need to shift the 1 for comparison.
+ * Test for initial LSN.  We only need to shift the 1 for comparison.
  */
 #define	WT_IS_INIT_LSN(l)	((l)->file_offset == ((uint64_t)1 << 32))
 /*
@@ -52,6 +67,17 @@ union __wt_lsn {
 #define	WT_IS_MAX_LSN(lsn)						\
 	((lsn)->l.file == UINT32_MAX &&					\
 	 ((lsn)->l.offset == INT32_MAX || (lsn)->l.offset == UINT32_MAX))
+/*
+ * Test for zero LSN.
+ */
+#define	WT_IS_ZERO_LSN(l)	((l)->file_offset == 0)
+
+/*
+ * Macro to print an LSN.
+ */
+#define	WT_LSN_MSG(lsn, msg)						\
+	__wt_msg(session, "%s LSN: [%" PRIu32 "][%" PRIu32 "]",		\
+	    (msg), (lsn)->l.file, (lsn)->l.offset)
 
 /*
  * Both of the macros below need to change if the content of __wt_lsn
@@ -65,6 +91,17 @@ union __wt_lsn {
     ((const uint8_t *)(data) + offsetof(WT_LOG_RECORD, record))
 #define	WT_LOG_REC_SIZE(size)						\
     ((size) - offsetof(WT_LOG_RECORD, record))
+
+/*
+ * We allocate the buffer size, but trigger a slot switch when we cross
+ * the maximum size of half the buffer.  If a record is more than the buffer
+ * maximum then we trigger a slot switch and write that record unbuffered.
+ * We use a larger buffer to provide overflow space so that we can switch
+ * once we cross the threshold.
+ */
+#define	WT_LOG_SLOT_BUF_SIZE		(256 * 1024)	/* Must be power of 2 */
+#define	WT_LOG_SLOT_BUF_MAX		((uint32_t)log->slot_buf_size / 2)
+#define	WT_LOG_SLOT_UNBUFFERED		(WT_LOG_SLOT_BUF_SIZE << 1)
 
 /*
  * Possible values for the consolidation array slot states:
@@ -81,6 +118,12 @@ union __wt_lsn {
  * a few special states, reserve the top few bits for state.  That makes
  * the maximum size less than 32 bits for both joined and released.
  */
+/*
+ * XXX
+ * The log slot bits are signed and should be rewritten as unsigned. For now,
+ * give the logging subsystem its own flags macro.
+ */
+#define	FLD_LOG_SLOT_ISSET(field, mask)	(((field) & (uint64_t)(mask)) != 0)
 
 /*
  * The high bit is reserved for the special states.  If the high bit is
@@ -88,17 +131,6 @@ union __wt_lsn {
  */
 #define	WT_LOG_SLOT_FREE	(-1)	/* Not in use */
 #define	WT_LOG_SLOT_WRITTEN	(-2)	/* Slot data written, not processed */
-
-/*
- * We allocate the buffer size, but trigger a slot switch when we cross
- * the maximum size of half the buffer.  If a record is more than the buffer
- * maximum then we trigger a slot switch and write that record unbuffered.
- * We use a larger buffer to provide overflow space so that we can switch
- * once we cross the threshold.
- */
-#define	WT_LOG_SLOT_BUF_SIZE		(256 * 1024)	/* Must be power of 2 */
-#define	WT_LOG_SLOT_BUF_MAX		((uint32_t)log->slot_buf_size / 2)
-#define	WT_LOG_SLOT_UNBUFFERED		(WT_LOG_SLOT_BUF_SIZE << 1)
 
 /*
  * If new slot states are added, adjust WT_LOG_SLOT_BITS and
@@ -144,8 +176,8 @@ union __wt_lsn {
 /* Slot is in use, but closed to new joins */
 #define	WT_LOG_SLOT_CLOSED(state)					\
     (WT_LOG_SLOT_ACTIVE(state) &&					\
-    (FLD64_ISSET((uint64_t)(state), WT_LOG_SLOT_CLOSE) &&		\
-    !FLD64_ISSET((uint64_t)(state), WT_LOG_SLOT_RESERVED)))
+    (FLD_LOG_SLOT_ISSET((uint64_t)(state), WT_LOG_SLOT_CLOSE) &&	\
+    !FLD_LOG_SLOT_ISSET((uint64_t)(state), WT_LOG_SLOT_RESERVED)))
 /* Slot is in use, all data copied into buffer */
 #define	WT_LOG_SLOT_INPROGRESS(state)					\
     (WT_LOG_SLOT_RELEASED(state) != WT_LOG_SLOT_JOINED(state))
@@ -156,7 +188,7 @@ union __wt_lsn {
 #define	WT_LOG_SLOT_OPEN(state)						\
     (WT_LOG_SLOT_ACTIVE(state) &&					\
     !WT_LOG_SLOT_UNBUFFERED_ISSET(state) &&				\
-    !FLD64_ISSET((uint64_t)(state), WT_LOG_SLOT_CLOSE) &&		\
+    !FLD_LOG_SLOT_ISSET((uint64_t)(state), WT_LOG_SLOT_CLOSE) &&	\
     WT_LOG_SLOT_JOINED(state) < WT_LOG_SLOT_BUF_MAX)
 
 struct __wt_logslot {
@@ -172,11 +204,13 @@ struct __wt_logslot {
 	WT_FH	*slot_fh;		/* File handle for this group */
 	WT_ITEM  slot_buf;		/* Buffer for grouped writes */
 
-#define	WT_SLOT_CLOSEFH		0x01		/* Close old fh on release */
-#define	WT_SLOT_FLUSH		0x02		/* Wait for write */
-#define	WT_SLOT_SYNC		0x04		/* Needs sync on release */
-#define	WT_SLOT_SYNC_DIR	0x08		/* Directory sync on release */
-	uint32_t flags;			/* Flags */
+/* AUTOMATIC FLAG VALUE GENERATION START */
+#define	WT_SLOT_CLOSEFH		0x1u		/* Close old fh on release */
+#define	WT_SLOT_FLUSH		0x2u		/* Wait for write */
+#define	WT_SLOT_SYNC		0x4u		/* Needs sync on release */
+#define	WT_SLOT_SYNC_DIR	0x8u		/* Directory sync on release */
+/* AUTOMATIC FLAG VALUE GENERATION STOP */
+	uint32_t flags;
 	WT_CACHE_LINE_PAD_END
 };
 
@@ -192,16 +226,20 @@ struct __wt_myslot {
 	WT_LOGSLOT	*slot;		/* Slot I'm using */
 	wt_off_t	 end_offset;	/* My end offset in buffer */
 	wt_off_t	 offset;	/* Slot buffer offset */
-#define	WT_MYSLOT_CLOSE		0x01	/* This thread is closing the slot */
-#define	WT_MYSLOT_NEEDS_RELEASE	0x02	/* This thread is releasing the slot */
-#define	WT_MYSLOT_UNBUFFERED	0x04	/* Write directly */
-	uint32_t flags;			/* Flags */
+
+/* AUTOMATIC FLAG VALUE GENERATION START */
+#define	WT_MYSLOT_CLOSE		0x1u	/* This thread is closing the slot */
+#define	WT_MYSLOT_NEEDS_RELEASE	0x2u	/* This thread is releasing the slot */
+#define	WT_MYSLOT_UNBUFFERED	0x4u	/* Write directly */
+/* AUTOMATIC FLAG VALUE GENERATION STOP */
+	uint32_t flags;
 };
 
-#define	WT_LOG_FIRST_RECORD	log->allocsize
+#define	WT_LOG_END_HEADER	log->allocsize
 
 struct __wt_log {
 	uint32_t	allocsize;	/* Allocation alignment size */
+	uint32_t	first_record;	/* Offset of first record in file */
 	wt_off_t	log_written;	/* Amount of log written this period */
 	/*
 	 * Log file information
@@ -214,6 +252,8 @@ struct __wt_log {
 	WT_FH           *log_dir_fh;	/* Log directory file handle */
 	WT_FH           *log_close_fh;	/* Logging file handle to close */
 	WT_LSN		 log_close_lsn;	/* LSN needed to close */
+
+	uint16_t	 log_version;	/* Version of log file */
 
 	/*
 	 * System LSNs
@@ -232,6 +272,7 @@ struct __wt_log {
 	 * Synchronization resources
 	 */
 	WT_SPINLOCK      log_lock;      /* Locked: Logging fields */
+	WT_SPINLOCK      log_fs_lock;   /* Locked: tmp, prep and log files */
 	WT_SPINLOCK      log_slot_lock; /* Locked: Consolidation array */
 	WT_SPINLOCK      log_sync_lock; /* Locked: Single-thread fsync */
 	WT_SPINLOCK      log_writelsn_lock; /* Locked: write LSN */
@@ -261,8 +302,11 @@ struct __wt_log {
 	uint64_t	 write_calls;		/* Calls to log_write */
 #endif
 
-#define	WT_LOG_OPENED		0x01	/* Log subsystem successfully open */
-#define	WT_LOG_TRUNCATE_NOTSUP	0x02	/* File system truncate not supported */
+/* AUTOMATIC FLAG VALUE GENERATION START */
+#define	WT_LOG_FORCE_NEWFILE	0x1u	/* Force switch to new log file */
+#define	WT_LOG_OPENED		0x2u	/* Log subsystem successfully open */
+#define	WT_LOG_TRUNCATE_NOTSUP	0x4u	/* File system truncate not supported */
+/* AUTOMATIC FLAG VALUE GENERATION STOP */
 	uint32_t	flags;
 };
 
@@ -270,8 +314,12 @@ struct __wt_log_record {
 	uint32_t	len;		/* 00-03: Record length including hdr */
 	uint32_t	checksum;	/* 04-07: Checksum of the record */
 
-#define	WT_LOG_RECORD_COMPRESSED	0x01	/* Compressed except hdr */
-#define	WT_LOG_RECORD_ENCRYPTED		0x02	/* Encrypted except hdr */
+	/*
+	 * No automatic generation: flag values cannot change, they're written
+	 * to disk.
+	 */
+#define	WT_LOG_RECORD_COMPRESSED	0x01u	/* Compressed except hdr */
+#define	WT_LOG_RECORD_ENCRYPTED		0x02u	/* Encrypted except hdr */
 	uint16_t	flags;		/* 08-09: Flags */
 	uint8_t		unused[2];	/* 10-11: Padding */
 	uint32_t	mem_len;	/* 12-15: Uncompressed len if needed */
@@ -301,14 +349,24 @@ __wt_log_record_byteswap(WT_LOG_RECORD *record)
  *	The log file's description.
  */
 struct __wt_log_desc {
-#define	WT_LOG_MAGIC		0x101064
+#define	WT_LOG_MAGIC		0x101064u
 	uint32_t	log_magic;	/* 00-03: Magic number */
-#define	WT_LOG_MAJOR_VERSION	1
-	uint16_t	majorv;		/* 04-05: Major version */
-#define	WT_LOG_MINOR_VERSION	0
-	uint16_t	minorv;		/* 06-07: Minor version */
+#define	WT_LOG_VERSION	2
+	uint16_t	version;	/* 04-05: Log version */
+	uint16_t	unused;		/* 06-07: Unused */
 	uint64_t	log_size;	/* 08-15: Log file size */
 };
+/*
+ * This is the log version that introduced the system record.
+ */
+#define	WT_LOG_VERSION_SYSTEM	2
+
+/*
+ * WiredTiger release version where log format version changed.
+ * We only have to check the major version for now.  It is minor
+ * version 0 once release numbers move on.
+ */
+#define	WT_LOG_V2	3
 
 /*
  * __wt_log_desc_byteswap --
@@ -320,8 +378,8 @@ __wt_log_desc_byteswap(WT_LOG_DESC *desc)
 {
 #ifdef	WORDS_BIGENDIAN
 	desc->log_magic = __wt_bswap32(desc->log_magic);
-	desc->majorv = __wt_bswap16(desc->majorv);
-	desc->minorv = __wt_bswap16(desc->minorv);
+	desc->version = __wt_bswap16(desc->version);
+	desc->unused = __wt_bswap16(desc->unused);
 	desc->log_size = __wt_bswap64(desc->log_size);
 #else
 	WT_UNUSED(desc);
@@ -331,7 +389,9 @@ __wt_log_desc_byteswap(WT_LOG_DESC *desc)
 /*
  * Flags for __wt_txn_op_printlog.
  */
-#define	WT_TXN_PRINTLOG_HEX	0x0001	/* Add hex output */
+/* AUTOMATIC FLAG VALUE GENERATION START */
+#define	WT_TXN_PRINTLOG_HEX	0x1u	/* Add hex output */
+/* AUTOMATIC FLAG VALUE GENERATION STOP */
 
 /*
  * WT_LOG_REC_DESC --

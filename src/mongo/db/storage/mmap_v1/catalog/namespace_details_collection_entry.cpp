@@ -34,6 +34,7 @@
 
 #include "mongo/db/catalog/database.h"
 #include "mongo/db/catalog/database_holder.h"
+#include "mongo/db/catalog/uuid_catalog.h"
 #include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/ops/update.h"
 #include "mongo/db/record_id.h"
@@ -103,6 +104,19 @@ void NamespaceDetailsCollectionCatalogEntry::getAllIndexes(OperationContext* opC
         const IndexDetails& id = i.next();
         const BSONObj obj = _indexRecordStore->dataFor(opCtx, id.info.toRecordId()).toBson();
         names->push_back(obj.getStringField("name"));
+    }
+}
+
+void NamespaceDetailsCollectionCatalogEntry::getReadyIndexes(
+    OperationContext* opCtx, std::vector<std::string>* names) const {
+    NamespaceDetails::IndexIterator i = _details->ii(true);
+    while (i.more()) {
+        const IndexDetails& id = i.next();
+        const BSONObj obj = _indexRecordStore->dataFor(opCtx, id.info.toRecordId()).toBson();
+        const char* idxName = obj.getStringField("name");
+        if (isIndexReady(opCtx, StringData(idxName))) {
+            names->push_back(idxName);
+        }
     }
 }
 
@@ -279,8 +293,9 @@ Status NamespaceDetailsCollectionCatalogEntry::prepareForIndexBuild(OperationCon
                                                                     const IndexDescriptor* desc) {
     BSONObj spec = desc->infoObj();
     // 1) entry in system.indexs
+    // TODO SERVER-30638: using timestamp 0 for these inserts.
     StatusWith<RecordId> systemIndexesEntry =
-        _indexRecordStore->insertRecord(opCtx, spec.objdata(), spec.objsize(), false);
+        _indexRecordStore->insertRecord(opCtx, spec.objdata(), spec.objsize(), Timestamp(), false);
     if (!systemIndexesEntry.isOK())
         return systemIndexesEntry.getStatus();
 
@@ -334,7 +349,7 @@ void NamespaceDetailsCollectionCatalogEntry::indexBuildSuccess(OperationContext*
         setIndexIsMultikey(opCtx, toIdxNo, tempMultikey);
 
         idxNo = toIdxNo;
-        invariant((idxNo = _findIndexNumber(opCtx, indexName)));
+        invariant((idxNo == _findIndexNumber(opCtx, indexName)));
     }
 
     opCtx->recoveryUnit()->writingInt(_details->indexBuildsInProgress) -= 1;
@@ -384,14 +399,15 @@ void NamespaceDetailsCollectionCatalogEntry::_updateSystemNamespaces(OperationCo
         return;
 
     RecordData entry = _namespacesRecordStore->dataFor(opCtx, _namespacesRecordId);
-    const BSONObj newEntry = applyUpdateOperators(entry.releaseToBson(), update);
+    const BSONObj newEntry = applyUpdateOperators(opCtx, entry.releaseToBson(), update);
 
     Status result = _namespacesRecordStore->updateRecord(
         opCtx, _namespacesRecordId, newEntry.objdata(), newEntry.objsize(), false, NULL);
 
     if (ErrorCodes::NeedsDocumentMove == result) {
+        // TODO SERVER-30638: using timestamp 0 for these inserts.
         StatusWith<RecordId> newLocation = _namespacesRecordStore->insertRecord(
-            opCtx, newEntry.objdata(), newEntry.objsize(), false);
+            opCtx, newEntry.objdata(), newEntry.objsize(), Timestamp(), false);
         fassert(40074, newLocation.getStatus().isOK());
 
         // Invalidate old namespace record
@@ -412,6 +428,73 @@ void NamespaceDetailsCollectionCatalogEntry::updateFlags(OperationContext* opCtx
     _updateSystemNamespaces(opCtx, BSON("$set" << BSON("options.flags" << newValue)));
 }
 
+void NamespaceDetailsCollectionCatalogEntry::addUUID(OperationContext* opCtx,
+                                                     CollectionUUID uuid,
+                                                     Collection* coll) {
+    // Add a UUID to CollectionOptions if a UUID does not yet exist.
+    if (ns().coll() == "system.namespaces") {
+        return;
+    }
+    RecordData namespaceData;
+    invariant(_namespacesRecordStore->findRecord(opCtx, _namespacesRecordId, &namespaceData));
+
+    auto namespacesBson = namespaceData.releaseToBson();
+
+    if (namespacesBson["options"].isABSONObj() && !namespacesBson["options"].Obj()["uuid"].eoo()) {
+        fassert(40565, UUID::parse(namespacesBson["options"].Obj()["uuid"]).getValue() == uuid);
+    } else {
+        _updateSystemNamespaces(opCtx, BSON("$set" << BSON("options.uuid" << uuid)));
+        UUIDCatalog& catalog = UUIDCatalog::get(opCtx->getServiceContext());
+        catalog.onCreateCollection(opCtx, coll, uuid);
+    }
+}
+
+void NamespaceDetailsCollectionCatalogEntry::removeUUID(OperationContext* opCtx) {
+    // Remove the UUID from CollectionOptions if a UUID exists.
+    if (ns().coll() == "system.namespaces") {
+        return;
+    }
+    RecordData namespaceData;
+    invariant(_namespacesRecordStore->findRecord(opCtx, _namespacesRecordId, &namespaceData));
+    auto namespacesBson = namespaceData.releaseToBson();
+    if (!namespacesBson["options"].isABSONObj()) {
+        return;
+    }
+    auto optionsObj = namespacesBson["options"].Obj();
+
+    if (!optionsObj["uuid"].eoo()) {
+        CollectionUUID uuid = UUID::parse(optionsObj["uuid"]).getValue();
+        _updateSystemNamespaces(opCtx,
+                                BSON("$unset" << BSON("options.uuid"
+                                                      << "")));
+        UUIDCatalog& catalog = UUIDCatalog::get(opCtx->getServiceContext());
+        Collection* coll = catalog.lookupCollectionByUUID(uuid);
+        if (coll) {
+            catalog.onDropCollection(opCtx, uuid);
+        }
+    }
+}
+
+bool NamespaceDetailsCollectionCatalogEntry::isEqualToMetadataUUID(OperationContext* opCtx,
+                                                                   OptionalCollectionUUID uuid) {
+    if (ns().coll() != "system.namespaces") {
+        RecordData namespaceData;
+        invariant(_namespacesRecordStore->findRecord(opCtx, _namespacesRecordId, &namespaceData));
+
+        auto namespacesBson = namespaceData.releaseToBson();
+        if (uuid && namespacesBson["options"].isABSONObj()) {
+            auto optionsObj = namespacesBson["options"].Obj();
+            return !optionsObj["uuid"].eoo() &&
+                UUID::parse(optionsObj["uuid"]).getValue() == uuid.get();
+        } else {
+            return !uuid && (!namespacesBson["options"].isABSONObj() ||
+                             namespacesBson["options"].Obj()["uuid"].eoo());
+        }
+    } else {
+        return true;
+    }
+}
+
 void NamespaceDetailsCollectionCatalogEntry::updateValidator(OperationContext* opCtx,
                                                              const BSONObj& validator,
                                                              StringData validationLevel,
@@ -423,6 +506,11 @@ void NamespaceDetailsCollectionCatalogEntry::updateValidator(OperationContext* o
                                                 << "options.validationAction"
                                                 << validationAction)));
 }
+
+void NamespaceDetailsCollectionCatalogEntry::setIsTemp(OperationContext* opCtx, bool isTemp) {
+    _updateSystemNamespaces(opCtx, BSON("$set" << BSON("options.temp" << isTemp)));
+}
+
 
 void NamespaceDetailsCollectionCatalogEntry::setNamespacesRecordId(OperationContext* opCtx,
                                                                    RecordId newId) {
@@ -441,5 +529,10 @@ void NamespaceDetailsCollectionCatalogEntry::setNamespacesRecordId(OperationCont
         }
         _namespacesRecordId = newId;
     }
+}
+
+void NamespaceDetailsCollectionCatalogEntry::updateCappedSize(OperationContext* opCtx,
+                                                              long long size) {
+    invariant(false);
 }
 }

@@ -50,6 +50,19 @@ OperationShardingState& OperationShardingState::get(OperationContext* opCtx) {
     return shardingMetadataDecoration(opCtx);
 }
 
+void OperationShardingState::setAllowImplicitCollectionCreation(
+    const BSONElement& allowImplicitCollectionCreationElem) {
+    if (!allowImplicitCollectionCreationElem.eoo()) {
+        _allowImplicitCollectionCreation = allowImplicitCollectionCreationElem.Bool();
+    } else {
+        _allowImplicitCollectionCreation = true;
+    }
+}
+
+bool OperationShardingState::allowImplicitCollectionCreation() const {
+    return _allowImplicitCollectionCreation;
+}
+
 void OperationShardingState::initializeShardVersion(NamespaceString nss,
                                                     const BSONElement& shardVersionElt) {
     invariant(!hasShardVersion());
@@ -128,27 +141,6 @@ void OperationShardingState::_clear() {
     _hasVersion = false;
     _shardVersion = ChunkVersion();
     _ns = NamespaceString();
-}
-
-OperationShardingState::IgnoreVersioningBlock::IgnoreVersioningBlock(OperationContext* opCtx,
-                                                                     const NamespaceString& ns)
-    : _opCtx(opCtx), _ns(ns) {
-    auto& oss = OperationShardingState::get(opCtx);
-    _hadOriginalVersion = oss._hasVersion;
-    if (_hadOriginalVersion) {
-        _originalVersion = oss.getShardVersion(ns);
-    }
-    oss.setShardVersion(ns, ChunkVersion::IGNORED());
-}
-
-OperationShardingState::IgnoreVersioningBlock::~IgnoreVersioningBlock() {
-    auto& oss = OperationShardingState::get(_opCtx);
-    invariant(ChunkVersion::isIgnoredVersion(oss.getShardVersion(_ns)));
-    if (_hadOriginalVersion) {
-        oss.setShardVersion(_ns, _originalVersion);
-    } else {
-        oss._clear();
-    }
 }
 
 }  // namespace mongo

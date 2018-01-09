@@ -11,23 +11,10 @@ if (!Mongo.prototype) {
     throw Error("Mongo.prototype not defined");
 }
 
-(function(original) {
-    Mongo.prototype.find = function find(ns, query, fields, limit, skip, batchSize, options) {
-        const self = this;
-        if (this._isCausal) {
-            query = this._gossipLogicalTime(query);
-        }
-        const res = original.call(this, ns, query, fields, limit, skip, batchSize, options);
-        const origNext = res.next;
-        res.next = function next() {
-            const ret = origNext.call(this);
-            self._setLogicalTimeFromReply(ret);
-            return ret;
-        };
-        return res;
+if (!Mongo.prototype.find)
+    Mongo.prototype.find = function(ns, query, fields, limit, skip, batchSize, options) {
+        throw Error("find not implemented");
     };
-})(Mongo.prototype.find);
-
 if (!Mongo.prototype.insert)
     Mongo.prototype.insert = function(ns, obj) {
         throw Error("insert not implemented");
@@ -44,53 +31,6 @@ if (!Mongo.prototype.update)
 if (typeof mongoInject == "function") {
     mongoInject(Mongo.prototype);
 }
-
-Mongo.prototype.setCausalConsistency = function(value) {
-    if (arguments.length === 0) {
-        value = true;
-    }
-    this._isCausal = value;
-};
-
-Mongo.prototype.isCausalConsistencyEnabled = function(cmdName, cmdObj) {
-    if (!this._isCausal) {
-        return false;
-    }
-
-    // Currently, read concern afterClusterTime is only supported for read concern level majority.
-    var commandsThatSupportMajorityReadConcern = [
-        "count",
-        "distinct",
-        "find",
-        "geoNear",
-        "geoSearch",
-        "group",
-        "mapReduce",
-        "mapreduce",
-        "parallelCollectionScan",
-    ];
-
-    var supportsMajorityReadConcern =
-        Array.contains(commandsThatSupportMajorityReadConcern, cmdName);
-
-    if (cmdName === "aggregate") {
-        // Aggregate can be either a read or a write depending on whether it has a $out stage.
-        // $out is required to be the last stage of the pipeline.
-        var stages = cmdObj.pipeline;
-        const lastStage = stages && Array.isArray(stages) && (stages.length !== 0)
-            ? stages[stages.length - 1]
-            : undefined;
-        const hasOut =
-            lastStage && (typeof lastStage === "object") && lastStage.hasOwnProperty("$out");
-        const hasExplain = cmdObj.hasOwnProperty("explain");
-
-        if (!hasExplain && !hasOut) {
-            supportsMajorityReadConcern = true;
-        }
-    }
-
-    return supportsMajorityReadConcern;
-};
 
 Mongo.prototype.setSlaveOk = function(value) {
     if (value == undefined)
@@ -116,96 +56,15 @@ Mongo.prototype.getDB = function(name) {
     return new DB(this, name);
 };
 
-Mongo.prototype.getDBs = function() {
-    var res = this.adminCommand({"listDatabases": 1});
+Mongo.prototype.getDBs = function(driverSession = this._getDefaultSession()) {
+    var cmdObj = {listDatabases: 1};
+    cmdObj = driverSession._serverSession.injectSessionId(cmdObj);
+
+    var res = this.adminCommand(cmdObj);
     if (!res.ok)
         throw _getErrorWithCode(res, "listDatabases failed:" + tojson(res));
     return res;
 };
-
-/**
- *  Adds afterClusterTime to the readConcern.
- */
-Mongo.prototype._injectAfterClusterTime = function(cmdObj) {
-    cmdObj = Object.assign({}, cmdObj);
-    // The operationTime returned by the current session (i.e. connection) is the
-    // smallest time that is needed for causal consistent read. The clusterTime is >=
-    // the operationTime so it's less efficient to wait on the server for the
-    // clusterTime.
-    const operationTime = this.getOperationTime();
-    if (operationTime) {
-        const readConcern = Object.assign({}, cmdObj.readConcern);
-        // Currently server supports afterClusterTime only with level:majority. Going forward it
-        // will be relaxed for any level of readConcern.
-        if (!readConcern.hasOwnProperty("level") || readConcern.level === "majority") {
-            if (!readConcern.hasOwnProperty("afterClusterTime")) {
-                readConcern.afterClusterTime = operationTime;
-            }
-            readConcern.level = "majority";
-            cmdObj.readConcern = readConcern;
-        }
-    }
-    return cmdObj;
-};
-
-Mongo.prototype._gossipLogicalTime = function(obj) {
-    obj = Object.assign({}, obj);
-    const clusterTime = this.getClusterTime();
-    if (clusterTime) {
-        obj["$logicalTime"] = clusterTime;
-    }
-    return obj;
-};
-
-/**
- * Sets logicalTime and operationTime extracted from command reply.
- * This is applicable for the protocol starting from version 3.6.
- */
-Mongo.prototype._setLogicalTimeFromReply = function(res) {
-    if (res.hasOwnProperty("operationTime")) {
-        this.setOperationTime(res["operationTime"]);
-    }
-    if (res.hasOwnProperty("$logicalTime")) {
-        this.setClusterTime(res["$logicalTime"]);
-    }
-};
-
-/**
- *  Adds afterClusterTime to the readConcern if its supported and runs the command.
- */
-(function(original) {
-    Mongo.prototype.runCommandWithMetadata = function runCommandWithMetadata(
-        dbName, cmdName, metadata, cmdObj) {
-        if (this.isCausalConsistencyEnabled(cmdName, cmdObj) && cmdObj) {
-            cmdObj = this._injectAfterClusterTime(cmdObj);
-        }
-        if (this._isCausal) {
-            metadata = this._gossipLogicalTime(metadata);
-        }
-        const res = original.call(this, dbName, cmdName, metadata, cmdObj);
-        this._setLogicalTimeFromReply(res);
-        return res;
-    };
-})(Mongo.prototype.runCommandWithMetadata);
-
-/**
- *  Adds afterClusterTime to the readConcern if its supported and runs the command.
- */
-(function(original) {
-    Mongo.prototype.runCommand = function runCommand(dbName, cmdObj, options) {
-        const cmdName = Object.keys(cmdObj)[0];
-
-        if (this.isCausalConsistencyEnabled(cmdName, cmdObj) && cmdObj) {
-            cmdObj = this._injectAfterClusterTime(cmdObj);
-        }
-        if (this._isCausal) {
-            cmdObj = this._gossipLogicalTime(cmdObj);
-        }
-        const res = original.call(this, dbName, cmdObj, options);
-        this._setLogicalTimeFromReply(res);
-        return res;
-    };
-})(Mongo.prototype.runCommand);
 
 Mongo.prototype.adminCommand = function(cmd) {
     return this.getDB("admin").runCommand(cmd);
@@ -214,8 +73,11 @@ Mongo.prototype.adminCommand = function(cmd) {
 /**
  * Returns all log components and current verbosity values
  */
-Mongo.prototype.getLogComponents = function() {
-    var res = this.adminCommand({getParameter: 1, logComponentVerbosity: 1});
+Mongo.prototype.getLogComponents = function(driverSession = this._getDefaultSession()) {
+    var cmdObj = {getParameter: 1, logComponentVerbosity: 1};
+    cmdObj = driverSession._serverSession.injectSessionId(cmdObj);
+
+    var res = this.adminCommand(cmdObj);
     if (!res.ok)
         throw _getErrorWithCode(res, "getLogComponents failed:" + tojson(res));
     return res.logComponentVerbosity;
@@ -225,7 +87,8 @@ Mongo.prototype.getLogComponents = function() {
  * Accepts optional second argument "component",
  * string of form "storage.journaling"
  */
-Mongo.prototype.setLogLevel = function(logLevel, component) {
+Mongo.prototype.setLogLevel = function(
+    logLevel, component, driverSession = this._getDefaultSession()) {
     componentNames = [];
     if (typeof component === "string") {
         componentNames = component.split(".");
@@ -241,7 +104,11 @@ Mongo.prototype.setLogLevel = function(logLevel, component) {
         obj[key] = vDoc;
         vDoc = obj;
     }
-    var res = this.adminCommand({setParameter: 1, logComponentVerbosity: vDoc});
+
+    var cmdObj = {setParameter: 1, logComponentVerbosity: vDoc};
+    cmdObj = driverSession._serverSession.injectSessionId(cmdObj);
+
+    var res = this.adminCommand(cmdObj);
     if (!res.ok)
         throw _getErrorWithCode(res, "setLogLevel failed:" + tojson(res));
     return res;
@@ -364,9 +231,12 @@ connect = function(url, user, pass) {
         throw Error("Empty connection string");
     }
 
-    if (!url.startsWith("mongodb://")) {
+    if (!url.startsWith("mongodb://") && !url.startsWith("mongodb+srv://")) {
         const colon = url.lastIndexOf(":");
         const slash = url.lastIndexOf("/");
+        if (url.split("/").length > 1) {
+            url = url.substring(0, slash).replace(/\//g, "%2F") + url.substring(slash);
+        }
         if (slash == 0) {
             throw Error("Failed to parse mongodb:// URL: " + url);
         }
@@ -524,44 +394,71 @@ Mongo.prototype.unsetWriteConcern = function() {
     delete this._writeConcern;
 };
 
-/**
- * Sets the operationTime.
- */
-Mongo.prototype.setOperationTime = function(operationTime) {
-    if (this._operationTime === undefined || this._operationTime === null ||
-        (typeof operationTime === "object" &&
-         bsonWoCompare(operationTime, this._operationTime) === 1)) {
-        this._operationTime = operationTime;
+Mongo.prototype.advanceClusterTime = function(newTime) {
+    if (!newTime.hasOwnProperty("clusterTime")) {
+        throw new Error("missing clusterTime field in setClusterTime argument");
+    }
+
+    if (typeof this._clusterTime === "object" && this._clusterTime !== null) {
+        this._clusterTime =
+            (bsonWoCompare({_: this._clusterTime.clusterTime}, {_: newTime.clusterTime}) >= 0)
+            ? this._clusterTime
+            : newTime;
+    } else {
+        this._clusterTime = newTime;
     }
 };
 
-/**
- * Gets the operationTime or null if unset.
- */
-Mongo.prototype.getOperationTime = function() {
-    if (this._operationTime === undefined) {
-        return null;
-    }
-    return this._operationTime;
+Mongo.prototype.resetClusterTime_forTesting = function() {
+    delete this._clusterTime;
 };
 
-/**
- * Sets the clusterTime.
- */
-Mongo.prototype.setClusterTime = function(logicalTimeObj) {
-    if (typeof logicalTimeObj === "object" && logicalTimeObj.hasOwnProperty("clusterTime") &&
-        (this._clusterTime === undefined || this._clusterTime === null ||
-         bsonWoCompare(logicalTimeObj.clusterTime, this._clusterTime.clusterTime) === 1)) {
-        this._clusterTime = logicalTimeObj;
-    }
-};
-
-/**
- * Gets the clusterTime or null if unset.
- */
 Mongo.prototype.getClusterTime = function() {
-    if (this._clusterTime === undefined) {
-        return null;
-    }
     return this._clusterTime;
+};
+
+Mongo.prototype.startSession = function startSession(options) {
+    return new DriverSession(this, options);
+};
+
+Mongo.prototype._getDefaultSession = function getDefaultSession() {
+    // We implicitly associate a Mongo connection object with a DriverSession so that tests which
+    // call DB.prototype.getMongo() and then Mongo.prototype.getDB() to get a different DB instance
+    // are still causally consistent.
+    if (!this.hasOwnProperty("_defaultSession")) {
+        this._defaultSession = new _DummyDriverSession(this);
+    }
+    return this._defaultSession;
+};
+
+Mongo.prototype.isCausalConsistency = function isCausalConsistency() {
+    if (!this.hasOwnProperty("_causalConsistency")) {
+        this._causalConsistency = false;
+    }
+    return this._causalConsistency;
+};
+
+Mongo.prototype.setCausalConsistency = function setCausalConsistency(causalConsistency = true) {
+    this._causalConsistency = causalConsistency;
+};
+
+Mongo.prototype.waitForClusterTime = function waitForClusterTime(maxRetries = 10) {
+    let isFirstTime = true;
+    let count = 0;
+    while (count < maxRetries) {
+        if (typeof this._clusterTime === "object" && this._clusterTime !== null) {
+            if (this._clusterTime.hasOwnProperty("signature") &&
+                this._clusterTime.signature.keyId > 0) {
+                return;
+            }
+        }
+        if (isFirstTime) {
+            isFirstTime = false;
+        } else {
+            sleep(500);
+        }
+        count++;
+        this.adminCommand({"ping": 1});
+    }
+    throw new Error("failed waiting for non default clusterTime");
 };

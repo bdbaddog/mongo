@@ -34,6 +34,7 @@
 #include "mongo/base/status_with.h"
 #include "mongo/base/string_data.h"
 #include "mongo/bson/bsonobj.h"
+#include "mongo/bson/timestamp.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/repl/storage_interface.h"
 #include "mongo/stdx/mutex.h"
@@ -89,15 +90,20 @@ public:
             const CollectionOptions& options,
             const BSONObj idIndexSpec,
             const std::vector<BSONObj>& secondaryIndexSpecs)>;
-    using InsertDocumentFn = stdx::function<Status(
-        OperationContext* opCtx, const NamespaceString& nss, const BSONObj& doc)>;
-    using InsertDocumentsFn = stdx::function<Status(
-        OperationContext* opCtx, const NamespaceString& nss, const std::vector<BSONObj>& docs)>;
+    using InsertDocumentFn = stdx::function<Status(OperationContext* opCtx,
+                                                   const NamespaceString& nss,
+                                                   const TimestampedBSONObj& doc,
+                                                   long long term)>;
+    using InsertDocumentsFn = stdx::function<Status(OperationContext* opCtx,
+                                                    const NamespaceString& nss,
+                                                    const std::vector<InsertStatement>& docs)>;
     using DropUserDatabasesFn = stdx::function<Status(OperationContext* opCtx)>;
     using CreateOplogFn =
         stdx::function<Status(OperationContext* opCtx, const NamespaceString& nss)>;
     using CreateCollectionFn = stdx::function<Status(
         OperationContext* opCtx, const NamespaceString& nss, const CollectionOptions& options)>;
+    using TruncateCollectionFn =
+        stdx::function<Status(OperationContext* opCtx, const NamespaceString& nss)>;
     using DropCollectionFn =
         stdx::function<Status(OperationContext* opCtx, const NamespaceString& nss)>;
     using FindDocumentsFn =
@@ -117,12 +123,15 @@ public:
                                                         BoundInclusion boundInclusion,
                                                         std::size_t limit)>;
     using IsAdminDbValidFn = stdx::function<Status(OperationContext* opCtx)>;
+    using GetCollectionUUIDFn = stdx::function<StatusWith<OptionalCollectionUUID>(
+        OperationContext* opCtx, const NamespaceString& nss)>;
+    using UpgradeUUIDSchemaVersionNonReplicatedFn = stdx::function<Status(OperationContext* opCtx)>;
 
     StorageInterfaceMock() = default;
 
     StatusWith<int> getRollbackID(OperationContext* opCtx) override;
-    Status initializeRollbackID(OperationContext* opCtx) override;
-    Status incrementRollbackID(OperationContext* opCtx) override;
+    StatusWith<int> initializeRollbackID(OperationContext* opCtx) override;
+    StatusWith<int> incrementRollbackID(OperationContext* opCtx) override;
 
     StatusWith<std::unique_ptr<CollectionBulkLoader>> createCollectionForBulkLoading(
         const NamespaceString& nss,
@@ -134,13 +143,14 @@ public:
 
     Status insertDocument(OperationContext* opCtx,
                           const NamespaceString& nss,
-                          const BSONObj& doc) override {
-        return insertDocumentFn(opCtx, nss, doc);
+                          const TimestampedBSONObj& doc,
+                          long long term) override {
+        return insertDocumentFn(opCtx, nss, doc, term);
     };
 
     Status insertDocuments(OperationContext* opCtx,
                            const NamespaceString& nss,
-                           const std::vector<BSONObj>& docs) override {
+                           const std::vector<InsertStatement>& docs) override {
         return insertDocumentsFn(opCtx, nss, docs);
     }
 
@@ -166,6 +176,10 @@ public:
     Status dropCollection(OperationContext* opCtx, const NamespaceString& nss) override {
         return dropCollFn(opCtx, nss);
     };
+
+    Status truncateCollection(OperationContext* opCtx, const NamespaceString& nss) override {
+        return truncateCollFn(opCtx, nss);
+    }
 
     Status renameCollection(OperationContext* opCtx,
                             const NamespaceString& fromNS,
@@ -204,8 +218,15 @@ public:
 
     Status putSingleton(OperationContext* opCtx,
                         const NamespaceString& nss,
-                        const BSONObj& update) override {
+                        const TimestampedBSONObj& update) override {
         return Status{ErrorCodes::IllegalOperation, "putSingleton not implemented."};
+    }
+
+    Status updateSingleton(OperationContext* opCtx,
+                           const NamespaceString& nss,
+                           const BSONObj& query,
+                           const TimestampedBSONObj& update) override {
+        return Status{ErrorCodes::IllegalOperation, "updateSingleton not implemented."};
     }
 
     StatusWith<BSONObj> findById(OperationContext* opCtx,
@@ -243,10 +264,34 @@ public:
         return 0;
     }
 
+    StatusWith<OptionalCollectionUUID> getCollectionUUID(OperationContext* opCtx,
+                                                         const NamespaceString& nss) override {
+        return getCollectionUUIDFn(opCtx, nss);
+    }
+
+    Status upgradeUUIDSchemaVersionNonReplicated(OperationContext* opCtx) override {
+        return upgradeUUIDSchemaVersionNonReplicatedFn(opCtx);
+    }
+
+    void setStableTimestamp(ServiceContext* serviceCtx, Timestamp snapshotName) override;
+
+    void setInitialDataTimestamp(ServiceContext* serviceCtx, Timestamp snapshotName) override;
+
+    Timestamp getStableTimestamp() const;
+
+    Timestamp getInitialDataTimestamp() const;
+
+    Status recoverToStableTimestamp(ServiceContext* serviceCtx) override {
+        return Status{ErrorCodes::IllegalOperation, "recoverToStableTimestamp not implemented."};
+    }
+
     Status isAdminDbValid(OperationContext* opCtx) override {
         return isAdminDbValidFn(opCtx);
     };
 
+    void waitForAllEarlierOplogWritesToBeVisible(OperationContext* opCtx) override {
+        return;
+    }
 
     // Testing functions.
     CreateCollectionForBulkFn createCollectionForBulkFn =
@@ -257,14 +302,17 @@ public:
                secondaryIndexSpecs) -> StatusWith<std::unique_ptr<CollectionBulkLoader>> {
         return Status{ErrorCodes::IllegalOperation, "CreateCollectionForBulkFn not implemented."};
     };
-    InsertDocumentFn insertDocumentFn =
-        [](OperationContext* opCtx, const NamespaceString& nss, const BSONObj& doc) {
-            return Status{ErrorCodes::IllegalOperation, "InsertDocumentFn not implemented."};
-        };
-    InsertDocumentsFn insertDocumentsFn =
-        [](OperationContext* opCtx, const NamespaceString& nss, const std::vector<BSONObj>& docs) {
-            return Status{ErrorCodes::IllegalOperation, "InsertDocumentsFn not implemented."};
-        };
+    InsertDocumentFn insertDocumentFn = [](OperationContext* opCtx,
+                                           const NamespaceString& nss,
+                                           const TimestampedBSONObj& doc,
+                                           long long term) {
+        return Status{ErrorCodes::IllegalOperation, "InsertDocumentFn not implemented."};
+    };
+    InsertDocumentsFn insertDocumentsFn = [](OperationContext* opCtx,
+                                             const NamespaceString& nss,
+                                             const std::vector<InsertStatement>& docs) {
+        return Status{ErrorCodes::IllegalOperation, "InsertDocumentsFn not implemented."};
+    };
     DropUserDatabasesFn dropUserDBsFn = [](OperationContext* opCtx) {
         return Status{ErrorCodes::IllegalOperation, "DropUserDatabasesFn not implemented."};
     };
@@ -275,6 +323,9 @@ public:
         [](OperationContext* opCtx, const NamespaceString& nss, const CollectionOptions& options) {
             return Status{ErrorCodes::IllegalOperation, "CreateCollectionFn not implemented."};
         };
+    TruncateCollectionFn truncateCollFn = [](OperationContext* opCtx, const NamespaceString& nss) {
+        return Status{ErrorCodes::IllegalOperation, "TruncateCollectionFn not implemented."};
+    };
     DropCollectionFn dropCollFn = [](OperationContext* opCtx, const NamespaceString& nss) {
         return Status{ErrorCodes::IllegalOperation, "DropCollectionFn not implemented."};
     };
@@ -299,11 +350,24 @@ public:
     IsAdminDbValidFn isAdminDbValidFn = [](OperationContext*) {
         return Status{ErrorCodes::IllegalOperation, "IsAdminDbValidFn not implemented."};
     };
+    GetCollectionUUIDFn getCollectionUUIDFn = [](
+        OperationContext* opCtx, const NamespaceString& nss) -> StatusWith<OptionalCollectionUUID> {
+        return Status{ErrorCodes::IllegalOperation, "GetCollectionUUIDFn not implemented."};
+    };
+    UpgradeUUIDSchemaVersionNonReplicatedFn upgradeUUIDSchemaVersionNonReplicatedFn =
+        [](OperationContext* opCtx) -> Status {
+        return Status{ErrorCodes::IllegalOperation,
+                      "UpgradeUUIDSchemaVersionNonReplicatedFn not implemented."};
+    };
 
 private:
-    mutable stdx::mutex _rbidMutex;
+    mutable stdx::mutex _mutex;
     int _rbid;
     bool _rbidInitialized = false;
+    Timestamp _stableTimestamp = Timestamp::min();
+    Timestamp _initialDataTimestamp = Timestamp::min();
+    OptionalCollectionUUID _uuid;
+    bool _schemaUpgraded;
 };
 
 }  // namespace repl

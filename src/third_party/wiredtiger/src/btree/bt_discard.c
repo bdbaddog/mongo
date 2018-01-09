@@ -1,5 +1,5 @@
 /*-
- * Copyright (c) 2014-2017 MongoDB, Inc.
+ * Copyright (c) 2014-2018 MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -249,8 +249,8 @@ __free_page_modify(WT_SESSION_IMPL *session, WT_PAGE *page)
 
 	/* Free the overflow on-page, reuse and transaction-cache skiplists. */
 	__wt_ovfl_reuse_free(session, page);
-	__wt_ovfl_txnc_free(session, page);
 	__wt_ovfl_discard_free(session, page);
+	__wt_ovfl_discard_remove(session, page);
 
 	__wt_free(session, page->modify->ovfl_track);
 	__wt_spin_destroy(session, &page->modify->page_lock);
@@ -316,8 +316,14 @@ __wt_free_ref(
 	 */
 	__wt_ref_addr_free(session, ref);
 
-	/* Free any page-deleted information. */
-	if (ref->page_del != NULL) {
+	/*
+	 * Free any lookaside or page-deleted information.  We only expect a
+	 * lookaside structure for lookaside references, but can see
+	 * page-deleted information in other cases (such as WT_REF_MEM).
+	 */
+	if (ref->state == WT_REF_LOOKASIDE)
+		__wt_free(session, ref->page_las);
+	else if (ref->page_del != NULL) {
 		__wt_free(session, ref->page_del->update_list);
 		__wt_free(session, ref->page_del);
 	}

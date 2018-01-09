@@ -47,6 +47,7 @@
 #include "mongo/transport/message_compressor_registry.h"
 #include "mongo/util/log.h"
 #include "mongo/util/mongoutils/str.h"
+#include "mongo/util/net/sock.h"
 #include "mongo/util/net/ssl_options.h"
 #include "mongo/util/options_parser/startup_options.h"
 #include "mongo/util/version.h"
@@ -130,7 +131,7 @@ Status addMongoShellOptions(moe::OptionSection* options) {
         moe::String,
         "Remote host name to use for purpose of GSSAPI/Kerberos authentication");
 
-    options->addSection(authenticationOptions);
+    options->addSection(authenticationOptions).transitional_ignore();
 
     options->addOptionChaining("help", "help,h", moe::Switch, "show this usage information");
 
@@ -206,6 +207,12 @@ Status addMongoShellOptions(moe::OptionSection* options) {
                             "mode to determine how .find() queries are done:"
                             " commands, compatibility, legacy")
         .hidden();
+
+    options->addOptionChaining(
+        "retryWrites",
+        "retryWrites",
+        moe::Switch,
+        "automatically retry write operations upon transient network errors");
 
     options
         ->addOptionChaining(
@@ -347,31 +354,32 @@ Status storeMongoShellOptions(const moe::Environment& params,
     if (params.count("writeMode")) {
         std::string mode = params["writeMode"].as<string>();
         if (mode != "commands" && mode != "legacy" && mode != "compatibility") {
-            throw MsgAssertionException(
-                17396, mongoutils::str::stream() << "Unknown writeMode option: " << mode);
+            uasserted(17396, mongoutils::str::stream() << "Unknown writeMode option: " << mode);
         }
         shellGlobalParams.writeMode = mode;
     }
     if (params.count("readMode")) {
         std::string mode = params["readMode"].as<string>();
         if (mode != "commands" && mode != "compatibility" && mode != "legacy") {
-            throw MsgAssertionException(
-                17397,
-                mongoutils::str::stream()
-                    << "Unknown readMode option: '"
-                    << mode
-                    << "'. Valid modes are: {commands, compatibility, legacy}");
+            uasserted(17397,
+                      mongoutils::str::stream()
+                          << "Unknown readMode option: '"
+                          << mode
+                          << "'. Valid modes are: {commands, compatibility, legacy}");
         }
         shellGlobalParams.readMode = mode;
+    }
+    if (params.count("retryWrites")) {
+        shellGlobalParams.shouldRetryWrites = true;
     }
     if (params.count("rpcProtocols")) {
         std::string protos = params["rpcProtocols"].as<string>();
         auto parsedRPCProtos = rpc::parseProtocolSet(protos);
         if (!parsedRPCProtos.isOK()) {
-            throw MsgAssertionException(28653,
-                                        str::stream() << "Unknown RPC Protocols: '" << protos
-                                                      << "'. Valid values are {none, opQueryOnly, "
-                                                      << "opCommandOnly, all}");
+            uasserted(28653,
+                      str::stream() << "Unknown RPC Protocols: '" << protos
+                                    << "'. Valid values are {none, opQueryOnly, "
+                                    << "opCommandOnly, all}");
         }
         shellGlobalParams.rpcProtocols = parsedRPCProtos.getValue();
     }
@@ -417,32 +425,39 @@ Status storeMongoShellOptions(const moe::Environment& params,
         return Status(ErrorCodes::BadValue, sb.str());
     }
 
-    if (shellGlobalParams.url.find("mongodb://") == 0) {
+    if ((shellGlobalParams.url.find("mongodb://") == 0) ||
+        (shellGlobalParams.url.find("mongodb+srv://") == 0)) {
         auto cs_status = MongoURI::parse(shellGlobalParams.url);
         if (!cs_status.isOK()) {
             return cs_status.getStatus();
         }
 
         auto cs = cs_status.getValue();
+        auto uriOptions = cs.getOptions();
         StringBuilder sb;
         sb << "ERROR: Cannot specify ";
-        auto uriOptions = cs.getOptions();
-        if (!shellGlobalParams.username.empty() && !cs.getUser().empty()) {
-            sb << "username";
-        } else if (!shellGlobalParams.password.empty() && !cs.getPassword().empty()) {
-            sb << "password";
+
+        if (!shellGlobalParams.username.empty() && !cs.getUser().empty() &&
+            shellGlobalParams.username != cs.getUser()) {
+            sb << "different usernames";
+        } else if (!shellGlobalParams.password.empty() && !cs.getPassword().empty() &&
+                   shellGlobalParams.password != cs.getPassword()) {
+            sb << "different passwords";
         } else if (!shellGlobalParams.authenticationMechanism.empty() &&
-                   uriOptions.count("authMechanism")) {
-            sb << "the authentication mechanism";
+                   uriOptions.count("authMechanism") &&
+                   uriOptions["authMechanism"] != shellGlobalParams.authenticationMechanism) {
+            sb << "different authentication mechanisms";
         } else if (!shellGlobalParams.authenticationDatabase.empty() &&
-                   uriOptions.count("authSource")) {
-            sb << "the authentication database";
+                   uriOptions.count("authSource") &&
+                   uriOptions["authSource"] != shellGlobalParams.authenticationDatabase) {
+            sb << "different authentication databases ";
         } else if (shellGlobalParams.gssapiServiceName != saslDefaultServiceName &&
                    uriOptions.count("gssapiServiceName")) {
             sb << "the GSSAPI service name";
         } else {
             return Status::OK();
         }
+
         sb << " in connection URI and as a command-line option";
         return Status(ErrorCodes::InvalidOptions, sb.str());
     }
@@ -453,4 +468,4 @@ Status storeMongoShellOptions(const moe::Environment& params,
 
     return Status::OK();
 }
-}
+}  // namespace mongo

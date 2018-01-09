@@ -32,8 +32,10 @@
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/database_catalog_entry.h"
 #include "mongo/db/catalog/database_holder.h"
+#include "mongo/db/catalog/drop_collection.h"
 #include "mongo/db/catalog/head_manager.h"
 #include "mongo/db/catalog/index_create.h"
+#include "mongo/db/catalog/rename_collection.h"
 #include "mongo/db/client.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/index/index_descriptor.h"
@@ -80,8 +82,7 @@ Status renameCollection(OperationContext* opCtx,
                         const NamespaceString& source,
                         const NamespaceString& target) {
     ASSERT_EQ(source.db(), target.db());
-    Database* db = dbHolder().get(opCtx, source.db());
-    return db->renameCollection(opCtx, source.ns(), target.ns(), false);
+    return renameCollection(opCtx, source, target, {});
 }
 Status truncateCollection(OperationContext* opCtx, const NamespaceString& nss) {
     Collection* coll = dbHolder().get(opCtx, nss.db())->getCollection(opCtx, nss);
@@ -91,7 +92,7 @@ Status truncateCollection(OperationContext* opCtx, const NamespaceString& nss) {
 void insertRecord(OperationContext* opCtx, const NamespaceString& nss, const BSONObj& data) {
     Collection* coll = dbHolder().get(opCtx, nss.db())->getCollection(opCtx, nss);
     OpDebug* const nullOpDebug = nullptr;
-    ASSERT_OK(coll->insertDocument(opCtx, data, nullOpDebug, false));
+    ASSERT_OK(coll->insertDocument(opCtx, InsertStatement(data), nullOpDebug, false));
 }
 void assertOnlyRecord(OperationContext* opCtx, const NamespaceString& nss, const BSONObj& data) {
     Collection* coll = dbHolder().get(opCtx, nss.db())->getCollection(opCtx, nss);
@@ -215,7 +216,7 @@ public:
     }
 };
 
-template <bool rollback, bool defaultIndexes>
+template <bool rollback, bool defaultIndexes, bool capped>
 class RenameCollection {
 public:
     void run() {
@@ -234,10 +235,11 @@ public:
             WriteUnitOfWork uow(&opCtx);
             ASSERT(!collectionExists(&ctx, source.ns()));
             ASSERT(!collectionExists(&ctx, target.ns()));
+            auto options = capped ? BSON("capped" << true << "size" << 1000) : BSONObj();
             ASSERT_OK(userCreateNS(&opCtx,
                                    ctx.db(),
                                    source.ns(),
-                                   BSONObj(),
+                                   options,
                                    CollectionOptions::parseForCommand,
                                    defaultIndexes));
             uow.commit();
@@ -266,7 +268,7 @@ public:
     }
 };
 
-template <bool rollback, bool defaultIndexes>
+template <bool rollback, bool defaultIndexes, bool capped>
 class RenameDropTargetCollection {
 public:
     void run() {
@@ -290,16 +292,17 @@ public:
             WriteUnitOfWork uow(&opCtx);
             ASSERT(!collectionExists(&ctx, source.ns()));
             ASSERT(!collectionExists(&ctx, target.ns()));
+            auto options = capped ? BSON("capped" << true << "size" << 1000) : BSONObj();
             ASSERT_OK(userCreateNS(&opCtx,
                                    ctx.db(),
                                    source.ns(),
-                                   BSONObj(),
+                                   options,
                                    CollectionOptions::parseForCommand,
                                    defaultIndexes));
             ASSERT_OK(userCreateNS(&opCtx,
                                    ctx.db(),
                                    target.ns(),
-                                   BSONObj(),
+                                   options,
                                    CollectionOptions::parseForCommand,
                                    defaultIndexes));
 
@@ -317,7 +320,13 @@ public:
 
         {
             WriteUnitOfWork uow(&opCtx);
-            ASSERT_OK(ctx.db()->dropCollection(&opCtx, target.ns()));
+            BSONObjBuilder result;
+            ASSERT_OK(
+                dropCollection(&opCtx,
+                               target,
+                               result,
+                               {},
+                               DropCollectionSystemCollectionMode::kDisallowSystemCollectionDrops));
             ASSERT_OK(renameCollection(&opCtx, source, target));
             ASSERT(!collectionExists(&ctx, source.ns()));
             ASSERT(collectionExists(&ctx, target.ns()));
@@ -375,7 +384,13 @@ public:
 
         {
             WriteUnitOfWork uow(&opCtx);
-            ASSERT_OK(ctx.db()->dropCollection(&opCtx, nss.ns()));
+            BSONObjBuilder result;
+            ASSERT_OK(
+                dropCollection(&opCtx,
+                               nss,
+                               result,
+                               {},
+                               DropCollectionSystemCollectionMode::kDisallowSystemCollectionDrops));
             ASSERT(!collectionExists(&ctx, nss.ns()));
             ASSERT_OK(userCreateNS(&opCtx,
                                    ctx.db(),
@@ -428,7 +443,13 @@ public:
             insertRecord(&opCtx, nss, doc);
             assertOnlyRecord(&opCtx, nss, doc);
 
-            ASSERT_OK(ctx.db()->dropCollection(&opCtx, nss.ns()));
+            BSONObjBuilder result;
+            ASSERT_OK(
+                dropCollection(&opCtx,
+                               nss,
+                               result,
+                               {},
+                               DropCollectionSystemCollectionMode::kDisallowSystemCollectionDrops));
             ASSERT(!collectionExists(&ctx, nss.ns()));
 
             if (!rollback) {

@@ -42,8 +42,8 @@ class KeysCollectionDocument;
 class KeysCollectionManager;
 
 /**
- * This is responsible for signing logical times that can be used to sent to other servers and
- * verifying signatures of signed logical times.
+ * This is responsible for signing cluster times that can be used to sent to other servers and
+ * verifying signatures of signed cluster times.
  */
 class LogicalTimeValidator {
 public:
@@ -52,7 +52,11 @@ public:
     static LogicalTimeValidator* get(OperationContext* ctx);
     static void set(ServiceContext* service, std::unique_ptr<LogicalTimeValidator> validator);
 
-    explicit LogicalTimeValidator(std::unique_ptr<KeysCollectionManager> keyManager);
+    /**
+     * Constructs a new LogicalTimeValidator that uses the given key manager. The passed-in
+     * key manager must outlive this object.
+     */
+    explicit LogicalTimeValidator(std::shared_ptr<KeysCollectionManager> keyManager);
 
     /**
      * Tries to sign the newTime with a valid signature. Can return an empty signature and keyId
@@ -91,13 +95,42 @@ public:
      */
     static bool isAuthorizedToAdvanceClock(OperationContext* opCtx);
 
+    /**
+     * Returns true if the server should gossip, sign, and validate cluster times. False until there
+     * are keys in the config server.
+     */
+    bool shouldGossipLogicalTime();
+
+    /**
+     * Makes the KeysCollectionManager refresh synchronously.
+     */
+    void forceKeyRefreshNow(OperationContext* opCtx);
+
+    /**
+     * Reset the key manager to prevent the former members of standalone replica set to use old
+     * keys with sharded cluster.
+     */
+    void resetKeyManager();
+
+    /**
+     * Reset the key manager cache of keys.
+     */
+    void resetKeyManagerCache(ServiceContext* service);
+
 private:
+    /**
+     *  Returns the copy of the _keyManager to work when its reset by resetKeyManager call.
+     */
+    std::shared_ptr<KeysCollectionManager> _getKeyManagerCopy();
+
+
     SignedLogicalTime _getProof(const KeysCollectionDocument& keyDoc, LogicalTime newTime);
 
-    stdx::mutex _mutex;
+    stdx::mutex _mutex;            // protects _lastSeenValidTime
+    stdx::mutex _mutexKeyManager;  // protects _keyManager
     SignedLogicalTime _lastSeenValidTime;
     TimeProofService _timeProofService;
-    std::unique_ptr<KeysCollectionManager> _keyManager;
+    std::shared_ptr<KeysCollectionManager> _keyManager;
 };
 
 }  // namespace mongo

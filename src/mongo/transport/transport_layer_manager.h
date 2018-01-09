@@ -40,6 +40,9 @@
 #include "mongo/util/time_support.h"
 
 namespace mongo {
+struct ServerGlobalParams;
+class ServiceContext;
+
 namespace transport {
 
 /**
@@ -52,6 +55,8 @@ class TransportLayerManager final : public TransportLayer {
     MONGO_DISALLOW_COPYING(TransportLayerManager);
 
 public:
+    TransportLayerManager(std::vector<std::unique_ptr<TransportLayer>> tls)
+        : _tls(std::move(tls)) {}
     TransportLayerManager();
 
     Ticket sourceMessage(const SessionHandle& session,
@@ -64,21 +69,33 @@ public:
     Status wait(Ticket&& ticket) override;
     void asyncWait(Ticket&& ticket, TicketCallback callback) override;
 
-    Stats sessionStats() override;
-
     void end(const SessionHandle& session) override;
-    void endAllSessions(Session::TagMask tags) override;
 
     Status start() override;
     void shutdown() override;
+    Status setup() override;
 
+    // TODO This method is not called anymore, but may be useful to add new TransportLayers
+    // to the manager after it's been created.
     Status addAndStartTransportLayer(std::unique_ptr<TransportLayer> tl);
+
+    /*
+     * This initializes a TransportLayerManager with the global configuration of the server.
+     *
+     * To setup networking in mongod/mongos, create a TransportLayerManager with this function,
+     * then call
+     * tl->setup();
+     * serviceContext->setTransportLayer(std::move(tl));
+     * serviceContext->getTransportLayer->start();
+     */
+    static std::unique_ptr<TransportLayer> createWithConfig(const ServerGlobalParams* config,
+                                                            ServiceContext* ctx);
 
 private:
     template <typename Callable>
-    void _foreach(Callable&& cb);
+    void _foreach(Callable&& cb) const;
 
-    stdx::mutex _tlsMutex;
+    mutable stdx::mutex _tlsMutex;
     std::vector<std::unique_ptr<TransportLayer>> _tls;
 };
 

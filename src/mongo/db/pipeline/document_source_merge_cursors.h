@@ -37,6 +37,8 @@ namespace mongo {
 
 class DocumentSourceMergeCursors : public DocumentSource {
 public:
+    static constexpr StringData kStageName = "$mergeCursors"_sd;
+
     struct CursorDescriptor {
         CursorDescriptor(ConnectionString connectionString, std::string ns, CursorId cursorId)
             : connectionString(std::move(connectionString)),
@@ -48,12 +50,23 @@ public:
         CursorId cursorId;
     };
 
-    // virtuals from DocumentSource
     GetNextResult getNext() final;
-    const char* getSourceName() const final;
+
+    const char* getSourceName() const final {
+        return kStageName.rawData();
+    }
+
     Value serialize(boost::optional<ExplainOptions::Verbosity> explain = boost::none) const final;
-    InitialSourceType getInitialSourceType() const final {
-        return InitialSourceType::kInitialSource;
+
+    StageConstraints constraints(Pipeline::SplitState pipeState) const final {
+        StageConstraints constraints(StreamType::kStreaming,
+                                     PositionRequirement::kFirst,
+                                     HostTypeRequirement::kAnyShard,
+                                     DiskUseRequirement::kNoDiskUse,
+                                     FacetRequirement::kNotAllowed);
+
+        constraints.requiresInputDocSource = false;
+        return constraints;
     }
 
     static boost::intrusive_ptr<DocumentSource> createFromBson(
@@ -62,6 +75,11 @@ public:
     static boost::intrusive_ptr<DocumentSource> create(
         std::vector<CursorDescriptor> cursorDescriptors,
         const boost::intrusive_ptr<ExpressionContext>& pExpCtx);
+
+    /**
+     * Returns true if all remotes have reported that their cursors are closed.
+     */
+    bool remotesExhausted() const;
 
     /** Returns non-owning pointers to cursors managed by this stage.
      *  Call this instead of getNext() if you want access to the raw streams.

@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 #
-# Public Domain 2014-2017 MongoDB, Inc.
+# Public Domain 2014-2018 MongoDB, Inc.
 # Public Domain 2008-2014 WiredTiger, Inc.
 #
 # This is free and unencumbered software released into the public domain.
@@ -40,7 +40,7 @@ class test_bug010(wttest.WiredTigerTestCase):
     num_tables = 1000
 
     # Disable checkpoint sync, to make checkpoints faster and
-    # increase the likelyhood of triggering the symptom
+    # increase the likelihood of triggering the symptom
     conn_config = 'checkpoint_sync=false'
 
     def test_checkpoint_dirty(self):

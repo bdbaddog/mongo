@@ -35,18 +35,16 @@
 #include "mongo/db/auth/authorization_manager.h"
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/auth/privilege.h"
+#include "mongo/db/catalog/catalog_raii.h"
 #include "mongo/db/client.h"
 #include "mongo/db/commands.h"
-#include "mongo/db/db_raii.h"
 #include "mongo/db/lasterror.h"
 #include "mongo/db/operation_context.h"
-#include "mongo/db/repl/replication_coordinator_global.h"
-#include "mongo/db/s/collection_metadata.h"
+#include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/s/collection_sharding_state.h"
 #include "mongo/db/s/migration_source_manager.h"
 #include "mongo/db/s/sharded_connection_info.h"
 #include "mongo/db/s/sharding_state.h"
-#include "mongo/db/wire_version.h"
 #include "mongo/s/chunk_version.h"
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/grid.h"
@@ -60,9 +58,9 @@ using str::stream;
 
 namespace {
 
-class SetShardVersion : public Command {
+class SetShardVersion : public ErrmsgCommandDeprecated {
 public:
-    SetShardVersion() : Command("setShardVersion") {}
+    SetShardVersion() : ErrmsgCommandDeprecated("setShardVersion") {}
 
     void help(std::stringstream& help) const override {
         help << "internal";
@@ -88,16 +86,16 @@ public:
         out->push_back(Privilege(ResourcePattern::forClusterResource(), actions));
     }
 
-    bool run(OperationContext* opCtx,
-             const std::string&,
-             const BSONObj& cmdObj,
-             string& errmsg,
-             BSONObjBuilder& result) {
+    bool errmsgRun(OperationContext* opCtx,
+                   const std::string&,
+                   const BSONObj& cmdObj,
+                   string& errmsg,
+                   BSONObjBuilder& result) {
         uassert(ErrorCodes::IllegalOperation,
                 "can't issue setShardVersion from 'eval'",
                 !opCtx->getClient()->isInDirectClient());
 
-        auto shardingState = ShardingState::get(opCtx);
+        auto const shardingState = ShardingState::get(opCtx);
         uassertStatusOK(shardingState->canAcceptShardedCommands());
 
         // Steps
@@ -158,8 +156,8 @@ public:
         // Step 3
 
         // Validate shardName parameter.
-        string shardName = cmdObj["shard"].str();
-        auto storedShardName = ShardingState::get(opCtx)->getShardName();
+        const auto shardName = cmdObj["shard"].str();
+        const auto storedShardName = ShardingState::get(opCtx)->getShardName();
         uassert(ErrorCodes::BadValue,
                 str::stream() << "received shardName " << shardName
                               << " which differs from stored shardName "
@@ -167,45 +165,29 @@ public:
                 storedShardName == shardName);
 
         // Validate config connection string parameter.
+        const auto configdb = cmdObj["configdb"].String();
+        uassert(ErrorCodes::BadValue,
+                "Config server connection string cannot be empty",
+                !configdb.empty());
 
-        const auto configdb = cmdObj["configdb"].str();
-        if (configdb.size() == 0) {
-            errmsg = "no configdb";
-            return false;
-        }
+        const auto givenConnStr = uassertStatusOK(ConnectionString::parse(configdb));
+        uassert(ErrorCodes::InvalidOptions,
+                str::stream() << "Given config server string " << givenConnStr.toString()
+                              << " is not of type SET",
+                givenConnStr.type() == ConnectionString::SET);
 
-        auto givenConnStrStatus = ConnectionString::parse(configdb);
-        uassertStatusOK(givenConnStrStatus);
-
-        const auto& givenConnStr = givenConnStrStatus.getValue();
-        if (givenConnStr.type() != ConnectionString::SET) {
-            errmsg = str::stream() << "given config server string is not of type SET";
-            return false;
-        }
-
-        ConnectionString storedConnStr = ShardingState::get(opCtx)->getConfigServer(opCtx);
-        if (givenConnStr.getSetName() != storedConnStr.getSetName()) {
-            errmsg = str::stream()
-                << "given config server set name: " << givenConnStr.getSetName()
-                << " differs from known set name: " << storedConnStr.getSetName();
-
-            return false;
-        }
+        const auto storedConnStr = ShardingState::get(opCtx)->getConfigServer(opCtx);
+        uassert(ErrorCodes::IllegalOperation,
+                str::stream() << "Given config server set name: " << givenConnStr.getSetName()
+                              << " differs from known set name: "
+                              << storedConnStr.getSetName(),
+                givenConnStr.getSetName() == storedConnStr.getSetName());
 
         // Validate namespace parameter.
-
-        const string ns = cmdObj["setShardVersion"].valuestrsafe();
-        if (ns.size() == 0) {
-            errmsg = "need to specify namespace";
-            return false;
-        }
-
-        // Backwards compatibility for SERVER-23119
-        const NamespaceString nss(ns);
-        if (!nss.isValid()) {
-            warning() << "Invalid namespace used for setShardVersion: " << ns;
-            return true;
-        }
+        const NamespaceString nss(cmdObj["setShardVersion"].String());
+        uassert(ErrorCodes::InvalidNamespace,
+                str::stream() << "Invalid namespace " << nss.ns(),
+                nss.isValid());
 
         // Validate chunk version parameter.
         const ChunkVersion requestedVersion =
@@ -213,20 +195,20 @@ public:
 
         // Step 4
 
-        const ChunkVersion connectionVersion = info->getVersion(ns);
+        const ChunkVersion connectionVersion = info->getVersion(nss.ns());
         connectionVersion.addToBSON(result, "oldVersion");
 
         {
             boost::optional<AutoGetDb> autoDb;
             autoDb.emplace(opCtx, nss.db(), MODE_IS);
 
-            // we can run on a slave up to here
-            if (!repl::getGlobalReplicationCoordinator()->canAcceptWritesForDatabase(opCtx,
-                                                                                     nss.db())) {
-                result.append("errmsg", "not master");
-                result.append("note", "from post init in setShardVersion");
-                return false;
-            }
+            // Slave nodes cannot support set shard version
+            uassert(ErrorCodes::NotMaster,
+                    str::stream() << "setShardVersion with collection version is only supported "
+                                     "against primary nodes, but it was received for namespace "
+                                  << nss.ns(),
+                    repl::ReplicationCoordinator::get(opCtx)->canAcceptWritesForDatabase(opCtx,
+                                                                                         nss.db()));
 
             // Views do not require a shard version check.
             if (autoDb->getDb() && !autoDb->getDb()->getCollection(opCtx, nss) &&
@@ -252,15 +234,15 @@ public:
                     // A migration occurred.
                     if (connectionVersion < collectionShardVersion &&
                         connectionVersion.epoch() == collectionShardVersion.epoch()) {
-                        info->setVersion(ns, requestedVersion);
+                        info->setVersion(nss.ns(), requestedVersion);
                     }
                     // The collection was dropped and recreated.
                     else if (authoritative) {
-                        info->setVersion(ns, requestedVersion);
+                        info->setVersion(nss.ns(), requestedVersion);
                     } else {
-                        result.append("ns", ns);
+                        result.append("ns", nss.ns());
                         result.appendBool("need_authoritative", true);
-                        errmsg = "verifying drop on '" + ns + "'";
+                        errmsg = str::stream() << "verifying drop on '" << nss.ns() << "'";
                         return false;
                     }
                 }
@@ -276,7 +258,7 @@ public:
             if (isDropRequested) {
                 if (!authoritative) {
                     result.appendBool("need_authoritative", true);
-                    result.append("ns", ns);
+                    result.append("ns", nss.ns());
                     collectionShardVersion.addToBSON(result, "globalVersion");
                     errmsg = "dropping needs to be authoritative";
                     return false;
@@ -292,8 +274,8 @@ public:
                 if (requestedVersion < connectionVersion &&
                     requestedVersion.epoch() == connectionVersion.epoch()) {
                     errmsg = str::stream() << "this connection already had a newer version "
-                                           << "of collection '" << ns << "'";
-                    result.append("ns", ns);
+                                           << "of collection '" << nss.ns() << "'";
+                    result.append("ns", nss.ns());
                     requestedVersion.addToBSON(result, "newVersion");
                     collectionShardVersion.addToBSON(result, "globalVersion");
                     return false;
@@ -315,8 +297,8 @@ public:
                     }
 
                     errmsg = str::stream() << "shard global version for collection is higher "
-                                           << "than trying to set to '" << ns << "'";
-                    result.append("ns", ns);
+                                           << "than trying to set to '" << nss.ns() << "'";
+                    result.append("ns", nss.ns());
                     requestedVersion.addToBSON(result, "version");
                     collectionShardVersion.addToBSON(result, "globalVersion");
                     result.appendBool("reloadConfig", true);
@@ -339,9 +321,9 @@ public:
                     }
 
                     // need authoritative for first look
-                    result.append("ns", ns);
+                    result.append("ns", nss.ns());
                     result.appendBool("need_authoritative", true);
-                    errmsg = "first time for collection '" + ns + "'";
+                    errmsg = str::stream() << "first time for collection '" << nss.ns() << "'";
                     return false;
                 }
 
@@ -365,14 +347,15 @@ public:
             if (!status.isOK()) {
                 // The reload itself was interrupted or confused here
 
-                errmsg = str::stream()
-                    << "could not refresh metadata for " << ns << " with requested shard version "
-                    << requestedVersion.toString() << ", stored shard version is "
-                    << currVersion.toString() << causedBy(redact(status));
+                errmsg = str::stream() << "could not refresh metadata for " << nss.ns()
+                                       << " with requested shard version "
+                                       << requestedVersion.toString()
+                                       << ", stored shard version is " << currVersion.toString()
+                                       << causedBy(redact(status));
 
                 warning() << errmsg;
 
-                result.append("ns", ns);
+                result.append("ns", nss.ns());
                 requestedVersion.addToBSON(result, "version");
                 currVersion.addToBSON(result, "globalVersion");
                 result.appendBool("reloadConfig", true);
@@ -382,7 +365,7 @@ public:
                 // We reloaded a version that doesn't match the version mongos was trying to
                 // set.
                 errmsg = str::stream() << "requested shard version differs from"
-                                       << " config shard version for " << ns
+                                       << " config shard version for " << nss.ns()
                                        << ", requested version is " << requestedVersion.toString()
                                        << " but found version " << currVersion.toString();
 
@@ -391,7 +374,7 @@ public:
                 // WARNING: the exact fields below are important for compatibility with mongos
                 // version reload.
 
-                result.append("ns", ns);
+                result.append("ns", nss.ns());
                 currVersion.addToBSON(result, "globalVersion");
 
                 // If this was a reset of a collection or the last chunk moved out, inform mongos to
@@ -411,7 +394,7 @@ public:
             }
         }
 
-        info->setVersion(ns, requestedVersion);
+        info->setVersion(nss.ns(), requestedVersion);
         return true;
     }
 

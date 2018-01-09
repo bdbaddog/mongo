@@ -32,15 +32,18 @@
 
 #include "mongo/db/dbdirectclient.h"
 
+#include <boost/core/swap.hpp>
+
 #include "mongo/db/client.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/curop.h"
-#include "mongo/db/lasterror.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/wire_version.h"
 #include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/transport/service_entry_point.h"
 #include "mongo/util/log.h"
+#include "mongo/util/scopeguard.h"
 
 namespace mongo {
 
@@ -70,7 +73,9 @@ private:
 }  // namespace
 
 
-DBDirectClient::DBDirectClient(OperationContext* opCtx) : _opCtx(opCtx) {}
+DBDirectClient::DBDirectClient(OperationContext* opCtx) : _opCtx(opCtx) {
+    _setServerRPCProtocols(rpc::supports::kAll);
+}
 
 bool DBDirectClient::isFailed() const {
     return false;
@@ -90,12 +95,17 @@ std::string DBDirectClient::getServerAddress() const {
 
 // Returned version should match the incoming connections restrictions.
 int DBDirectClient::getMinWireVersion() {
-    return WireSpec::instance().incoming.minWireVersion;
+    return WireSpec::instance().incomingExternalClient.minWireVersion;
 }
 
 // Returned version should match the incoming connections restrictions.
 int DBDirectClient::getMaxWireVersion() {
-    return WireSpec::instance().incoming.maxWireVersion;
+    return WireSpec::instance().incomingExternalClient.maxWireVersion;
+}
+
+bool DBDirectClient::isReplicaSetMember() const {
+    auto const* replCoord = repl::ReplicationCoordinator::get(_opCtx);
+    return replCoord && replCoord->isReplEnabled();
 }
 
 ConnectionString::ConnectionType DBDirectClient::type() const {
@@ -120,17 +130,24 @@ QueryOptions DBDirectClient::_lookupAvailableOptions() {
 }
 
 namespace {
-DbResponse loopbackBuildResponse(OperationContext* const opCtx, Message& toSend) {
+DbResponse loopbackBuildResponse(OperationContext* const opCtx,
+                                 LastError* lastError,
+                                 Message& toSend) {
+    DirectClientScope directClientScope(opCtx);
+    boost::swap(*lastError, LastError::get(opCtx->getClient()));
+    ON_BLOCK_EXIT([&] { boost::swap(*lastError, LastError::get(opCtx->getClient())); });
+
+    LastError::get(opCtx->getClient()).startRequest();
+    CurOp curOp(opCtx);
+
+    toSend.header().setId(nextMessageId());
+    toSend.header().setResponseToMsgId(0);
     return opCtx->getServiceContext()->getServiceEntryPoint()->handleRequest(opCtx, toSend);
 }
 }  // namespace
 
 bool DBDirectClient::call(Message& toSend, Message& response, bool assertOk, string* actualServer) {
-    DirectClientScope directClientScope(_opCtx);
-    LastError::get(_opCtx->getClient()).startRequest();
-
-    CurOp curOp(_opCtx);
-    auto dbResponse = loopbackBuildResponse(_opCtx, toSend);
+    auto dbResponse = loopbackBuildResponse(_opCtx, &_lastError, toSend);
     invariant(!dbResponse.response.empty());
     response = std::move(dbResponse.response);
 
@@ -138,11 +155,7 @@ bool DBDirectClient::call(Message& toSend, Message& response, bool assertOk, str
 }
 
 void DBDirectClient::say(Message& toSend, bool isRetry, string* actualServer) {
-    DirectClientScope directClientScope(_opCtx);
-    LastError::get(_opCtx->getClient()).startRequest();
-
-    CurOp curOp(_opCtx);
-    auto dbResponse = loopbackBuildResponse(_opCtx, toSend);
+    auto dbResponse = loopbackBuildResponse(_opCtx, &_lastError, toSend);
     invariant(dbResponse.response.empty());
 }
 
@@ -162,23 +175,12 @@ unsigned long long DBDirectClient::count(
     BSONObj cmdObj = _countCmd(ns, query, options, limit, skip);
 
     NamespaceString nsString(ns);
-    std::string dbname = nsString.db().toString();
 
-    Command* countCmd = Command::findCommand("count");
-    invariant(countCmd);
+    auto result = Command::runCommandDirectly(
+        _opCtx, OpMsgRequest::fromDBAndBody(nsString.db(), std::move(cmdObj)));
 
-    std::string errmsg;
-    BSONObjBuilder result;
-    bool runRetval = countCmd->run(_opCtx, dbname, cmdObj, errmsg, result);
-    if (!runRetval) {
-        Command::appendCommandStatus(result, runRetval, errmsg);
-        Status commandStatus = getStatusFromCommandResult(result.obj());
-        invariant(!commandStatus.isOK());
-        uassertStatusOK(commandStatus);
-    }
-
-    BSONObj resultObj = result.obj();
-    return static_cast<unsigned long long>(resultObj["n"].numberLong());
+    uassertStatusOK(getStatusFromCommandResult(result));
+    return static_cast<unsigned long long>(result["n"].numberLong());
 }
 
 }  // namespace mongo

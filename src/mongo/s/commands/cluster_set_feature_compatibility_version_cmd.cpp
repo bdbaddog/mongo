@@ -48,9 +48,9 @@ namespace {
  *   setFeatureCompatibilityVersion: <string version>
  * }
  */
-class SetFeatureCompatibilityVersionCmd : public Command {
+class SetFeatureCompatibilityVersionCmd : public BasicCommand {
 public:
-    SetFeatureCompatibilityVersionCmd() : Command("setFeatureCompatibilityVersion") {}
+    SetFeatureCompatibilityVersionCmd() : BasicCommand("setFeatureCompatibilityVersion") {}
 
     virtual bool slaveOk() const {
         return false;
@@ -61,23 +61,25 @@ public:
     }
 
     virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
-        return false;
+        return true;
     }
 
     virtual void help(std::stringstream& help) const {
-        help << "Set the API version for the cluster. If set to \"3.4\", then 3.6 features are "
-                "disabled. If \"3.6\", then 3.6 features are enabled, and all nodes in the cluster "
-                "must be version 3.6. See "
-                "http://dochub.mongodb.org/core/3.6-feature-compatibility.";
+        help << "Set the API version for the cluster. If set to \""
+             << FeatureCompatibilityVersionCommandParser::kVersion34
+             << "\", then 3.6 features are disabled. If \""
+             << FeatureCompatibilityVersionCommandParser::kVersion36
+             << "\", then 3.6 features are enabled, and all nodes in the cluster must be version "
+                "3.6. See "
+             << feature_compatibility_version::kDochubLink << ".";
     }
 
     Status checkAuthForCommand(Client* client,
                                const std::string& dbname,
                                const BSONObj& cmdObj) override {
         if (!AuthorizationSession::get(client)->isAuthorizedForActionsOnResource(
-                ResourcePattern::forExactNamespace(
-                    NamespaceString("$setFeatureCompatibilityVersion.version")),
-                ActionType::update)) {
+                ResourcePattern::forClusterResource(),
+                ActionType::setFeatureCompatibilityVersion)) {
             return Status(ErrorCodes::Unauthorized, "Unauthorized");
         }
         return Status::OK();
@@ -86,7 +88,6 @@ public:
     bool run(OperationContext* opCtx,
              const std::string& dbname,
              const BSONObj& cmdObj,
-             std::string& errmsg,
              BSONObjBuilder& result) {
         const auto version = uassertStatusOK(
             FeatureCompatibilityVersionCommandParser::extractVersionFromCommand(getName(), cmdObj));
@@ -97,7 +98,8 @@ public:
             opCtx,
             ReadPreferenceSetting{ReadPreference::PrimaryOnly},
             dbname,
-            BSON("_configsvrSetFeatureCompatibilityVersion" << version),
+            Command::appendMajorityWriteConcern(Command::appendPassthroughFields(
+                cmdObj, BSON("setFeatureCompatibilityVersion" << version))),
             Shard::RetryPolicy::kIdempotent));
         uassertStatusOK(response.commandStatus);
 

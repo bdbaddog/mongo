@@ -68,7 +68,7 @@ void throwCursorError(DBClientCursor* cursor) {
 
     if (cursor->hasResultFlag(ResultFlag_ErrSet)) {
         BSONObj o = cursor->next();
-        throw UserException(o["code"].numberInt(), o["$err"].str());
+        uasserted(o["code"].numberInt(), o["$err"].str());
     }
 }
 
@@ -328,10 +328,10 @@ void ParallelSortClusteredCursor::_markStaleNS(const NamespaceString& staleNS,
     const int tries = ++_staleNSMap[staleNS.ns()];
 
     if (tries >= 5) {
-        throw SendStaleConfigException(staleNS.ns(),
-                                       "too many retries of stale version info",
-                                       e.getVersionReceived(),
-                                       e.getVersionWanted());
+        throw StaleConfigException(staleNS.ns(),
+                                   "too many retries of stale version info",
+                                   e.getVersionReceived(),
+                                   e.getVersionWanted());
     }
 }
 
@@ -395,11 +395,10 @@ void ParallelSortClusteredCursor::setupVersionAndHandleSlaveOk(
                     << "compatible with " << vinfo;
         }
     } catch (const DBException& dbExcep) {
-        auto errCode = dbExcep.getCode();
-        if (allowShardVersionFailure &&
-            (ErrorCodes::isNotMasterError(ErrorCodes::fromInt(errCode)) ||
-             errCode == ErrorCodes::FailedToSatisfyReadPreference ||
-             errCode == ErrorCodes::SocketException)) {
+        auto errCode = dbExcep.code();
+        if (allowShardVersionFailure && (ErrorCodes::isNotMasterError(errCode) ||
+                                         errCode == ErrorCodes::FailedToSatisfyReadPreference ||
+                                         errCode == ErrorCodes::SocketException)) {
             // It's okay if we don't set the version when talking to a secondary, we can
             // be stale in any case.
 
@@ -636,7 +635,6 @@ void ParallelSortClusteredCursor::startInit(OperationContext* opCtx) {
         } catch (SocketException& e) {
             warning() << "socket exception when initializing on " << shardId
                       << ", current connection state is " << mdata.toBSON() << causedBy(redact(e));
-            e._shard = shardId.toString();
             mdata.errored = true;
             if (returnPartial) {
                 mdata.cleanup(true);
@@ -646,9 +644,8 @@ void ParallelSortClusteredCursor::startInit(OperationContext* opCtx) {
         } catch (DBException& e) {
             warning() << "db exception when initializing on " << shardId
                       << ", current connection state is " << mdata.toBSON() << causedBy(redact(e));
-            e._shard = shardId.toString();
             mdata.errored = true;
-            if (returnPartial && e.getCode() == 15925 /* From above! */) {
+            if (returnPartial && e.code() == 15925 /* From above! */) {
                 mdata.cleanup(true);
                 continue;
             }
@@ -766,7 +763,7 @@ void ParallelSortClusteredCursor::finishInit(OperationContext* opCtx) {
                 LOG(pc) << "finished on shard " << shardId << ", current connection state is "
                         << mdata.toBSON();
             }
-        } catch (RecvStaleConfigException& e) {
+        } catch (StaleConfigException& e) {
             retry = true;
 
             string staleNS = e.getns();
@@ -792,7 +789,7 @@ void ParallelSortClusteredCursor::finishInit(OperationContext* opCtx) {
         } catch (DBException& e) {
             // NOTE: RECV() WILL NOT THROW A SOCKET EXCEPTION - WE GET THIS AS ERROR 15988 FROM
             // ABOVE
-            if (e.getCode() == 15988) {
+            if (e.code() == 15988) {
                 warning() << "exception when receiving data from " << shardId
                           << ", current connection state is " << mdata.toBSON()
                           << causedBy(redact(e));
@@ -806,7 +803,7 @@ void ParallelSortClusteredCursor::finishInit(OperationContext* opCtx) {
             } else {
                 // the InvalidBSON exception indicates that the BSON is malformed ->
                 // don't print/call "mdata.toBSON()" to avoid unexpected errors e.g. a segfault
-                if (e.getCode() == 22)
+                if (e.code() == ErrorCodes::InvalidBSON)
                     warning() << "bson is malformed :: db exception when finishing on " << shardId
                               << causedBy(redact(e));
                 else
@@ -1001,10 +998,10 @@ void ParallelSortClusteredCursor::_oldInit() {
                 // Version is zero b/c this is deprecated codepath
                 staleConfigExs.push_back(str::stream()
                                          << "stale config detected for "
-                                         << RecvStaleConfigException(_ns,
-                                                                     "ParallelCursor::_init",
-                                                                     ChunkVersion(0, 0, OID()),
-                                                                     ChunkVersion(0, 0, OID()))
+                                         << StaleConfigException(_ns,
+                                                                 "ParallelCursor::_init",
+                                                                 ChunkVersion(0, 0, OID()),
+                                                                 ChunkVersion(0, 0, OID()))
                                                 .what()
                                          << errLoc);
                 break;
@@ -1159,10 +1156,10 @@ void ParallelSortClusteredCursor::_oldInit() {
 
         if (throwException && staleConfigExs.size() > 0) {
             // Version is zero b/c this is deprecated codepath
-            throw RecvStaleConfigException(
+            throw StaleConfigException(
                 _ns, errMsg.str(), ChunkVersion(0, 0, OID()), ChunkVersion(0, 0, OID()));
         } else if (throwException) {
-            throw DBException(errMsg.str(), 14827);
+            uasserted(14827, errMsg.str());
         } else {
             warning() << redact(errMsg.str());
         }
@@ -1343,7 +1340,7 @@ void throwCursorStale(DBClientCursor* cursor) {
     if (cursor->hasResultFlag(ResultFlag_ShardConfigStale)) {
         BSONObj error;
         cursor->peekError(&error);
-        throw RecvStaleConfigException("query returned a stale config error", error);
+        throw StaleConfigException("query returned a stale config error", error);
     }
 
     if (NamespaceString(cursor->getns()).isCommand()) {
@@ -1353,8 +1350,8 @@ void throwCursorStale(DBClientCursor* cursor) {
         //
         // TODO: Standardize stale config reporting.
         BSONObj res = cursor->peekFirst();
-        if (res.hasField("code") && res["code"].Number() == ErrorCodes::SendStaleConfig) {
-            throw RecvStaleConfigException("command returned a stale config error", res);
+        if (res.hasField("code") && res["code"].Number() == ErrorCodes::StaleConfig) {
+            throw StaleConfigException("command returned a stale config error", res);
         }
     }
 }

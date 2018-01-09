@@ -40,11 +40,13 @@
 
 namespace mongo {
 
+class BalancerConfiguration;
 class BSONObj;
 struct ChunkVersion;
 class CollectionMetadata;
 class MigrationSourceManager;
 class OperationContext;
+class Timestamp;
 
 /**
  * Contains all sharding-related runtime state for a given collection. One such object is assigned
@@ -67,16 +69,19 @@ public:
     ~CollectionShardingState();
 
     /**
-     * Holds information used for tracking document removals during chunk migration.
+     * Details of documents being removed from a sharded collection.
      */
     struct DeleteState {
-        // Contains the _id field of the document being deleted.
-        BSONObj idDoc;
+        // Contains the fields of the document that are in the collection's shard key, and "_id".
+        BSONObj documentKey;
 
-        // True if the document being deleted belongs to a chunk which is currently being migrated
-        // out of this shard.
-        bool isMigrating = false;
+        // True if the document being deleted belongs to a chunk which, while still in the shard,
+        // is being migrated out. (Not to be confused with "fromMigrate", which tags operations
+        // that are steps in performing the migration.)
+        bool isMigrating;
     };
+
+    DeleteState makeDeleteState(BSONObj const& doc);
 
     /**
      * Obtains the sharding state for the specified collection. If it does not exist, it will be
@@ -118,35 +123,39 @@ public:
     void markNotShardedAtStepdown();
 
     /**
-     * Schedules any documents in the range for immediate cleanup iff no running queries can depend
-     * on them, and adds the range to the list of pending ranges. Otherwise, returns false.  Does
-     * not block.  Call get() on the return value to wait for the deletion to complete or fail.
-     * After that, call waitForClean to ensure no other deletions are pending for the range.
+     * Schedules any documents in `range` for immediate cleanup iff no running queries can depend
+     * on them, and adds the range to the list of pending ranges. Otherwise, returns a notification
+     * that yields bad status immediately.  Does not block.  Call waitStatus(opCtx) on the result
+     * to wait for the deletion to complete or fail.  After that, call waitForClean to ensure no
+     * other deletions are pending for the range.
      */
     auto beginReceive(ChunkRange const& range) -> CleanupNotification;
 
     /*
-     * Removes the range from the list of pending ranges, and schedules any documents in the range
-     * for immediate cleanup.  Does not block.
+     * Removes `range` from the list of pending ranges, and schedules any documents in the range for
+     * immediate cleanup.  Does not block.
      */
     void forgetReceive(const ChunkRange& range);
 
     /**
-     * Schedules documents in the range for cleanup after any running queries that may depend on
-     * them have terminated.  Does not block. Fails if range overlaps any current local shard chunk.
-     * Call `result->get(opCtx)` on the return value `result` to wait for the deletion to complete
-     * or fail. If that succeeds, call waitForClean to ensure no other deletions are pending for the
-     * range.
+     * Schedules documents in `range` for cleanup after any running queries that may depend on them
+     * have terminated. Does not block. Fails if range overlaps any current local shard chunk.
+     * Passed kDelayed, an additional delay (configured via server parameter orphanCleanupDelaySecs)
+     * is added to permit (most) dependent queries on secondaries to complete, too.
+     *
+     * Call result.waitStatus(opCtx) to wait for the deletion to complete or fail. If that succeeds,
+     * waitForClean can be called to ensure no other deletions are pending for the range. Call
+     * result.abandon(), instead of waitStatus, to ignore the outcome.
      */
-    auto cleanUpRange(ChunkRange const& range) -> CleanupNotification;
+    enum CleanWhen { kNow, kDelayed };
+    auto cleanUpRange(ChunkRange const& range, CleanWhen) -> CleanupNotification;
 
     /**
      * Returns a vector of ScopedCollectionMetadata objects representing metadata instances in use
      * by running queries that overlap the argument range, suitable for identifying and invalidating
      * those queries.
      */
-    auto overlappingMetadata(ChunkRange const& range) const
-        -> std::vector<ScopedCollectionMetadata>;
+    std::vector<ScopedCollectionMetadata> overlappingMetadata(ChunkRange const& range) const;
 
     /**
      * Returns the active migration source manager, if one is available.
@@ -169,10 +178,10 @@ public:
 
     /**
      * Checks whether the shard version in the context is compatible with the shard version of the
-     * collection locally and if not throws SendStaleConfigException populated with the expected and
+     * collection locally and if not throws StaleConfigException populated with the expected and
      * actual versions.
      *
-     * Because SendStaleConfigException has special semantics in terms of how a sharded command's
+     * Because StaleConfigException has special semantics in terms of how a sharded command's
      * response is constructed, this function should be the only means of checking for shard version
      * match.
      */
@@ -186,9 +195,12 @@ public:
 
     /**
      * Tracks deletion of any documents within the range, returning when deletion is complete.
-     * Throws if the collection is dropped while it sleeps. Call this with the collection unlocked.
+     * Throws if the collection is dropped while it sleeps.
      */
-    static Status waitForClean(OperationContext*, NamespaceString, OID const& epoch, ChunkRange);
+    static Status waitForClean(OperationContext* opCtx,
+                               const NamespaceString& nss,
+                               OID const& epoch,
+                               ChunkRange orphanRange);
 
     /**
      * Reports whether any range still scheduled for deletion overlaps the argument range. If so,
@@ -203,7 +215,7 @@ public:
      * Returns a range _not_ owned by this shard that starts no lower than the specified
      * startingFrom key value, if any, or boost::none if there is no such range.
      */
-    boost::optional<KeyRange> getNextOrphanRange(BSONObj const& startingFrom);
+    boost::optional<ChunkRange> getNextOrphanRange(BSONObj const& startingFrom);
 
     /**
      * Replication oplog OpObserver hooks. Informs the sharding system of changes that may be
@@ -211,45 +223,63 @@ public:
      *
      * The global exclusive lock is expected to be held by the caller of any of these functions.
      */
-    bool isDocumentInMigratingChunk(OperationContext* opCtx, const BSONObj& doc);
-    void onInsertOp(OperationContext* opCtx, const BSONObj& insertedDoc);
+    void onInsertOp(OperationContext* opCtx,
+                    const BSONObj& insertedDoc,
+                    const repl::OpTime& opTime);
     void onUpdateOp(OperationContext* opCtx,
                     const BSONObj& query,
                     const BSONObj& update,
-                    const BSONObj& updatedDoc);
-    void onDeleteOp(OperationContext* opCtx, const DeleteState& deleteState);
+                    const BSONObj& updatedDoc,
+                    const repl::OpTime& opTime,
+                    const repl::OpTime& prePostImageOpTime);
+    void onDeleteOp(OperationContext* opCtx,
+                    const DeleteState& deleteState,
+                    const repl::OpTime& opTime,
+                    const repl::OpTime& preImageOpTime);
     void onDropCollection(OperationContext* opCtx, const NamespaceString& collectionName);
 
 private:
     /**
-     * On shard secondaries, invalidates the catalog cache's in-memory routing table for the
-     * collection specified in the _id field of 'query' if 'update' bumps the refreshSequenceNumber
-     * -- meaning a chunk metadata refresh finished being applied to the collection's locally
-     * persisted metadata store. Invalidating the catalog cache's routing table will provoke a
-     * routing table refresh next time the routing table is requested and the new metadata updates
-     * will be found.
+     * This runs on updates to the shard's persisted cache of the config server's
+     * config.collections collection.
+     *
+     * If an update occurs to the 'lastRefreshedCollectionVersion' field, registers a task on the
+     * opCtx -- to run after writes from the oplog are committed and visible to reads -- to notify
+     * the catalog cache loader of a new collection version and clear the routing table so the next
+     * caller with routing information will provoke a routing table refresh. When
+     * 'lastRefreshedCollectionVersion' is in 'update', it means that a chunk metadata refresh
+     * finished being applied to the collection's locally persisted metadata store.
+     *
+     * If an update occurs to the 'enterCriticalSectionSignal' field, simply clear the routing table
+     * immediately. This will provoke the next secondary caller to refresh through the primary,
+     * blocking behind the critical section.
      *
      * query - BSON with an _id that identifies which collections entry is being updated.
-     * update - the $set update being applied to the collections entry.
+     * update - the update being applied to the collections entry.
+     * updatedDoc - the document identified by 'query' with the 'update' applied.
      *
+     * This only runs on secondaries.
      * The global exclusive lock is expected to be held by the caller.
      */
-    void _onConfigRefreshCompleteInvalidateCachedMetadata(OperationContext* opCtx,
-                                                          const BSONObj& query,
-                                                          const BSONObj& update);
+    void _onConfigCollectionsUpdateOp(OperationContext* opCtx,
+                                      const BSONObj& query,
+                                      const BSONObj& update,
+                                      const BSONObj& updatedDoc);
 
     /**
-     * On secondaries, invalidates the catalog cache's in-memory routing table for the collection
-     * specified in the _id field of 'query' because the collection entry has been deleted as part
-     * of dropping the data collection. Invalidating the catalog cache's routing table will provoke
-     * a routing table refresh next time the routing table is requested and the metadata update will
-     * be discovered.
+     * Invalidates the in-memory routing table cache when a collection is dropped, so the next
+     * caller with routing information will provoke a routing table refresh and see the drop.
+     *
+     * Registers a task on the opCtx -- to run after writes from the oplog are committed and visible
+     * to reads.
      *
      * query - BSON with an _id field that identifies which collections entry is being updated.
      *
+     * This only runs on secondaries.
      * The global exclusive lock is expected to be held by the caller.
      */
-    void _onConfigDeleteInvalidateCachedMetadata(OperationContext* opCtx, const BSONObj& query);
+    void _onConfigDeleteInvalidateCachedMetadataAndNotify(OperationContext* opCtx,
+                                                          const BSONObj& query);
 
     /**
      * Checks whether the shard version of the operation matches that of the collection.
@@ -269,6 +299,23 @@ private:
                               ChunkVersion* expectedShardVersion,
                               ChunkVersion* actualShardVersion);
 
+    /**
+     * If the collection is sharded, finds the chunk that contains the specified document, and
+     * increments the size tracked for that chunk by the specified amount of data written, in
+     * bytes. Returns the number of total bytes on that chunk, after the data is written.
+     */
+    uint64_t _incrementChunkOnInsertOrUpdate(OperationContext* opCtx,
+                                             const BSONObj& document,
+                                             long dataWritten);
+
+    /**
+     * Returns true if the total number of bytes on the specified chunk nears the max size of
+     * a shard.
+     */
+    bool _shouldSplitChunk(OperationContext* opCtx,
+                           const ShardKeyPattern& shardKeyPattern,
+                           const Chunk& chunk);
+
     // Namespace this state belongs to.
     const NamespaceString _nss;
 
@@ -285,10 +332,10 @@ private:
     // for access to _metadataManager
     friend auto CollectionRangeDeleter::cleanUpNextRange(OperationContext*,
                                                          NamespaceString const&,
-                                                         CollectionRangeDeleter::Action,
+                                                         OID const& epoch,
                                                          int maxToDelete,
                                                          CollectionRangeDeleter*)
-        -> CollectionRangeDeleter::Action;
+        -> boost::optional<Date_t>;
 };
 
 }  // namespace mongo

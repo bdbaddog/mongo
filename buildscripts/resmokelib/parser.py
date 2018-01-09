@@ -10,6 +10,7 @@ import os.path
 import optparse
 
 from . import config as _config
+from . import errors
 from . import testing
 from . import utils
 from .. import resmokeconfig
@@ -23,6 +24,7 @@ DEST_TO_CONFIG = {
     "continue_on_failure": "continueOnFailure",
     "dbpath_prefix": "dbpathPrefix",
     "dbtest_executable": "dbtest",
+    "distro_id": "distroId",
     "dry_run": "dryRun",
     "exclude_with_any_tags": "excludeWithAnyTags",
     "include_with_any_tags": "includeWithAnyTags",
@@ -34,11 +36,15 @@ DEST_TO_CONFIG = {
     "mongos_parameters": "mongosSetParameters",
     "no_journal": "nojournal",
     "num_clients_per_fixture": "numClientsPerFixture",
+    "patch_build": "patchBuild",
     "prealloc_journal": "preallocJournal",
     "repeat": "repeat",
     "report_failure_status": "reportFailureStatus",
     "report_file": "reportFile",
     "seed": "seed",
+    "service_executor": "serviceExecutor",
+    "shell_conn_string": "shellConnString",
+    "shell_port": "shellPort",
     "shell_read_mode": "shellReadMode",
     "shell_write_mode": "shellWriteMode",
     "shuffle": "shuffle",
@@ -47,6 +53,9 @@ DEST_TO_CONFIG = {
     "storage_engine_cache_size": "storageEngineCacheSizeGB",
     "tag_file": "tagFile",
     "task_id": "taskId",
+    "task_name": "taskName",
+    "transport_layer": "transportLayer",
+    "variant_name": "variantName",
     "wt_coll_config": "wiredTigerCollectionConfigString",
     "wt_engine_config": "wiredTigerEngineConfigString",
     "wt_index_config": "wiredTigerIndexConfigString"
@@ -64,14 +73,9 @@ def parse_command_line():
                       help=("Comma separated list of YAML files that each specify the configuration"
                             " of a suite. If the file is located in the resmokeconfig/suites/"
                             " directory, then the basename without the .yml extension can be"
-                            " specified, e.g. 'core'."))
-
-    parser.add_option("--executor", dest="executor_file", metavar="EXECUTOR",
-                      help=("A YAML file that specifies the executor configuration. If the file is"
-                            " located in the resmokeconfig/suites/ directory, then the basename"
-                            " without the .yml extension can be specified, e.g. 'core_small_oplog'."
-                            " If specified in combination with the --suites option, then the suite"
-                            " configuration takes precedence."))
+                            " specified, e.g. 'core'. If a list of files is passed in as"
+                            " positional arguments, they will be run using the suites'"
+                            " configurations"))
 
     parser.add_option("--log", dest="logger_file", metavar="LOGGER",
                       help=("A YAML file that specifies the logging configuration. If the file is"
@@ -164,6 +168,18 @@ def parse_command_line():
                       help=("Enable or disable preallocation of journal files for all mongod"
                             " processes. Defaults to %default."))
 
+    parser.add_option("--shellConnString", dest="shell_conn_string",
+                      metavar="CONN_STRING",
+                      help="Override the default fixture and connect to an existing MongoDB"
+                           " cluster instead. This is useful for connecting to a MongoDB"
+                           " deployment started outside of resmoke.py including one running in a"
+                           " debugger.")
+
+    parser.add_option("--shellPort", dest="shell_port", metavar="PORT",
+                      help="Convenience form of --shellConnString for connecting to an"
+                           " existing MongoDB cluster with the URL mongodb://localhost:[PORT]."
+                           " This is useful for connecting to a server running in a debugger.")
+
     parser.add_option("--repeat", type="int", dest="repeat", metavar="N",
                       help="Repeat the given suite(s) N times, or until one fails.")
 
@@ -180,6 +196,12 @@ def parse_command_line():
     parser.add_option("--seed", type="int", dest="seed", metavar="SEED",
                       help=("Seed for the random number generator. Useful in combination with the"
                             " --shuffle option for producing a consistent test execution order."))
+
+    parser.add_option("--serviceExecutor", dest="service_executor", metavar="EXECUTOR",
+                      help="The service executor used by jstests")
+
+    parser.add_option("--transportLayer", dest="transport_layer", metavar="TRANSPORT",
+                      help="The transport layer used by jstests")
 
     parser.add_option("--shellReadMode", type="choice", action="store", dest="shell_read_mode",
                       choices=("commands", "compatibility", "legacy"), metavar="READ_MODE",
@@ -214,9 +236,6 @@ def parse_command_line():
     parser.add_option("--tagFile", dest="tag_file", metavar="OPTIONS",
                       help="A YAML file that associates tests and tags.")
 
-    parser.add_option("--taskId", dest="task_id", metavar="TASK_ID",
-                      help="Set the Id of the Evergreen task running the tests.")
-
     parser.add_option("--wiredTigerCollectionConfigString", dest="wt_coll_config", metavar="CONFIG",
                       help="Set the WiredTiger collection configuration setting for all mongod's.")
 
@@ -226,16 +245,63 @@ def parse_command_line():
     parser.add_option("--wiredTigerIndexConfigString", dest="wt_index_config", metavar="CONFIG",
                       help="Set the WiredTiger index configuration setting for all mongod's.")
 
-    parser.set_defaults(executor_file="with_server",
-                        logger_file="console",
+    parser.add_option("--executor", dest="executor_file",
+                      help="OBSOLETE: Superceded by --suites; specify --suites=SUITE path/to/test"
+                           " to run a particular test under a particular suite configuration.")
+
+    evergreen_options = optparse.OptionGroup(
+        parser,
+        title="Evergreen options",
+        description=("Options used to propagate information about the Evergreen task running this"
+                     " script."))
+    parser.add_option_group(evergreen_options)
+
+    evergreen_options.add_option("--distroId", dest="distro_id", metavar="DISTRO_ID",
+                                 help=("Set the identifier for the Evergreen distro running the"
+                                       " tests."))
+
+    evergreen_options.add_option("--patchBuild", action="store_true", dest="patch_build",
+                                 help=("Indicate that the Evergreen task running the tests is a"
+                                       " patch build."))
+
+    evergreen_options.add_option("--taskName", dest="task_name", metavar="TASK_NAME",
+                                 help="Set the name of the Evergreen task running the tests.")
+
+    evergreen_options.add_option("--taskId", dest="task_id", metavar="TASK_ID",
+                                 help="Set the Id of the Evergreen task running the tests.")
+
+    evergreen_options.add_option("--variantName", dest="variant_name", metavar="VARIANT_NAME",
+                                 help=("Set the name of the Evergreen build variant running the"
+                                       " tests."))
+
+    parser.set_defaults(logger_file="console",
                         dry_run="off",
                         find_suites=False,
                         list_suites=False,
+                        suite_files="with_server",
                         prealloc_journal="off",
                         shuffle="auto",
                         stagger_jobs="off")
 
-    return parser.parse_args()
+    options, args = parser.parse_args()
+
+    validate_options(parser, options, args)
+
+    return options, args
+
+
+def validate_options(parser, options, args):
+    """
+    Do preliminary validation on the options and error on any invalid options.
+    """
+
+    if options.shell_port is not None and options.shell_conn_string is not None:
+        parser.error("Cannot specify both `shellPort` and `shellConnString`")
+
+    if options.executor_file:
+        parser.error("--executor is superseded by --suites; specify --suites={} {} to run the"
+                     "test(s) under those suite configuration(s)"
+                     .format(options.executor_file, " ".join(args)))
 
 
 def get_logging_config(values):
@@ -261,9 +327,14 @@ def update_config_vars(values):
     _config.DBPATH_PREFIX = _expand_user(config.pop("dbpathPrefix"))
     _config.DBTEST_EXECUTABLE = _expand_user(config.pop("dbtest"))
     _config.DRY_RUN = config.pop("dryRun")
-    _config.EXCLUDE_WITH_ANY_TAGS = config.pop("excludeWithAnyTags")
+    _config.EVERGREEN_DISTRO_ID = config.pop("distroId")
+    _config.EVERGREEN_PATCH_BUILD = config.pop("patchBuild")
+    _config.EVERGREEN_TASK_ID = config.pop("taskId")
+    _config.EVERGREEN_TASK_NAME = config.pop("taskName")
+    _config.EVERGREEN_VARIANT_NAME = config.pop("variantName")
+    _config.EXCLUDE_WITH_ANY_TAGS = _tags_from_list(config.pop("excludeWithAnyTags"))
     _config.FAIL_FAST = not config.pop("continueOnFailure")
-    _config.INCLUDE_WITH_ANY_TAGS = config.pop("includeWithAnyTags")
+    _config.INCLUDE_WITH_ANY_TAGS = _tags_from_list(config.pop("includeWithAnyTags"))
     _config.JOBS = config.pop("jobs")
     _config.MONGO_EXECUTABLE = _expand_user(config.pop("mongo"))
     _config.MONGOD_EXECUTABLE = _expand_user(config.pop("mongod"))
@@ -277,13 +348,14 @@ def update_config_vars(values):
     _config.REPEAT = config.pop("repeat")
     _config.REPORT_FAILURE_STATUS = config.pop("reportFailureStatus")
     _config.REPORT_FILE = config.pop("reportFile")
+    _config.SERVICE_EXECUTOR = config.pop("serviceExecutor")
     _config.SHELL_READ_MODE = config.pop("shellReadMode")
     _config.SHELL_WRITE_MODE = config.pop("shellWriteMode")
     _config.STAGGER_JOBS = config.pop("staggerJobs") == "on"
     _config.STORAGE_ENGINE = config.pop("storageEngine")
     _config.STORAGE_ENGINE_CACHE_SIZE = config.pop("storageEngineCacheSizeGB")
     _config.TAG_FILE = config.pop("tagFile")
-    _config.TASK_ID = config.pop("taskId")
+    _config.TRANSPORT_LAYER = config.pop("transportLayer")
     _config.WT_COLL_CONFIG = config.pop("wiredTigerCollectionConfigString")
     _config.WT_ENGINE_CONFIG = config.pop("wiredTigerEngineConfigString")
     _config.WT_INDEX_CONFIG = config.pop("wiredTigerIndexConfigString")
@@ -297,13 +369,24 @@ def update_config_vars(values):
     else:
         _config.SHUFFLE = shuffle == "on"
 
+    conn_string = config.pop("shellConnString")
+    port = config.pop("shellPort")
+
+    if port is not None:
+        conn_string = "mongodb://localhost:" + port
+
+    if conn_string is not None:
+        _config.SHELL_CONN_STRING = conn_string
+
     if config:
         raise optparse.OptionValueError("Unknown option(s): %s" % (config.keys()))
 
 
-def create_test_membership_map(fail_on_missing_selector=False):
+def create_test_membership_map(fail_on_missing_selector=False, test_kind=None):
     """
     Returns a dict keyed by test name containing all of the suites that will run that test.
+
+    If 'test_kind' is specified then only the mappings for that kind are returned.
     Since this iterates through every available suite, it should only be run once.
     """
 
@@ -312,6 +395,8 @@ def create_test_membership_map(fail_on_missing_selector=False):
     for suite_name in suite_names:
         try:
             suite_config = _get_suite_config(suite_name)
+            if test_kind and suite_config.get("test_kind") != test_kind:
+                continue
             suite = testing.suite.Suite(suite_name, suite_config)
         except IOError as err:
             # If unittests.txt or integration_tests.txt aren't there we'll ignore the error because
@@ -329,34 +414,24 @@ def create_test_membership_map(fail_on_missing_selector=False):
 
 
 def get_suites(values, args):
-    if (values.suite_files is None and not args) or (values.suite_files is not None and args):
-        raise optparse.OptionValueError("Must specify either --suites or a list of tests")
-
-    _config.INTERNAL_EXECUTOR_NAME = values.executor_file
-
-    # If there are no suites specified, but args, collect the specified files.
+    suite_roots = None
     if args:
         # Do not change the execution order of the tests passed as args, unless a tag option is
         # specified. If an option is specified, then sort the tests for consistent execution order.
         _config.ORDER_TESTS_BY_NAME = any(tag_filter is not None for
                                           tag_filter in (_config.EXCLUDE_WITH_ANY_TAGS,
                                                          _config.INCLUDE_WITH_ANY_TAGS))
-        # No specified config, just use the following, and default the logging and executor.
-        suite_config = _make_config(args)
-        _ensure_executor(suite_config, values.executor_file)
-        # The test_kind comes from the executor file.
-        _ensure_test_kind(suite_config,
-                          _get_yaml_config("executor", values.executor_file),
-                          values.executor_file)
-        suite = testing.suite.Suite("<%s>" % suite_config["test_kind"], suite_config)
-        return [suite]
+        # Build configuration for list of files to run.
+        suite_roots = _get_suite_roots(args)
 
     suite_files = values.suite_files.split(",")
 
     suites = []
     for suite_filename in suite_files:
         suite_config = _get_suite_config(suite_filename)
-        _ensure_executor(suite_config, values.executor_file)
+        if suite_roots:
+            # Override the suite's default test files with those passed in from the command line.
+            suite_config.update(suite_roots)
         suite = testing.suite.Suite(suite_filename, suite_config)
         suites.append(suite)
     return suites
@@ -367,8 +442,8 @@ def get_named_suites():
     Returns the list of suites available to execute.
     """
 
-    # Skip "with_server" and "no_server" because they do not define any test files to run.
-    executor_only = set(["with_server", "no_server"])
+    # Skip "with_*server" and "no_server" because they do not define any test files to run.
+    executor_only = set(["with_server", "with_external_server", "no_server"])
     suite_names = [suite for suite in resmokeconfig.NAMED_SUITES if suite not in executor_only]
     suite_names.sort()
     return suite_names
@@ -412,14 +487,8 @@ def _get_suite_config(pathname):
     return _get_yaml_config("suite", pathname)
 
 
-def _make_config(files):
+def _get_suite_roots(files):
     return {"selector": {"roots": files}}
-
-
-def _ensure_test_kind(suite_config, yaml_config, yaml_file):
-    if "test_kind" not in yaml_config:
-        raise ValueError("YAML config file %s missing key 'test_kind'" % (yaml_file))
-    suite_config["test_kind"] = yaml_config["test_kind"]
 
 
 def _get_yaml_config(kind, pathname):
@@ -427,19 +496,13 @@ def _get_yaml_config(kind, pathname):
     # extension.
     if not utils.is_yaml_file(pathname) and not os.path.dirname(pathname):
         if pathname not in resmokeconfig.NAMED_SUITES:
-            raise optparse.OptionValueError("Unknown %s '%s'" % (kind, pathname))
+            raise errors.SuiteNotFound("Unknown %s '%s'" % (kind, pathname))
         pathname = resmokeconfig.NAMED_SUITES[pathname]  # Expand 'pathname' to full path.
 
     if not utils.is_yaml_file(pathname) or not os.path.isfile(pathname):
         raise optparse.OptionValueError("Expected a %s YAML config, but got '%s'"
                                         % (kind, pathname))
     return utils.load_yaml_file(pathname)
-
-
-def _ensure_executor(suite_config, pathname):
-    if "executor" not in suite_config:
-        # Named executors are specified as the basename of the file, without the .yml extension.
-        suite_config["executor"] = _get_yaml_config("executor", pathname).pop("executor")
 
 
 def _expand_user(pathname):
@@ -449,3 +512,17 @@ def _expand_user(pathname):
     if pathname is None:
         return None
     return os.path.expanduser(pathname)
+
+
+def _tags_from_list(tags_list):
+    """
+    Returns the list of tags from a list of tag parameter values.
+
+    Each parameter value in the list may be a list of comma separated tags, with empty strings
+    ignored.
+    """
+    tags = []
+    if tags_list is not None:
+        for tag in tags_list:
+            tags.extend([t for t in tag.split(",") if t != ""])
+    return tags

@@ -120,15 +120,11 @@ void ShardRemote::updateReplSetMonitor(const HostAndPort& remoteHost,
     if (remoteCommandStatus.isOK())
         return;
 
-    if (ErrorCodes::isNotMasterError(remoteCommandStatus.code()) ||
-        (remoteCommandStatus == ErrorCodes::InterruptedDueToReplStateChange) ||
-        (remoteCommandStatus == ErrorCodes::PrimarySteppedDown)) {
+    if (ErrorCodes::isNotMasterError(remoteCommandStatus.code())) {
         _targeter->markHostNotMaster(remoteHost, remoteCommandStatus);
     } else if (ErrorCodes::isNetworkError(remoteCommandStatus.code())) {
         _targeter->markHostUnreachable(remoteHost, remoteCommandStatus);
-    } else if (remoteCommandStatus == ErrorCodes::NotMasterOrSecondary) {
-        _targeter->markHostUnreachable(remoteHost, remoteCommandStatus);
-    } else if (remoteCommandStatus == ErrorCodes::ExceededTimeLimit) {
+    } else if (remoteCommandStatus == ErrorCodes::NetworkInterfaceExceededTimeLimit) {
         _targeter->markHostUnreachable(remoteHost, remoteCommandStatus);
     }
 }
@@ -192,7 +188,8 @@ StatusWith<Shard::CommandResponse> ShardRemote::_runCommand(OperationContext* op
         requestTimeout < Milliseconds::max() ? requestTimeout : RemoteCommandRequest::kNoTimeout);
 
     RemoteCommandResponse response =
-        Status(ErrorCodes::InternalError, "Internal error running command");
+        Status(ErrorCodes::InternalError,
+               str::stream() << "Failed to run remote command request " << request.toString());
 
     TaskExecutor* executor = Grid::get(opCtx)->getExecutorPool()->getFixedExecutor();
     auto swCallbackHandle = executor->scheduleRemoteCommand(
@@ -207,7 +204,7 @@ StatusWith<Shard::CommandResponse> ShardRemote::_runCommand(OperationContext* op
     updateReplSetMonitor(host, response.status);
 
     if (!response.status.isOK()) {
-        if (response.status == ErrorCodes::ExceededTimeLimit) {
+        if (ErrorCodes::isExceededTimeLimitError(response.status.code())) {
             LOG(0) << "Operation timed out with status " << redact(response.status);
         }
         return response.status;
@@ -249,45 +246,44 @@ StatusWith<Shard::QueryResponse> ShardRemote::_exhaustiveFindOnConfig(
     // If for some reason the callback never gets invoked, we will return this status in response.
     Status status = Status(ErrorCodes::InternalError, "Internal error running find command");
 
-    auto fetcherCallback =
-        [this, &status, &response](const Fetcher::QueryResponseStatus& dataStatus,
-                                   Fetcher::NextAction* nextAction,
-                                   BSONObjBuilder* getMoreBob) {
+    auto fetcherCallback = [&status, &response](const Fetcher::QueryResponseStatus& dataStatus,
+                                                Fetcher::NextAction* nextAction,
+                                                BSONObjBuilder* getMoreBob) {
 
-            // Throw out any accumulated results on error
-            if (!dataStatus.isOK()) {
-                status = dataStatus.getStatus();
+        // Throw out any accumulated results on error
+        if (!dataStatus.isOK()) {
+            status = dataStatus.getStatus();
+            response.docs.clear();
+            return;
+        }
+
+        const auto& data = dataStatus.getValue();
+
+        if (data.otherFields.metadata.hasField(rpc::kReplSetMetadataFieldName)) {
+            auto replParseStatus =
+                rpc::ReplSetMetadata::readFromMetadata(data.otherFields.metadata);
+            if (!replParseStatus.isOK()) {
+                status = replParseStatus.getStatus();
                 response.docs.clear();
                 return;
             }
 
-            const auto& data = dataStatus.getValue();
+            const auto& replSetMetadata = replParseStatus.getValue();
+            response.opTime = replSetMetadata.getLastOpCommitted();
+        }
 
-            if (data.otherFields.metadata.hasField(rpc::kReplSetMetadataFieldName)) {
-                auto replParseStatus =
-                    rpc::ReplSetMetadata::readFromMetadata(data.otherFields.metadata);
-                if (!replParseStatus.isOK()) {
-                    status = replParseStatus.getStatus();
-                    response.docs.clear();
-                    return;
-                }
+        for (const BSONObj& doc : data.documents) {
+            response.docs.push_back(doc.getOwned());
+        }
 
-                const auto& replSetMetadata = replParseStatus.getValue();
-                response.opTime = replSetMetadata.getLastOpCommitted();
-            }
+        status = Status::OK();
 
-            for (const BSONObj& doc : data.documents) {
-                response.docs.push_back(doc.getOwned());
-            }
-
-            status = Status::OK();
-
-            if (!getMoreBob) {
-                return;
-            }
-            getMoreBob->append("getMore", data.cursorId);
-            getMoreBob->append("collection", data.nss.coll());
-        };
+        if (!getMoreBob) {
+            return;
+        }
+        getMoreBob->append("getMore", data.cursorId);
+        getMoreBob->append("collection", data.nss.coll());
+    };
 
     BSONObj readConcernObj;
     {
@@ -324,7 +320,8 @@ StatusWith<Shard::QueryResponse> ShardRemote::_exhaustiveFindOnConfig(
                     findCmdBuilder.done(),
                     fetcherCallback,
                     _appendMetadataForCommand(opCtx, readPrefWithMinOpTime),
-                    maxTimeMS);
+                    maxTimeMS /* find network timeout */,
+                    maxTimeMS /* getMore network timeout */);
     Status scheduleStatus = fetcher.schedule();
     if (!scheduleStatus.isOK()) {
         return scheduleStatus;
@@ -335,7 +332,7 @@ StatusWith<Shard::QueryResponse> ShardRemote::_exhaustiveFindOnConfig(
     updateReplSetMonitor(host.getValue(), status);
 
     if (!status.isOK()) {
-        if (status.compareCode(ErrorCodes::ExceededTimeLimit)) {
+        if (ErrorCodes::isExceededTimeLimitError(status.code())) {
             LOG(0) << "Operation timed out " << causedBy(status);
         }
         return status;

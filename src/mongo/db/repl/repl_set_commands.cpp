@@ -32,6 +32,8 @@
 
 #include "mongo/platform/basic.h"
 
+#include <boost/algorithm/string.hpp>
+
 #include "mongo/db/repl/repl_set_command.h"
 
 #include "mongo/base/init.h"
@@ -47,7 +49,6 @@
 #include "mongo/db/lasterror.h"
 #include "mongo/db/op_observer.h"
 #include "mongo/db/repl/drop_pending_collection_reaper.h"
-#include "mongo/db/repl/old_update_position_args.h"
 #include "mongo/db/repl/oplog.h"
 #include "mongo/db/repl/repl_set_heartbeat_args.h"
 #include "mongo/db/repl/repl_set_heartbeat_args_v1.h"
@@ -65,6 +66,7 @@
 #include "mongo/transport/transport_layer.h"
 #include "mongo/util/fail_point_service.h"
 #include "mongo/util/log.h"
+#include "mongo/util/net/sock.h"
 #include "mongo/util/scopeguard.h"
 
 namespace mongo {
@@ -97,7 +99,6 @@ public:
     virtual bool run(OperationContext* opCtx,
                      const string&,
                      const BSONObj& cmdObj,
-                     string& errmsg,
                      BSONObjBuilder& result) {
         log() << "replSetTest command received: " << cmdObj.toString();
 
@@ -165,7 +166,6 @@ public:
     virtual bool run(OperationContext* opCtx,
                      const string&,
                      const BSONObj& cmdObj,
-                     string& errmsg,
                      BSONObjBuilder& result) {
         Status status = getGlobalReplicationCoordinator()->checkReplEnabledForCommand(&result);
         if (!status.isOK())
@@ -192,7 +192,6 @@ public:
     virtual bool run(OperationContext* opCtx,
                      const string&,
                      const BSONObj& cmdObj,
-                     string& errmsg,
                      BSONObjBuilder& result) {
         if (cmdObj["forShell"].trueValue())
             LastError::get(opCtx->getClient()).disable();
@@ -233,7 +232,6 @@ public:
     virtual bool run(OperationContext* opCtx,
                      const string&,
                      const BSONObj& cmdObj,
-                     string& errmsg,
                      BSONObjBuilder& result) {
         Status status = getGlobalReplicationCoordinator()->checkReplEnabledForCommand(&result);
         if (!status.isOK())
@@ -251,23 +249,41 @@ private:
 
 namespace {
 HostAndPort someHostAndPortForMe() {
-    const char* ips = serverGlobalParams.bind_ip.c_str();
-    while (*ips) {
-        std::string ip;
-        const char* comma = strchr(ips, ',');
-        if (comma) {
-            ip = std::string(ips, comma - ips);
-            ips = comma + 1;
-        } else {
-            ip = std::string(ips);
-            ips = "";
-        }
-        HostAndPort h = HostAndPort(ip, serverGlobalParams.port);
-        if (!h.isLocalHost() && !h.isDefaultRoute()) {
-            return h;
+    const auto& bind_ip = serverGlobalParams.bind_ip;
+    const auto& bind_port = serverGlobalParams.port;
+    const auto& af = IPv6Enabled() ? AF_UNSPEC : AF_INET;
+    bool localhost_only = true;
+
+    std::vector<std::string> addrs;
+    if (!bind_ip.empty()) {
+        boost::split(addrs, bind_ip, boost::is_any_of(","), boost::token_compress_on);
+    }
+    for (const auto& addr : addrs) {
+        // Get all addresses associated with each named bind host.
+        // If we find any that are valid external identifiers,
+        // then go ahead and use the first one.
+        const auto& socks = SockAddr::createAll(addr, bind_port, af);
+        for (const auto& sock : socks) {
+            if (!sock.isLocalHost()) {
+                if (!sock.isDefaultRoute()) {
+                    // Return the hostname as passed rather than the resolved address.
+                    return HostAndPort(addr, bind_port);
+                }
+                localhost_only = false;
+            }
         }
     }
 
+    if (localhost_only) {
+        // We're only binding localhost-type interfaces.
+        // Use one of those by name if available,
+        // otherwise fall back on "localhost".
+        return HostAndPort(addrs.size() ? addrs[0] : "localhost", bind_port);
+    }
+
+    // Based on the above logic, this is only reached for --bind_ip '0.0.0.0'.
+    // We are listening externally, but we don't have a definite hostname.
+    // Ask the OS.
     std::string h = getHostName();
     verify(!h.empty());
     verify(h != "localhost");
@@ -332,7 +348,6 @@ public:
     virtual bool run(OperationContext* opCtx,
                      const string&,
                      const BSONObj& cmdObj,
-                     string& errmsg,
                      BSONObjBuilder& result) {
         BSONObj configObj;
         if (cmdObj["replSetInitiate"].type() == Object) {
@@ -381,8 +396,7 @@ public:
 
         if (configObj.getField("version").eoo()) {
             // Missing version field defaults to version 1.
-            BSONObjBuilder builder;
-            builder.appendElements(configObj);
+            BSONObjBuilder builder(std::move(configObj));
             builder.append("version", 1);
             configObj = builder.obj();
         }
@@ -409,7 +423,6 @@ public:
     virtual bool run(OperationContext* opCtx,
                      const string&,
                      const BSONObj& cmdObj,
-                     string& errmsg,
                      BSONObjBuilder& result) {
         Status status = getGlobalReplicationCoordinator()->checkReplEnabledForCommand(&result);
         if (!status.isOK()) {
@@ -417,7 +430,7 @@ public:
         }
 
         if (cmdObj["replSetReconfig"].type() != Object) {
-            errmsg = "no configuration specified";
+            result.append("errmsg", "no configuration specified");
             return false;
         }
 
@@ -431,6 +444,8 @@ public:
 
         WriteUnitOfWork wuow(opCtx);
         if (status.isOK() && !parsedArgs.force) {
+            // Users must not be allowed to provide their own contents for the o2 field.
+            // o2 field of no-ops is supposed to be used internally.
             getGlobalServiceContext()->getOpObserver()->onOpMessage(
                 opCtx,
                 BSON("msg"
@@ -465,7 +480,6 @@ public:
     virtual bool run(OperationContext* opCtx,
                      const string&,
                      const BSONObj& cmdObj,
-                     string& errmsg,
                      BSONObjBuilder& result) {
         Status status = getGlobalReplicationCoordinator()->checkReplEnabledForCommand(&result);
         if (!status.isOK())
@@ -496,7 +510,6 @@ public:
     virtual bool run(OperationContext* opCtx,
                      const string&,
                      const BSONObj& cmdObj,
-                     string& errmsg,
                      BSONObjBuilder& result) {
         Status status = getGlobalReplicationCoordinator()->checkReplEnabledForCommand(&result);
         if (!status.isOK())
@@ -561,7 +574,6 @@ public:
     virtual bool run(OperationContext* opCtx,
                      const string&,
                      const BSONObj& cmdObj,
-                     string& errmsg,
                      BSONObjBuilder& result) {
         Status status = getGlobalReplicationCoordinator()->checkReplEnabledForCommand(&result);
         if (!status.isOK())
@@ -589,7 +601,6 @@ public:
     virtual bool run(OperationContext* opCtx,
                      const string&,
                      const BSONObj& cmdObj,
-                     string& errmsg,
                      BSONObjBuilder& result) {
         Status status = getGlobalReplicationCoordinator()->checkReplEnabledForCommand(&result);
         if (!status.isOK())
@@ -617,7 +628,6 @@ public:
     virtual bool run(OperationContext* opCtx,
                      const string&,
                      const BSONObj& cmdObj,
-                     string& errmsg,
                      BSONObjBuilder& result) {
         auto replCoord = repl::ReplicationCoordinator::get(opCtx->getClient()->getServiceContext());
 
@@ -646,21 +656,7 @@ public:
 
         status = args.initialize(cmdObj);
         if (status.isOK()) {
-            // v3.2.4+ style replSetUpdatePosition command.
             status = replCoord->processReplSetUpdatePosition(args, &configVersion);
-
-            if (status == ErrorCodes::InvalidReplicaSetConfig) {
-                result.append("configVersion", configVersion);
-            }
-            return appendCommandStatus(result, status);
-        } else if (status == ErrorCodes::NoSuchKey) {
-            // Pre-3.2.4 style replSetUpdatePosition command.
-            OldUpdatePositionArgs oldArgs;
-            status = oldArgs.initialize(cmdObj);
-            if (!status.isOK())
-                return appendCommandStatus(result, status);
-
-            status = replCoord->processReplSetUpdatePosition(oldArgs, &configVersion);
 
             if (status == ErrorCodes::InvalidReplicaSetConfig) {
                 result.append("configVersion", configVersion);
@@ -692,7 +688,7 @@ bool replHasDatabases(OperationContext* opCtx) {
 
         // we have a local database.  return true if oplog isn't empty
         BSONObj o;
-        if (Helpers::getSingleton(opCtx, repl::rsOplogName.c_str(), o)) {
+        if (Helpers::getSingleton(opCtx, NamespaceString::kRsOplogNamespace.ns().c_str(), o)) {
             return true;
         }
     }
@@ -716,7 +712,6 @@ public:
     virtual bool run(OperationContext* opCtx,
                      const string&,
                      const BSONObj& cmdObj,
-                     string& errmsg,
                      BSONObjBuilder& result) {
         MONGO_FAIL_POINT_BLOCK(rsDelayHeartbeatResponse, delay) {
             const BSONObj& data = delay.getData();
@@ -733,22 +728,6 @@ public:
             status = Status(ErrorCodes::NoReplicationEnabled, "not running with --replSet");
             return appendCommandStatus(result, status);
         }
-
-        /* we want to keep heartbeat connections open when relinquishing primary.
-           tag them here. */
-        transport::Session::TagMask originalTag = 0;
-        auto session = opCtx->getClient()->session();
-        if (session) {
-            originalTag = session->getTags();
-            session->replaceTags(originalTag | transport::Session::kKeepOpen);
-        }
-
-        // Unset the tag on block exit
-        ON_BLOCK_EXIT([session, originalTag]() {
-            if (session) {
-                session->replaceTags(originalTag);
-            }
-        });
 
         // Process heartbeat based on the version of request. The missing fields in mismatched
         // version will be empty.
@@ -802,7 +781,6 @@ public:
     virtual bool run(OperationContext* opCtx,
                      const string&,
                      const BSONObj& cmdObj,
-                     string& errmsg,
                      BSONObjBuilder& result) {
         Status status = getGlobalReplicationCoordinator()->checkReplEnabledForCommand(&result);
         if (!status.isOK())
@@ -834,7 +812,6 @@ private:
     virtual bool run(OperationContext* opCtx,
                      const string&,
                      const BSONObj& cmdObj,
-                     string& errmsg,
                      BSONObjBuilder& result) {
         DEV log() << "received elect msg " << cmdObj.toString();
         else LOG(2) << "received elect msg " << cmdObj.toString();
@@ -867,7 +844,6 @@ public:
     virtual bool run(OperationContext* opCtx,
                      const string&,
                      const BSONObj& cmdObj,
-                     string& errmsg,
                      BSONObjBuilder& result) {
         Status status = getGlobalReplicationCoordinator()->checkReplEnabledForCommand(&result);
         if (!status.isOK())
@@ -903,7 +879,6 @@ public:
     virtual bool run(OperationContext* opCtx,
                      const string&,
                      const BSONObj& cmdObj,
-                     string& errmsg,
                      BSONObjBuilder& result) override {
         Status status = getGlobalReplicationCoordinator()->checkReplEnabledForCommand(&result);
         if (!status.isOK())

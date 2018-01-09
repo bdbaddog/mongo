@@ -34,19 +34,17 @@
 #include "mongo/base/init.h"
 #include "mongo/base/simple_string_data_comparator.h"
 #include "mongo/base/status.h"
-#include "mongo/db/ops/modifier_add_to_set.h"
-#include "mongo/db/ops/modifier_bit.h"
-#include "mongo/db/ops/modifier_compare.h"
-#include "mongo/db/ops/modifier_current_date.h"
-#include "mongo/db/ops/modifier_inc.h"
-#include "mongo/db/ops/modifier_pop.h"
-#include "mongo/db/ops/modifier_pull.h"
-#include "mongo/db/ops/modifier_pull_all.h"
-#include "mongo/db/ops/modifier_push.h"
-#include "mongo/db/ops/modifier_rename.h"
-#include "mongo/db/ops/modifier_set.h"
-#include "mongo/db/ops/modifier_unset.h"
+#include "mongo/db/update/addtoset_node.h"
 #include "mongo/db/update/arithmetic_node.h"
+#include "mongo/db/update/bit_node.h"
+#include "mongo/db/update/compare_node.h"
+#include "mongo/db/update/conflict_placeholder_node.h"
+#include "mongo/db/update/current_date_node.h"
+#include "mongo/db/update/pop_node.h"
+#include "mongo/db/update/pull_node.h"
+#include "mongo/db/update/pullall_node.h"
+#include "mongo/db/update/push_node.h"
+#include "mongo/db/update/rename_node.h"
 #include "mongo/db/update/set_node.h"
 #include "mongo/db/update/unset_node.h"
 #include "mongo/platform/unordered_map.h"
@@ -106,9 +104,6 @@ void init(NameMap* nameMap) {
     ModifierEntry* entryPush = new ModifierEntry("$push", MOD_PUSH);
     nameMap->insert(make_pair(StringData(entryPush->name), entryPush));
 
-    ModifierEntry* entryPushAll = new ModifierEntry("$pushAll", MOD_PUSH_ALL);
-    nameMap->insert(make_pair(StringData(entryPushAll->name), entryPushAll));
-
     ModifierEntry* entrySet = new ModifierEntry("$set", MOD_SET);
     nameMap->insert(make_pair(StringData(entrySet->name), entrySet));
 
@@ -140,53 +135,38 @@ ModifierType getType(StringData typeStr) {
     return it->second->type;
 }
 
-ModifierInterface* makeUpdateMod(ModifierType modType) {
-    switch (modType) {
-        case MOD_ADD_TO_SET:
-            return new ModifierAddToSet;
-        case MOD_BIT:
-            return new ModifierBit;
-        case MOD_CURRENTDATE:
-            return new ModifierCurrentDate;
-        case MOD_INC:
-            return new ModifierInc(ModifierInc::MODE_INC);
-        case MOD_MAX:
-            return new ModifierCompare(ModifierCompare::MAX);
-        case MOD_MIN:
-            return new ModifierCompare(ModifierCompare::MIN);
-        case MOD_MUL:
-            return new ModifierInc(ModifierInc::MODE_MUL);
-        case MOD_POP:
-            return new ModifierPop;
-        case MOD_PULL:
-            return new ModifierPull;
-        case MOD_PULL_ALL:
-            return new ModifierPullAll;
-        case MOD_PUSH:
-            return new ModifierPush(ModifierPush::PUSH_NORMAL);
-        case MOD_PUSH_ALL:
-            return new ModifierPush(ModifierPush::PUSH_ALL);
-        case MOD_SET:
-            return new ModifierSet(ModifierSet::SET_NORMAL);
-        case MOD_SET_ON_INSERT:
-            return new ModifierSet(ModifierSet::SET_ON_INSERT);
-        case MOD_RENAME:
-            return new ModifierRename;
-        case MOD_UNSET:
-            return new ModifierUnset;
-        default:
-            return NULL;
-    }
-}
-
 std::unique_ptr<UpdateLeafNode> makeUpdateLeafNode(ModifierType modType) {
     switch (modType) {
+        case MOD_ADD_TO_SET:
+            return stdx::make_unique<AddToSetNode>();
+        case MOD_BIT:
+            return stdx::make_unique<BitNode>();
+        case MOD_CONFLICT_PLACEHOLDER:
+            return stdx::make_unique<ConflictPlaceholderNode>();
+        case MOD_CURRENTDATE:
+            return stdx::make_unique<CurrentDateNode>();
         case MOD_INC:
             return stdx::make_unique<ArithmeticNode>(ArithmeticNode::ArithmeticOp::kAdd);
+        case MOD_MAX:
+            return stdx::make_unique<CompareNode>(CompareNode::CompareMode::kMax);
+        case MOD_MIN:
+            return stdx::make_unique<CompareNode>(CompareNode::CompareMode::kMin);
         case MOD_MUL:
             return stdx::make_unique<ArithmeticNode>(ArithmeticNode::ArithmeticOp::kMultiply);
+        case MOD_POP:
+            return stdx::make_unique<PopNode>();
+        case MOD_PULL:
+            return stdx::make_unique<PullNode>();
+        case MOD_PULL_ALL:
+            return stdx::make_unique<PullAllNode>();
+        case MOD_PUSH:
+            return stdx::make_unique<PushNode>();
+        case MOD_RENAME:
+            return stdx::make_unique<RenameNode>();
         case MOD_SET:
             return stdx::make_unique<SetNode>();
+        case MOD_SET_ON_INSERT:
+            return stdx::make_unique<SetNode>(UpdateNode::Context::kInsertOnly);
         case MOD_UNSET:
             return stdx::make_unique<UnsetNode>();
         default:

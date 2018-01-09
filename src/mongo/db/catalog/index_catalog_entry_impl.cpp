@@ -36,6 +36,7 @@
 
 #include "mongo/base/init.h"
 #include "mongo/db/catalog/collection_catalog_entry.h"
+#include "mongo/db/catalog/collection_info_cache_impl.h"
 #include "mongo/db/catalog/head_manager.h"
 #include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
@@ -43,7 +44,6 @@
 #include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/matcher/expression.h"
 #include "mongo/db/matcher/expression_parser.h"
-#include "mongo/db/matcher/extensions_callback_disallow_extensions.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/query/collation/collator_factory_interface.h"
 #include "mongo/db/service_context.h"
@@ -127,9 +127,18 @@ IndexCatalogEntryImpl::IndexCatalogEntryImpl(IndexCatalogEntry* const this_,
     if (BSONElement filterElement = _descriptor->getInfoElement("partialFilterExpression")) {
         invariant(filterElement.isABSONObj());
         BSONObj filter = filterElement.Obj();
-        StatusWithMatchExpression statusWithMatcher = MatchExpressionParser::parse(
-            filter, ExtensionsCallbackDisallowExtensions(), _collator.get());
-        // this should be checked in create, so can blow up here
+        boost::intrusive_ptr<ExpressionContext> expCtx(
+            new ExpressionContext(opCtx, _collator.get()));
+
+        // Parsing the partial filter expression is not expected to fail here since the
+        // expression would have been successfully parsed upstream during index creation. However,
+        // filters that were allowed in partial filter expressions prior to 3.6 may be present in
+        // the index catalog and must also successfully parse.
+        StatusWithMatchExpression statusWithMatcher =
+            MatchExpressionParser::parse(filter,
+                                         std::move(expCtx),
+                                         ExtensionsCallbackNoop(),
+                                         MatchExpressionParser::AllowedFeatures::kIsolated);
         invariantOK(statusWithMatcher.getStatus());
         _filterExpression = std::move(statusWithMatcher.getValue());
         LOG(2) << "have filter expression for " << _ns << " " << _descriptor->indexName() << " "
@@ -276,7 +285,14 @@ void IndexCatalogEntryImpl::setMultikey(OperationContext* opCtx,
         // snapshot isolation.
         {
             StorageEngine* storageEngine = getGlobalServiceContext()->getGlobalStorageEngine();
-            RecoveryUnitSwap ruSwap(opCtx, storageEngine->newRecoveryUnit());
+
+            // This ensures that the recovery unit is not swapped for engines that do not support
+            // database level locking.
+            std::unique_ptr<RecoveryUnitSwap> ruSwap;
+            if (storageEngine->supportsDBLocking()) {
+                ruSwap =
+                    stdx::make_unique<RecoveryUnitSwap>(opCtx, storageEngine->newRecoveryUnit());
+            }
 
             WriteUnitOfWork wuow(opCtx);
 

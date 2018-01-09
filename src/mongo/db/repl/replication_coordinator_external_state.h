@@ -47,7 +47,6 @@ class OID;
 class OldThreadPool;
 class OperationContext;
 class ServiceContext;
-class SnapshotName;
 class Status;
 struct HostAndPort;
 template <typename T>
@@ -69,8 +68,8 @@ class ReplicationCoordinatorExternalState {
     MONGO_DISALLOW_COPYING(ReplicationCoordinatorExternalState);
 
 public:
-    ReplicationCoordinatorExternalState();
-    virtual ~ReplicationCoordinatorExternalState();
+    ReplicationCoordinatorExternalState() {}
+    virtual ~ReplicationCoordinatorExternalState() {}
 
     /**
      * Starts the journal listener, and snapshot threads
@@ -128,6 +127,13 @@ public:
      * Creates the oplog, writes the first entry and stores the replica set config document.
      */
     virtual Status initializeReplSetStorage(OperationContext* opCtx, const BSONObj& config) = 0;
+
+    /**
+     * Waits for all committed writes to be visible in the oplog.  Committed writes will be hidden
+     * if there are uncommitted writes ahead of them, and some operations require that all committed
+     * writes are visible before proceeding.
+     */
+    virtual void waitForAllEarlierOplogWritesToBeVisible(OperationContext* opCtx) = 0;
 
     /**
      * Called when a node on way to becoming a primary is ready to leave drain mode. It is called
@@ -204,13 +210,6 @@ public:
     virtual StatusWith<OpTime> loadLastOpTime(OperationContext* opCtx) = 0;
 
     /**
-     * Cleaning up the oplog, by potentially truncating:
-     * If we are recovering from a failed batch then minvalid.start though minvalid.end need
-     * to be removed from the oplog before we can start applying operations.
-     */
-    virtual void cleanUpLastApplyBatch(OperationContext* opCtx) = 0;
-
-    /**
      * Returns the HostAndPort of the remote client connected to us that initiated the operation
      * represented by "opCtx".
      */
@@ -261,20 +260,7 @@ public:
      *
      * It is illegal to call with a newCommitPoint that does not name an existing snapshot.
      */
-    virtual void updateCommittedSnapshot(SnapshotName newCommitPoint) = 0;
-
-    /**
-     * Creates a new snapshot.
-     */
-    virtual void createSnapshot(OperationContext* opCtx, SnapshotName name) = 0;
-
-    /**
-     * Signals the SnapshotThread, if running, to take a forced snapshot even if the global
-     * timestamp hasn't changed.
-     *
-     * Does not wait for the snapshot to be taken.
-     */
-    virtual void forceSnapshotCreation() = 0;
+    virtual void updateCommittedSnapshot(const OpTime& newCommitPoint) = 0;
 
     /**
      * Returns whether or not the SnapshotThread is active.

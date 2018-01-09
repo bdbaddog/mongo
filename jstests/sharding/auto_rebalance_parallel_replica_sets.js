@@ -1,5 +1,9 @@
 /**
  * Tests that the cluster is balanced in parallel in one balancer round (replica sets).
+ *
+ * This test is labeled resource intensive because its total io_write is 900MB compared to a median
+ * of 135MB across all sharding tests in mmapv1.
+ * @tags: [resource_intensive]
  */
 (function() {
     'use strict';
@@ -26,18 +30,36 @@
     assert.commandWorked(st.moveChunk('TestDB.TestColl', {Key: 20}, st.shard1.shardName));
     assert.commandWorked(st.moveChunk('TestDB.TestColl', {Key: 30}, st.shard1.shardName));
 
-    assert.eq(2, st.s0.getDB('config').chunks.find({shard: st.shard0.shardName}).itcount());
-    assert.eq(2, st.s0.getDB('config').chunks.find({shard: st.shard1.shardName}).itcount());
+    assert.eq(2,
+              st.s0.getDB('config')
+                  .chunks.find({ns: 'TestDB.TestColl', shard: st.shard0.shardName})
+                  .itcount());
+    assert.eq(2,
+              st.s0.getDB('config')
+                  .chunks.find({ns: 'TestDB.TestColl', shard: st.shard1.shardName})
+                  .itcount());
 
     // Do enable the balancer and wait for a single balancer round
     st.startBalancer();
     st.awaitBalancerRound();
     st.stopBalancer();
 
-    assert.eq(1, st.s0.getDB('config').chunks.find({shard: st.shard0.shardName}).itcount());
-    assert.eq(1, st.s0.getDB('config').chunks.find({shard: st.shard1.shardName}).itcount());
-    assert.eq(1, st.s0.getDB('config').chunks.find({shard: st.shard2.shardName}).itcount());
-    assert.eq(1, st.s0.getDB('config').chunks.find({shard: st.shard3.shardName}).itcount());
+    assert.eq(1,
+              st.s0.getDB('config')
+                  .chunks.find({ns: 'TestDB.TestColl', shard: st.shard0.shardName})
+                  .itcount());
+    assert.eq(1,
+              st.s0.getDB('config')
+                  .chunks.find({ns: 'TestDB.TestColl', shard: st.shard1.shardName})
+                  .itcount());
+    assert.eq(1,
+              st.s0.getDB('config')
+                  .chunks.find({ns: 'TestDB.TestColl', shard: st.shard2.shardName})
+                  .itcount());
+    assert.eq(1,
+              st.s0.getDB('config')
+                  .chunks.find({ns: 'TestDB.TestColl', shard: st.shard3.shardName})
+                  .itcount());
 
     // Ensure the range deleter quiesces
     st.rs0.awaitReplication();

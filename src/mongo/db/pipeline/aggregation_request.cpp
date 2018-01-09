@@ -50,7 +50,8 @@ namespace mongo {
 constexpr StringData AggregationRequest::kCommandName;
 constexpr StringData AggregationRequest::kCursorName;
 constexpr StringData AggregationRequest::kBatchSizeName;
-constexpr StringData AggregationRequest::kFromRouterName;
+constexpr StringData AggregationRequest::kFromMongosName;
+constexpr StringData AggregationRequest::kNeedsMergeName;
 constexpr StringData AggregationRequest::kPipelineName;
 constexpr StringData AggregationRequest::kCollationName;
 constexpr StringData AggregationRequest::kExplainName;
@@ -105,6 +106,9 @@ StatusWith<AggregationRequest> AggregationRequest::parseFromBSON(
 
     bool hasCursorElem = false;
     bool hasExplainElem = false;
+
+    bool hasFromMongosElem = false;
+    bool hasNeedsMergeElem = false;
 
     // Parse optional parameters.
     for (auto&& elem : cmdObj) {
@@ -179,13 +183,24 @@ StatusWith<AggregationRequest> AggregationRequest::parseFromBSON(
             if (elem.Bool()) {
                 request.setExplain(ExplainOptions::Verbosity::kQueryPlanner);
             }
-        } else if (kFromRouterName == fieldName) {
+        } else if (kFromMongosName == fieldName) {
             if (elem.type() != BSONType::Bool) {
                 return {ErrorCodes::TypeMismatch,
-                        str::stream() << kFromRouterName << " must be a boolean, not a "
+                        str::stream() << kFromMongosName << " must be a boolean, not a "
                                       << typeName(elem.type())};
             }
-            request.setFromRouter(elem.Bool());
+
+            hasFromMongosElem = true;
+            request.setFromMongos(elem.Bool());
+        } else if (kNeedsMergeName == fieldName) {
+            if (elem.type() != BSONType::Bool) {
+                return {ErrorCodes::TypeMismatch,
+                        str::stream() << kNeedsMergeName << " must be a boolean, not a "
+                                      << typeName(elem.type())};
+            }
+
+            hasNeedsMergeElem = true;
+            request.setNeedsMerge(elem.Bool());
         } else if (kAllowDiskUseName == fieldName) {
             if (storageGlobalParams.readOnly) {
                 return {ErrorCodes::IllegalOperation,
@@ -216,17 +231,14 @@ StatusWith<AggregationRequest> AggregationRequest::parseFromBSON(
         request.setExplain(explainVerbosity);
     }
 
-    if (!hasCursorElem && !request.getExplain()) {
+    // 'hasExplainElem' implies an aggregate command-level explain option, which does not require
+    // a cursor argument.
+    if (!hasCursorElem && !hasExplainElem) {
         return {ErrorCodes::FailedToParse,
-                str::stream() << "The '" << kCursorName
-                              << "' option is required, except for aggregation explain"};
-    }
-
-    if (request.getExplain() && !request.getReadConcern().isEmpty()) {
-        return {ErrorCodes::FailedToParse,
-                str::stream() << "Aggregation explain does not support the '"
-                              << repl::ReadConcernArgs::kReadConcernFieldName
-                              << "' option"};
+                str::stream()
+                    << "The '"
+                    << kCursorName
+                    << "' option is required, except for aggregate with the explain argument"};
     }
 
     if (request.getExplain() && cmdObj[WriteConcernOptions::kWriteConcernField]) {
@@ -234,6 +246,13 @@ StatusWith<AggregationRequest> AggregationRequest::parseFromBSON(
                 str::stream() << "Aggregation explain does not support the'"
                               << WriteConcernOptions::kWriteConcernField
                               << "' option"};
+    }
+
+    if (hasNeedsMergeElem && !hasFromMongosElem) {
+        return {ErrorCodes::FailedToParse,
+                str::stream() << "Cannot specify '" << kNeedsMergeName << "' without '"
+                              << kFromMongosName
+                              << "'"};
     }
 
     return request;
@@ -272,13 +291,15 @@ Document AggregationRequest::serializeToCommandObj() const {
         {kPipelineName, _pipeline},
         // Only serialize booleans if different than their default.
         {kAllowDiskUseName, _allowDiskUse ? Value(true) : Value()},
-        {kFromRouterName, _fromRouter ? Value(true) : Value()},
+        {kFromMongosName, _fromMongos ? Value(true) : Value()},
+        {kNeedsMergeName, _needsMerge ? Value(true) : Value()},
         {bypassDocumentValidationCommandOption(),
          _bypassDocumentValidation ? Value(true) : Value()},
         // Only serialize a collation if one was specified.
         {kCollationName, _collation.isEmpty() ? Value() : Value(_collation)},
-        // Only serialize batchSize when explain is false.
-        {kCursorName, _explainMode ? Value() : Value(Document{{kBatchSizeName, _batchSize}})},
+        // Only serialize batchSize if not an explain, otherwise serialize an empty cursor object.
+        {kCursorName,
+         _explainMode ? Value(Document()) : Value(Document{{kBatchSizeName, _batchSize}})},
         // Only serialize a hint if one was specified.
         {kHintName, _hint.isEmpty() ? Value() : Value(_hint)},
         // Only serialize a comment if one was specified.

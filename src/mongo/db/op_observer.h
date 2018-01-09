@@ -31,12 +31,14 @@
 #include <string>
 
 #include "mongo/base/disallow_copying.h"
+#include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/collection_options.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/s/collection_sharding_state.h"
 
 namespace mongo {
 struct CollectionOptions;
+struct InsertStatement;
 class NamespaceString;
 class OperationContext;
 
@@ -48,10 +50,17 @@ class OpTime;
  * Holds document update information used in logging.
  */
 struct OplogUpdateEntryArgs {
+    enum class StoreDocOption { None, PreImage, PostImage };
+
     // Name of the collection in which document is being updated.
     NamespaceString nss;
 
     OptionalCollectionUUID uuid;
+
+    StmtId stmtId = kUninitializedStmtId;
+
+    // The document before modifiers were applied.
+    boost::optional<BSONObj> preImageDoc;
 
     // Fully updated document with damages (update modifiers) applied.
     BSONObj updatedDoc;
@@ -63,7 +72,9 @@ struct OplogUpdateEntryArgs {
     BSONObj criteria;
 
     // True if this update comes from a chunk migration.
-    bool fromMigrate;
+    bool fromMigrate = false;
+
+    StoreDocOption storeDocOption = StoreDocOption::None;
 };
 
 struct TTLCollModInfo {
@@ -73,12 +84,8 @@ struct TTLCollModInfo {
 };
 
 class OpObserver {
-    MONGO_DISALLOW_COPYING(OpObserver);
-
 public:
-    OpObserver() = default;
     virtual ~OpObserver() = default;
-
     virtual void onCreateIndex(OperationContext* opCtx,
                                const NamespaceString& nss,
                                OptionalCollectionUUID uuid,
@@ -87,18 +94,17 @@ public:
     virtual void onInserts(OperationContext* opCtx,
                            const NamespaceString& nss,
                            OptionalCollectionUUID uuid,
-                           std::vector<BSONObj>::const_iterator begin,
-                           std::vector<BSONObj>::const_iterator end,
+                           std::vector<InsertStatement>::const_iterator begin,
+                           std::vector<InsertStatement>::const_iterator end,
                            bool fromMigrate) = 0;
     virtual void onUpdate(OperationContext* opCtx, const OplogUpdateEntryArgs& args) = 0;
-    virtual CollectionShardingState::DeleteState aboutToDelete(OperationContext* opCtx,
-                                                               const NamespaceString& nss,
-                                                               const BSONObj& doc) = 0;
+    virtual void aboutToDelete(OperationContext* opCtx,
+                               const NamespaceString& nss,
+                               const BSONObj& doc) = 0;
     /**
      * Handles logging before document is deleted.
      *
      * "ns" name of the collection from which deleteState.idDoc will be deleted.
-     * "deleteState" holds information about the deleted document.
      * "fromMigrate" indicates whether the delete was induced by a chunk migration, and
      * so should be ignored by the user as an internal maintenance operation and not a
      * real delete.
@@ -106,9 +112,28 @@ public:
     virtual void onDelete(OperationContext* opCtx,
                           const NamespaceString& nss,
                           OptionalCollectionUUID uuid,
-                          CollectionShardingState::DeleteState deleteState,
-                          bool fromMigrate) = 0;
-    virtual void onOpMessage(OperationContext* opCtx, const BSONObj& msgObj) = 0;
+                          StmtId stmtId,
+                          bool fromMigrate,
+                          const boost::optional<BSONObj>& deletedDoc) = 0;
+    /**
+     * Logs a no-op with "msgObj" in the o field into oplog.
+     *
+     * This function should only be used internally. "nss", "uuid" and the o2 field should never be
+     * exposed to users (for instance through the appendOplogNote command).
+     */
+    virtual void onInternalOpMessage(OperationContext* opCtx,
+                                     const NamespaceString& nss,
+                                     const boost::optional<UUID> uuid,
+                                     const BSONObj& msgObj,
+                                     const boost::optional<BSONObj> o2MsgObj) = 0;
+
+    /**
+     * Logs a no-op with "msgObj" in the o field into oplog.
+     */
+    void onOpMessage(OperationContext* opCtx, const BSONObj& msgObj) {
+        onInternalOpMessage(opCtx, {}, boost::none, msgObj, boost::none);
+    }
+
     virtual void onCreateCollection(OperationContext* opCtx,
                                     Collection* coll,
                                     const NamespaceString& collectionName,
@@ -156,7 +181,7 @@ public:
     /**
      * This function logs an oplog entry when a 'drop' command on a collection is executed.
      * Returns the optime of the oplog entry successfully written to the oplog.
-     * Returns a null optime if an oplog entry should not be written for this operation.
+     * Returns a null optime if an oplog entry was not written for this operation.
      */
     virtual repl::OpTime onDropCollection(OperationContext* opCtx,
                                           const NamespaceString& collectionName,
@@ -176,24 +201,26 @@ public:
                              OptionalCollectionUUID uuid,
                              const std::string& indexName,
                              const BSONObj& indexInfo) = 0;
-    virtual void onRenameCollection(OperationContext* opCtx,
-                                    const NamespaceString& fromCollection,
-                                    const NamespaceString& toCollection,
-                                    OptionalCollectionUUID uuid,
-                                    bool dropTarget,
-                                    OptionalCollectionUUID dropTargetUUID,
-                                    OptionalCollectionUUID dropSourceUUID,
-                                    bool stayTemp) = 0;
+
+    /**
+     * This function logs an oplog entry when a 'renameCollection' command on a collection is
+     * executed.
+     * Returns the optime of the oplog entry successfully written to the oplog.
+     * Returns a null optime if an oplog entry was not written for this operation.
+     */
+    virtual repl::OpTime onRenameCollection(OperationContext* opCtx,
+                                            const NamespaceString& fromCollection,
+                                            const NamespaceString& toCollection,
+                                            OptionalCollectionUUID uuid,
+                                            bool dropTarget,
+                                            OptionalCollectionUUID dropTargetUUID,
+                                            bool stayTemp) = 0;
     virtual void onApplyOps(OperationContext* opCtx,
                             const std::string& dbName,
                             const BSONObj& applyOpCmd) = 0;
     virtual void onEmptyCapped(OperationContext* opCtx,
                                const NamespaceString& collectionName,
                                OptionalCollectionUUID uuid) = 0;
-    virtual void onConvertToCapped(OperationContext* opCtx,
-                                   const NamespaceString& collectionName,
-                                   OptionalCollectionUUID uuid,
-                                   double size) = 0;
 };
 
 }  // namespace mongo

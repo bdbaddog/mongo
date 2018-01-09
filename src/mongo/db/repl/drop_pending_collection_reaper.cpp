@@ -32,6 +32,7 @@
 
 #include "mongo/db/repl/drop_pending_collection_reaper.h"
 
+#include <algorithm>
 #include <utility>
 
 #include "mongo/db/client.h"
@@ -77,13 +78,17 @@ void DropPendingCollectionReaper::addDropPendingNamespace(
     const OpTime& dropOpTime, const NamespaceString& dropPendingNamespace) {
     invariant(dropPendingNamespace.isDropPendingNamespace());
     stdx::lock_guard<stdx::mutex> lock(_mutex);
-    auto insertResult =
+    const auto equalRange = _dropPendingNamespaces.equal_range(dropOpTime);
+    const auto& lowerBound = equalRange.first;
+    const auto& upperBound = equalRange.second;
+    auto matcher = [&dropPendingNamespace](const auto& pair) {
+        return pair.second == dropPendingNamespace;
+    };
+    if (std::find_if(lowerBound, upperBound, matcher) == upperBound) {
         _dropPendingNamespaces.insert(std::make_pair(dropOpTime, dropPendingNamespace));
-    if (!insertResult.second) {
+    } else {
         severe() << "Failed to add drop-pending collection " << dropPendingNamespace
-                 << " with drop optime " << dropOpTime
-                 << ". There is already an existing collection " << insertResult.first->second
-                 << " with the same drop optime.";
+                 << " with drop optime " << dropOpTime << ": duplicate optime and namespace pair.";
         fassertFailedNoTrace(40448);
     }
 }
@@ -95,6 +100,34 @@ boost::optional<OpTime> DropPendingCollectionReaper::getEarliestDropOpTime() {
         return boost::none;
     }
     return it->first;
+}
+
+bool DropPendingCollectionReaper::rollBackDropPendingCollection(
+    OperationContext* opCtx, const OpTime& opTime, const NamespaceString& collectionNamespace) {
+    // renames because these are internal operations.
+    UnreplicatedWritesBlock uwb(opCtx);
+
+    const auto pendingNss = collectionNamespace.makeDropPendingNamespace(opTime);
+    {
+        stdx::lock_guard<stdx::mutex> lock(_mutex);
+        const auto equalRange = _dropPendingNamespaces.equal_range(opTime);
+        const auto& lowerBound = equalRange.first;
+        const auto& upperBound = equalRange.second;
+        auto matcher = [&pendingNss](const auto& pair) { return pair.second == pendingNss; };
+        auto it = std::find_if(lowerBound, upperBound, matcher);
+        if (it == upperBound) {
+            warning() << "Cannot find drop-pending namespace at OpTime " << opTime
+                      << " for collection " << collectionNamespace << " to roll back.";
+            return false;
+        }
+
+        _dropPendingNamespaces.erase(it);
+    }
+
+    log() << "Rolling back collection drop for " << pendingNss << " with drop OpTime " << opTime
+          << " to namespace " << collectionNamespace;
+
+    return true;
 }
 
 void DropPendingCollectionReaper::dropCollectionsOlderThan(OperationContext* opCtx,

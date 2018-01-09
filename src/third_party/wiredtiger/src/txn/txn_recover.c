@@ -1,5 +1,5 @@
 /*-
- * Copyright (c) 2014-2017 MongoDB, Inc.
+ * Copyright (c) 2014-2018 MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -10,14 +10,16 @@
 
 /* State maintained during recovery. */
 typedef struct {
+	const char *uri;		/* File URI. */
+	WT_CURSOR *c;			/* Cursor used for recovery. */
+	WT_LSN ckpt_lsn;		/* File's checkpoint LSN. */
+} WT_RECOVERY_FILE;
+
+typedef struct {
 	WT_SESSION_IMPL *session;
 
 	/* Files from the metadata, indexed by file ID. */
-	struct WT_RECOVERY_FILE {
-		const char *uri;	/* File URI. */
-		WT_CURSOR *c;		/* Cursor used for recovery. */
-		WT_LSN ckpt_lsn;	/* File's checkpoint LSN. */
-	} *files;
+	WT_RECOVERY_FILE *files;
 	size_t file_alloc;		/* Allocated size of files array. */
 	u_int max_fileid;		/* Maximum file ID seen. */
 	WT_LSN max_lsn;			/* Maximum checkpoint LSN seen. */
@@ -121,6 +123,24 @@ __txn_op_apply(
 	end = *pp + opsize;
 
 	switch (optype) {
+	case WT_LOGOP_COL_MODIFY:
+		WT_ERR(__wt_logop_col_modify_unpack(session, pp, end,
+		    &fileid, &recno, &value));
+		GET_RECOVERY_CURSOR(session, r, lsnp, fileid, &cursor);
+		cursor->set_key(cursor, recno);
+		if ((ret = cursor->search(cursor)) != 0)
+			WT_ERR_NOTFOUND_OK(ret);
+		else {
+			/*
+			 * Build/insert a complete value during recovery rather
+			 * than using cursor modify to create a partial update
+			 * (for no particular reason than simplicity).
+			 */
+			WT_ERR(__wt_modify_apply(session, cursor, value.data));
+			WT_ERR(cursor->insert(cursor));
+		}
+		break;
+
 	case WT_LOGOP_COL_PUT:
 		WT_ERR(__wt_logop_col_put_unpack(session, pp, end,
 		    &fileid, &recno, &value));
@@ -168,6 +188,24 @@ __txn_op_apply(
 		if (stop != NULL && stop != cursor)
 			WT_TRET(stop->close(stop));
 		WT_ERR(ret);
+		break;
+
+	case WT_LOGOP_ROW_MODIFY:
+		WT_ERR(__wt_logop_row_modify_unpack(session, pp, end,
+		    &fileid, &key, &value));
+		GET_RECOVERY_CURSOR(session, r, lsnp, fileid, &cursor);
+		__wt_cursor_set_raw_key(cursor, &key);
+		if ((ret = cursor->search(cursor)) != 0)
+			WT_ERR_NOTFOUND_OK(ret);
+		else {
+			/*
+			 * Build/insert a complete value during recovery rather
+			 * than using cursor modify to create a partial update
+			 * (for no particular reason than simplicity).
+			 */
+			WT_ERR(__wt_modify_apply(session, cursor, value.data));
+			WT_ERR(cursor->insert(cursor));
+		}
 		break;
 
 	case WT_LOGOP_ROW_PUT:
@@ -235,8 +273,8 @@ __txn_op_apply(
 	return (0);
 
 err:	__wt_err(session, ret,
-	    "operation apply failed during recovery: operation type %d "
-	    "at LSN %" PRIu32 "/%" PRIu32,
+	    "operation apply failed during recovery: operation type %"
+	    PRIu32 " at LSN %" PRIu32 "/%" PRIu32,
 	    optype, lsnp->l.file, lsnp->l.offset);
 	return (ret);
 }
@@ -419,7 +457,7 @@ __wt_txn_recover(WT_SESSION_IMPL *session)
 	WT_CURSOR *metac;
 	WT_DECL_RET;
 	WT_RECOVERY r;
-	struct WT_RECOVERY_FILE *metafile;
+	WT_RECOVERY_FILE *metafile;
 	char *config;
 	bool eviction_started, needs_rec, was_backup;
 
@@ -458,6 +496,11 @@ __wt_txn_recover(WT_SESSION_IMPL *session)
 		 * larger than any checkpoint LSN we have from the earlier time.
 		 */
 		WT_ERR(__recovery_file_scan(&r));
+		/*
+		 * The array can be re-allocated in recovery_file_scan.  Reset
+		 * our pointer after scanning all the files.
+		 */
+		metafile = &r.files[WT_METAFILE_ID];
 		conn->next_file_id = r.max_fileid;
 
 		if (FLD_ISSET(conn->log_flags, WT_CONN_LOG_ENABLED) &&
@@ -509,6 +552,11 @@ __wt_txn_recover(WT_SESSION_IMPL *session)
 
 	/* Scan the metadata to find the live files and their IDs. */
 	WT_ERR(__recovery_file_scan(&r));
+	/*
+	 * Clear this out.  We no longer need it and it could have been
+	 * re-allocated when scanning the files.
+	 */
+	metafile = NULL;
 
 	/*
 	 * We no longer need the metadata cursor: close it to avoid pinning any
@@ -578,7 +626,6 @@ __wt_txn_recover(WT_SESSION_IMPL *session)
 	 * LSN and archiving.
 	 */
 ckpt:	WT_ERR(session->iface.checkpoint(&session->iface, "force=1"));
-
 done:	FLD_SET(conn->log_flags, WT_CONN_LOG_RECOVER_DONE);
 err:	WT_TRET(__recovery_free(&r));
 	__wt_free(session, config);

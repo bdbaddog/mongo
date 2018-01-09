@@ -62,9 +62,12 @@ struct MongoBase : public BaseInfo {
         MONGO_DECLARE_JS_FUNCTION(update);
         MONGO_DECLARE_JS_FUNCTION(getMinWireVersion);
         MONGO_DECLARE_JS_FUNCTION(getMaxWireVersion);
+        MONGO_DECLARE_JS_FUNCTION(isReplicaSetMember);
+        MONGO_DECLARE_JS_FUNCTION(isMongos);
+        MONGO_DECLARE_JS_FUNCTION(_startSession);
     };
 
-    static const JSFunctionSpec methods[19];
+    static const JSFunctionSpec methods[22];
 
     static const char* const className;
     static const unsigned classFlags = JSCLASS_HAS_PRIVATE;

@@ -5,6 +5,10 @@
  * "latest", not equal to "last-stable", and x.y compares equal to x.y.z, but that x.w does
  * not.
  */
+
+// Checking UUID consistency involves talking to a shard node, which in this test is shutdown
+TestData.skipCheckingUUIDsConsistentAcrossCluster = true;
+
 (function() {
     "use strict";
 
@@ -18,9 +22,9 @@
                "Expected \"" + v1 + "\" not to equal \"" + v2 + "\"");
     }
 
-    // The current version is in the 3.4 series. This has to be changed very time we bump
+    // The current version is in the 3.7 series. This has to be changed very time we bump
     // the major version pair, but it provides a useful test of assumptions.
-    assertBinVersionsEqual("3.5", version());
+    assertBinVersionsEqual("3.7", version());
 
     // "latest" is the same version as the shell, "last-stable" is not.
     assertBinVersionsEqual("latest", version());

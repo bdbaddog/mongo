@@ -52,6 +52,7 @@
 #include "mongo/db/server_options.h"
 #include "mongo/db/server_parameters.h"
 #include "mongo/util/mongoutils/str.h"
+#include "mongo/util/net/sock.h"
 #include "mongo/util/version.h"
 
 namespace {
@@ -308,6 +309,9 @@ void Explain::statsToBSON(const PlanStageStats& stats,
     } else if (STAGE_COLLSCAN == stats.stageType) {
         CollectionScanStats* spec = static_cast<CollectionScanStats*>(stats.specific.get());
         bob->append("direction", spec->direction > 0 ? "forward" : "backward");
+        if (spec->maxTs) {
+            bob->append("maxTs", *(spec->maxTs));
+        }
         if (verbosity >= ExplainOptions::Verbosity::kExecStats) {
             bob->appendNumber("docsExamined", spec->docsTested);
         }

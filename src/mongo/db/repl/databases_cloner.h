@@ -34,6 +34,7 @@
 
 #include "mongo/base/disallow_copying.h"
 #include "mongo/base/status.h"
+#include "mongo/base/status_with.h"
 #include "mongo/bson/bsonobj.h"
 #include "mongo/client/fetcher.h"
 #include "mongo/db/namespace_string.h"
@@ -50,13 +51,6 @@ namespace mongo {
 class OldThreadPool;
 
 namespace repl {
-namespace {
-
-using CBHStatus = StatusWith<executor::TaskExecutor::CallbackHandle>;
-using CommandCallbackArgs = executor::TaskExecutor::RemoteCommandCallbackArgs;
-using UniqueLock = stdx::unique_lock<stdx::mutex>;
-
-}  // namespace.
 
 /**
  * Clones all databases.
@@ -104,6 +98,18 @@ public:
      */
     void setScheduleDbWorkFn_forTest(const CollectionCloner::ScheduleDbWorkFn& scheduleDbWorkFn);
 
+    /**
+     * Calls DatabasesCloner::_setAdminAsFirst.
+     * For testing only.
+     */
+    void setAdminAsFirst_forTest(std::vector<BSONElement>& dbsArray);
+
+    /**
+     * Calls DatabasesCloner::_parseListDatabasesResponse.
+     * For testing only.
+     */
+    StatusWith<std::vector<BSONElement>> parseListDatabasesResponse_forTest(BSONObj dbResponse);
+
 private:
     bool _isActive_inlock() const;
 
@@ -123,17 +129,34 @@ private:
     void _setStatus_inlock(Status s);
 
     /** Will fail the cloner, call the completion function, and become inactive. */
-    void _fail_inlock(UniqueLock* lk, Status s);
+    void _fail_inlock(stdx::unique_lock<stdx::mutex>* lk, Status s);
 
     /** Will call the completion function, and become inactive. */
-    void _succeed_inlock(UniqueLock* lk);
+    void _succeed_inlock(stdx::unique_lock<stdx::mutex>* lk);
 
     /** Called each time a database clone is finished */
     void _onEachDBCloneFinish(const Status& status, const std::string& name);
 
     //  Callbacks
 
-    void _onListDatabaseFinish(const CommandCallbackArgs& cbd);
+    void _onListDatabaseFinish(const executor::TaskExecutor::RemoteCommandCallbackArgs& cbd);
+
+    /**
+     * Takes a vector of BSONElements and scans for an element that contains a 'name' field with the
+     * value 'admin'. If found, the element is swapped with the first element in the vector.
+     * Otherwise, return.
+     *
+     * Used to parse the BSONResponse returned by listDatabases.
+     */
+    void _setAdminAsFirst(std::vector<BSONElement>& dbsArray);
+
+    /**
+     * Takes a 'listDatabases' command response and parses the response into a
+     * vector of BSON elements.
+     *
+     * If the input response is malformed, Status ErrorCodes::BadValue will be returned.
+     */
+    StatusWith<std::vector<BSONElement>> _parseListDatabasesResponse(BSONObj dbResponse);
 
     //
     // All member variables are labeled with one of the following codes indicating the

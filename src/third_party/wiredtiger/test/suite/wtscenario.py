@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 #
-# Public Domain 2014-2017 MongoDB, Inc.
+# Public Domain 2014-2018 MongoDB, Inc.
 # Public Domain 2008-2014 WiredTiger, Inc.
 #
 # This is free and unencumbered software released into the public domain.
@@ -195,6 +195,12 @@ def prune_scenarios(scenes, default_count = -1, long_count = -1):
             del scene[1]['_rand']
             del scene[1]['_order']
         return check_scenarios(scenes)
+
+def filter_scenarios(scenes, pred):
+    """
+    Filter scenarios that match a predicate
+    """
+    return [s for s in scenes if pred(*s)]
 
 def number_scenarios(scenes):
     """

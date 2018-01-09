@@ -31,8 +31,11 @@
 #include <boost/optional.hpp>
 #include <string>
 
+#include "mongo/db/catalog/collection_options.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/query/tailable_mode.h"
 
 namespace mongo {
 
@@ -52,6 +55,8 @@ public:
 
     QueryRequest(NamespaceString nss);
 
+    QueryRequest(CollectionUUID uuid);
+
     /**
      * Returns a non-OK status if any property of the QR has a bad value (e.g. a negative skip
      * value) or if there is a bad combination of options (e.g. awaitData is illegal without
@@ -61,7 +66,8 @@ public:
 
     /**
      * Parses a find command object, 'cmdObj'. Caller must indicate whether or not this lite
-     * parsed query is an explained query or not via 'isExplain'.
+     * parsed query is an explained query or not via 'isExplain'. Accepts a NSS with which
+     * to initialize the QueryRequest if there is no UUID in cmdObj.
      *
      * Returns a heap allocated QueryRequest on success or an error if 'cmdObj' is not well
      * formed.
@@ -69,6 +75,13 @@ public:
     static StatusWith<std::unique_ptr<QueryRequest>> makeFromFindCommand(NamespaceString nss,
                                                                          const BSONObj& cmdObj,
                                                                          bool isExplain);
+
+    /**
+     * If _uuid exists for this QueryRequest, use it to update the value of _nss via the
+     * UUIDCatalog associated with opCtx. This should only be called when we hold a DBLock
+     * on the database to which _uuid belongs, if the _uuid is present in the UUIDCatalog.
+     */
+    void refreshNSS(OperationContext* opCtx);
 
     /**
      * Converts this QR into a find command.
@@ -131,11 +144,8 @@ public:
     static const std::string metaTextScore;
 
     const NamespaceString& nss() const {
+        invariant(!_nss.isEmpty());
         return _nss;
-    }
-
-    const std::string& ns() const {
-        return _nss.ns();
     }
 
     const BSONObj& getFilter() const {
@@ -323,11 +333,20 @@ public:
     }
 
     bool isTailable() const {
-        return _tailable;
+        return _tailableMode == TailableMode::kTailable ||
+            _tailableMode == TailableMode::kTailableAndAwaitData;
     }
 
-    void setTailable(bool tailable) {
-        _tailable = tailable;
+    bool isTailableAndAwaitData() const {
+        return _tailableMode == TailableMode::kTailableAndAwaitData;
+    }
+
+    void setTailableMode(TailableMode tailableMode) {
+        _tailableMode = tailableMode;
+    }
+
+    TailableMode getTailableMode() const {
+        return _tailableMode;
     }
 
     bool isSlaveOk() const {
@@ -352,14 +371,6 @@ public:
 
     void setNoCursorTimeout(bool noCursorTimeout) {
         _noCursorTimeout = noCursorTimeout;
-    }
-
-    bool isAwaitData() const {
-        return _awaitData;
-    }
-
-    void setAwaitData(bool awaitData) {
-        _awaitData = awaitData;
     }
 
     bool isExhaust() const {
@@ -404,14 +415,16 @@ public:
     /**
      * Parse the provided legacy query object and parameters to construct a QueryRequest.
      */
-    static StatusWith<std::unique_ptr<QueryRequest>> fromLegacyQueryForTest(NamespaceString nss,
-                                                                            const BSONObj& queryObj,
-                                                                            const BSONObj& proj,
-                                                                            int ntoskip,
-                                                                            int ntoreturn,
-                                                                            int queryOptions);
+    static StatusWith<std::unique_ptr<QueryRequest>> fromLegacyQuery(NamespaceString nss,
+                                                                     const BSONObj& queryObj,
+                                                                     const BSONObj& proj,
+                                                                     int ntoskip,
+                                                                     int ntoreturn,
+                                                                     int queryOptions);
 
 private:
+    static StatusWith<std::unique_ptr<QueryRequest>> parseFromFindCommand(
+        std::unique_ptr<QueryRequest> qr, const BSONObj& cmdObj, bool isExplain);
     Status init(int ntoskip,
                 int ntoreturn,
                 int queryOptions,
@@ -443,7 +456,8 @@ private:
      */
     void addMetaProjection();
 
-    const NamespaceString _nss;
+    NamespaceString _nss;
+    OptionalCollectionUUID _uuid;
 
     BSONObj _filter;
     BSONObj _proj;
@@ -499,11 +513,10 @@ private:
     bool _hasReadPref = false;
 
     // Options that can be specified in the OP_QUERY 'flags' header.
-    bool _tailable = false;
+    TailableMode _tailableMode = TailableMode::kNormal;
     bool _slaveOk = false;
     bool _oplogReplay = false;
     bool _noCursorTimeout = false;
-    bool _awaitData = false;
     bool _exhaust = false;
     bool _allowPartialResults = false;
 

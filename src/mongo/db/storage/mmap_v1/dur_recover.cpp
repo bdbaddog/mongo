@@ -265,9 +265,13 @@ RecoveryJob::RecoveryJob()
       _lastSeqSkipped(0),
       _appliedAnySections(false) {}
 
+#pragma warning(push)
+// C4722: 'mongo::dur::RecoveryJob::~RecoveryJob': destructor never returns, potential memory leak
+#pragma warning(disable : 4722)
 RecoveryJob::~RecoveryJob() {
     invariant(!"RecoveryJob is intentionally leaked with a bare call to operator new()");
 }
+#pragma warning(pop)
 
 void RecoveryJob::close(OperationContext* opCtx) {
     stdx::lock_guard<stdx::mutex> lk(_mx);
@@ -539,7 +543,7 @@ bool RecoveryJob::processFileBuffer(OperationContext* opCtx, const void* p, unsi
                     !globalInShutdownDeprecated());
         }
     } catch (const DBException& ex) {
-        if (ex.getCode() != ErrorCodes::Overflow)
+        if (ex.code() != ErrorCodes::Overflow)
             throw;  // Only ignore errors related to the file abruptly ending.
 
         if (mmapv1GlobalOptions.journalOptions & MMAPV1Options::JournalDumpJournal)

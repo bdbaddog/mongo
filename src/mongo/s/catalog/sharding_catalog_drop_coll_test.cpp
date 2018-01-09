@@ -42,7 +42,6 @@
 #include "mongo/s/catalog/type_shard.h"
 #include "mongo/s/chunk_version.h"
 #include "mongo/s/client/shard_registry.h"
-#include "mongo/s/write_ops/batched_update_request.h"
 #include "mongo/util/time_support.h"
 
 namespace mongo {
@@ -113,6 +112,8 @@ public:
 
             BSONObj expectedCmd(fromjson(R"({
                 delete: "chunks",
+                bypassDocumentValidation: false,
+                ordered: true,
                 deletes: [{ q: { ns: "test.user" }, limit: 0 }],
                 writeConcern: { w: "majority", wtimeout: 15000 },
                 maxTimeMS: 30000
@@ -266,25 +267,6 @@ TEST_F(DropColl2ShardTest, ConfigTargeterError) {
         ASSERT_EQ(ErrorCodes::HostUnreachable, status.code());
         ASSERT_FALSE(status.reason().empty());
     });
-
-    future.timed_get(kFutureTimeout);
-}
-
-TEST_F(DropColl2ShardTest, DistLockBusy) {
-    distLock()->expectLock([](StringData, StringData, Milliseconds) {},
-                           {ErrorCodes::LockBusy, "test lock taken"});
-
-    auto future = launchAsync([this] {
-        auto status = catalogClient()->dropCollection(operationContext(), dropNS());
-        ASSERT_EQ(ErrorCodes::LockBusy, status.code());
-        ASSERT_FALSE(status.reason().empty());
-    });
-
-    expectChangeLogCreate(configHost(), BSON("ok" << 1));
-    expectChangeLogInsert(
-        configHost(), network()->now(), "dropCollection.start", dropNS().ns(), BSONObj());
-
-    expectGetShards({shard1(), shard2()});
 
     future.timed_get(kFutureTimeout);
 }

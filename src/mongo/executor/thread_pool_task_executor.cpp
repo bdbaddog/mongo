@@ -39,6 +39,7 @@
 #include "mongo/base/checked_cast.h"
 #include "mongo/base/disallow_copying.h"
 #include "mongo/base/status_with.h"
+#include "mongo/db/operation_context.h"
 #include "mongo/executor/connection_pool_stats.h"
 #include "mongo/executor/network_interface.h"
 #include "mongo/platform/atomic_word.h"
@@ -284,10 +285,29 @@ StatusWith<TaskExecutor::CallbackHandle> ThreadPoolTaskExecutor::onEvent(const E
     return cbHandle;
 }
 
+Status ThreadPoolTaskExecutor::waitForEvent(OperationContext* opCtx, const EventHandle& event) {
+    invariant(opCtx);
+    invariant(event.isValid());
+    auto eventState = checked_cast<EventState*>(getEventFromHandle(event));
+    stdx::unique_lock<stdx::mutex> lk(_mutex);
+
+    try {
+        // std::condition_variable::wait() can wake up spuriously, so provide a callback to detect
+        // when that happens and go back to waiting.
+        opCtx->waitForConditionOrInterrupt(eventState->isSignaledCondition, lk, [&eventState]() {
+            return eventState->isSignaledFlag;
+        });
+    } catch (const DBException& e) {
+        return e.toStatus();
+    }
+    return Status::OK();
+}
+
 void ThreadPoolTaskExecutor::waitForEvent(const EventHandle& event) {
     invariant(event.isValid());
     auto eventState = checked_cast<EventState*>(getEventFromHandle(event));
     stdx::unique_lock<stdx::mutex> lk(_mutex);
+
     while (!eventState->isSignaledFlag) {
         eventState->isSignaledCondition.wait(lk);
     }
@@ -318,17 +338,20 @@ StatusWith<TaskExecutor::CallbackHandle> ThreadPoolTaskExecutor::scheduleWorkAt(
         return cbHandle;
     }
     lk.unlock();
-    _net->setAlarm(when, [this, when, cbHandle] {
-        auto cbState = checked_cast<CallbackState*>(getCallbackFromHandle(cbHandle.getValue()));
-        if (cbState->canceled.load()) {
-            return;
-        }
-        stdx::unique_lock<stdx::mutex> lk(_mutex);
-        if (cbState->canceled.load()) {
-            return;
-        }
-        scheduleIntoPool_inlock(&_sleepersQueue, cbState->iter, std::move(lk));
-    });
+    _net->setAlarm(when,
+                   [this, cbHandle] {
+                       auto cbState =
+                           checked_cast<CallbackState*>(getCallbackFromHandle(cbHandle.getValue()));
+                       if (cbState->canceled.load()) {
+                           return;
+                       }
+                       stdx::unique_lock<stdx::mutex> lk(_mutex);
+                       if (cbState->canceled.load()) {
+                           return;
+                       }
+                       scheduleIntoPool_inlock(&_sleepersQueue, cbState->iter, std::move(lk));
+                   })
+        .transitional_ignore();
 
     return cbHandle;
 }
@@ -384,22 +407,24 @@ StatusWith<TaskExecutor::CallbackHandle> ThreadPoolTaskExecutor::scheduleRemoteC
     LOG(3) << "Scheduling remote command request: " << redact(scheduledRequest.toString());
     lk.unlock();
     _net->startCommand(
-        cbHandle.getValue(),
-        scheduledRequest,
-        [this, scheduledRequest, cbState, cb](const ResponseStatus& response) {
-            using std::swap;
-            CallbackFn newCb = [cb, scheduledRequest, response](const CallbackArgs& cbData) {
-                remoteCommandFinished(cbData, cb, scheduledRequest, response);
-            };
-            stdx::unique_lock<stdx::mutex> lk(_mutex);
-            if (_inShutdown_inlock()) {
-                return;
-            }
-            LOG(3) << "Received remote response: "
-                   << redact(response.isOK() ? response.toString() : response.status.toString());
-            swap(cbState->callback, newCb);
-            scheduleIntoPool_inlock(&_networkInProgressQueue, cbState->iter, std::move(lk));
-        });
+            cbHandle.getValue(),
+            scheduledRequest,
+            [this, scheduledRequest, cbState, cb](const ResponseStatus& response) {
+                using std::swap;
+                CallbackFn newCb = [cb, scheduledRequest, response](const CallbackArgs& cbData) {
+                    remoteCommandFinished(cbData, cb, scheduledRequest, response);
+                };
+                stdx::unique_lock<stdx::mutex> lk(_mutex);
+                if (_inShutdown_inlock()) {
+                    return;
+                }
+                LOG(3) << "Received remote response: "
+                       << redact(response.isOK() ? response.toString()
+                                                 : response.status.toString());
+                swap(cbState->callback, newCb);
+                scheduleIntoPool_inlock(&_networkInProgressQueue, cbState->iter, std::move(lk));
+            })
+        .transitional_ignore();
     return cbHandle;
 }
 

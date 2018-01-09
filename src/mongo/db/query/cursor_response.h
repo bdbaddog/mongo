@@ -39,7 +39,8 @@
 namespace mongo {
 
 /**
- * Builds the cursor field for a reply to a cursor-generating command in place.
+ * Builds the cursor field and the _latestOplogTimestamp field for a reply to a cursor-generating
+ * command in place.
  */
 class CursorResponseBuilder {
     MONGO_DISALLOW_COPYING(CursorResponseBuilder);
@@ -70,6 +71,10 @@ public:
         _batch.append(obj);
     }
 
+    void setLatestOplogTimestamp(Timestamp ts) {
+        _latestOplogTimestamp = ts;
+    }
+
     /**
      * Call this after successfully appending all fields that will be part of this response.
      * After calling, you may not call any more methods on this object.
@@ -89,6 +94,7 @@ private:
     BSONObjBuilder* const _commandResponse;
     BSONObjBuilder _cursorObject;
     BSONArrayBuilder _batch;
+    Timestamp _latestOplogTimestamp;
 };
 
 /**
@@ -134,7 +140,9 @@ public:
     CursorResponse(NamespaceString nss,
                    CursorId cursorId,
                    std::vector<BSONObj> batch,
-                   boost::optional<long long> numReturnedSoFar = boost::none);
+                   boost::optional<long long> numReturnedSoFar = boost::none,
+                   boost::optional<Timestamp> latestOplogTimestamp = boost::none,
+                   boost::optional<BSONObj> writeConcernError = boost::none);
 
     CursorResponse(CursorResponse&& other) = default;
     CursorResponse& operator=(CursorResponse&& other) = default;
@@ -155,8 +163,20 @@ public:
         return _batch;
     }
 
+    std::vector<BSONObj> releaseBatch() {
+        return std::move(_batch);
+    }
+
     boost::optional<long long> getNumReturnedSoFar() const {
         return _numReturnedSoFar;
+    }
+
+    boost::optional<Timestamp> getLastOplogTimestamp() const {
+        return _latestOplogTimestamp;
+    }
+
+    boost::optional<BSONObj> getWriteConcernError() const {
+        return _writeConcernError;
     }
 
     /**
@@ -175,6 +195,8 @@ private:
     CursorId _cursorId;
     std::vector<BSONObj> _batch;
     boost::optional<long long> _numReturnedSoFar;
+    boost::optional<Timestamp> _latestOplogTimestamp;
+    boost::optional<BSONObj> _writeConcernError;
 };
 
 }  // namespace mongo

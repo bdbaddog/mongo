@@ -1,5 +1,5 @@
 /*-
- * Copyright (c) 2014-2017 MongoDB, Inc.
+ * Copyright (c) 2014-2018 MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -746,8 +746,8 @@ __wt_huffman_decode(WT_SESSION_IMPL *session, void *huffman_arg,
     const uint8_t *from_arg, size_t from_len, WT_ITEM *to_buf)
 {
 	WT_DECL_RET;
-	WT_ITEM *tmp;
 	WT_HUFFMAN_OBJ *huffman;
+	WT_ITEM *tmp;
 	size_t from_bytes, len, max_len, outlen;
 	uint64_t from_len_bits;
 	uint32_t bits, mask, max;

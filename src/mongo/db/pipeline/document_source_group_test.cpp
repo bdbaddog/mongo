@@ -70,7 +70,7 @@ using DocumentSourceGroupTest = AggregationContextFixture;
 
 TEST_F(DocumentSourceGroupTest, ShouldBeAbleToPauseLoading) {
     auto expCtx = getExpCtx();
-    expCtx->inRouter = true;  // Disallow external sort.
+    expCtx->inMongos = true;  // Disallow external sort.
                               // This is the only way to do this in a debug build.
     AccumulationStatement countStatement{"count",
                                          ExpressionConstant::create(expCtx, Value(1)),
@@ -103,7 +103,7 @@ TEST_F(DocumentSourceGroupTest, ShouldBeAbleToPauseLoadingWhileSpilled) {
     // Allow the $group stage to spill to disk.
     TempDir tempDir("DocumentSourceGroupTest");
     expCtx->tempDir = tempDir.path();
-    expCtx->extSortAllowed = true;
+    expCtx->allowDiskUse = true;
     const size_t maxMemoryUsageBytes = 1000;
 
     VariablesParseState vps = expCtx->variablesParseState;
@@ -142,7 +142,7 @@ TEST_F(DocumentSourceGroupTest, ShouldBeAbleToPauseLoadingWhileSpilled) {
 TEST_F(DocumentSourceGroupTest, ShouldErrorIfNotAllowedToSpillToDiskAndResultSetIsTooLarge) {
     auto expCtx = getExpCtx();
     const size_t maxMemoryUsageBytes = 1000;
-    expCtx->inRouter = true;  // Disallow external sort.
+    expCtx->inMongos = true;  // Disallow external sort.
                               // This is the only way to do this in a debug build.
 
     VariablesParseState vps = expCtx->variablesParseState;
@@ -158,13 +158,13 @@ TEST_F(DocumentSourceGroupTest, ShouldErrorIfNotAllowedToSpillToDiskAndResultSet
                                             Document{{"_id", 1}, {"largeStr", largeStr}}});
     group->setSource(mock.get());
 
-    ASSERT_THROWS_CODE(group->getNext(), UserException, 16945);
+    ASSERT_THROWS_CODE(group->getNext(), AssertionException, 16945);
 }
 
 TEST_F(DocumentSourceGroupTest, ShouldCorrectlyTrackMemoryUsageBetweenPauses) {
     auto expCtx = getExpCtx();
     const size_t maxMemoryUsageBytes = 1000;
-    expCtx->inRouter = true;  // Disallow external sort.
+    expCtx->inMongos = true;  // Disallow external sort.
                               // This is the only way to do this in a debug build.
 
     VariablesParseState vps = expCtx->variablesParseState;
@@ -186,7 +186,7 @@ TEST_F(DocumentSourceGroupTest, ShouldCorrectlyTrackMemoryUsageBetweenPauses) {
     ASSERT_TRUE(group->getNext().isPaused());
 
     // The next should realize it's used too much memory.
-    ASSERT_THROWS_CODE(group->getNext(), UserException, 16945);
+    ASSERT_THROWS_CODE(group->getNext(), AssertionException, 16945);
 }
 
 BSONObj toBson(const intrusive_ptr<DocumentSource>& source) {
@@ -206,14 +206,15 @@ public:
           _tempDir("DocumentSourceGroupTest") {}
 
 protected:
-    void createGroup(const BSONObj& spec, bool inShard = false, bool inRouter = false) {
+    void createGroup(const BSONObj& spec, bool inShard = false, bool inMongos = false) {
         BSONObj namedSpec = BSON("$group" << spec);
         BSONElement specElement = namedSpec.firstElement();
 
         intrusive_ptr<ExpressionContextForTest> expressionContext =
             new ExpressionContextForTest(_opCtx.get(), AggregationRequest(NamespaceString(ns), {}));
-        expressionContext->inShard = inShard;
-        expressionContext->inRouter = inRouter;
+        // For $group, 'inShard' implies 'fromMongos' and 'needsMerge'.
+        expressionContext->fromMongos = expressionContext->needsMerge = inShard;
+        expressionContext->inMongos = inMongos;
         // Won't spill to disk properly if it needs to.
         expressionContext->tempDir = _tempDir.path();
 
@@ -257,7 +258,7 @@ class ParseErrorBase : public Base {
 public:
     virtual ~ParseErrorBase() {}
     void run() {
-        ASSERT_THROWS(createGroup(spec()), UserException);
+        ASSERT_THROWS(createGroup(spec()), AssertionException);
     }
 
 protected:
@@ -301,7 +302,7 @@ public:
         BSONObj spec = BSON("$group"
                             << "foo");
         BSONElement specElement = spec.firstElement();
-        ASSERT_THROWS(DocumentSourceGroup::createFromBson(specElement, ctx()), UserException);
+        ASSERT_THROWS(DocumentSourceGroup::createFromBson(specElement, ctx()), AssertionException);
     }
 };
 
@@ -543,9 +544,10 @@ protected:
         // case only one shard is in use.
         SplittableDocumentSource* splittable = dynamic_cast<SplittableDocumentSource*>(group());
         ASSERT(splittable);
-        intrusive_ptr<DocumentSource> routerSource = splittable->getMergeSource();
-        ASSERT_NOT_EQUALS(group(), routerSource.get());
-        return routerSource;
+        auto routerSources = splittable->getMergeSources();
+        ASSERT_EQ(routerSources.size(), 1UL);
+        ASSERT_NOT_EQUALS(group(), routerSources.front().get());
+        return routerSources.front();
     }
     void checkResultSet(const intrusive_ptr<DocumentSource>& sink) {
         // Load the results from the DocumentSourceGroup and sort them by _id.
@@ -1011,7 +1013,7 @@ public:
 
         // We pretend to be in the router so that we don't spill to disk, because this produces
         // inconsistent output on debug vs. non-debug builds.
-        const bool inRouter = true;
+        const bool inMongos = true;
         const bool inShard = false;
 
         createGroup(BSON("_id" << BSON("x"
@@ -1019,7 +1021,7 @@ public:
                                        << "y"
                                        << "$b")),
                     inShard,
-                    inRouter);
+                    inMongos);
         group()->setSource(source.get());
 
         group()->getNext();
@@ -1038,7 +1040,7 @@ public:
 
         // We pretend to be in the router so that we don't spill to disk, because this produces
         // inconsistent output on debug vs. non-debug builds.
-        const bool inRouter = true;
+        const bool inMongos = true;
         const bool inShard = false;
 
         createGroup(BSON("_id" << BSON("a"
@@ -1046,7 +1048,7 @@ public:
                                        << "b"
                                        << "$a")),
                     inShard,
-                    inRouter);
+                    inMongos);
         group()->setSource(source.get());
 
         group()->getNext();
@@ -1065,10 +1067,10 @@ public:
 
         // We pretend to be in the router so that we don't spill to disk, because this produces
         // inconsistent output on debug vs. non-debug builds.
-        const bool inRouter = true;
+        const bool inMongos = true;
         const bool inShard = false;
 
-        createGroup(fromjson("{_id: {$sum: ['$a', '$b']}}"), inShard, inRouter);
+        createGroup(fromjson("{_id: {$sum: ['$a', '$b']}}"), inShard, inMongos);
         group()->setSource(source.get());
 
         group()->getNext();
@@ -1100,7 +1102,7 @@ class ArrayConstantAccumulatorExpression : public CheckResultsBase {
 public:
     void run() {
         // A parse exception is thrown when a raw array is provided to an accumulator.
-        ASSERT_THROWS(createGroup(fromjson("{_id:1,a:{$push:[4,5,6]}}")), UserException);
+        ASSERT_THROWS(createGroup(fromjson("{_id:1,a:{$push:[4,5,6]}}")), AssertionException);
         // Run standard base tests.
         CheckResultsBase::run();
     }

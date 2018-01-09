@@ -1,7 +1,7 @@
 // Cannot implicitly shard accessed collections because of following errmsg: A single
 // update/delete on a sharded collection must contain an exact match on _id or contain the shard
 // key.
-// @tags: [assumes_unsharded_collection]
+// @tags: [assumes_unsharded_collection, requires_non_retryable_writes]
 
 //
 // Ensures that mongod respects the batch write protocols for updates
@@ -16,7 +16,7 @@ var request;
 var result;
 var batch;
 
-var maxWriteBatchSize = 1000;
+var maxWriteBatchSize = db.isMaster().maxWriteBatchSize;
 
 function resultOK(result) {
     return result.ok && !('code' in result) && !('errmsg' in result) && !('errInfo' in result) &&

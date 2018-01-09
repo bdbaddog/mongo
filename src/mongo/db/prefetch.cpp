@@ -34,6 +34,7 @@
 
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/database.h"
+#include "mongo/db/catalog/index_catalog.h"
 #include "mongo/db/commands/server_status_metric.h"
 #include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/dbhelpers.h"
@@ -86,7 +87,7 @@ void prefetchIndexPages(OperationContext* opCtx,
                     return;
                 IndexAccessMethod* iam = collection->getIndexCatalog()->getIndex(desc);
                 invariant(iam);
-                iam->touch(opCtx, obj);
+                iam->touch(opCtx, obj).transitional_ignore();
             } catch (const DBException& e) {
                 LOG(2) << "ignoring exception in prefetchIndexPages(): " << redact(e);
             }
@@ -104,7 +105,7 @@ void prefetchIndexPages(OperationContext* opCtx,
                     IndexDescriptor* desc = ii.next();
                     IndexAccessMethod* iam = collection->getIndexCatalog()->getIndex(desc);
                     verify(iam);
-                    iam->touch(opCtx, obj);
+                    iam->touch(opCtx, obj).transitional_ignore();
                 } catch (const DBException& e) {
                     LOG(2) << "ignoring exception in prefetchIndexPages(): " << redact(e);
                 }

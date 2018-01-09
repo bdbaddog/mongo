@@ -34,6 +34,7 @@
 #include "mongo/base/status_with.h"
 #include "mongo/base/string_data.h"
 #include "mongo/bson/bsonobj.h"
+#include "mongo/bson/timestamp.h"
 #include "mongo/db/catalog/index_create.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/repl/storage_interface.h"
@@ -52,8 +53,8 @@ public:
     StorageInterfaceImpl();
 
     StatusWith<int> getRollbackID(OperationContext* opCtx) override;
-    Status initializeRollbackID(OperationContext* opCtx) override;
-    Status incrementRollbackID(OperationContext* opCtx) override;
+    StatusWith<int> initializeRollbackID(OperationContext* opCtx) override;
+    StatusWith<int> incrementRollbackID(OperationContext* opCtx) override;
 
     /**
      *  Allocates a new TaskRunner for use by the passed in collection.
@@ -66,11 +67,12 @@ public:
 
     Status insertDocument(OperationContext* opCtx,
                           const NamespaceString& nss,
-                          const BSONObj& doc) override;
+                          const TimestampedBSONObj& doc,
+                          long long term) override;
 
     Status insertDocuments(OperationContext* opCtx,
                            const NamespaceString& nss,
-                           const std::vector<BSONObj>& docs) override;
+                           const std::vector<InsertStatement>& docs) override;
 
     Status dropReplicatedDatabases(OperationContext* opCtx) override;
 
@@ -83,6 +85,8 @@ public:
                             const CollectionOptions& options) override;
 
     Status dropCollection(OperationContext* opCtx, const NamespaceString& nss) override;
+
+    Status truncateCollection(OperationContext* opCtx, const NamespaceString& nss) override;
 
     Status renameCollection(OperationContext* opCtx,
                             const NamespaceString& fromNS,
@@ -109,7 +113,12 @@ public:
 
     Status putSingleton(OperationContext* opCtx,
                         const NamespaceString& nss,
-                        const BSONObj& update) override;
+                        const TimestampedBSONObj& update) override;
+
+    Status updateSingleton(OperationContext* opCtx,
+                           const NamespaceString& nss,
+                           const BSONObj& query,
+                           const TimestampedBSONObj& update) override;
 
     StatusWith<BSONObj> findById(OperationContext* opCtx,
                                  const NamespaceString& nss,
@@ -134,10 +143,23 @@ public:
     StatusWith<StorageInterface::CollectionCount> getCollectionCount(
         OperationContext* opCtx, const NamespaceString& nss) override;
 
+    StatusWith<OptionalCollectionUUID> getCollectionUUID(OperationContext* opCtx,
+                                                         const NamespaceString& nss) override;
+
+    Status upgradeUUIDSchemaVersionNonReplicated(OperationContext* opCtx) override;
+
+    void setStableTimestamp(ServiceContext* serviceCtx, Timestamp snapshotName) override;
+
+    void setInitialDataTimestamp(ServiceContext* serviceCtx, Timestamp snapshotName) override;
+
+    Status recoverToStableTimestamp(ServiceContext* serviceCtx) override;
+
     /**
      * Checks that the "admin" database contains a supported version of the auth data schema.
      */
     Status isAdminDbValid(OperationContext* opCtx) override;
+
+    void waitForAllEarlierOplogWritesToBeVisible(OperationContext* opCtx) override;
 
 private:
     const NamespaceString _rollbackIdNss;

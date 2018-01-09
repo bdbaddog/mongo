@@ -38,7 +38,6 @@
 #include "mongo/db/exec/queued_data_stage.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/json.h"
-#include "mongo/db/matcher/extensions_callback_disallow_extensions.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/query/canonical_query.h"
 #include "mongo/db/query/get_executor.h"
@@ -85,7 +84,7 @@ public:
         }
 
         WriteUnitOfWork wuow(&_opCtx);
-        database->dropCollection(&_opCtx, nss.ns());
+        database->dropCollection(&_opCtx, nss.ns()).transitional_ignore();
         wuow.commit();
     }
 
@@ -94,7 +93,8 @@ public:
 
         const bool enforceQuota = false;
         OpDebug* const nullOpDebug = nullptr;
-        ASSERT_OK(collection->insertDocument(&_opCtx, obj, nullOpDebug, enforceQuota));
+        ASSERT_OK(
+            collection->insertDocument(&_opCtx, InsertStatement(obj), nullOpDebug, enforceQuota));
         wuow.commit();
     }
 
@@ -122,8 +122,7 @@ public:
         // Query can be answered by either index on "a" or index on "b".
         auto qr = stdx::make_unique<QueryRequest>(nss);
         qr->setFilter(fromjson("{a: {$gte: 8}, b: 1}"));
-        auto statusWithCQ = CanonicalQuery::canonicalize(
-            opCtx(), std::move(qr), ExtensionsCallbackDisallowExtensions());
+        auto statusWithCQ = CanonicalQuery::canonicalize(opCtx(), std::move(qr));
         ASSERT_OK(statusWithCQ.getStatus());
         const std::unique_ptr<CanonicalQuery> cq = std::move(statusWithCQ.getValue());
 
@@ -190,8 +189,7 @@ public:
         // Query can be answered by either index on "a" or index on "b".
         auto qr = stdx::make_unique<QueryRequest>(nss);
         qr->setFilter(fromjson("{a: {$gte: 8}, b: 1}"));
-        auto statusWithCQ = CanonicalQuery::canonicalize(
-            opCtx(), std::move(qr), ExtensionsCallbackDisallowExtensions());
+        auto statusWithCQ = CanonicalQuery::canonicalize(opCtx(), std::move(qr));
         ASSERT_OK(statusWithCQ.getStatus());
         const std::unique_ptr<CanonicalQuery> cq = std::move(statusWithCQ.getValue());
 

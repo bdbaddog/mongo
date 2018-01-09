@@ -31,6 +31,7 @@
 #include "mongo/s/query/cluster_cursor_cleanup_job.h"
 
 #include "mongo/db/client.h"
+#include "mongo/db/cursor_server_params.h"
 #include "mongo/db/server_parameters.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/query/cluster_cursor_manager.h"
@@ -40,22 +41,6 @@
 
 namespace mongo {
 
-namespace {
-
-// Period of time after which mortal cursors are killed for inactivity. Configurable with server
-// parameter "cursorTimeoutMillis".
-AtomicInt64 cursorTimeoutMillis(durationCount<Milliseconds>(Minutes(10)));
-
-ExportedServerParameter<long long, ServerParameterType::kStartupAndRuntime>
-    cursorTimeoutMillisConfig(ServerParameterSet::getGlobal(),
-                              "cursorTimeoutMillis",
-                              &cursorTimeoutMillis);
-
-// Frequency with which ClusterCursorCleanupJob is run.
-MONGO_EXPORT_SERVER_PARAMETER(clientCursorMonitorFrequencySecs, long long, 4);
-
-}  // namespace
-
 ClusterCursorCleanupJob clusterCursorCleanupJob;
 
 std::string ClusterCursorCleanupJob::name() const {
@@ -64,21 +49,24 @@ std::string ClusterCursorCleanupJob::name() const {
 
 void ClusterCursorCleanupJob::run() {
     Client::initThread(name().c_str());
-    ClusterCursorManager* manager = grid.getCursorManager();
+
+    auto* const client = Client::getCurrent();
+    auto* const manager = Grid::get(client->getServiceContext())->getCursorManager();
     invariant(manager);
 
     while (!globalInShutdownDeprecated()) {
         // Mirroring the behavior in CursorManager::timeoutCursors(), a negative value for
         // cursorTimeoutMillis has the same effect as a 0 value: cursors are cleaned immediately.
-        auto cursorTimeoutValue = cursorTimeoutMillis.load();
+        auto cursorTimeoutValue = getCursorTimeoutMillis();
+        const auto opCtx = client->makeOperationContext();
         Date_t cutoff = (cursorTimeoutValue > 0)
             ? (Date_t::now() - Milliseconds(cursorTimeoutValue))
             : Date_t::now();
         manager->killMortalCursorsInactiveSince(cutoff);
-        manager->incrementCursorsTimedOut(manager->reapZombieCursors());
+        manager->incrementCursorsTimedOut(manager->reapZombieCursors(opCtx.get()));
 
         MONGO_IDLE_THREAD_BLOCK;
-        sleepsecs(clientCursorMonitorFrequencySecs.load());
+        sleepsecs(getClientCursorMonitorFrequencySecs());
     }
 }
 

@@ -52,14 +52,16 @@ OplogEntry::CommandType parseCommandType(const BSONObj& objectField) {
         return OplogEntry::CommandType::kCollMod;
     } else if (commandString == "applyOps") {
         return OplogEntry::CommandType::kApplyOps;
+    } else if (commandString == "dbCheck") {
+        return OplogEntry::CommandType::kDbCheck;
     } else if (commandString == "dropDatabase") {
         return OplogEntry::CommandType::kDropDatabase;
     } else if (commandString == "emptycapped") {
         return OplogEntry::CommandType::kEmptyCapped;
     } else if (commandString == "convertToCapped") {
         return OplogEntry::CommandType::kConvertToCapped;
-    } else if (commandString == "createIndex") {
-        return OplogEntry::CommandType::kCreateIndex;
+    } else if (commandString == "createIndexes") {
+        return OplogEntry::CommandType::kCreateIndexes;
     } else if (commandString == "dropIndexes") {
         return OplogEntry::CommandType::kDropIndexes;
     } else if (commandString == "deleteIndexes") {
@@ -70,6 +72,63 @@ OplogEntry::CommandType parseCommandType(const BSONObj& objectField) {
         fassertFailedNoTrace(40444);
     }
     MONGO_UNREACHABLE;
+}
+
+/**
+ * Returns a document representing an oplog entry with the given fields.
+ */
+BSONObj makeOplogEntryDoc(OpTime opTime,
+                          long long hash,
+                          OpTypeEnum opType,
+                          const NamespaceString& nss,
+                          const boost::optional<UUID>& uuid,
+                          const boost::optional<bool>& fromMigrate,
+                          int64_t version,
+                          const BSONObj& oField,
+                          const boost::optional<BSONObj>& o2Field,
+                          const OperationSessionInfo& sessionInfo,
+                          const boost::optional<mongo::Date_t>& wallClockTime,
+                          const boost::optional<StmtId>& statementId,
+                          const boost::optional<OpTime>& prevWriteOpTimeInTransaction,
+                          const boost::optional<OpTime>& preImageOpTime,
+                          const boost::optional<OpTime>& postImageOpTime) {
+    BSONObjBuilder builder;
+    sessionInfo.serialize(&builder);
+    builder.append(OplogEntryBase::kTimestampFieldName, opTime.getTimestamp());
+    builder.append(OplogEntryBase::kTermFieldName, opTime.getTerm());
+    builder.append(OplogEntryBase::kHashFieldName, hash);
+    builder.append(OplogEntryBase::kVersionFieldName, version);
+    builder.append(OplogEntryBase::kOpTypeFieldName, OpType_serializer(opType));
+    builder.append(OplogEntryBase::kNamespaceFieldName, nss.toString());
+    if (uuid) {
+        uuid->appendToBuilder(&builder, OplogEntryBase::kUuidFieldName);
+    }
+    if (fromMigrate) {
+        builder.append(OplogEntryBase::kFromMigrateFieldName, fromMigrate.get());
+    }
+    builder.append(OplogEntryBase::kObjectFieldName, oField);
+    if (o2Field) {
+        builder.append(OplogEntryBase::kObject2FieldName, o2Field.get());
+    }
+    if (wallClockTime) {
+        builder.append(OplogEntryBase::kWallClockTimeFieldName, wallClockTime.get());
+    }
+    if (statementId) {
+        builder.append(OplogEntryBase::kStatementIdFieldName, statementId.get());
+    }
+    if (prevWriteOpTimeInTransaction) {
+        const BSONObj localObject = prevWriteOpTimeInTransaction.get().toBSON();
+        builder.append(OplogEntryBase::kPrevWriteOpTimeInTransactionFieldName, localObject);
+    }
+    if (preImageOpTime) {
+        const BSONObj localObject = preImageOpTime.get().toBSON();
+        builder.append(OplogEntryBase::kPreImageOpTimeFieldName, localObject);
+    }
+    if (postImageOpTime) {
+        const BSONObj localObject = postImageOpTime.get().toBSON();
+        builder.append(OplogEntryBase::kPostImageOpTimeFieldName, localObject);
+    }
+    return builder.obj();
 }
 
 }  // namespace
@@ -97,45 +156,37 @@ OplogEntry::OplogEntry(BSONObj rawInput)
         _commandType = parseCommandType(getObject());
     }
 }
+
 OplogEntry::OplogEntry(OpTime opTime,
                        long long hash,
                        OpTypeEnum opType,
-                       NamespaceString nss,
+                       const NamespaceString& nss,
+                       const boost::optional<UUID>& uuid,
+                       const boost::optional<bool>& fromMigrate,
                        int version,
                        const BSONObj& oField,
-                       const BSONObj& o2Field) {
-    setTimestamp(opTime.getTimestamp());
-    setTerm(opTime.getTerm());
-    setHash(hash);
-    setOpType(opType);
-    setNamespace(nss);
-    setVersion(version);
-    setObject(oField);
-    setObject2(o2Field);
-
-    // This is necessary until we remove `raw` in SERVER-29200.
-    raw = toBSON();
-}
-
-OplogEntry::OplogEntry(OpTime opTime,
-                       long long hash,
-                       OpTypeEnum opType,
-                       NamespaceString nss,
-                       int version,
-                       const BSONObj& oField)
-    : OplogEntry(opTime, hash, opType, nss, version, oField, BSONObj()) {}
-
-OplogEntry::OplogEntry(
-    OpTime opTime, long long hash, OpTypeEnum opType, NamespaceString nss, const BSONObj& oField)
-    : OplogEntry(opTime, hash, opType, nss, OplogEntry::kOplogVersion, oField, BSONObj()) {}
-
-OplogEntry::OplogEntry(OpTime opTime,
-                       long long hash,
-                       OpTypeEnum opType,
-                       NamespaceString nss,
-                       const BSONObj& oField,
-                       const BSONObj& o2Field)
-    : OplogEntry(opTime, hash, opType, nss, OplogEntry::kOplogVersion, oField, o2Field) {}
+                       const boost::optional<BSONObj>& o2Field,
+                       const OperationSessionInfo& sessionInfo,
+                       const boost::optional<mongo::Date_t>& wallClockTime,
+                       const boost::optional<StmtId>& statementId,
+                       const boost::optional<OpTime>& prevWriteOpTimeInTransaction,
+                       const boost::optional<OpTime>& preImageOpTime,
+                       const boost::optional<OpTime>& postImageOpTime)
+    : OplogEntry(makeOplogEntryDoc(opTime,
+                                   hash,
+                                   opType,
+                                   nss,
+                                   uuid,
+                                   fromMigrate,
+                                   version,
+                                   oField,
+                                   o2Field,
+                                   sessionInfo,
+                                   wallClockTime,
+                                   statementId,
+                                   prevWriteOpTimeInTransaction,
+                                   preImageOpTime,
+                                   postImageOpTime)) {}
 
 bool OplogEntry::isCommand() const {
     return getOpType() == OpTypeEnum::kCommand;

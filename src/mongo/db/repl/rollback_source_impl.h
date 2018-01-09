@@ -58,14 +58,23 @@ public:
 
     const OplogInterface& getOplog() const override;
 
+    const HostAndPort& getSource() const override;
+
     int getRollbackId() const override;
 
     BSONObj getLastOperation() const override;
 
     BSONObj findOne(const NamespaceString& nss, const BSONObj& filter) const override;
 
+    std::pair<BSONObj, NamespaceString> findOneByUUID(const std::string& db,
+                                                      UUID uuid,
+                                                      const BSONObj& filter) const override;
+
     void copyCollectionFromRemote(OperationContext* opCtx,
                                   const NamespaceString& nss) const override;
+
+    StatusWith<BSONObj> getCollectionInfoByUUID(const std::string& db,
+                                                const UUID& uuid) const override;
 
     StatusWith<BSONObj> getCollectionInfo(const NamespaceString& nss) const override;
 

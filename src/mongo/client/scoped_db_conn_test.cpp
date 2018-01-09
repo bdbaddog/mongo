@@ -43,7 +43,7 @@
 #include "mongo/transport/service_entry_point.h"
 #include "mongo/transport/session.h"
 #include "mongo/transport/transport_layer.h"
-#include "mongo/transport/transport_layer_legacy.h"
+#include "mongo/transport/transport_layer_asio.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/fail_point_service.h"
 #include "mongo/util/log.h"
@@ -90,6 +90,24 @@ public:
         _threads.emplace_back(&DummyServiceEntryPoint::run, this, std::move(session));
     }
 
+    // This is not used in this test, so it is only here to complete the interface of
+    // ServiceEntryPoint
+    void endAllSessions(transport::Session::TagMask tags) override {
+        MONGO_UNREACHABLE;
+    }
+
+    bool shutdown(Milliseconds timeout) override {
+        return true;
+    }
+
+    Stats sessionStats() const override {
+        return {};
+    }
+
+    size_t numOpenSessions() const override {
+        return 0ULL;
+    }
+
     void setReplyDelay(Milliseconds delay) {
         _replyDelay = delay;
     }
@@ -118,7 +136,7 @@ private:
             commandResponse.append("minWireVersion", WireVersion::RELEASE_2_4_AND_BEFORE);
         }
 
-        auto response = reply->setCommandReply(commandResponse.done())
+        auto response = reply->setCommandReply(commandResponse.obj())
                             .setMetadata(rpc::makeEmptyMetadata())
                             .done();
 
@@ -179,10 +197,10 @@ public:
             return;
         }
 
-        transport::TransportLayerLegacy::Options options;
+        transport::TransportLayerASIO::Options options;
         options.port = _port;
 
-        _server = stdx::make_unique<transport::TransportLayerLegacy>(options, serviceEntryPoint);
+        _server = stdx::make_unique<transport::TransportLayerASIO>(options, serviceEntryPoint);
         _serverThread = stdx::thread(runServer, _server.get());
     }
 
@@ -215,16 +233,16 @@ public:
     /**
      * Helper method for running the server on a separate thread.
      */
-    static void runServer(transport::TransportLayerLegacy* server) {
-        server->setup();
-        server->start();
+    static void runServer(transport::TransportLayer* server) {
+        server->setup().transitional_ignore();
+        server->start().transitional_ignore();
     }
 
 private:
     const int _port;
 
     stdx::thread _serverThread;
-    unique_ptr<transport::TransportLayerLegacy> _server;
+    unique_ptr<transport::TransportLayer> _server;
 };
 
 /**
@@ -351,9 +369,9 @@ protected:
     }
 
 private:
-    static void runServer(transport::TransportLayerLegacy* server) {
-        server->setup();
-        server->start();
+    static void runServer(transport::TransportLayer* server) {
+        server->setup().transitional_ignore();
+        server->start().transitional_ignore();
     }
 
     /**
@@ -415,7 +433,7 @@ TEST_F(DummyServerFixture, ScopedDbConnectionWithTimeout) {
 
     log() << "Testing MongoURI with explicit timeout";
     start = Date_t::now();
-    ASSERT_THROWS(ScopedDbConnection conn4(uri, overrideTimeout.count()), UserException);
+    ASSERT_THROWS(ScopedDbConnection conn4(uri, overrideTimeout.count()), AssertionException);
     end = Date_t::now();
     ASSERT_GTE((end - start) + gracePeriod, overrideTimeout);
     ASSERT_LT(end - start, uriTimeout);

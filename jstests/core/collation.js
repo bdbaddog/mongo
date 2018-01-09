@@ -1,6 +1,7 @@
 // Cannot implicitly shard accessed collections because of collection existing when none
 // expected.
-// @tags: [assumes_no_implicit_collection_creation_after_drop]
+// @tags: [assumes_no_implicit_collection_creation_after_drop, does_not_support_stepdowns,
+// requires_non_retryable_commands, requires_non_retryable_writes]
 
 // Integration tests for the collation feature.
 (function() {
@@ -646,6 +647,14 @@
                       .collation({locale: "en_US", strength: 3})
                       .sort({a: 1});
         assert.eq(res.toArray(), [{a: "a"}, {a: "A"}, {a: "b"}, {a: "B"}]);
+
+        // Find should return correct results when collation specified and query contains $expr.
+        coll.drop();
+        assert.writeOK(coll.insert([{a: "A"}, {a: "B"}]));
+        assert.eq(1,
+                  coll.find({$expr: {$eq: ["$a", "a"]}})
+                      .collation({locale: "en_US", strength: 2})
+                      .itcount());
     }
 
     // Find should return correct results when no collation specified and collection has a default
@@ -691,6 +700,14 @@
               coll.find({str: "foo", ts: {$gte: Timestamp(1000, 1)}})
                   .addOption(DBQuery.Option.oplogReplay)
                   .itcount());
+
+    // Find should return correct results for query containing $expr when no collation specified and
+    // collection has a default collation.
+    coll.drop();
+    assert.commandWorked(
+        db.createCollection(coll.getName(), {collation: {locale: "en_US", strength: 2}}));
+    assert.writeOK(coll.insert([{a: "A"}, {a: "B"}]));
+    assert.eq(1, coll.find({$expr: {$eq: ["$a", "a"]}}).itcount());
 
     if (db.getMongo().useReadCommands()) {
         // Find should return correct results when "simple" collation specified and collection has a
@@ -1950,6 +1967,43 @@
         // <operation>.o2 respects collection default collation.
         assert.commandWorked(db.runCommand(
             {applyOps: [{op: "u", ns: coll.getFullName(), o2: {_id: "FOO"}, o: {$set: {x: 8}}}]}));
+        assert.eq(8, coll.findOne({_id: "foo"}).x);
+    }
+
+    // doTxn
+    if (!isMongos) {
+        coll.drop();
+        assert.commandWorked(
+            db.createCollection("collation", {collation: {locale: "en_US", strength: 2}}));
+        assert.writeOK(coll.insert({_id: "foo", x: 5, str: "bar"}));
+
+        // preCondition.q respects collection default collation.
+        assert.commandFailed(db.runCommand({
+            doTxn: [{op: "u", ns: coll.getFullName(), o2: {_id: "foo"}, o: {$set: {x: 6}}}],
+            preCondition: [{ns: coll.getFullName(), q: {_id: "not foo"}, res: {str: "bar"}}]
+        }));
+        assert.eq(5, coll.findOne({_id: "foo"}).x);
+        assert.commandWorked(db.runCommand({
+            doTxn: [{op: "u", ns: coll.getFullName(), o2: {_id: "foo"}, o: {$set: {x: 6}}}],
+            preCondition: [{ns: coll.getFullName(), q: {_id: "FOO"}, res: {str: "bar"}}]
+        }));
+        assert.eq(6, coll.findOne({_id: "foo"}).x);
+
+        // preCondition.res respects collection default collation.
+        assert.commandFailed(db.runCommand({
+            doTxn: [{op: "u", ns: coll.getFullName(), o2: {_id: "foo"}, o: {$set: {x: 7}}}],
+            preCondition: [{ns: coll.getFullName(), q: {_id: "foo"}, res: {str: "not bar"}}]
+        }));
+        assert.eq(6, coll.findOne({_id: "foo"}).x);
+        assert.commandWorked(db.runCommand({
+            doTxn: [{op: "u", ns: coll.getFullName(), o2: {_id: "foo"}, o: {$set: {x: 7}}}],
+            preCondition: [{ns: coll.getFullName(), q: {_id: "foo"}, res: {str: "BAR"}}]
+        }));
+        assert.eq(7, coll.findOne({_id: "foo"}).x);
+
+        // <operation>.o2 respects collection default collation.
+        assert.commandWorked(db.runCommand(
+            {doTxn: [{op: "u", ns: coll.getFullName(), o2: {_id: "FOO"}, o: {$set: {x: 8}}}]}));
         assert.eq(8, coll.findOne({_id: "foo"}).x);
     }
 

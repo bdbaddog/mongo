@@ -1,5 +1,5 @@
 /*-
- * Copyright (c) 2014-2017 MongoDB, Inc.
+ * Copyright (c) 2014-2018 MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -19,7 +19,8 @@ __truncate_table(WT_SESSION_IMPL *session, const char *uri, const char *cfg[])
 	WT_TABLE *table;
 	u_int i;
 
-	WT_RET(__wt_schema_get_table(session, uri, strlen(uri), false, &table));
+	WT_RET(__wt_schema_get_table(
+	    session, uri, strlen(uri), false, 0, &table));
 	WT_STAT_DATA_INCR(session, cursor_truncate);
 
 	/* Truncate the column groups. */
@@ -33,7 +34,7 @@ __truncate_table(WT_SESSION_IMPL *session, const char *uri, const char *cfg[])
 		WT_ERR(__wt_schema_truncate(
 		    session, table->indices[i]->source, cfg));
 
-err:	__wt_schema_release_table(session, table);
+err:	WT_TRET(__wt_schema_release_table(session, table));
 	return (ret);
 }
 

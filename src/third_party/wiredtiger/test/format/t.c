@@ -1,5 +1,5 @@
 /*-
- * Public Domain 2014-2017 MongoDB, Inc.
+ * Public Domain 2014-2018 MongoDB, Inc.
  * Public Domain 2008-2014 WiredTiger, Inc.
  *
  * This is free and unencumbered software released into the public domain.
@@ -99,7 +99,7 @@ main(int argc, char *argv[])
 			g.c_quiet = 1;
 			break;
 		case 'r':			/* Replay a run */
-			g.replay = 1;
+			g.replay = true;
 			break;
 		default:
 			usage();
@@ -169,7 +169,6 @@ main(int argc, char *argv[])
 	 */
 	testutil_check(pthread_rwlock_init(&g.append_lock, NULL));
 	testutil_check(pthread_rwlock_init(&g.backup_lock, NULL));
-	testutil_check(pthread_rwlock_init(&g.checkpoint_lock, NULL));
 	testutil_check(pthread_rwlock_init(&g.death_lock, NULL));
 
 	printf("%s: process %" PRIdMAX "\n", progname, (intmax_t)getpid());
@@ -178,7 +177,8 @@ main(int argc, char *argv[])
 
 		config_setup();			/* Run configuration */
 		config_print(0);		/* Dump run configuration */
-		key_len_setup();		/* Setup keys */
+		key_init();			/* Setup keys/values */
+		val_init();
 
 		start = time(NULL);
 		track("starting up", 0ULL, NULL);
@@ -250,10 +250,12 @@ main(int argc, char *argv[])
 		/* Overwrite the progress line with a completion line. */
 		if (!g.c_quiet)
 			printf("\r%78s\r", " ");
-		printf("%4d: %s, %s (%.0f seconds)\n",
+		printf("%4" PRIu32 ": %s, %s (%.0f seconds)\n",
 		    g.run_cnt, g.c_data_source,
 		    g.c_file_type, difftime(time(NULL), start));
 		fflush(stdout);
+
+		val_teardown();			/* Teardown keys/values */
 	}
 
 	/* Flush/close any logging information. */
@@ -264,7 +266,6 @@ main(int argc, char *argv[])
 
 	testutil_check(pthread_rwlock_destroy(&g.append_lock));
 	testutil_check(pthread_rwlock_destroy(&g.backup_lock));
-	testutil_check(pthread_rwlock_destroy(&g.checkpoint_lock));
 	testutil_check(pthread_rwlock_destroy(&g.death_lock));
 
 	config_clear();

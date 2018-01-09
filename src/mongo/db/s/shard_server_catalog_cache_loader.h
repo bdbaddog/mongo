@@ -28,13 +28,13 @@
 
 #pragma once
 
+#include "mongo/db/operation_context_group.h"
+#include "mongo/db/s/namespace_metadata_change_notifications.h"
 #include "mongo/s/catalog_cache_loader.h"
+#include "mongo/stdx/condition_variable.h"
 #include "mongo/util/concurrency/thread_pool.h"
 
 namespace mongo {
-
-class ConfigServerCatalogCacheLoader;
-class ThreadPoolInterface;
 
 /**
  * Shard implementation of the CatalogCacheLoader used by the CatalogCache. Retrieves chunk metadata
@@ -48,7 +48,7 @@ class ShardServerCatalogCacheLoader : public CatalogCacheLoader {
     MONGO_DISALLOW_COPYING(ShardServerCatalogCacheLoader);
 
 public:
-    ShardServerCatalogCacheLoader(std::unique_ptr<CatalogCacheLoader> configLoader);
+    ShardServerCatalogCacheLoader(std::unique_ptr<CatalogCacheLoader> configServerLoader);
     ~ShardServerCatalogCacheLoader();
 
     /**
@@ -68,6 +68,12 @@ public:
     void onStepUp() override;
 
     /**
+     * Sets any notifications waiting for this version to arrive and invalidates the catalog cache's
+     * chunk metadata for collection 'nss' so that the next caller provokes a refresh.
+     */
+    void notifyOfCollectionVersionUpdate(const NamespaceString& nss) override;
+
+    /**
      * This must be called serially, never in parallel, including waiting for the returned
      * Notification to be signalled.
      *
@@ -83,6 +89,8 @@ public:
         stdx::function<void(OperationContext*, StatusWith<CollectionAndChangedChunks>)> callbackFn)
         override;
 
+    void waitForCollectionFlush(OperationContext* opCtx, const NamespaceString& nss) override;
+
 private:
     // Differentiates the server's role in the replica set so that the chunk loader knows whether to
     // load metadata locally or remotely.
@@ -94,6 +102,9 @@ private:
      * metadata for a specific collection.
      */
     struct Task {
+        MONGO_DISALLOW_COPYING(Task);
+        Task(Task&&) = default;
+
         /**
          * Initializes a task for either dropping or updating the persisted metadata for the
          * associated collection. Which type of task is determined by the Status of
@@ -110,6 +121,9 @@ private:
         Task(StatusWith<CollectionAndChangedChunks> statusWithCollectionAndChangedChunks,
              ChunkVersion minimumQueryVersion,
              long long currentTerm);
+
+        // Always-incrementing task number to uniquely identify different tasks
+        uint64_t taskNum;
 
         // Chunks and Collection updates to be applied to the shard persisted metadata store.
         boost::optional<CollectionAndChangedChunks> collectionAndChangedChunks{boost::none};
@@ -143,6 +157,8 @@ private:
      */
     class TaskList {
     public:
+        TaskList();
+
         /**
          * Adds 'task' to the back of the 'tasks' list.
          *
@@ -152,22 +168,41 @@ private:
          */
         void addTask(Task task);
 
-        /**
-         * Returns the front of the 'tasks' list. Invariants if 'tasks' is empty.
-         */
-        const Task& getActiveTask() const;
+        auto& front() {
+            invariant(!_tasks.empty());
+            return _tasks.front();
+        }
 
-        /**
-         * Erases the current active task and updates 'activeTask' to the next task in 'tasks'.
-         */
-        void removeActiveTask();
+        auto& back() {
+            invariant(!_tasks.empty());
+            return _tasks.back();
+        }
 
-        /**
-         * Checks whether there are any tasks left.
-         */
-        const bool empty() {
+        auto begin() {
+            invariant(!_tasks.empty());
+            return _tasks.begin();
+        }
+
+        auto end() {
+            invariant(!_tasks.empty());
+            return _tasks.end();
+        }
+
+        void pop_front();
+
+        bool empty() const {
             return _tasks.empty();
         }
+
+        /**
+         * Must only be called if there is an active task. Behaves like a condition variable and
+         * will be signaled when the active task has been completed.
+         *
+         * NOTE: Because this call unlocks and locks the provided mutex, it is not safe to use the
+         * same task object on which it was called because it might have been deleted during the
+         * unlocked period.
+         */
+        void waitForActiveTaskCompletion(stdx::unique_lock<stdx::mutex>& lg);
 
         /**
          * Checks whether 'term' matches the term of the latest task in the task list. This is
@@ -189,9 +224,25 @@ private:
 
     private:
         std::list<Task> _tasks{};
+
+        // Condition variable which will be signaled whenever the active task from the tasks list is
+        // completed. Must be used in conjunction with the loader's mutex.
+        std::shared_ptr<stdx::condition_variable> _activeTaskCompletedCondVar;
     };
 
     typedef std::map<NamespaceString, TaskList> TaskLists;
+
+    /**
+     * Forces the primary to refresh its metadata for 'nss' and waits until this node's metadata
+     * has caught up to the primary's.
+     * Then retrieves chunk metadata from this node's persisted metadata store and passes it to
+     * 'callbackFn'.
+     */
+    void _runSecondaryGetChunksSince(
+        OperationContext* opCtx,
+        const NamespaceString& nss,
+        const ChunkVersion& catalogCacheSinceVersion,
+        stdx::function<void(OperationContext*, StatusWith<CollectionAndChangedChunks>)> callbackFn);
 
     /**
      * Refreshes chunk metadata from the config server's metadata store, and schedules maintenance
@@ -246,12 +297,18 @@ private:
         const long long term);
 
     /**
-     * Adds 'task' to the task list for 'nss'. If this creates a new task list, then '_runTasks' is
-     * started on another thread to execute the tasks.
+     * First ensures that this server is a majority primary in the case of a replica set with two
+     * primaries: we do not want a minority primary to see majority side routing table changes for
+     * which the minority does not have the corresponding data.
+     *
+     * Then adds 'task' to the task list for 'nss'. If this creates a new task list, then
+     * '_runTasks' is started on another thread to execute the tasks.
      *
      * Only run on the shard primary.
      */
-    Status _scheduleTask(const NamespaceString& nss, Task task);
+    Status _ensureMajorityPrimaryAndScheduleTask(OperationContext* opCtx,
+                                                 const NamespaceString& nss,
+                                                 Task task);
 
     /**
      * Schedules tasks in the 'nss' task list to execute until the task list is depleted.
@@ -266,7 +323,19 @@ private:
      *
      * Only run on the shard primary.
      */
-    bool _updatePersistedMetadata(OperationContext* opCtx, const NamespaceString& nss);
+    void _updatePersistedMetadata(OperationContext* opCtx, const NamespaceString& nss);
+
+    /**
+     * Attempts to read the collection and chunk metadata since 'version' from the shard persisted
+     * metadata store. Continues to retry reading the metadata until a complete diff is read
+     * uninterrupted by concurrent updates.
+     *
+     * Returns a complete metadata update since 'version', which when applied to a complete metadata
+     * store up to 'version' again produces a complete metadata store. Throws on error --
+     * NamespaceNotFound error means the collection does not exist.
+     */
+    CollectionAndChangedChunks _getCompletePersistedMetadataForSecondarySinceVersion(
+        OperationContext* opCtx, const NamespaceString& nss, const ChunkVersion& version);
 
     // Used by the shard primary to retrieve chunk metadata from the config server.
     const std::unique_ptr<CatalogCacheLoader> _configServerLoader;
@@ -274,20 +343,24 @@ private:
     // Thread pool used to load chunk metadata.
     ThreadPool _threadPool;
 
+    NamespaceMetadataChangeNotifications _namespaceNotifications;
+
     // Protects the class state below.
     stdx::mutex _mutex;
 
     // Map to track in progress persisted cache updates on the shard primary.
     TaskLists _taskLists;
 
-    // This value is increment every time this server changes from primary to secondary and vice
-    // versa. In this way, if a task is scheduled with one term value and then execution is
-    // attempted during another term, we can skip the operation because it is no longer valid.
+    // This value is bumped every time the set of currently scheduled tasks should no longer be
+    // running. This includes, replica set state transitions and shutdown.
     long long _term{0};
 
     // Indicates whether this server is the primary or not, so that the appropriate loading action
     // can be taken.
     ReplicaSetRole _role{ReplicaSetRole::None};
+
+    // The collection of operation contexts in use by all threads.
+    OperationContextGroup _contexts;
 };
 
 }  // namespace mongo

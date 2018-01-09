@@ -26,6 +26,8 @@
  *    it in the license file.
  */
 
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kReplication
+
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/logical_time_validator.h"
@@ -39,6 +41,7 @@
 #include "mongo/db/operation_context.h"
 #include "mongo/db/service_context.h"
 #include "mongo/util/assert_util.h"
+#include "mongo/util/log.h"
 
 namespace mongo {
 
@@ -48,12 +51,12 @@ const auto getLogicalClockValidator =
 
 stdx::mutex validatorMutex;  // protects access to decoration instance of LogicalTimeValidator.
 
-std::vector<Privilege> advanceLogicalClockPrivilege;
+std::vector<Privilege> advanceClusterTimePrivilege;
 
-MONGO_INITIALIZER(InitializeAdvanceLogicalClockPrivilegeVector)(InitializerContext* const) {
+MONGO_INITIALIZER(InitializeAdvanceClusterTimePrivilegeVector)(InitializerContext* const) {
     ActionSet actions;
-    actions.addAction(ActionType::internal);
-    advanceLogicalClockPrivilege.emplace_back(ResourcePattern::forClusterResource(), actions);
+    actions.addAction(ActionType::advanceClusterTime);
+    advanceClusterTimePrivilege.emplace_back(ResourcePattern::forClusterResource(), actions);
     return Status::OK();
 }
 
@@ -77,15 +80,15 @@ void LogicalTimeValidator::set(ServiceContext* service,
     validator = std::move(newValidator);
 }
 
-LogicalTimeValidator::LogicalTimeValidator(std::unique_ptr<KeysCollectionManager> keyManager)
-    : _keyManager(std::move(keyManager)) {}
+LogicalTimeValidator::LogicalTimeValidator(std::shared_ptr<KeysCollectionManager> keyManager)
+    : _keyManager(keyManager) {}
 
 SignedLogicalTime LogicalTimeValidator::_getProof(const KeysCollectionDocument& keyDoc,
                                                   LogicalTime newTime) {
     auto key = keyDoc.getKey();
 
     // Compare and calculate HMAC inside mutex to prevent multiple threads computing HMAC for the
-    // same logical time.
+    // same cluster time.
     stdx::lock_guard<stdx::mutex> lk(_mutex);
     // Note: _lastSeenValidTime will initially not have a proof set.
     if (newTime == _lastSeenValidTime.getTime() && _lastSeenValidTime.getProof()) {
@@ -103,7 +106,7 @@ SignedLogicalTime LogicalTimeValidator::_getProof(const KeysCollectionDocument& 
 }
 
 SignedLogicalTime LogicalTimeValidator::trySignLogicalTime(const LogicalTime& newTime) {
-    auto keyStatusWith = _keyManager->getKeyForSigning(newTime);
+    auto keyStatusWith = _getKeyManagerCopy()->getKeyForSigning(nullptr, newTime);
     auto keyStatus = keyStatusWith.getStatus();
 
     if (keyStatus == ErrorCodes::KeyNotFound) {
@@ -117,13 +120,14 @@ SignedLogicalTime LogicalTimeValidator::trySignLogicalTime(const LogicalTime& ne
 
 SignedLogicalTime LogicalTimeValidator::signLogicalTime(OperationContext* opCtx,
                                                         const LogicalTime& newTime) {
-    auto keyStatusWith = _keyManager->getKeyForSigning(newTime);
+    auto keyManager = _getKeyManagerCopy();
+    auto keyStatusWith = keyManager->getKeyForSigning(nullptr, newTime);
     auto keyStatus = keyStatusWith.getStatus();
 
     while (keyStatus == ErrorCodes::KeyNotFound) {
-        _keyManager->refreshNow(opCtx);
+        keyManager->refreshNow(opCtx);
 
-        keyStatusWith = _keyManager->getKeyForSigning(newTime);
+        keyStatusWith = keyManager->getKeyForSigning(nullptr, newTime);
         keyStatus = keyStatusWith.getStatus();
 
         if (keyStatus == ErrorCodes::KeyNotFound) {
@@ -138,19 +142,20 @@ SignedLogicalTime LogicalTimeValidator::signLogicalTime(OperationContext* opCtx,
 Status LogicalTimeValidator::validate(OperationContext* opCtx, const SignedLogicalTime& newTime) {
     {
         stdx::lock_guard<stdx::mutex> lk(_mutex);
-        if (newTime.getTime() == _lastSeenValidTime.getTime()) {
+        if (newTime.getTime() <= _lastSeenValidTime.getTime()) {
             return Status::OK();
         }
     }
 
-    auto keyStatus = _keyManager->getKeyForValidation(opCtx, newTime.getKeyId(), newTime.getTime());
+    auto keyStatus =
+        _getKeyManagerCopy()->getKeyForValidation(opCtx, newTime.getKeyId(), newTime.getTime());
     uassertStatusOK(keyStatus.getStatus());
 
     const auto& key = keyStatus.getValue().getKey();
 
     const auto newProof = newTime.getProof();
-    // Logical time is only sent if a server's clock can verify and sign logical times, so any
-    // received logical times should have proofs.
+    // Cluster time is only sent if a server's clock can verify and sign cluster times, so any
+    // received cluster times should have proofs.
     invariant(newProof);
 
     auto res = _timeProofService.checkProof(newTime.getTime(), newProof.get(), key);
@@ -162,15 +167,15 @@ Status LogicalTimeValidator::validate(OperationContext* opCtx, const SignedLogic
 }
 
 void LogicalTimeValidator::init(ServiceContext* service) {
-    _keyManager->startMonitoring(service);
+    _getKeyManagerCopy()->startMonitoring(service);
 }
 
 void LogicalTimeValidator::shutDown() {
-    _keyManager->stopMonitoring();
+    _getKeyManagerCopy()->stopMonitoring();
 }
 
 void LogicalTimeValidator::enableKeyGenerator(OperationContext* opCtx, bool doEnable) {
-    _keyManager->enableKeyGenerator(opCtx, doEnable);
+    _getKeyManagerCopy()->enableKeyGenerator(opCtx, doEnable);
 }
 
 bool LogicalTimeValidator::isAuthorizedToAdvanceClock(OperationContext* opCtx) {
@@ -178,7 +183,42 @@ bool LogicalTimeValidator::isAuthorizedToAdvanceClock(OperationContext* opCtx) {
     // Note: returns true if auth is off, courtesy of
     // AuthzSessionExternalStateServerCommon::shouldIgnoreAuthChecks.
     return AuthorizationSession::get(client)->isAuthorizedForPrivileges(
-        advanceLogicalClockPrivilege);
+        advanceClusterTimePrivilege);
+}
+
+bool LogicalTimeValidator::shouldGossipLogicalTime() {
+    return _getKeyManagerCopy()->hasSeenKeys();
+}
+
+void LogicalTimeValidator::forceKeyRefreshNow(OperationContext* opCtx) {
+    _getKeyManagerCopy()->refreshNow(opCtx);
+}
+
+void LogicalTimeValidator::resetKeyManagerCache(ServiceContext* service) {
+    log() << "Resetting key manager cache";
+    if (auto keyManager = _getKeyManagerCopy()) {
+        keyManager->stopMonitoring();
+        keyManager->startMonitoring(service);
+        _lastSeenValidTime = SignedLogicalTime();
+        _timeProofService.resetCache();
+    }
+}
+
+void LogicalTimeValidator::resetKeyManager() {
+    log() << "Resetting key manager";
+    stdx::lock_guard<stdx::mutex> lk(_mutexKeyManager);
+    if (_keyManager) {
+        _keyManager->stopMonitoring();
+        _keyManager.reset();
+        _lastSeenValidTime = SignedLogicalTime();
+        _timeProofService.resetCache();
+    }
+}
+
+std::shared_ptr<KeysCollectionManager> LogicalTimeValidator::_getKeyManagerCopy() {
+    stdx::lock_guard<stdx::mutex> lk(_mutexKeyManager);
+    invariant(_keyManager);
+    return _keyManager;
 }
 
 }  // namespace mongo

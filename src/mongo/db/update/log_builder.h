@@ -33,6 +33,19 @@
 
 namespace mongo {
 
+/**
+ * Previously, there were multiple supported versions of the update language.
+ */
+enum class UpdateSemantics {
+    // The update system introduced in v3.6, and is the only supported system. When a single update
+    // adds multiple fields, those fields are added in lexicographic order by field name. This
+    // system introduces support for arrayFilters and $[] syntax.
+    kUpdateNode = 1,
+
+    // Must be last.
+    kNumUpdateSemantics
+};
+
 /** LogBuilder abstracts away some of the details of producing a properly constructed oplog
  *  update entry. It manages separate regions into which it accumulates $set and $unset
  *  operations, and distinguishes object replacement style oplog generation from
@@ -40,6 +53,8 @@ namespace mongo {
  */
 class LogBuilder {
 public:
+    static constexpr StringData kUpdateSemanticsFieldName = "$v"_sd;
+
     /** Construct a new LogBuilder. Log entries will be recorded as new children under the
      *  'logRoot' Element, which must be of type mongo::Object and have no children.
      */
@@ -47,7 +62,8 @@ public:
         : _logRoot(logRoot),
           _objectReplacementAccumulator(_logRoot),
           _setAccumulator(_logRoot.getDocument().end()),
-          _unsetAccumulator(_setAccumulator) {
+          _unsetAccumulator(_setAccumulator),
+          _updateSemantics(_setAccumulator) {
         dassert(logRoot.isType(mongo::Object));
         dassert(!logRoot.hasChildren());
     }
@@ -95,6 +111,11 @@ public:
      */
     Status addToUnsets(StringData path);
 
+    /**
+     * Add a "$v" field to the log. Fails if there is already a "$v" field.
+     */
+    Status setUpdateSemantics(UpdateSemantics updateSemantics);
+
     /** Obtain, via the out parameter 'outElt', a pointer to the mongo::Object type Element
      *  to which the components of an object replacement should be recorded. It is an error
      *  to call this if any Elements have been added by calling either addToSets or
@@ -116,6 +137,7 @@ private:
     mutablebson::Element _objectReplacementAccumulator;
     mutablebson::Element _setAccumulator;
     mutablebson::Element _unsetAccumulator;
+    mutablebson::Element _updateSemantics;
 };
 
 }  // namespace mongo

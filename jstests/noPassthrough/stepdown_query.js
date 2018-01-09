@@ -1,7 +1,14 @@
-// Test that a query with default read preference ("primary") will succeed even if the node being
-// queried steps down before the final result batch has been delivered.
+/**
+ * Tests that a query with default read preference ("primary") will succeed even if the node being
+ * queried steps down before the final result batch has been delivered.
+ */
+
+// Checking UUID consistency involves talking to a shard node, which in this test is shutdown
+TestData.skipCheckingUUIDsConsistentAcrossCluster = true;
+
 (function() {
-    "use strict";
+    'use strict';
+
     var dbName = "test";
     var collName = jsTest.name();
 

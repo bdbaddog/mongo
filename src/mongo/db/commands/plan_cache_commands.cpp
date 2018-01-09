@@ -108,12 +108,11 @@ using std::unique_ptr;
 PlanCacheCommand::PlanCacheCommand(const string& name,
                                    const string& helpText,
                                    ActionType actionType)
-    : Command(name), helpText(helpText), actionType(actionType) {}
+    : BasicCommand(name), helpText(helpText), actionType(actionType) {}
 
 bool PlanCacheCommand::run(OperationContext* opCtx,
                            const string& dbname,
                            const BSONObj& cmdObj,
-                           string& errmsg,
                            BSONObjBuilder& result) {
     const NamespaceString nss(parseNsCollectionRequired(dbname, cmdObj));
     Status status = runPlanCacheCommand(opCtx, nss.ns(), cmdObj, &result);
@@ -208,7 +207,13 @@ StatusWith<unique_ptr<CanonicalQuery>> PlanCacheCommand::canonicalize(OperationC
     qr->setProj(projObj);
     qr->setCollation(collationObj);
     const ExtensionsCallbackReal extensionsCallback(opCtx, &nss);
-    auto statusWithCQ = CanonicalQuery::canonicalize(opCtx, std::move(qr), extensionsCallback);
+    const boost::intrusive_ptr<ExpressionContext> expCtx;
+    auto statusWithCQ =
+        CanonicalQuery::canonicalize(opCtx,
+                                     std::move(qr),
+                                     expCtx,
+                                     extensionsCallback,
+                                     MatchExpressionParser::kAllowAllSpecialFeatures);
     if (!statusWithCQ.isOK()) {
         return statusWithCQ.getStatus();
     }
@@ -401,10 +406,8 @@ Status PlanCacheListPlans::list(OperationContext* opCtx,
     for (size_t i = 0; i < numPlans; ++i) {
         BSONObjBuilder planBob(plansBuilder.subobjStart());
 
-        // Create plan details field.
-        // Currently, simple string representationg of
-        // SolutionCacheData. Need to revisit format when we
-        // need to parse user-provided plan details for planCacheAddPlan.
+        // Create the plan details field. Currently, this is a simple string representation of
+        // SolutionCacheData.
         SolutionCacheData* scd = entry->plannerData[i];
         BSONObjBuilder detailsBob(planBob.subobjStart("details"));
         detailsBob.append("solution", scd->toString());
@@ -437,7 +440,11 @@ Status PlanCacheListPlans::list(OperationContext* opCtx,
 
         planBob.append("filterSet", scd->indexFilterApplied);
     }
+
     plansBuilder.doneFast();
+
+    // Append the time the entry was inserted into the plan cache.
+    bob->append("timeOfCreation", entry->timeOfCreation);
 
     return Status::OK();
 }

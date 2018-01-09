@@ -38,6 +38,7 @@
 #include <signal.h>
 
 #ifndef _WIN32
+#include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <syslog.h>
@@ -51,6 +52,7 @@
 #include "mongo/db/auth/internal_user_auth.h"
 #include "mongo/db/auth/security_key.h"
 #include "mongo/db/server_options.h"
+#include "mongo/db/server_parameters.h"
 #include "mongo/logger/console_appender.h"
 #include "mongo/logger/logger.h"
 #include "mongo/logger/message_event.h"
@@ -130,12 +132,17 @@ static bool forkServer() {
         } else if (child1) {
             // this is run in the original parent process
             int pstat;
-            waitpid(child1, &pstat, 0);
+            if (waitpid(child1, &pstat, 0) == pid_t{-1}) {
+                perror("waitpid");
+                quickExit(-1);
+            }
 
             if (WIFEXITED(pstat)) {
                 if (WEXITSTATUS(pstat)) {
                     cout << "ERROR: child process failed, exited with error number "
-                         << WEXITSTATUS(pstat) << endl;
+                         << WEXITSTATUS(pstat) << endl
+                         << "To see additional information in this output, start without "
+                         << "the \"--fork\" option." << endl;
                 } else {
                     cout << "child process started successfully, parent exiting" << endl;
                 }
@@ -162,7 +169,10 @@ static bool forkServer() {
             // this is run in the middle process
             int pstat;
             cout << "forked process: " << child2 << endl;
-            waitpid(child2, &pstat, 0);
+            if (waitpid(child2, &pstat, 0) == pid_t{-1}) {
+                perror("waitpid");
+                quickExit(-1);
+            }
 
             if (WIFEXITED(pstat)) {
                 quickExit(WEXITSTATUS(pstat));
@@ -334,11 +344,30 @@ MONGO_INITIALIZER(RegisterShortCircuitExitHandler)(InitializerContext*) {
     return Status::OK();
 }
 
+// On non-windows platforms, drop rwx for group and other unless the
+// user has opted into using the system umask. To do so, we first read
+// out the current umask (by temporarily setting it to
+// no-permissions), and then or the returned umask with the
+// restrictions we want to apply and set it back. The overall effect
+// is to set the bits for 'other' and 'group', but leave umask bits
+// bits for 'user' unaltered.
+#ifndef _WIN32
+namespace {
+MONGO_EXPORT_STARTUP_SERVER_PARAMETER(honorSystemUmask, bool, false);
+MONGO_INITIALIZER(MungeUmask)(InitializerContext*) {
+    if (!honorSystemUmask) {
+        umask(umask(S_IRWXU | S_IRWXG | S_IRWXO) | S_IRWXG | S_IRWXO);
+    }
+    return Status::OK();
+}
+}  // namespace
+#endif
+
 bool initializeServerGlobalState() {
-    Listener::globalTicketHolder.resize(serverGlobalParams.maxConns);
+    Listener::globalTicketHolder.resize(serverGlobalParams.maxConns).transitional_ignore();
 
 #ifndef _WIN32
-    if (!fs::is_directory(serverGlobalParams.socket)) {
+    if (!serverGlobalParams.noUnixSocket && !fs::is_directory(serverGlobalParams.socket)) {
         cout << serverGlobalParams.socket << " must be a directory" << endl;
         return false;
     }

@@ -45,7 +45,8 @@
             assert.commandWorked(res, "enabling sharding on the '" + dbName + "' db failed");
         }
 
-        res = db.adminCommand({shardCollection: fullName, key: {_id: 'hashed'}});
+        res = db.adminCommand(
+            {shardCollection: fullName, key: {_id: 'hashed'}, collation: {locale: "simple"}});
         if (res.ok === 0 && testMayRunDropInParallel) {
             // We ignore ConflictingOperationInProgress error responses from the
             // "shardCollection" command if it's possible the test was running a "drop" command
@@ -64,9 +65,10 @@
     DB.prototype.getCollection = function() {
         var collection = originalGetCollection.apply(this, arguments);
 
-        // If the collection exists, there must have been a previous call to getCollection
-        // where we sharded the collection so there's no need to do it again.
-        if (collection.exists()) {
+        const collStats = this.runCommand({collStats: collection.getName()});
+
+        // If the collection is already sharded or is non-empty, do not attempt to shard.
+        if (collStats.sharded || collStats.count > 0) {
             return collection;
         }
 
@@ -79,11 +81,9 @@
     DBCollection.prototype.drop = function() {
         var dropResult = originalDBCollectionDrop.apply(this, arguments);
 
-        // TODO: Disable sharding collection on OSX until SERVER-28418 is fixed.
-        if (this.getDB().serverBuildInfo().buildEnvironment.target_os !== "macOS") {
-            // Attempt to enable sharding on database and collection if not already done.
-            shardCollection(this);
-        }
+        // Attempt to enable sharding on database and collection if not already done.
+        shardCollection(this);
+
         return dropResult;
     };
 

@@ -24,15 +24,9 @@ global:
 
 imports:
   - "mongo/idl/basic_types.idl"
+  - "mongo/crypto/sha256_block.idl"
 
 types:
-
-  UUIDIDL:
-    description: "IDL representation of the UUID type"
-    bson_serialization_type: object
-    cpp_type: "mongo::UUID"
-    deserializer: "mongo::UUID::parse"
-    serializer: "mongo::UUID::toBSON"
 
   TxnNumber:
     description: "A strictly-increasing per-session counter, which indicates to which transaction
@@ -42,10 +36,129 @@ types:
     cpp_type: "std::int64_t"
     deserializer: "mongo::BSONElement::_numberLong"
 
+  StmtId:
+    description: "A number representing an operation within a transaction."
+    bson_serialization_type: int
+    cpp_type: "std::int32_t"
+    deserializer: "mongo::BSONElement::_numberInt"
+
 structs:
 
-  logical_session_id:
+  LogicalSessionId:
     description: "A struct representing a LogicalSessionId"
     strict: true
     fields:
-      id: UUIDIDL
+      id: uuid
+      uid: sha256Block
+
+  LogicalSessionIdToClient:
+    description: "A struct representing a LogicalSessionId to external clients"
+    strict: true
+    fields:
+      id: uuid
+
+  LogicalSessionToClient:
+    description: "A struct representing a LogicalSession reply to external clients"
+    strict: true
+    fields:
+      id: LogicalSessionIdToClient
+      timeoutMinutes: int
+
+  LogicalSessionRecord:
+    description: "A struct representing a LogicalSessionRecord"
+    strict: true
+    fields:
+      _id:
+        type: LogicalSessionId
+        cpp_name: id
+      lastUse: date
+      user:
+        type: string
+        optional: true
+
+  LogicalSessionFromClient:
+    description: "A struct representing a LogicalSessionId from external clients"
+    strict: true
+    fields:
+      id: uuid
+      uid:
+        type: sha256Block
+        optional: true
+
+  OperationSessionInfo:
+    description: "Parser for serializing sessionId/txnNumber combination"
+    strict: false
+    fields:
+      lsid:
+        type: LogicalSessionId
+        cpp_name: sessionId
+        optional: true
+      txnNumber:
+        description: "The transaction number relative to the session in which a particular write
+                      operation executes."
+        type: TxnNumber
+        optional: true
+
+  OperationSessionInfoFromClient:
+    description: "Parser for pulling out the sessionId/txnNumber combination from commands"
+    strict: false
+    fields:
+      lsid:
+        type: LogicalSessionFromClient
+        cpp_name: sessionId
+        optional: true
+      txnNumber:
+        description: "The transaction number relative to the session in which a particular write
+                      operation executes."
+        type: TxnNumber
+        optional: true
+
+  SessionsCollectionFetchResultIndividualResult:
+    description: "Individual result"
+    strict: true
+    fields:
+      _id: LogicalSessionId
+
+  SessionsCollectionFetchResultCursor:
+    description: "Cursor object"
+    strict: false
+    fields:
+      firstBatch: array<SessionsCollectionFetchResultIndividualResult>
+
+  SessionsCollectionFetchResult:
+    description: "Parser for pulling out the fetch results from SessionsCollection::fetch"
+    strict: false
+    fields:
+      cursor: SessionsCollectionFetchResultCursor
+
+  SessionsCollectionFetchRequestFilterId:
+    description: "Id"
+    strict: true
+    fields:
+      $in:
+        type: array<LogicalSessionId>
+        cpp_name: "in"
+
+  SessionsCollectionFetchRequestFilter:
+    description: "filter"
+    strict: true
+    fields:
+      _id: SessionsCollectionFetchRequestFilterId
+
+  SessionsCollectionFetchRequestProjection:
+    description: "projection"
+    strict: true
+    fields:
+      _id: int
+
+  SessionsCollectionFetchRequest:
+    description: "Parser for forming the fetch request for SessionsCollection::fetch"
+    strict: true
+    fields:
+      find: string
+      filter: SessionsCollectionFetchRequestFilter
+      projection: SessionsCollectionFetchRequestProjection
+      batchSize: int
+      singleBatch: bool
+      allowPartialResults: bool
+      limit: int

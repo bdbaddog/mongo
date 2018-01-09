@@ -47,9 +47,19 @@
 
 namespace mongo {
 
-void FTDCController::setEnabled(bool enabled) {
+Status FTDCController::setEnabled(bool enabled) {
     stdx::lock_guard<stdx::mutex> lock(_mutex);
+
+    if (_path.empty()) {
+        return Status(ErrorCodes::FTDCPathNotSet,
+                      str::stream() << "FTDC cannot be enabled without setting the set parameter "
+                                       "'diagnosticDataCollectionDirectoryPath' first.");
+    }
+
     _configTemp.enabled = enabled;
+    _condvar.notify_one();
+
+    return Status::OK();
 }
 
 void FTDCController::setPeriod(Milliseconds millis) {
@@ -82,6 +92,23 @@ void FTDCController::setMaxSamplesPerInterimMetricChunk(size_t size) {
     _condvar.notify_one();
 }
 
+Status FTDCController::setDirectory(const boost::filesystem::path& path) {
+    stdx::lock_guard<stdx::mutex> lock(_mutex);
+
+    if (!_path.empty()) {
+        return Status(ErrorCodes::FTDCPathAlreadySet,
+                      str::stream() << "FTDC path has already been set to '" << _path.string()
+                                    << "'. It cannot be changed.");
+    }
+
+    _path = path;
+
+    // Do not notify for the change since it has to be enabled via setEnabled.
+
+    return Status::OK();
+}
+
+
 void FTDCController::addPeriodicCollector(std::unique_ptr<FTDCCollectorInterface> collector) {
     {
         stdx::lock_guard<stdx::mutex> lock(_mutex);
@@ -112,7 +139,7 @@ void FTDCController::start() {
           << _path.generic_string() << "'";
 
     // Start the thread
-    _thread = stdx::thread(stdx::bind(&FTDCController::doLoop, this));
+    _thread = stdx::thread([this] { doLoop(); });
 
     {
         stdx::lock_guard<stdx::mutex> lock(_mutex);
@@ -203,7 +230,7 @@ void FTDCController::doLoop() {
             }
 
             // TODO: consider only running this thread if we are enabled
-            // for now, we just keep an idle thread as it is simplier
+            // for now, we just keep an idle thread as it is simpler
             if (_config.enabled) {
                 // Delay initialization of FTDCFileManager until we are sure the user has enabled
                 // FTDC

@@ -46,7 +46,9 @@ DocumentSourceSingleDocumentTransformation::DocumentSourceSingleDocumentTransfor
     const intrusive_ptr<ExpressionContext>& pExpCtx,
     std::unique_ptr<TransformerInterface> parsedTransform,
     std::string name)
-    : DocumentSource(pExpCtx), _parsedTransform(std::move(parsedTransform)), _name(name) {}
+    : DocumentSource(pExpCtx),
+      _parsedTransform(std::move(parsedTransform)),
+      _name(std::move(name)) {}
 
 const char* DocumentSourceSingleDocumentTransformation::getSourceName() const {
     return _name.c_str();
@@ -76,16 +78,15 @@ void DocumentSourceSingleDocumentTransformation::doDispose() {
 
 Value DocumentSourceSingleDocumentTransformation::serialize(
     boost::optional<ExplainOptions::Verbosity> explain) const {
-    return Value(Document{{getSourceName(), _parsedTransform->serialize(explain)}});
+    return Value(Document{{getSourceName(), _parsedTransform->serializeStageOptions(explain)}});
 }
 
 Pipeline::SourceContainer::iterator DocumentSourceSingleDocumentTransformation::doOptimizeAt(
     Pipeline::SourceContainer::iterator itr, Pipeline::SourceContainer* container) {
     invariant(*itr == this);
     auto nextSkip = dynamic_cast<DocumentSourceSkip*>((*std::next(itr)).get());
-    auto nextLimit = dynamic_cast<DocumentSourceLimit*>((*std::next(itr)).get());
 
-    if (nextSkip || nextLimit) {
+    if (nextSkip) {
         std::swap(*itr, *std::next(itr));
         return itr == container->begin() ? itr : std::prev(itr);
     }

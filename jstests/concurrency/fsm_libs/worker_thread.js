@@ -18,12 +18,15 @@ var workerThread = (function() {
     // args.seed = seed for the random number generator
     // args.globalAssertLevel = the global assertion level to use
     // args.errorLatch = CountDownLatch instance that threads count down when they error
+    // args.sessionOptions = the options to start a session with
+    // args.testData = TestData object
     // run = callback that takes a map of workloads to their associated $config
     function main(workloads, args, run) {
         var myDB;
         var configs = {};
 
         globalAssertLevel = args.globalAssertLevel;
+        TestData = args.testData;
 
         try {
             if (Cluster.isStandalone(args.clusterOptions)) {
@@ -36,7 +39,78 @@ var workerThread = (function() {
                     gc();
                 }
 
-                myDB = new Mongo(args.host).getDB(args.dbName);
+                if (typeof args.sessionOptions !== 'undefined') {
+                    let initialClusterTime;
+                    let initialOperationTime;
+
+                    // JavaScript objects backed by C++ objects (e.g. BSON values from a command
+                    // response) do not serialize correctly when passed through the ScopedThread
+                    // constructor. To work around this behavior, we instead pass a stringified form
+                    // of the JavaScript object through the ScopedThread constructor and use eval()
+                    // to rehydrate it.
+                    if (typeof args.sessionOptions.initialClusterTime === 'string') {
+                        initialClusterTime =
+                            eval('(' + args.sessionOptions.initialClusterTime + ')');
+
+                        // The initialClusterTime property was removed from SessionOptions in a
+                        // later revision of the Driver's specification, so we remove the property
+                        // and call advanceClusterTime() ourselves.
+                        delete args.sessionOptions.initialClusterTime;
+                    }
+
+                    if (typeof args.sessionOptions.initialOperationTime === 'string') {
+                        initialOperationTime =
+                            eval('(' + args.sessionOptions.initialOperationTime + ')');
+
+                        // The initialOperationTime property was removed from SessionOptions in a
+                        // later revision of the Driver's specification, so we remove the property
+                        // and call advanceOperationTime() ourselves.
+                        delete args.sessionOptions.initialOperationTime;
+                    }
+
+                    const session = new Mongo(args.host).startSession(args.sessionOptions);
+
+                    if (typeof initialClusterTime !== 'undefined') {
+                        session.advanceClusterTime(initialClusterTime);
+                    }
+
+                    if (typeof initialOperationTime !== 'undefined') {
+                        session.advanceOperationTime(initialOperationTime);
+                    }
+
+                    myDB = session.getDatabase(args.dbName);
+                } else {
+                    myDB = new Mongo(args.host).getDB(args.dbName);
+                }
+            }
+
+            if (Cluster.isReplication(args.clusterOptions)) {
+                if (args.clusterOptions.hasOwnProperty('sharded') &&
+                    args.clusterOptions.sharded.hasOwnProperty('stepdownOptions') &&
+                    args.clusterOptions.sharded.stepdownOptions.shardStepdown) {
+                    const newOptions = {
+                        alwaysInjectTransactionNumber: true,
+                        defaultReadConcernLevel: "majority",
+                        logRetryAttempts: true,
+                        overrideRetryAttempts: 3
+                    };
+                    Object.assign(TestData, newOptions);
+
+                    load('jstests/libs/override_methods/auto_retry_on_network_error.js');
+                }
+
+                // Operations that run after a "dropDatabase" command has been issued may fail with
+                // a "DatabaseDropPending" error response if they would create a new collection on
+                // that database while we're waiting for a majority of nodes in the replica set to
+                // confirm it has been dropped. We load the
+                // implicitly_retry_on_database_drop_pending.js file to make it so that the clients
+                // started by the concurrency framework automatically retry their operation in the
+                // face of this particular error response.
+                load('jstests/libs/override_methods/implicitly_retry_on_database_drop_pending.js');
+            }
+
+            if (TestData.defaultReadConcernLevel || TestData.defaultWriteConcern) {
+                load('jstests/libs/override_methods/set_read_and_write_concerns.js');
             }
 
             workloads.forEach(function(workload) {

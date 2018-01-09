@@ -6,6 +6,7 @@ execute.
 from __future__ import absolute_import
 
 import itertools
+import threading
 import time
 
 from . import report as _report
@@ -14,21 +15,34 @@ from .. import config as _config
 from .. import selector as _selector
 
 
+def synchronized(method):
+    """Decorator to enfore instance lock ownership when calling the method."""
+
+    def synced(self, *args, **kwargs):
+        lock = getattr(self, "_lock")
+        with lock:
+            return method(self, *args, **kwargs)
+
+    return synced
+
+
 class Suite(object):
     """
     A suite of tests of a particular kind (e.g. C++ unit tests, dbtests, jstests).
     """
 
-    def __init__(self, suite_name, suite_config):
+    def __init__(self, suite_name, suite_config, suite_options=_config.SuiteOptions.ALL_INHERITED):
         """
         Initializes the suite with the specified name and configuration.
         """
+        self._lock = threading.RLock()
 
         self._suite_name = suite_name
         self._suite_config = suite_config
+        self._suite_options = suite_options
 
         self.test_kind = self.get_test_kind_config()
-        self.tests = self._get_tests_for_kind(self.test_kind)
+        self.tests, self.excluded = self._get_tests_for_kind(self.test_kind)
 
         self.return_code = None  # Set by the executor.
 
@@ -48,7 +62,6 @@ class Suite(object):
         Returns the tests to run based on the 'test_kind'-specific
         filtering policy.
         """
-
         test_info = self.get_selector_config()
 
         # The mongos_test doesn't have to filter anything, the test_info is just the arguments to
@@ -57,19 +70,13 @@ class Suite(object):
             mongos_options = test_info  # Just for easier reading.
             if not isinstance(mongos_options, dict):
                 raise TypeError("Expected dictionary of arguments to mongos")
-            return [mongos_options]
-        elif test_kind == "cpp_integration_test":
-            tests = _selector.filter_cpp_integration_tests(**test_info)
-        elif test_kind == "cpp_unit_test":
-            tests = _selector.filter_cpp_unit_tests(**test_info)
-        elif test_kind == "db_test":
-            tests = _selector.filter_dbtests(**test_info)
-        else:  # test_kind == "js_test":
-            tests = _selector.filter_jstests(**test_info)
+            return [mongos_options], []
 
+        tests, excluded = _selector.filter_tests(test_kind, test_info)
         if _config.ORDER_TESTS_BY_NAME:
-            return sorted(tests, key=str.lower)
-        return tests
+            return sorted(tests, key=str.lower), sorted(excluded, key=str.lower)
+
+        return tests, excluded
 
     def get_name(self):
         """
@@ -77,11 +84,40 @@ class Suite(object):
         """
         return self._suite_name
 
+    def get_display_name(self):
+        """
+        Returns the name of the test suite with a unique identifier for its SuiteOptions.
+        """
+
+        if self.options.description is None:
+            return self.get_name()
+
+        return "{} ({})".format(self.get_name(), self.options.description)
+
     def get_selector_config(self):
         """
         Returns the "selector" section of the YAML configuration.
         """
-        return self._suite_config["selector"]
+
+        if "selector" not in self._suite_config:
+            return {}
+        selector = self._suite_config["selector"].copy()
+
+        if self.options.include_tags is not None:
+            if "include_tags" in selector:
+                selector["include_tags"] = {"$allOf": [
+                    selector["include_tags"],
+                    self.options.include_tags,
+                ]}
+            elif "exclude_tags" in selector:
+                selector["exclude_tags"] = {"$anyOf": [
+                    selector["exclude_tags"],
+                    {"$not": self.options.include_tags},
+                ]}
+            else:
+                selector["include_tags"] = self.options.include_tags
+
+        return selector
 
     def get_executor_config(self):
         """
@@ -95,18 +131,32 @@ class Suite(object):
         """
         return self._suite_config["test_kind"]
 
+    @property
+    def options(self):
+        return self._suite_options.resolve()
+
+    def with_options(self, suite_options):
+        """
+        Returns a Suite instance with the specified resmokelib.config.SuiteOptions.
+        """
+
+        return Suite(self._suite_name, self._suite_config, suite_options)
+
+    @synchronized
     def record_suite_start(self):
         """
         Records the start time of the suite.
         """
         self._suite_start_time = time.time()
 
+    @synchronized
     def record_suite_end(self):
         """
         Records the end time of the suite.
         """
         self._suite_end_time = time.time()
 
+    @synchronized
     def record_test_start(self, partial_reports):
         """
         Records the start time of an execution and stores the
@@ -115,6 +165,7 @@ class Suite(object):
         self._test_start_times.append(time.time())
         self._partial_reports = partial_reports
 
+    @synchronized
     def record_test_end(self, report):
         """
         Records the end time of an execution.
@@ -123,23 +174,7 @@ class Suite(object):
         self._reports.append(report)
         self._partial_reports = None
 
-    def interrupt(self):
-        """
-        Records the end of the suite and forces the end of the execution's report.
-
-        Used when handling SIGUSR1 interrupts.
-        """
-
-        if self._suite_end_time:
-            return
-
-        self.record_suite_end()
-
-        #  Converts any partial reports to completed reports and ensures that report is ended.
-        active_report = self.get_active_report()
-        if active_report:
-            self.record_test_end(active_report)
-
+    @synchronized
     def get_active_report(self):
         """
         Returns the partial report of the currently running execution, if there is one.
@@ -148,6 +183,7 @@ class Suite(object):
             return None
         return _report.TestReport.combine(*self._partial_reports)
 
+    @synchronized
     def get_reports(self):
         """
         Returns the list of reports. If there's an execution currently
@@ -160,15 +196,17 @@ class Suite(object):
 
         return self._reports
 
+    @synchronized
     def summarize(self, sb):
         """
         Appends a summary of the suite onto the string builder 'sb'.
         """
-
-        if not self._reports:
+        if not self._reports and not self._partial_reports:
             sb.append("No tests ran.")
             summary = _summary.Summary(0, 0.0, 0, 0, 0, 0)
-        elif len(self._reports) == 1:
+        elif not self._reports and self._partial_reports:
+            summary = self.summarize_latest(sb)
+        elif len(self._reports) == 1 and not self._partial_reports:
             summary = self._summarize_execution(0, sb)
         else:
             summary = self._summarize_repeated(sb)
@@ -190,6 +228,7 @@ class Suite(object):
 
         sb.append(summarized_group)
 
+    @synchronized
     def summarize_latest(self, sb):
         """
         Returns a summary of the latest execution of the suite and appends a
@@ -214,15 +253,25 @@ class Suite(object):
         appends information of how many repetitions there were.
         """
 
-        num_iterations = len(self._reports)
-        total_time_taken = self._test_end_times[-1] - self._test_start_times[0]
+        reports = self.get_reports()  # Also includes the combined partial reports.
+        num_iterations = len(reports)
+        start_times = self._test_start_times[:]
+        end_times = self._test_end_times[:]
+        if self._partial_reports:
+            end_times.append(time.time())  # Add an end time in this copy for the partial reports.
+
+        total_time_taken = end_times[-1] - start_times[0]
         sb.append("Executed %d times in %0.2f seconds:" % (num_iterations, total_time_taken))
 
         combined_summary = _summary.Summary(0, 0.0, 0, 0, 0, 0)
         for iteration in xrange(num_iterations):
             # Summarize each execution as a bulleted list of results.
             bulleter_sb = []
-            summary = self._summarize_execution(iteration, bulleter_sb)
+            summary = self._summarize_report(
+                reports[iteration],
+                start_times[iteration],
+                end_times[iteration],
+                bulleter_sb)
             combined_summary = _summary.combine(combined_summary, summary)
 
             for (i, line) in enumerate(bulleter_sb):
@@ -291,7 +340,7 @@ class Suite(object):
         for suite in suites:
             suite_sb = []
             suite.summarize(suite_sb)
-            sb.append("    %s: %s" % (suite.get_name(), "\n    ".join(suite_sb)))
+            sb.append("    %s: %s" % (suite.get_display_name(), "\n    ".join(suite_sb)))
 
         logger.info("=" * 80)
         logger.info("\n".join(sb))

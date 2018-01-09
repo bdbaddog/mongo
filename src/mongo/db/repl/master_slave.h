@@ -59,9 +59,12 @@ extern AtomicInt32 syncing;
 extern const char* replInfo;
 
 /* A replication exception */
-class SyncException : public DBException {
+class SyncException final : public DBException {
 public:
-    SyncException() : DBException("sync exception", 10001) {}
+    SyncException() : DBException(Status(ErrorCodes::Error(10001), "sync exception")) {}
+
+private:
+    void defineOnlyInFinalSubclassToPreventSlicing() final {}
 };
 
 /* A Source is a source from which we can pull (replicate) data.

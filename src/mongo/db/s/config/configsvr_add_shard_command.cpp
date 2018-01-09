@@ -35,6 +35,7 @@
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/auth/privilege.h"
 #include "mongo/db/commands.h"
+#include "mongo/db/commands/feature_compatibility_version.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/repl/repl_set_config.h"
 #include "mongo/db/repl/replication_coordinator.h"
@@ -55,9 +56,9 @@ const long long kMaxSizeMBDefault = 0;
 /**
  * Internal sharding command run on config servers to add a shard to the cluster.
  */
-class ConfigSvrAddShardCommand : public Command {
+class ConfigSvrAddShardCommand : public BasicCommand {
 public:
-    ConfigSvrAddShardCommand() : Command("_configsvrAddShard") {}
+    ConfigSvrAddShardCommand() : BasicCommand("_configsvrAddShard") {}
 
     void help(std::stringstream& help) const override {
         help << "Internal command, which is exported by the sharding config server. Do not call "
@@ -89,7 +90,6 @@ public:
     bool run(OperationContext* opCtx,
              const std::string& unusedDbName,
              const BSONObj& cmdObj,
-             std::string& errmsg,
              BSONObjBuilder& result) override {
         if (serverGlobalParams.clusterRole != ClusterRole::ConfigServer) {
             return appendCommandStatus(
@@ -97,6 +97,10 @@ public:
                 Status(ErrorCodes::IllegalOperation,
                        "_configsvrAddShard can only be run on config servers"));
         }
+
+        // Do not allow adding shards while a featureCompatibilityVersion upgrade or downgrade is in
+        // progress (see SERVER-31231 for details).
+        Lock::ExclusiveLock lk(opCtx->lockState(), FeatureCompatibilityVersion::fcvLock);
 
         auto swParsedRequest = AddShardRequest::parseFromConfigCommand(cmdObj);
         if (!swParsedRequest.isOK()) {
@@ -112,13 +116,18 @@ public:
             return appendCommandStatus(result, validationStatus);
         }
 
+        uassert(ErrorCodes::InvalidOptions,
+                str::stream() << "addShard must be called with majority writeConcern, got "
+                              << cmdObj,
+                opCtx->getWriteConcern().wMode == WriteConcernOptions::kMajority);
+
         audit::logAddShard(Client::getCurrent(),
                            parsedRequest.hasName() ? parsedRequest.getName() : "",
                            parsedRequest.getConnString().toString(),
                            parsedRequest.hasMaxSize() ? parsedRequest.getMaxSize()
                                                       : kMaxSizeMBDefault);
 
-        StatusWith<string> addShardResult = Grid::get(opCtx)->catalogManager()->addShard(
+        StatusWith<string> addShardResult = ShardingCatalogManager::get(opCtx)->addShard(
             opCtx,
             parsedRequest.hasName() ? &parsedRequest.getName() : nullptr,
             parsedRequest.getConnString(),

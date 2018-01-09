@@ -1,5 +1,5 @@
 /*-
- * Public Domain 2014-2017 MongoDB, Inc.
+ * Public Domain 2014-2018 MongoDB, Inc.
  * Public Domain 2008-2014 WiredTiger, Inc.
  *
  * This is free and unencumbered software released into the public domain.
@@ -550,7 +550,7 @@ __posix_open_file_cloexec(WT_SESSION_IMPL *session, int fd, const char *name)
 	if ((f = fcntl(fd, F_GETFD)) == -1 ||
 	    fcntl(fd, F_SETFD, f | FD_CLOEXEC) == -1)
 		WT_RET_MSG(session, __wt_errno(),
-		    "%s: handle-open: fcntl", name);
+		    "%s: handle-open: fcntl(FD_CLOEXEC)", name);
 	return (0);
 #else
 	WT_UNUSED(session);
@@ -602,7 +602,8 @@ __posix_open_file(WT_FILE_SYSTEM *file_system, WT_SESSION *wt_session,
 		WT_SYSCALL_RETRY((
 		    (pfh->fd = open(name, f, 0444)) == -1 ? -1 : 0), ret);
 		if (ret != 0)
-			WT_ERR_MSG(session, ret, "%s: handle-open: open", name);
+			WT_ERR_MSG(session, ret,
+			    "%s: handle-open: open-directory", name);
 		WT_ERR(__posix_open_file_cloexec(session, pfh->fd, name));
 		goto directory_open;
 	}
@@ -775,6 +776,8 @@ __wt_os_posix(WT_SESSION_IMPL *session)
 
 	/* Initialize the POSIX jump table. */
 	file_system->fs_directory_list = __wt_posix_directory_list;
+	file_system->fs_directory_list_single =
+	    __wt_posix_directory_list_single;
 	file_system->fs_directory_list_free = __wt_posix_directory_list_free;
 	file_system->fs_exist = __posix_fs_exist;
 	file_system->fs_open_file = __posix_open_file;

@@ -51,9 +51,9 @@
 namespace mongo {
 namespace {
 
-class ClusterKillOpCommand : public Command {
+class ClusterKillOpCommand : public BasicCommand {
 public:
-    ClusterKillOpCommand() : Command("killOp") {}
+    ClusterKillOpCommand() : BasicCommand("killOp") {}
 
 
     virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
@@ -79,7 +79,6 @@ public:
     bool run(OperationContext* opCtx,
              const std::string& db,
              const BSONObj& cmdObj,
-             std::string& errmsg,
              BSONObjBuilder& result) final {
         // The format of op is shardid:opid
         // This is different than the format passed to the mongod killOp command.
@@ -117,8 +116,7 @@ public:
 
         ScopedDbConnection conn(shard->getConnString());
         // intentionally ignore return value - that is how legacy killOp worked.
-        conn->runCommandWithMetadata(
-            "admin", "killOp", rpc::makeEmptyMetadata(), BSON("killOp" << 1 << "op" << opId));
+        conn->runCommand(OpMsgRequest::fromDBAndBody("admin", BSON("killOp" << 1 << "op" << opId)));
         conn.done();
 
         // The original behavior of killOp on mongos is to always return success, regardless of

@@ -35,8 +35,9 @@
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/auth/privilege.h"
 #include "mongo/db/bson/dotted_path_support.h"
+#include "mongo/db/catalog/catalog_raii.h"
+#include "mongo/db/catalog/index_catalog.h"
 #include "mongo/db/commands.h"
-#include "mongo/db/db_raii.h"
 #include "mongo/db/dbhelpers.h"
 #include "mongo/db/exec/working_set_common.h"
 #include "mongo/db/index/index_descriptor.h"
@@ -54,9 +55,9 @@ namespace dps = ::mongo::dotted_path_support;
 
 namespace {
 
-class CheckShardingIndex : public Command {
+class CheckShardingIndex : public ErrmsgCommandDeprecated {
 public:
-    CheckShardingIndex() : Command("checkShardingIndex") {}
+    CheckShardingIndex() : ErrmsgCommandDeprecated("checkShardingIndex") {}
 
     virtual void help(std::stringstream& help) const {
         help << "Internal command.\n";
@@ -82,11 +83,11 @@ public:
         return parseNsFullyQualified(dbname, cmdObj);
     }
 
-    bool run(OperationContext* opCtx,
-             const std::string& dbname,
-             const BSONObj& jsobj,
-             std::string& errmsg,
-             BSONObjBuilder& result) {
+    bool errmsgRun(OperationContext* opCtx,
+                   const std::string& dbname,
+                   const BSONObj& jsobj,
+                   std::string& errmsg,
+                   BSONObjBuilder& result) {
         const NamespaceString nss = NamespaceString(parseNs(dbname, jsobj));
 
         BSONObj keyPattern = jsobj.getObjectField("keyPattern");

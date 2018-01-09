@@ -34,6 +34,7 @@
 #include "mongo/base/status.h"
 #include "mongo/db/json.h"
 #include "mongo/db/logical_time.h"
+#include "mongo/db/operation_context.h"
 #include "mongo/db/repl/optime.h"
 #include "mongo/util/time_support.h"
 
@@ -43,21 +44,30 @@ class BSONObj;
 
 namespace repl {
 
-enum class ReadConcernLevel { kLocalReadConcern, kMajorityReadConcern, kLinearizableReadConcern };
+enum class ReadConcernLevel {
+    kLocalReadConcern,
+    kMajorityReadConcern,
+    kLinearizableReadConcern,
+    kAvailableReadConcern
+};
 
 class ReadConcernArgs {
 public:
     static const std::string kReadConcernFieldName;
     static const std::string kAfterOpTimeFieldName;
     static const std::string kAfterClusterTimeFieldName;
+    static const std::string kAtClusterTimeFieldName;
     static const std::string kLevelFieldName;
+
+    static const OperationContext::Decoration<ReadConcernArgs> get;
 
     ReadConcernArgs();
 
+    ReadConcernArgs(boost::optional<ReadConcernLevel> level);
+
     ReadConcernArgs(boost::optional<OpTime> opTime, boost::optional<ReadConcernLevel> level);
 
-    ReadConcernArgs(boost::optional<OpTime> opTime,
-                    boost::optional<LogicalTime> clusterTime,
+    ReadConcernArgs(boost::optional<LogicalTime> clusterTime,
                     boost::optional<ReadConcernLevel> level);
     /**
      * Format:
@@ -65,14 +75,14 @@ public:
      *    find: "coll"
      *    filter: <Query Object>,
      *    readConcern: { // optional
-     *      level: "[majority|local|linearizable]",
+     *      level: "[majority|local|linearizable|available]",
      *      afterOpTime: { ts: <timestamp>, term: <NumberLong> },
      *      afterClusterTime: <timestamp>,
      *    }
      * }
      */
-    Status initialize(const BSONObj& cmdObj) {
-        return initialize(cmdObj[kReadConcernFieldName]);
+    Status initialize(const BSONObj& cmdObj, bool testMode = false) {
+        return initialize(cmdObj[kReadConcernFieldName], testMode);
     }
 
     /**
@@ -80,7 +90,7 @@ public:
      * Use this if you are already iterating over the fields in the command object.
      * This method correctly handles missing BSONElements.
      */
-    Status initialize(const BSONElement& readConcernElem);
+    Status initialize(const BSONElement& readConcernElem, bool testMode = false);
 
     /**
      * Appends level and afterOpTime.
@@ -98,11 +108,18 @@ public:
     ReadConcernLevel getLevel() const;
 
     /**
+     * Checks whether _level is explicitly set.
+     */
+    bool hasLevel() const;
+
+    /**
      * Returns the opTime. Deprecated: will be replaced with getArgsClusterTime.
      */
     boost::optional<OpTime> getArgsOpTime() const;
 
     boost::optional<LogicalTime> getArgsClusterTime() const;
+
+    boost::optional<LogicalTime> getArgsPointInTime() const;
     BSONObj toBSON() const;
     std::string toString() const;
 
@@ -113,9 +130,11 @@ private:
      */
     boost::optional<OpTime> _opTime;
     /**
-     *  Read data after cluster-wide logical time.
+     *  Read data after cluster-wide cluster time.
      */
     boost::optional<LogicalTime> _clusterTime;
+
+    boost::optional<LogicalTime> _pointInTime;
     boost::optional<ReadConcernLevel> _level;
 };
 

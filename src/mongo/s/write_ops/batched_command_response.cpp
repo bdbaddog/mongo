@@ -117,12 +117,36 @@ BSONObj BatchedCommandResponse::toBSON() const {
         builder.appendOID(electionId(), const_cast<OID*>(&_electionId));
 
     if (_writeErrorDetails.get()) {
+        auto errorMessage =
+            [ errorCount = size_t(0), errorSize = size_t(0) ](StringData rawMessage) mutable {
+            // Start truncating error messages once both of these limits are exceeded.
+            constexpr size_t kErrorSizeTruncationMin = 1024 * 1024;
+            constexpr size_t kErrorCountTruncationMin = 2;
+            if (errorSize >= kErrorSizeTruncationMin && errorCount >= kErrorCountTruncationMin) {
+                return ""_sd;
+            }
+
+            errorCount++;
+            errorSize += rawMessage.size();
+            return rawMessage;
+        };
+
         BSONArrayBuilder errDetailsBuilder(builder.subarrayStart(writeErrors()));
-        for (std::vector<WriteErrorDetail*>::const_iterator it = _writeErrorDetails->begin();
-             it != _writeErrorDetails->end();
-             ++it) {
-            BSONObj errDetailsDocument = (*it)->toBSON();
-            errDetailsBuilder.append(errDetailsDocument);
+        for (auto&& writeError : *_writeErrorDetails) {
+            BSONObjBuilder errDetailsDocument(errDetailsBuilder.subobjStart());
+
+            if (writeError->isIndexSet())
+                builder.append(WriteErrorDetail::index(), writeError->getIndex());
+
+            if (writeError->isErrCodeSet())
+                builder.append(WriteErrorDetail::errCode(), writeError->getErrCode());
+
+            if (writeError->isErrInfoSet())
+                builder.append(WriteErrorDetail::errInfo(), writeError->getErrInfo());
+
+            if (writeError->isErrMessageSet())
+                builder.append(WriteErrorDetail::errMessage(),
+                               errorMessage(writeError->getErrMessage()));
         }
         errDetailsBuilder.done();
     }
@@ -276,61 +300,6 @@ void BatchedCommandResponse::clear() {
     }
 
     _wcErrDetails.reset();
-}
-
-void BatchedCommandResponse::cloneTo(BatchedCommandResponse* other) const {
-    other->clear();
-
-    other->_ok = _ok;
-    other->_isOkSet = _isOkSet;
-
-    other->_errCode = _errCode;
-    other->_isErrCodeSet = _isErrCodeSet;
-
-    other->_errMessage = _errMessage;
-    other->_isErrMessageSet = _isErrMessageSet;
-
-    other->_nModified = _nModified;
-    other->_isNModifiedSet = _isNModifiedSet;
-
-    other->_n = _n;
-    other->_isNSet = _isNSet;
-
-    other->_singleUpserted = _singleUpserted;
-    other->_isSingleUpsertedSet = _isSingleUpsertedSet;
-
-    other->unsetUpsertDetails();
-    if (_upsertDetails.get()) {
-        for (std::vector<BatchedUpsertDetail*>::const_iterator it = _upsertDetails->begin();
-             it != _upsertDetails->end();
-             ++it) {
-            BatchedUpsertDetail* upsertDetailsItem = new BatchedUpsertDetail;
-            (*it)->cloneTo(upsertDetailsItem);
-            other->addToUpsertDetails(upsertDetailsItem);
-        }
-    }
-
-    other->_lastOp = _lastOp;
-    other->_isLastOpSet = _isLastOpSet;
-
-    other->_electionId = _electionId;
-    other->_isElectionIdSet = _isElectionIdSet;
-
-    other->unsetErrDetails();
-    if (_writeErrorDetails.get()) {
-        for (std::vector<WriteErrorDetail*>::const_iterator it = _writeErrorDetails->begin();
-             it != _writeErrorDetails->end();
-             ++it) {
-            WriteErrorDetail* errDetailsItem = new WriteErrorDetail;
-            (*it)->cloneTo(errDetailsItem);
-            other->addToErrDetails(errDetailsItem);
-        }
-    }
-
-    if (_wcErrDetails.get()) {
-        other->_wcErrDetails.reset(new WriteConcernErrorDetail());
-        _wcErrDetails->cloneTo(other->_wcErrDetails.get());
-    }
 }
 
 std::string BatchedCommandResponse::toString() const {
@@ -577,19 +546,19 @@ const WriteConcernErrorDetail* BatchedCommandResponse::getWriteConcernError() co
 
 Status BatchedCommandResponse::toStatus() const {
     if (!getOk()) {
-        return Status(ErrorCodes::fromInt(getErrCode()), getErrMessage());
+        return Status(ErrorCodes::Error(getErrCode()), getErrMessage());
     }
 
     if (isErrDetailsSet()) {
         const WriteErrorDetail* errDetail = getErrDetails().front();
 
-        return Status(ErrorCodes::fromInt(errDetail->getErrCode()), errDetail->getErrMessage());
+        return Status(ErrorCodes::Error(errDetail->getErrCode()), errDetail->getErrMessage());
     }
 
     if (isWriteConcernErrorSet()) {
         const WriteConcernErrorDetail* errDetail = getWriteConcernError();
 
-        return Status(ErrorCodes::fromInt(errDetail->getErrCode()), errDetail->getErrMessage());
+        return Status(ErrorCodes::Error(errDetail->getErrCode()), errDetail->getErrMessage());
     }
 
     return Status::OK();

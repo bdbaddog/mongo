@@ -36,6 +36,8 @@
 #include "mongo/db/storage/wiredtiger/wiredtiger_session_cache.h"
 
 #include "mongo/base/error_codes.h"
+#include "mongo/db/mongod_options.h"
+#include "mongo/db/repl/repl_settings.h"
 #include "mongo/db/storage/journal_listener.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_kv_engine.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_util.h"
@@ -122,16 +124,32 @@ void WiredTigerSession::releaseCursor(uint64_t id, WT_CURSOR* cursor) {
     }
 }
 
-void WiredTigerSession::closeAllCursors() {
+void WiredTigerSession::closeAllCursors(const std::string& uri) {
     invariant(_session);
-    for (CursorCache::iterator i = _cursors.begin(); i != _cursors.end(); ++i) {
+
+    bool all = (uri == "");
+    for (auto i = _cursors.begin(); i != _cursors.end();) {
+        WT_CURSOR* cursor = i->_cursor;
+        if (cursor && (all || uri == cursor->uri)) {
+            invariantWTOK(cursor->close(cursor));
+            i = _cursors.erase(i);
+        } else
+            ++i;
+    }
+}
+
+void WiredTigerSession::closeCursorsForQueuedDrops(WiredTigerKVEngine* engine) {
+    invariant(_session);
+
+    _cursorEpoch = _cache->getCursorEpoch();
+    auto toDrop = engine->filterCursorsWithQueuedDrops(&_cursors);
+
+    for (auto i = toDrop.begin(); i != toDrop.end(); i++) {
         WT_CURSOR* cursor = i->_cursor;
         if (cursor) {
             invariantWTOK(cursor->close(cursor));
         }
     }
-    _cursors.clear();
-    _cursorEpoch = _cache->getCursorEpoch();
 }
 
 namespace {
@@ -175,7 +193,7 @@ void WiredTigerSessionCache::shuttingDown() {
     _snapshotManager.shutdown();
 }
 
-void WiredTigerSessionCache::waitUntilDurable(bool forceCheckpoint) {
+void WiredTigerSessionCache::waitUntilDurable(bool forceCheckpoint, bool stableCheckpoint) {
     // For inMemory storage engines, the data is "as durable as it's going to get".
     // That is, a restart is equivalent to a complete node failure.
     if (isEphemeral()) {
@@ -189,6 +207,15 @@ void WiredTigerSessionCache::waitUntilDurable(bool forceCheckpoint) {
             "Cannot wait for durability because a shutdown is in progress",
             !(shuttingDown & kShuttingDownMask));
 
+    // Stable checkpoints are only meaningful in a replica set. Replication sets the "stable
+    // timestamp". If the stable timestamp is unset, WiredTiger takes a full checkpoint, which is
+    // incidentally what we want. A "true" stable checkpoint (a stable timestamp was set on the
+    // WT_CONNECTION, i.e: replication is on) requires `forceCheckpoint` to be true and journaling
+    // to be enabled.
+    if (stableCheckpoint && getGlobalReplSettings().usingReplSets()) {
+        invariant(forceCheckpoint && _engine->isDurable());
+    }
+
     // When forcing a checkpoint with journaling enabled, don't synchronize with other
     // waiters, as a log flush is much cheaper than a full checkpoint.
     if (forceCheckpoint && _engine->isDurable()) {
@@ -197,7 +224,14 @@ void WiredTigerSessionCache::waitUntilDurable(bool forceCheckpoint) {
         {
             stdx::unique_lock<stdx::mutex> lk(_journalListenerMutex);
             JournalListener::Token token = _journalListener->getToken();
-            invariantWTOK(s->checkpoint(s, NULL));
+            const bool keepOldBehavior = true;
+            if (keepOldBehavior) {
+                invariantWTOK(s->checkpoint(s, nullptr));
+            } else {
+                std::string config =
+                    stableCheckpoint ? "use_timestamp=true" : "use_timestamp=false";
+                invariantWTOK(s->checkpoint(s, config.c_str()));
+            }
             _journalListener->onDurable(token);
         }
         LOG(4) << "created checkpoint (forced)";
@@ -216,32 +250,43 @@ void WiredTigerSessionCache::waitUntilDurable(bool forceCheckpoint) {
     _lastSyncTime.store(current + 1);
 
     // Nobody has synched yet, so we have to sync ourselves.
-    auto session = getSession();
-    WT_SESSION* s = session->getSession();
 
     // This gets the token (OpTime) from the last write, before flushing (either the journal, or a
     // checkpoint), and then reports that token (OpTime) as a durable write.
     stdx::unique_lock<stdx::mutex> jlk(_journalListenerMutex);
     JournalListener::Token token = _journalListener->getToken();
 
+    // Initialize on first use.
+    if (!_waitUntilDurableSession) {
+        invariantWTOK(
+            _conn->open_session(_conn, NULL, "isolation=snapshot", &_waitUntilDurableSession));
+    }
+
     // Use the journal when available, or a checkpoint otherwise.
     if (_engine && _engine->isDurable()) {
-        invariantWTOK(s->log_flush(s, "sync=on"));
+        invariantWTOK(_waitUntilDurableSession->log_flush(_waitUntilDurableSession, "sync=on"));
         LOG(4) << "flushed journal";
     } else {
-        invariantWTOK(s->checkpoint(s, NULL));
+        invariantWTOK(_waitUntilDurableSession->checkpoint(_waitUntilDurableSession, NULL));
         LOG(4) << "created checkpoint";
     }
     _journalListener->onDurable(token);
 }
 
-void WiredTigerSessionCache::closeAllCursors() {
+void WiredTigerSessionCache::closeAllCursors(const std::string& uri) {
+    stdx::lock_guard<stdx::mutex> lock(_cacheLock);
+    for (SessionCache::iterator i = _sessions.begin(); i != _sessions.end(); i++) {
+        (*i)->closeAllCursors(uri);
+    }
+}
+
+void WiredTigerSessionCache::closeCursorsForQueuedDrops() {
     // Increment the cursor epoch so that all cursors from this epoch are closed.
     _cursorEpoch.fetchAndAdd(1);
 
     stdx::lock_guard<stdx::mutex> lock(_cacheLock);
     for (SessionCache::iterator i = _sessions.begin(); i != _sessions.end(); i++) {
-        (*i)->closeAllCursors();
+        (*i)->closeCursorsForQueuedDrops(_engine);
     }
 }
 
@@ -318,7 +363,7 @@ void WiredTigerSessionCache::releaseSession(WiredTigerSession* session) {
     // If the cursor epoch has moved on, close all cursors in the session.
     uint64_t cursorEpoch = _cursorEpoch.load();
     if (session->_getCursorEpoch() != cursorEpoch)
-        session->closeAllCursors();
+        session->closeCursorsForQueuedDrops(_engine);
 
     bool returnedToCache = false;
     uint64_t currentEpoch = _epoch.load();
@@ -349,4 +394,5 @@ void WiredTigerSessionCache::WiredTigerSessionDeleter::operator()(
     WiredTigerSession* session) const {
     session->_cache->releaseSession(session);
 }
+
 }  // namespace mongo

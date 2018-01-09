@@ -58,8 +58,7 @@ var moveChunkStepNames = {
     startedMoveChunk: 3,    // called _recvChunkStart on recipient
     reachedSteadyState: 4,  // recipient reports state is "steady"
     chunkDataCommitted: 5,  // called _recvChunkCommit on recipient
-    committed: 6,
-    done: 7
+    committed: 6
 };
 
 function numberToName(names, stepNumber) {
@@ -97,9 +96,9 @@ function proceedToMoveChunkStep(shardConnection, stepNumber) {
 }
 
 function configureMoveChunkFailPoint(shardConnection, stepNumber, mode) {
-    assert.between(migrateStepNames.copiedIndexes,
+    assert.between(moveChunkStepNames.parsedOptions,
                    stepNumber,
-                   migrateStepNames.done,
+                   moveChunkStepNames.committed,
                    "incorrect stepNumber",
                    true);
     assert.commandWorked(shardConnection.adminCommand(
@@ -123,9 +122,13 @@ function waitForMoveChunkStep(shardConnection, stepNumber) {
                numberToName(moveChunkStepNames, stepNumber) + '".');
 
     assert.soon(function() {
-        var in_progress = admin.currentOp().inprog;
-        for (var i = 0; i < in_progress.length; ++i) {
-            var op = in_progress[i];
+        var inProgressStr = '';
+        let in_progress = admin.aggregate([{$currentOp: {'allUsers': true}}]);
+
+        while (in_progress.hasNext()) {
+            let op = in_progress.next();
+            inProgressStr += tojson(op);
+
             if (op.query && op.query.moveChunk ||  // compatibility with v3.4, remove after v3.6
                 op.command && op.command.moveChunk) {
                 // Note: moveChunk in join mode will not have the "step" message. So keep on

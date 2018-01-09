@@ -130,7 +130,8 @@ Status ShardKeyPattern::checkShardKeySize(const BSONObj& shardKey) {
 
 ShardKeyPattern::ShardKeyPattern(const BSONObj& keyPattern)
     : _keyPatternPaths(parseShardKeyPattern(keyPattern)),
-      _keyPattern(_keyPatternPaths.empty() ? BSONObj() : keyPattern) {}
+      _keyPattern(_keyPatternPaths.empty() ? BSONObj() : keyPattern),
+      _hasId(keyPattern.hasField("_id"_sd)) {}
 
 ShardKeyPattern::ShardKeyPattern(const KeyPattern& keyPattern)
     : ShardKeyPattern(keyPattern.toBSON()) {}
@@ -209,8 +210,8 @@ static BSONElement extractKeyElementFromMatchable(const MatchableDocument& match
                                                   StringData pathStr) {
     ElementPath path;
     path.init(pathStr);
-    path.setTraverseNonleafArrays(false);
-    path.setTraverseLeafArray(false);
+    path.setLeafArrayBehavior(ElementPath::LeafArrayBehavior::kNoTraversal);
+    path.setNonLeafArrayBehavior(ElementPath::NonLeafArrayBehavior::kNoTraversal);
 
     MatchableDocument::IteratorHolder matchIt(&matchable, &path);
     if (!matchIt->more())
@@ -282,8 +283,13 @@ StatusWith<BSONObj> ShardKeyPattern::extractShardKeyFromQuery(OperationContext* 
     auto qr = stdx::make_unique<QueryRequest>(NamespaceString(""));
     qr->setFilter(basicQuery);
 
+    const boost::intrusive_ptr<ExpressionContext> expCtx;
     auto statusWithCQ =
-        CanonicalQuery::canonicalize(opCtx, std::move(qr), ExtensionsCallbackNoop());
+        CanonicalQuery::canonicalize(opCtx,
+                                     std::move(qr),
+                                     expCtx,
+                                     ExtensionsCallbackNoop(),
+                                     MatchExpressionParser::kAllowAllSpecialFeatures);
     if (!statusWithCQ.isOK()) {
         return StatusWith<BSONObj>(statusWithCQ.getStatus());
     }

@@ -27,11 +27,14 @@
  */
 #pragma once
 
+#include <list>
+
 #include "mongo/base/disallow_copying.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/executor/task_executor.h"
 #include "mongo/s/catalog/type_chunk.h"
 #include "mongo/util/concurrency/notification.h"
+#include "mongo/util/time_support.h"
 
 namespace mongo {
 
@@ -52,7 +55,8 @@ public:
       * It is an error to destroy a returned CleanupNotification object n unless either n.ready()
       * is true or n.abandon() has been called.  After n.abandon(), n is in a moved-from state.
       */
-    struct DeleteNotification {
+    class DeleteNotification {
+    public:
         DeleteNotification();
         DeleteNotification(Status status);
 
@@ -65,44 +69,46 @@ public:
         DeleteNotification& operator=(DeleteNotification const& notifn) = default;
 
         ~DeleteNotification() {
-            // can be null only if moved from
-            dassert(!notification || *notification || notification.use_count() == 1);
+            // Can be null only if moved from
+            dassert(!_notification || *_notification || _notification.use_count() == 1);
         }
 
         void notify(Status status) const {
-            notification->set(status);
+            _notification->set(status);
         }
 
-        // Sleeps waiting for notification, and returns notify's argument.
-        // On interruption, throws; calling waitStatus afterward returns failed status.
+        /**
+         * Sleeps waiting for notification, and returns notify's argument. On interruption, throws;
+         * calling waitStatus afterward returns failed status.
+         */
         Status waitStatus(OperationContext* opCtx);
 
         bool ready() const {
-            return bool(*notification);
+            return bool(*_notification);
         }
         void abandon() {
-            notification = nullptr;
+            _notification = nullptr;
         }
         bool operator==(DeleteNotification const& other) const {
-            return notification == other.notification;
+            return _notification == other._notification;
         }
         bool operator!=(DeleteNotification const& other) const {
-            return notification != other.notification;
+            return _notification != other._notification;
         }
 
     private:
-        std::shared_ptr<Notification<Status>> notification;
+        std::shared_ptr<Notification<Status>> _notification;
     };
 
     struct Deletion {
-        Deletion(ChunkRange r) : range(std::move(r)) {}
+        Deletion(ChunkRange r, Date_t when) : range(std::move(r)), whenToDelete(when) {}
+
         ChunkRange range;
+        Date_t whenToDelete;  // A value of Date_t{} means immediately.
         DeleteNotification notification{};
     };
 
-    enum Action { kFinished, kMore, kWriteOpLog };
-
-    CollectionRangeDeleter() = default;
+    CollectionRangeDeleter();
     ~CollectionRangeDeleter();
 
     //
@@ -111,10 +117,12 @@ public:
     //
 
     /**
-     * Splices range's elements to the list to be cleaned up by the deleter thread. Returns true
-     * if the list is newly non-empty, so the caller knows to schedule a deletion task.
+     * Splices range's elements to the list to be cleaned up by the deleter thread.  Deletions d
+     * with d.delay == true are added to the delayed queue, and scheduled at time `later`.
+     * Returns the time to begin deletions, if needed, or boost::none if deletions are already
+     * scheduled.
      */
-    bool add(std::list<Deletion> ranges);
+    boost::optional<Date_t> add(std::list<Deletion> ranges);
 
     /**
      * Reports whether the argument range overlaps any of the ranges to clean.  If there is overlap,
@@ -137,7 +145,7 @@ public:
      * Notifies with the specified status anything waiting on ranges scheduled, and then discards
      * the ranges and notifications.  Is called in the destructor.
      */
-    void clear(Status);
+    void clear(Status status);
 
     /*
      * Append a representation of self to the specified builder.
@@ -149,18 +157,17 @@ public:
      * watchers of ranges as they are done being deleted. It performs its own collection locking, so
      * it must be called without locks.
      *
-     * Returns kMore or kWriteOpLog if it should be scheduled to run again because there might be
-     * more documents to delete, or kFinished otherwise.  When calling again, pass the value
-     * returned.
+     * If it should be scheduled to run again because there might be more documents to delete,
+     * returns the time to begin, or boost::none otherwise.
      *
      * Argument 'forTestOnly' is used in unit tests that exercise the CollectionRangeDeleter class,
      * so that they do not need to set up CollectionShardingState and MetadataManager objects.
      */
-    static Action cleanUpNextRange(OperationContext*,
-                                   NamespaceString const& nss,
-                                   Action,
-                                   int maxToDelete,
-                                   CollectionRangeDeleter* forTestOnly = nullptr);
+    static boost::optional<Date_t> cleanUpNextRange(OperationContext*,
+                                                    NamespaceString const& nss,
+                                                    OID const& epoch,
+                                                    int maxToDelete,
+                                                    CollectionRangeDeleter* forTestOnly = nullptr);
 
 private:
     /**
@@ -187,6 +194,7 @@ private:
      * As each range is completed, its notification is signaled before it is popped.
      */
     std::list<Deletion> _orphans;
+    std::list<Deletion> _delayedOrphans;
 };
 
 }  // namespace mongo

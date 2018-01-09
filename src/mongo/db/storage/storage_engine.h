@@ -35,6 +35,7 @@
 
 #include "mongo/base/status.h"
 #include "mongo/bson/bsonobj.h"
+#include "mongo/bson/timestamp.h"
 #include "mongo/util/mongoutils/str.h"
 
 namespace mongo {
@@ -178,6 +179,13 @@ public:
     virtual bool supportsDocLocking() const = 0;
 
     /**
+     * Returns whether the storage engine supports locking at a database level.
+     */
+    virtual bool supportsDBLocking() const {
+        return true;
+    }
+
+    /**
      * Returns whether the engine supports a journalling concept or not.
      */
     virtual bool isDurable() const = 0;
@@ -279,6 +287,73 @@ public:
      * system about journaled write progress.
      */
     virtual void setJournalListener(JournalListener* jl) = 0;
+
+    /**
+     * Returns whether the storage engine supports "recover to stable timestamp". Returns false
+     * if the storage engine supports the "recover to stable timestamp" feature but does not have
+     * a stable timestamp, or if for some reason the storage engine is unable to recover to the
+     * last provided stable timestamp.
+     *
+     * It is illegal to call this concurrently with `setStableTimestamp` or
+     * `setInitialDataTimestamp`.
+     */
+    virtual bool supportsRecoverToStableTimestamp() const {
+        return false;
+    }
+
+    /**
+     * Recovers the storage engine state to the last stable timestamp. "Stable" in this case
+     * refers to a timestamp that is guaranteed to never be rolled back. The stable timestamp
+     * used should be one provided by StorageEngine::setStableTimestamp().
+     *
+     * The "local" database is exempt and should not roll back any state except for
+     * "local.replset.minvalid" and "local.replset.checkpointTimestamp" which must roll back to
+     * the last stable timestamp.
+     *
+     * fasserts if StorageEngine::supportsRecoverToStableTimestamp() would return false.
+     */
+    virtual Status recoverToStableTimestamp() {
+        fassertFailed(40547);
+    }
+
+    /**
+     * Sets the highest timestamp at which the storage engine is allowed to take a checkpoint.
+     * This timestamp can never decrease, and thus should be a timestamp that can never roll back.
+     */
+    virtual void setStableTimestamp(Timestamp timestamp) {}
+
+    /**
+     * Tells the storage engine the timestamp of the data at startup. This is necessary because
+     * timestamps are not persisted in the storage layer.
+     */
+    virtual void setInitialDataTimestamp(Timestamp timestamp) {}
+
+    /**
+     * Sets the oldest timestamp for which the storage engine must maintain snapshot history
+     * through. Additionally, all future writes must be newer or equal to this value.
+     */
+    virtual void setOldestTimestamp(Timestamp timestampa) {}
+
+    /**
+     *  Notifies the storage engine that a replication batch has completed.
+     *  This means that all the writes associated with the oplog entries in the batch are
+     *  finished and no new writes with timestamps associated with those oplog entries will show
+     *  up in the future.
+     *  This function can be used to ensure oplog visibility rules are not broken, for example.
+     */
+    virtual void replicationBatchIsComplete() const {};
+
+    // (CollectionName, IndexName)
+    typedef std::pair<std::string, std::string> CollectionIndexNamePair;
+
+    /**
+     * Drop abandoned idents. In the successful case, returns a list of collection, index name
+     * pairs to rebuild.
+     */
+    virtual StatusWith<std::vector<CollectionIndexNamePair>> reconcileCatalogAndIdents(
+        OperationContext* opCtx) {
+        return std::vector<CollectionIndexNamePair>();
+    };
 
 protected:
     /**

@@ -108,6 +108,18 @@ lsm_config = [
             larger than this value.  This overrides the \c memory_page_max
             setting''',
             min='512K', max='500MB'),
+        Config('merge_custom', '', r'''
+            configure the tree to merge into a custom data source''',
+            type='category', subconfig=[
+            Config('prefix', '', r'''
+                custom data source prefix instead of \c "file"'''),
+            Config('start_generation', '0', r'''
+                merge generation at which the custom data source is used
+                (zero indicates no custom data source)''',
+                min='0', max='10'),
+            Config('suffix', '', r'''
+                custom data source suffix instead of \c ".lsm"'''),
+            ]),
         Config('merge_max', '15', r'''
             the maximum number of chunks to include in a merge operation''',
             min='2', max='100'),
@@ -131,6 +143,28 @@ file_runtime_config = [
         do not ever evict the object's pages from cache. Not compatible with
         LSM tables; see @ref tuning_cache_resident for more information''',
         type='boolean'),
+    Config('assert', '', r'''
+        enable enhanced checking. ''',
+        type='category', subconfig= [
+        Config('commit_timestamp', 'none', r'''
+            verify that timestamps should 'always' or 'never' be used
+            on modifications with this table.  Verification is 'none'
+            if mixed update use is allowed.''',
+            choices=['always','never','none']),
+        Config('read_timestamp', 'none', r'''
+            verify that timestamps should 'always' or 'never' be used
+            on reads with this table.  Verification is 'none'
+            if mixed read use is allowed.''',
+            choices=['always','never','none'])
+        ], undoc=True),
+    Config('log', '', r'''
+        the transaction log configuration for this object.  Only valid if
+        log is enabled in ::wiredtiger_open''',
+        type='category', subconfig=[
+        Config('enabled', 'true', r'''
+            if false, this object has checkpoint-level durability''',
+            type='boolean'),
+        ]),
 ]
 
 # Per-file configuration
@@ -252,14 +286,6 @@ file_config = format_meta + file_runtime_config + [
     Config('leaf_item_max', '0', r'''
         historic term for leaf_key_max and leaf_value_max''',
         min=0, undoc=True),
-    Config('log', '', r'''
-        the transaction log configuration for this object.  Only valid if
-        log is enabled in ::wiredtiger_open''',
-        type='category', subconfig=[
-        Config('enabled', 'true', r'''
-            if false, this object has checkpoint-level durability''',
-            type='boolean'),
-        ]),
     Config('memory_page_max', '5MB', r'''
         the maximum size a page can grow to in memory before being
         reconciled to disk.  The specified size will be adjusted to a lower
@@ -401,6 +427,14 @@ connection_runtime_config = [
             above 0 configures periodic checkpoints''',
             min='0', max='100000'),
         ]),
+    Config('compatibility', '', r'''
+        set compatibility version of database.  Changing the compatibility
+        version requires that there are no active operations for the duration
+        of the call.''',
+        type='category', subconfig=[
+        Config('release', '', r'''
+            compatibility release version string'''),
+        ]),
     Config('error_prefix', '', r'''
         prefix string for error messages'''),
     Config('eviction', '', r'''
@@ -475,6 +509,19 @@ connection_runtime_config = [
     Config('lsm_merge', 'true', r'''
         merge LSM chunks where possible (deprecated)''',
         type='boolean', undoc=True),
+    Config('operation_tracking', '', r'''
+        enable tracking of performance-critical functions. See
+        @ref operation_tracking for more information''',
+        type='category', subconfig=[
+            Config('enabled', 'false', r'''
+                enable operation tracking subsystem''',
+                type='boolean'),
+            Config('path', '"."', r'''
+                the name of a directory into which operation tracking files are
+                written. The directory must already exist. If the value is not
+                an absolute path, the path is relative to the database home
+                (see @ref absolute_path for more information)'''),
+        ]),
     Config('shared_cache', '', r'''
         shared cache configuration options. A database should configure
         either a cache_size or a shared_cache not both. Enabling a
@@ -503,7 +550,7 @@ connection_runtime_config = [
         Maintain database statistics, which may impact performance.
         Choosing "all" maintains all statistics regardless of cost,
         "fast" maintains a subset of statistics that are relatively
-        inexpensive, "none" turns off all statistics.  The "clear"
+        inexpensive, "none" turns off all statistics. The "clear"
         configuration resets statistics after they are gathered,
         where appropriate (for example, a cache size statistic is
         not cleared, while the count of cursor insert operations will
@@ -514,14 +561,23 @@ connection_runtime_config = [
         @ref statistics for more information''',
         type='list',
         choices=['all', 'cache_walk', 'fast', 'none', 'clear', 'tree_walk']),
+    Config('timing_stress_for_test', '', r'''
+        enable code that interrupts the usual timing of operations with a
+        goal of uncovering race conditions and unexpected blocking.
+        This option is intended for use with internal stress
+        testing of WiredTiger. Options are given as a list, such as
+        <code>"timing_stress_for_test=[checkpoint_slow,
+            internal_page_split_race, page_split_race]"</code>''',
+        type='list', undoc=True, choices=[
+            'checkpoint_slow', 'internal_page_split_race', 'page_split_race']),
     Config('verbose', '', r'''
-        enable messages for various events. Only available if WiredTiger
-        is configured with --enable-verbose. Options are given as a
+        enable messages for various events. Options are given as a
         list, such as <code>"verbose=[evictserver,read]"</code>''',
         type='list', choices=[
             'api',
             'block',
             'checkpoint',
+            'checkpoint_progress',
             'compact',
             'evict',
             'evict_stuck',
@@ -529,6 +585,7 @@ connection_runtime_config = [
             'fileops',
             'handleops',
             'log',
+            'lookaside',
             'lookaside_activity',
             'lsm',
             'lsm_manager',
@@ -545,6 +602,7 @@ connection_runtime_config = [
             'split',
             'temporary',
             'thread_group',
+            'timestamp',
             'transaction',
             'verify',
             'version',
@@ -876,7 +934,7 @@ methods = {
         not available immediately''',
         type='boolean', undoc=True),
     Config('remove_files', 'true', r'''
-        should the underlying files be removed?''',
+        if the underlying files should be removed''',
         type='boolean'),
 ]),
 
@@ -1028,7 +1086,8 @@ methods = {
 ]),
 'WT_SESSION.strerror' : Method([]),
 'WT_SESSION.transaction_sync' : Method([
-    Config('timeout_ms', '1200000', r'''
+    Config('timeout_ms', '1200000', # !!! Must match WT_SESSION_BG_SYNC_MSEC
+        r'''
         maximum amount of time to wait for background sync to complete in
         milliseconds.  A value of zero disables the timeout and returns
         immediately''',
@@ -1077,6 +1136,14 @@ methods = {
         priority of the transaction for resolving conflicts.
         Transactions with higher values are less likely to abort''',
         min='-100', max='100'),
+    Config('read_timestamp', '', r'''
+        read using the specified timestamp.  The supplied value should not be
+        older than the current oldest timestamp.  See
+        @ref transaction_timestamps'''),
+    Config('round_to_oldest', 'false', r'''
+        if read timestamp is earlier than oldest timestamp,
+        read timestamp will be rounded to oldest timestamp''',
+        type='boolean'),
     Config('snapshot', '', r'''
         use a named, in-memory snapshot, see
         @ref transaction_named_snapshots'''),
@@ -1087,6 +1154,12 @@ methods = {
 ]),
 
 'WT_SESSION.commit_transaction' : Method([
+    Config('commit_timestamp', '', r'''
+        set the commit timestamp for the current transaction.  The supplied
+        value should not be older than the first commit timestamp set for the
+        current transaction.  The value should also not be older than the
+        current oldest and stable timestamps.  See
+        @ref transaction_timestamps'''),
     Config('sync', '', r'''
         override whether to sync log records when the transaction commits,
         inherited from ::wiredtiger_open \c transaction_sync.
@@ -1097,6 +1170,16 @@ methods = {
         \c on setting forces log records to be written to the storage device''',
         choices=['background', 'off', 'on']),
 ]),
+
+'WT_SESSION.timestamp_transaction' : Method([
+    Config('commit_timestamp', '', r'''
+        set the commit timestamp for the current transaction.  The supplied
+        value should not be older than the first commit timestamp set for the
+        current transaction.  The value should also not be older than the
+        current oldest and stable timestamps.  See
+        @ref transaction_timestamps'''),
+]),
+
 'WT_SESSION.rollback_transaction' : Method([]),
 
 'WT_SESSION.checkpoint' : Method([
@@ -1119,6 +1202,12 @@ methods = {
         including LSM trees may not be named)'''),
     Config('target', '', r'''
         if non-empty, checkpoint the list of objects''', type='list'),
+    Config('use_timestamp', 'true', r'''
+        by default, create the checkpoint as of the last stable timestamp
+        if timestamps are in use, or all current updates if there is no
+        stable timestamp set.  If false, this option generates a checkpoint
+        with all updates including those later than the timestamp''',
+        type='boolean'),
 ]),
 
 'WT_SESSION.snapshot' : Method([
@@ -1175,6 +1264,20 @@ methods = {
         don't free memory during close''',
         type='boolean'),
 ]),
+'WT_CONNECTION.debug_info' : Method([
+    Config('cache', 'false', r'''
+        print cache information''', type='boolean'),
+    Config('cursors', 'false', r'''
+        print all open cursor information''', type='boolean'),
+    Config('handles', 'false', r'''
+        print open handles information''', type='boolean'),
+    Config('log', 'false', r'''
+        print log information''', type='boolean'),
+    Config('sessions', 'false', r'''
+        print open session information''', type='boolean'),
+    Config('txn', 'false', r'''
+        print global txn information''', type='boolean'),
+]),
 'WT_CONNECTION.reconfigure' : Method(
     connection_reconfigure_log_configuration +\
     connection_reconfigure_statistics_log_configuration +\
@@ -1203,6 +1306,48 @@ methods = {
 ]),
 
 'WT_CONNECTION.open_session' : Method(session_config),
+
+'WT_CONNECTION.query_timestamp' : Method([
+    Config('get', 'all_committed', r'''
+        specify which timestamp to query: \c all_committed returns the largest
+        timestamp such that all earlier timestamps have committed, \c oldest
+        returns the most recent \c oldest_timestamp set with
+        WT_CONNECTION::set_timestamp, \c pinned returns the minimum of the
+        \c oldest_timestamp and the read timestamps of all active readers, and
+        \c stable returns the most recent \c stable_timestamp set with
+        WT_CONNECTION::set_timestamp.  See @ref transaction_timestamps''',
+        choices=['all_committed','oldest','pinned','stable']),
+]),
+
+'WT_CONNECTION.set_timestamp' : Method([
+    Config('commit_timestamp', '', r'''
+        reset the maximum commit timestamp tracked by WiredTiger.  This will
+        cause future calls to WT_CONNECTION::query_timestamp to ignore commit
+        timestamps greater than the specified value until the next commit moves
+        the tracked commit timestamp forwards.  This is only intended for use
+        where the application is rolling back locally committed transactions.
+        The supplied value should not be older than the current oldest and
+        stable timestamps.  See @ref transaction_timestamps'''),
+    Config('force', 'false', r'''
+        set timestamps even if they violate normal ordering requirements.
+        For example allow the \c oldest_timestamp to move backwards''',
+        type='boolean'),
+    Config('oldest_timestamp', '', r'''
+        future commits and queries will be no earlier than the specified
+        timestamp.  Supplied values must be monotonically increasing, any
+        attempt to set the value to older than the current is silently ignored.
+        The supplied value should not be newer than the current
+        stable timestamp.  See @ref transaction_timestamps'''),
+    Config('stable_timestamp', '', r'''
+        checkpoints will not include commits that are newer than the specified
+        timestamp in tables configured with \c log=(enabled=false).  Supplied
+        values must be monotonically increasing, any attempt to set the value to
+        older than the current is silently ignored.  The supplied value should
+        not be older than the current oldest timestamp.  See
+        @ref transaction_timestamps'''),
+]),
+
+'WT_CONNECTION.rollback_to_stable' : Method([]),
 
 'WT_SESSION.reconfigure' : Method(session_config),
 

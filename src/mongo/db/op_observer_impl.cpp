@@ -31,196 +31,70 @@
 #include "mongo/db/op_observer_impl.h"
 
 #include "mongo/bson/bsonobjbuilder.h"
-#include "mongo/db/auth/authorization_manager_global.h"
+#include "mongo/db/auth/authorization_manager.h"
+#include "mongo/db/catalog/collection_catalog_entry.h"
 #include "mongo/db/catalog/collection_options.h"
+#include "mongo/db/catalog/database.h"
+#include "mongo/db/catalog/database_holder.h"
+#include "mongo/db/catalog/namespace_uuid_cache.h"
 #include "mongo/db/commands/feature_compatibility_version.h"
+#include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/repl/oplog.h"
+#include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/s/collection_sharding_state.h"
 #include "mongo/db/server_options.h"
+#include "mongo/db/session_catalog.h"
 #include "mongo/db/views/durable_view_catalog.h"
 #include "mongo/scripting/engine.h"
-#include "mongo/util/namespace_uuid_cache.h"
-#include "mongo/util/uuid_catalog.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/fail_point_service.h"
 
 namespace mongo {
-
-void OpObserverImpl::onCreateIndex(OperationContext* opCtx,
-                                   const NamespaceString& nss,
-                                   OptionalCollectionUUID uuid,
-                                   BSONObj indexDoc,
-                                   bool fromMigrate) {
-    NamespaceString systemIndexes{nss.getSystemIndexesCollection()};
-    if (uuid) {
-        BSONObjBuilder builder;
-        builder.append("createIndex", nss.coll());
-
-        for (const auto& e : indexDoc) {
-            if (e.fieldNameStringData() != "ns"_sd)
-                builder.append(e);
-        }
-        repl::logOp(opCtx, "c", nss.getCommandNS(), uuid, builder.done(), nullptr, fromMigrate);
-    } else {
-        repl::logOp(opCtx, "i", systemIndexes, {}, indexDoc, nullptr, fromMigrate);
-    }
-    AuthorizationManager::get(opCtx->getServiceContext())
-        ->logOp(opCtx, "i", systemIndexes, indexDoc, nullptr);
-
-    auto css = CollectionShardingState::get(opCtx, systemIndexes);
-    if (!fromMigrate) {
-        css->onInsertOp(opCtx, indexDoc);
-    }
-}
-
-void OpObserverImpl::onInserts(OperationContext* opCtx,
-                               const NamespaceString& nss,
-                               OptionalCollectionUUID uuid,
-                               std::vector<BSONObj>::const_iterator begin,
-                               std::vector<BSONObj>::const_iterator end,
-                               bool fromMigrate) {
-    repl::logOps(opCtx, "i", nss, uuid, begin, end, fromMigrate);
-
-    auto css = CollectionShardingState::get(opCtx, nss.ns());
-
-    for (auto it = begin; it != end; it++) {
-        AuthorizationManager::get(opCtx->getServiceContext())->logOp(opCtx, "i", nss, *it, nullptr);
-        if (!fromMigrate) {
-            css->onInsertOp(opCtx, *it);
-        }
-    }
-
-    if (nss.ns() == FeatureCompatibilityVersion::kCollection) {
-        for (auto it = begin; it != end; it++) {
-            FeatureCompatibilityVersion::onInsertOrUpdate(*it);
-        }
-    }
-
-    if (strstr(nss.ns().c_str(), ".system.js")) {
-        Scope::storedFuncMod(opCtx);
-    }
-    if (nss.coll() == DurableViewCatalog::viewsCollectionName()) {
-        DurableViewCatalog::onExternalChange(opCtx, nss);
-    }
-}
-
-void OpObserverImpl::onUpdate(OperationContext* opCtx, const OplogUpdateEntryArgs& args) {
-    // Do not log a no-op operation; see SERVER-21738
-    if (args.update.isEmpty()) {
-        return;
-    }
-
-    repl::logOp(opCtx, "u", args.nss, args.uuid, args.update, &args.criteria, args.fromMigrate);
-    AuthorizationManager::get(opCtx->getServiceContext())
-        ->logOp(opCtx, "u", args.nss, args.update, &args.criteria);
-
-    auto css = CollectionShardingState::get(opCtx, args.nss);
-    if (!args.fromMigrate) {
-        css->onUpdateOp(opCtx, args.criteria, args.update, args.updatedDoc);
-    }
-
-    if (strstr(args.nss.ns().c_str(), ".system.js")) {
-        Scope::storedFuncMod(opCtx);
-    }
-
-    if (args.nss.coll() == DurableViewCatalog::viewsCollectionName()) {
-        DurableViewCatalog::onExternalChange(opCtx, args.nss);
-    }
-
-    if (args.nss.ns() == FeatureCompatibilityVersion::kCollection) {
-        FeatureCompatibilityVersion::onInsertOrUpdate(args.updatedDoc);
-    }
-}
-
-CollectionShardingState::DeleteState OpObserverImpl::aboutToDelete(OperationContext* opCtx,
-                                                                   const NamespaceString& nss,
-                                                                   const BSONObj& doc) {
-    CollectionShardingState::DeleteState deleteState;
-    BSONElement idElement = doc["_id"];
-    if (!idElement.eoo()) {
-        deleteState.idDoc = idElement.wrap();
-    }
-
-    auto css = CollectionShardingState::get(opCtx, nss.ns());
-    deleteState.isMigrating = css->isDocumentInMigratingChunk(opCtx, doc);
-
-    return deleteState;
-}
-
-void OpObserverImpl::onDelete(OperationContext* opCtx,
-                              const NamespaceString& nss,
-                              OptionalCollectionUUID uuid,
-                              CollectionShardingState::DeleteState deleteState,
-                              bool fromMigrate) {
-    if (deleteState.idDoc.isEmpty())
-        return;
-
-    repl::logOp(opCtx, "d", nss, uuid, deleteState.idDoc, nullptr, fromMigrate);
-    AuthorizationManager::get(opCtx->getServiceContext())
-        ->logOp(opCtx, "d", nss, deleteState.idDoc, nullptr);
-
-    auto css = CollectionShardingState::get(opCtx, nss.ns());
-    if (!fromMigrate) {
-        css->onDeleteOp(opCtx, deleteState);
-    }
-
-    if (nss.coll() == "system.js") {
-        Scope::storedFuncMod(opCtx);
-    }
-    if (nss.coll() == DurableViewCatalog::viewsCollectionName()) {
-        DurableViewCatalog::onExternalChange(opCtx, nss);
-    }
-    if (nss.ns() == FeatureCompatibilityVersion::kCollection) {
-        FeatureCompatibilityVersion::onDelete(deleteState.idDoc);
-    }
-}
-
-void OpObserverImpl::onOpMessage(OperationContext* opCtx, const BSONObj& msgObj) {
-    repl::logOp(opCtx, "n", {}, {}, msgObj, nullptr, false);
-}
-
-void OpObserverImpl::onCreateCollection(OperationContext* opCtx,
-                                        Collection* coll,
-                                        const NamespaceString& collectionName,
-                                        const CollectionOptions& options,
-                                        const BSONObj& idIndex) {
-    const NamespaceString dbName = collectionName.getCommandNS();
-    BSONObjBuilder b;
-    b.append("create", collectionName.coll().toString());
-    {
-        // Don't store the UUID as part of the options, but instead only at the top level
-        CollectionOptions optionsToStore = options;
-        optionsToStore.uuid.reset();
-        b.appendElements(optionsToStore.toBSON());
-    }
-
-    // Include the full _id index spec in the oplog for index versions >= 2.
-    if (!idIndex.isEmpty()) {
-        auto versionElem = idIndex[IndexDescriptor::kIndexVersionFieldName];
-        invariant(versionElem.isNumber());
-        if (IndexDescriptor::IndexVersion::kV2 <=
-            static_cast<IndexDescriptor::IndexVersion>(versionElem.numberInt())) {
-            b.append("idIndex", idIndex);
-        }
-    }
-
-    BSONObj cmdObj = b.obj();
-
-    if (!collectionName.isSystemDotProfile()) {
-        // do not replicate system.profile modifications
-        repl::logOp(opCtx, "c", dbName, options.uuid, cmdObj, nullptr, false);
-    }
-
-    getGlobalAuthorizationManager()->logOp(opCtx, "c", dbName, cmdObj, nullptr);
-
-    if (options.uuid) {
-        UUIDCatalog& catalog = UUIDCatalog::get(opCtx->getServiceContext());
-        catalog.onCreateCollection(opCtx, coll, options.uuid.get());
-    }
-}
-
 namespace {
+
+MONGO_FP_DECLARE(failCollectionUpdates);
+
+using DeleteState = CollectionShardingState::DeleteState;
+
+const OperationContext::Decoration<DeleteState> getDeleteState =
+    OperationContext::declareDecoration<DeleteState>();
+
+/**
+ * Returns whether we're a master using master-slave replication.
+ */
+bool isMasterSlave(OperationContext* opCtx) {
+    return repl::ReplicationCoordinator::get(opCtx)->getReplicationMode() ==
+        repl::ReplicationCoordinator::modeMasterSlave;
+}
+
+/**
+ * Updates the session state with the last write timestamp and transaction for that session.
+ *
+ * In the case of writes with transaction/statement id, this method will be recursively entered a
+ * second time for the actual write to the transactions table. Since this write does not generate an
+ * oplog entry, the recursion will stop at this point.
+ */
+void onWriteOpCompleted(OperationContext* opCtx,
+                        const NamespaceString& nss,
+                        Session* session,
+                        std::vector<StmtId> stmtIdsWritten,
+                        const repl::OpTime& lastStmtIdWriteOpTime,
+                        Date_t lastStmtIdWriteDate) {
+    if (lastStmtIdWriteOpTime.isNull())
+        return;
+
+    if (session) {
+        session->onWriteOpCompletedOnPrimary(opCtx,
+                                             *opCtx->getTxnNumber(),
+                                             std::move(stmtIdsWritten),
+                                             lastStmtIdWriteOpTime,
+                                             lastStmtIdWriteDate);
+    }
+}
+
 /**
  * Given a raw collMod command object and associated collection metadata, create and return the
  * object for the 'o' field of a collMod oplog entry. For TTL index updates, we make sure the oplog
@@ -250,6 +124,411 @@ BSONObj makeCollModCmdObj(const BSONObj& collModCmd,
 
     return cmdObjBuilder.obj();
 }
+
+Date_t getWallClockTimeForOpLog(OperationContext* opCtx) {
+    auto const clockSource = opCtx->getServiceContext()->getFastClockSource();
+    return clockSource->now();
+}
+
+struct OpTimeBundle {
+    repl::OpTime writeOpTime;
+    repl::OpTime prePostImageOpTime;
+    Date_t wallClockTime;
+};
+
+/**
+ * Write oplog entry(ies) for the update operation.
+ */
+OpTimeBundle replLogUpdate(OperationContext* opCtx,
+                           Session* session,
+                           const OplogUpdateEntryArgs& args) {
+    BSONObj storeObj;
+    if (args.storeDocOption == OplogUpdateEntryArgs::StoreDocOption::PreImage) {
+        invariant(args.preImageDoc);
+        storeObj = *args.preImageDoc;
+    } else if (args.storeDocOption == OplogUpdateEntryArgs::StoreDocOption::PostImage) {
+        storeObj = args.updatedDoc;
+    }
+
+    OperationSessionInfo sessionInfo;
+    repl::OplogLink oplogLink;
+
+    if (session) {
+        sessionInfo.setSessionId(*opCtx->getLogicalSessionId());
+        sessionInfo.setTxnNumber(*opCtx->getTxnNumber());
+        oplogLink.prevOpTime = session->getLastWriteOpTime(*opCtx->getTxnNumber());
+    }
+
+    OpTimeBundle opTimes;
+    opTimes.wallClockTime = getWallClockTimeForOpLog(opCtx);
+
+    if (!storeObj.isEmpty() && opCtx->getTxnNumber()) {
+        auto noteUpdateOpTime = repl::logOp(opCtx,
+                                            "n",
+                                            args.nss,
+                                            args.uuid,
+                                            storeObj,
+                                            nullptr,
+                                            false,
+                                            opTimes.wallClockTime,
+                                            sessionInfo,
+                                            args.stmtId,
+                                            {});
+
+        opTimes.prePostImageOpTime = noteUpdateOpTime;
+
+        if (args.storeDocOption == OplogUpdateEntryArgs::StoreDocOption::PreImage) {
+            oplogLink.preImageOpTime = noteUpdateOpTime;
+        } else if (args.storeDocOption == OplogUpdateEntryArgs::StoreDocOption::PostImage) {
+            oplogLink.postImageOpTime = noteUpdateOpTime;
+        }
+    }
+
+    opTimes.writeOpTime = repl::logOp(opCtx,
+                                      "u",
+                                      args.nss,
+                                      args.uuid,
+                                      args.update,
+                                      &args.criteria,
+                                      args.fromMigrate,
+                                      opTimes.wallClockTime,
+                                      sessionInfo,
+                                      args.stmtId,
+                                      oplogLink);
+
+    return opTimes;
+}
+
+/**
+ * Write oplog entry(ies) for the delete operation.
+ */
+OpTimeBundle replLogDelete(OperationContext* opCtx,
+                           const NamespaceString& nss,
+                           OptionalCollectionUUID uuid,
+                           Session* session,
+                           StmtId stmtId,
+                           bool fromMigrate,
+                           const boost::optional<BSONObj>& deletedDoc) {
+    OperationSessionInfo sessionInfo;
+    repl::OplogLink oplogLink;
+
+    if (session) {
+        sessionInfo.setSessionId(*opCtx->getLogicalSessionId());
+        sessionInfo.setTxnNumber(*opCtx->getTxnNumber());
+        oplogLink.prevOpTime = session->getLastWriteOpTime(*opCtx->getTxnNumber());
+    }
+
+    OpTimeBundle opTimes;
+    opTimes.wallClockTime = getWallClockTimeForOpLog(opCtx);
+
+    if (deletedDoc && opCtx->getTxnNumber()) {
+        auto noteOplog = repl::logOp(opCtx,
+                                     "n",
+                                     nss,
+                                     uuid,
+                                     deletedDoc.get(),
+                                     nullptr,
+                                     false,
+                                     opTimes.wallClockTime,
+                                     sessionInfo,
+                                     stmtId,
+                                     {});
+        opTimes.prePostImageOpTime = noteOplog;
+        oplogLink.preImageOpTime = noteOplog;
+    }
+
+    CollectionShardingState::DeleteState& deleteState = getDeleteState(opCtx);
+    opTimes.writeOpTime = repl::logOp(opCtx,
+                                      "d",
+                                      nss,
+                                      uuid,
+                                      deleteState.documentKey,
+                                      nullptr,
+                                      fromMigrate,
+                                      opTimes.wallClockTime,
+                                      sessionInfo,
+                                      stmtId,
+                                      oplogLink);
+    return opTimes;
+}
+
+}  // namespace
+
+void OpObserverImpl::onCreateIndex(OperationContext* opCtx,
+                                   const NamespaceString& nss,
+                                   OptionalCollectionUUID uuid,
+                                   BSONObj indexDoc,
+                                   bool fromMigrate) {
+    const NamespaceString systemIndexes{nss.getSystemIndexesCollection()};
+
+    if (uuid && !isMasterSlave(opCtx)) {
+        BSONObjBuilder builder;
+        builder.append("createIndexes", nss.coll());
+
+        for (const auto& e : indexDoc) {
+            if (e.fieldNameStringData() != "ns"_sd)
+                builder.append(e);
+        }
+
+        repl::logOp(opCtx,
+                    "c",
+                    nss.getCommandNS(),
+                    uuid,
+                    builder.done(),
+                    nullptr,
+                    fromMigrate,
+                    getWallClockTimeForOpLog(opCtx),
+                    {},
+                    kUninitializedStmtId,
+                    {});
+    } else {
+        repl::logOp(opCtx,
+                    "i",
+                    systemIndexes,
+                    {},
+                    indexDoc,
+                    nullptr,
+                    fromMigrate,
+                    getWallClockTimeForOpLog(opCtx),
+                    {},
+                    kUninitializedStmtId,
+                    {});
+    }
+
+    AuthorizationManager::get(opCtx->getServiceContext())
+        ->logOp(opCtx, "i", systemIndexes, indexDoc, nullptr);
+
+    auto css = CollectionShardingState::get(opCtx, systemIndexes);
+    if (!fromMigrate) {
+        css->onInsertOp(opCtx, indexDoc, {});
+    }
+}
+
+void OpObserverImpl::onInserts(OperationContext* opCtx,
+                               const NamespaceString& nss,
+                               OptionalCollectionUUID uuid,
+                               std::vector<InsertStatement>::const_iterator begin,
+                               std::vector<InsertStatement>::const_iterator end,
+                               bool fromMigrate) {
+    Session* const session = opCtx->getTxnNumber() ? OperationContextSession::get(opCtx) : nullptr;
+
+    const auto lastWriteDate = getWallClockTimeForOpLog(opCtx);
+
+    const auto opTimeList =
+        repl::logInsertOps(opCtx, nss, uuid, session, begin, end, fromMigrate, lastWriteDate);
+
+    auto css = (nss == NamespaceString::kSessionTransactionsTableNamespace || fromMigrate)
+        ? nullptr
+        : CollectionShardingState::get(opCtx, nss.ns());
+
+    size_t index = 0;
+    for (auto it = begin; it != end; it++, index++) {
+        AuthorizationManager::get(opCtx->getServiceContext())
+            ->logOp(opCtx, "i", nss, it->doc, nullptr);
+        if (css) {
+            auto opTime = opTimeList.empty() ? repl::OpTime() : opTimeList[index];
+            css->onInsertOp(opCtx, it->doc, opTime);
+        }
+    }
+
+    const auto lastOpTime = opTimeList.empty() ? repl::OpTime() : opTimeList.back();
+    if (nss.coll() == "system.js") {
+        Scope::storedFuncMod(opCtx);
+    } else if (nss.coll() == DurableViewCatalog::viewsCollectionName()) {
+        DurableViewCatalog::onExternalChange(opCtx, nss);
+    } else if (nss.ns() == FeatureCompatibilityVersion::kCollection) {
+        for (auto it = begin; it != end; it++) {
+            FeatureCompatibilityVersion::onInsertOrUpdate(opCtx, it->doc);
+        }
+    } else if (nss == NamespaceString::kSessionTransactionsTableNamespace && !lastOpTime.isNull()) {
+        for (auto it = begin; it != end; it++) {
+            SessionCatalog::get(opCtx)->invalidateSessions(opCtx, it->doc);
+        }
+    }
+
+    std::vector<StmtId> stmtIdsWritten;
+    std::transform(begin, end, std::back_inserter(stmtIdsWritten), [](const InsertStatement& stmt) {
+        return stmt.stmtId;
+    });
+
+    onWriteOpCompleted(opCtx, nss, session, stmtIdsWritten, lastOpTime, lastWriteDate);
+}
+
+void OpObserverImpl::onUpdate(OperationContext* opCtx, const OplogUpdateEntryArgs& args) {
+    MONGO_FAIL_POINT_BLOCK(failCollectionUpdates, extraData) {
+        auto collElem = extraData.getData()["collectionNS"];
+        // If the failpoint specifies no collection or matches the existing one, fail.
+        if (!collElem || args.nss.ns() == collElem.String()) {
+            uasserted(40654,
+                      str::stream() << "failCollectionUpdates failpoint enabled, namespace: "
+                                    << args.nss.ns()
+                                    << ", update: "
+                                    << args.update
+                                    << " on document with "
+                                    << args.criteria);
+        }
+    }
+
+    // Do not log a no-op operation; see SERVER-21738
+    if (args.update.isEmpty()) {
+        return;
+    }
+
+    Session* const session = opCtx->getTxnNumber() ? OperationContextSession::get(opCtx) : nullptr;
+    const auto opTime = replLogUpdate(opCtx, session, args);
+
+    AuthorizationManager::get(opCtx->getServiceContext())
+        ->logOp(opCtx, "u", args.nss, args.update, &args.criteria);
+
+    if (args.nss != NamespaceString::kSessionTransactionsTableNamespace) {
+        if (!args.fromMigrate) {
+            auto css = CollectionShardingState::get(opCtx, args.nss);
+            css->onUpdateOp(opCtx,
+                            args.criteria,
+                            args.update,
+                            args.updatedDoc,
+                            opTime.writeOpTime,
+                            opTime.prePostImageOpTime);
+        }
+    }
+
+    if (args.nss.coll() == "system.js") {
+        Scope::storedFuncMod(opCtx);
+    } else if (args.nss.coll() == DurableViewCatalog::viewsCollectionName()) {
+        DurableViewCatalog::onExternalChange(opCtx, args.nss);
+    } else if (args.nss.ns() == FeatureCompatibilityVersion::kCollection) {
+        FeatureCompatibilityVersion::onInsertOrUpdate(opCtx, args.updatedDoc);
+    } else if (args.nss == NamespaceString::kSessionTransactionsTableNamespace &&
+               !opTime.writeOpTime.isNull()) {
+        SessionCatalog::get(opCtx)->invalidateSessions(opCtx, args.updatedDoc);
+    }
+
+    onWriteOpCompleted(opCtx,
+                       args.nss,
+                       session,
+                       std::vector<StmtId>{args.stmtId},
+                       opTime.writeOpTime,
+                       opTime.wallClockTime);
+}
+
+void OpObserverImpl::aboutToDelete(OperationContext* opCtx,
+                                   NamespaceString const& nss,
+                                   BSONObj const& doc) {
+    auto& deleteState = getDeleteState(opCtx);
+    auto* css = CollectionShardingState::get(opCtx, nss.ns());
+    deleteState = css->makeDeleteState(doc);
+}
+
+void OpObserverImpl::onDelete(OperationContext* opCtx,
+                              const NamespaceString& nss,
+                              OptionalCollectionUUID uuid,
+                              StmtId stmtId,
+                              bool fromMigrate,
+                              const boost::optional<BSONObj>& deletedDoc) {
+    auto& deleteState = getDeleteState(opCtx);
+    invariant(!deleteState.documentKey.isEmpty());
+
+    Session* const session = opCtx->getTxnNumber() ? OperationContextSession::get(opCtx) : nullptr;
+    const auto opTime = replLogDelete(opCtx, nss, uuid, session, stmtId, fromMigrate, deletedDoc);
+
+    AuthorizationManager::get(opCtx->getServiceContext())
+        ->logOp(opCtx, "d", nss, deleteState.documentKey, nullptr);
+
+    if (nss != NamespaceString::kSessionTransactionsTableNamespace) {
+        if (!fromMigrate) {
+            auto css = CollectionShardingState::get(opCtx, nss.ns());
+            css->onDeleteOp(opCtx, deleteState, opTime.writeOpTime, opTime.prePostImageOpTime);
+        }
+    }
+
+    if (nss.coll() == "system.js") {
+        Scope::storedFuncMod(opCtx);
+    } else if (nss.coll() == DurableViewCatalog::viewsCollectionName()) {
+        DurableViewCatalog::onExternalChange(opCtx, nss);
+    } else if (nss.isAdminDotSystemDotVersion()) {
+        auto _id = deleteState.documentKey["_id"];
+        if (_id.type() == BSONType::String &&
+            _id.String() == FeatureCompatibilityVersion::kParameterName)
+            uasserted(40670, "removing FeatureCompatibilityVersion document is not allowed");
+    } else if (nss == NamespaceString::kSessionTransactionsTableNamespace &&
+               !opTime.writeOpTime.isNull()) {
+        SessionCatalog::get(opCtx)->invalidateSessions(opCtx, deleteState.documentKey);
+    }
+
+    onWriteOpCompleted(
+        opCtx, nss, session, std::vector<StmtId>{stmtId}, opTime.writeOpTime, opTime.wallClockTime);
+}
+
+void OpObserverImpl::onInternalOpMessage(OperationContext* opCtx,
+                                         const NamespaceString& nss,
+                                         const boost::optional<UUID> uuid,
+                                         const BSONObj& msgObj,
+                                         const boost::optional<BSONObj> o2MsgObj) {
+    const BSONObj* o2MsgPtr = o2MsgObj ? o2MsgObj.get_ptr() : nullptr;
+    repl::logOp(opCtx,
+                "n",
+                nss,
+                uuid,
+                msgObj,
+                o2MsgPtr,
+                false,
+                getWallClockTimeForOpLog(opCtx),
+                {},
+                kUninitializedStmtId,
+                {});
+}
+
+void OpObserverImpl::onCreateCollection(OperationContext* opCtx,
+                                        Collection* coll,
+                                        const NamespaceString& collectionName,
+                                        const CollectionOptions& options,
+                                        const BSONObj& idIndex) {
+    const auto cmdNss = collectionName.getCommandNS();
+
+    BSONObjBuilder b;
+    b.append("create", collectionName.coll().toString());
+    {
+        // Don't store the UUID as part of the options, but instead only at the top level
+        CollectionOptions optionsToStore = options;
+        optionsToStore.uuid.reset();
+        b.appendElements(optionsToStore.toBSON());
+    }
+
+    // Include the full _id index spec in the oplog for index versions >= 2.
+    if (!idIndex.isEmpty()) {
+        auto versionElem = idIndex[IndexDescriptor::kIndexVersionFieldName];
+        invariant(versionElem.isNumber());
+        if (IndexDescriptor::IndexVersion::kV2 <=
+            static_cast<IndexDescriptor::IndexVersion>(versionElem.numberInt())) {
+            b.append("idIndex", idIndex);
+        }
+    }
+
+    const auto cmdObj = b.done();
+
+    if (!collectionName.isSystemDotProfile()) {
+        // do not replicate system.profile modifications
+        repl::logOp(opCtx,
+                    "c",
+                    cmdNss,
+                    options.uuid,
+                    cmdObj,
+                    nullptr,
+                    false,
+                    getWallClockTimeForOpLog(opCtx),
+                    {},
+                    kUninitializedStmtId,
+                    {});
+    }
+
+    AuthorizationManager::get(opCtx->getServiceContext())
+        ->logOp(opCtx, "c", cmdNss, cmdObj, nullptr);
+
+    if (options.uuid) {
+        opCtx->recoveryUnit()->onRollback([opCtx, collectionName]() {
+            NamespaceUUIDCache::get(opCtx).evictNamespace(collectionName);
+        });
+    }
 }
 
 void OpObserverImpl::onCollMod(OperationContext* opCtx,
@@ -258,11 +537,10 @@ void OpObserverImpl::onCollMod(OperationContext* opCtx,
                                const BSONObj& collModCmd,
                                const CollectionOptions& oldCollOptions,
                                boost::optional<TTLCollModInfo> ttlInfo) {
-
-    const NamespaceString cmdNss = nss.getCommandNS();
+    const auto cmdNss = nss.getCommandNS();
 
     // Create the 'o' field object.
-    BSONObj cmdObj = makeCollModCmdObj(collModCmd, oldCollOptions, ttlInfo);
+    const auto cmdObj = makeCollModCmdObj(collModCmd, oldCollOptions, ttlInfo);
 
     // Create the 'o2' field object. We save the old collection metadata and TTL expiration.
     BSONObjBuilder o2Builder;
@@ -272,63 +550,106 @@ void OpObserverImpl::onCollMod(OperationContext* opCtx,
         o2Builder.append("expireAfterSeconds_old", oldExpireAfterSeconds);
     }
 
-    const BSONObj o2Obj = o2Builder.obj();
+    const auto o2Obj = o2Builder.done();
 
     if (!nss.isSystemDotProfile()) {
         // do not replicate system.profile modifications
-        repl::logOp(opCtx, "c", cmdNss, uuid, cmdObj, &o2Obj, false);
+        repl::logOp(opCtx,
+                    "c",
+                    cmdNss,
+                    uuid,
+                    cmdObj,
+                    &o2Obj,
+                    false,
+                    getWallClockTimeForOpLog(opCtx),
+                    {},
+                    kUninitializedStmtId,
+                    {});
     }
 
-    getGlobalAuthorizationManager()->logOp(opCtx, "c", cmdNss, cmdObj, nullptr);
+    AuthorizationManager::get(opCtx->getServiceContext())
+        ->logOp(opCtx, "c", cmdNss, cmdObj, nullptr);
+
+    // Make sure the UUID values in the Collection metadata, the Collection object, and the UUID
+    // catalog are all present and equal if uuid exists and do not exist if uuid does not exist.
+    invariant(opCtx->lockState()->isDbLockedForMode(nss.db(), MODE_X));
+    Database* db = dbHolder().get(opCtx, nss.db());
+    // Some unit tests call the op observer on an unregistered Database.
+    if (!db) {
+        return;
+    }
+    Collection* coll = db->getCollection(opCtx, nss.ns());
+    invariant(coll->uuid() == uuid);
+    CollectionCatalogEntry* entry = coll->getCatalogEntry();
+    invariant(entry->isEqualToMetadataUUID(opCtx, uuid));
 }
 
 void OpObserverImpl::onDropDatabase(OperationContext* opCtx, const std::string& dbName) {
-    BSONObj cmdObj = BSON("dropDatabase" << 1);
     const NamespaceString cmdNss{dbName, "$cmd"};
+    const auto cmdObj = BSON("dropDatabase" << 1);
 
-    repl::logOp(opCtx, "c", cmdNss, {}, cmdObj, nullptr, false);
+    repl::logOp(opCtx,
+                "c",
+                cmdNss,
+                {},
+                cmdObj,
+                nullptr,
+                false,
+                getWallClockTimeForOpLog(opCtx),
+                {},
+                kUninitializedStmtId,
+                {});
 
     if (dbName == FeatureCompatibilityVersion::kDatabase) {
-        FeatureCompatibilityVersion::onDropCollection();
+        FeatureCompatibilityVersion::onDropCollection(opCtx);
+    } else if (dbName == NamespaceString::kSessionTransactionsTableNamespace.db()) {
+        SessionCatalog::get(opCtx)->invalidateSessions(opCtx, boost::none);
     }
 
-    getGlobalAuthorizationManager()->logOp(opCtx, "c", cmdNss, cmdObj, nullptr);
+    NamespaceUUIDCache::get(opCtx).evictNamespacesInDatabase(dbName);
+
+    AuthorizationManager::get(opCtx->getServiceContext())
+        ->logOp(opCtx, "c", cmdNss, cmdObj, nullptr);
 }
 
 repl::OpTime OpObserverImpl::onDropCollection(OperationContext* opCtx,
                                               const NamespaceString& collectionName,
                                               OptionalCollectionUUID uuid) {
-    const NamespaceString dbName = collectionName.getCommandNS();
-    BSONObj cmdObj = BSON("drop" << collectionName.coll().toString());
+    const auto cmdNss = collectionName.getCommandNS();
+    const auto cmdObj = BSON("drop" << collectionName.coll());
 
     repl::OpTime dropOpTime;
     if (!collectionName.isSystemDotProfile()) {
-        // do not replicate system.profile modifications
-        dropOpTime = repl::logOp(opCtx, "c", dbName, uuid, cmdObj, nullptr, false);
+        // Do not replicate system.profile modifications.
+        dropOpTime = repl::logOp(opCtx,
+                                 "c",
+                                 cmdNss,
+                                 uuid,
+                                 cmdObj,
+                                 nullptr,
+                                 false,
+                                 getWallClockTimeForOpLog(opCtx),
+                                 {},
+                                 kUninitializedStmtId,
+                                 {});
     }
 
     if (collectionName.coll() == DurableViewCatalog::viewsCollectionName()) {
         DurableViewCatalog::onExternalChange(opCtx, collectionName);
+    } else if (collectionName.ns() == FeatureCompatibilityVersion::kCollection) {
+        FeatureCompatibilityVersion::onDropCollection(opCtx);
+    } else if (collectionName == NamespaceString::kSessionTransactionsTableNamespace) {
+        SessionCatalog::get(opCtx)->invalidateSessions(opCtx, boost::none);
     }
 
-    if (collectionName.ns() == FeatureCompatibilityVersion::kCollection) {
-        FeatureCompatibilityVersion::onDropCollection();
-    }
-
-    getGlobalAuthorizationManager()->logOp(opCtx, "c", dbName, cmdObj, nullptr);
+    AuthorizationManager::get(opCtx->getServiceContext())
+        ->logOp(opCtx, "c", cmdNss, cmdObj, nullptr);
 
     auto css = CollectionShardingState::get(opCtx, collectionName);
     css->onDropCollection(opCtx, collectionName);
 
     // Evict namespace entry from the namespace/uuid cache if it exists.
-    NamespaceUUIDCache& cache = NamespaceUUIDCache::get(opCtx);
-    cache.onDropCollection(collectionName);
-
-    // Remove collection from the uuid catalog.
-    if (uuid) {
-        UUIDCatalog& catalog = UUIDCatalog::get(opCtx->getServiceContext());
-        catalog.onDropCollection(opCtx, uuid.get());
-    }
+    NamespaceUUIDCache::get(opCtx).evictNamespace(collectionName);
 
     return dropOpTime;
 }
@@ -338,86 +659,119 @@ void OpObserverImpl::onDropIndex(OperationContext* opCtx,
                                  OptionalCollectionUUID uuid,
                                  const std::string& indexName,
                                  const BSONObj& indexInfo) {
-    BSONObj cmdObj = BSON("dropIndexes" << nss.coll() << "index" << indexName);
-    auto commandNS = nss.getCommandNS();
-    repl::logOp(opCtx, "c", commandNS, uuid, cmdObj, &indexInfo, false);
+    const auto cmdNss = nss.getCommandNS();
+    const auto cmdObj = BSON("dropIndexes" << nss.coll() << "index" << indexName);
 
-    getGlobalAuthorizationManager()->logOp(opCtx, "c", commandNS, cmdObj, &indexInfo);
+    repl::logOp(opCtx,
+                "c",
+                cmdNss,
+                uuid,
+                cmdObj,
+                &indexInfo,
+                false,
+                getWallClockTimeForOpLog(opCtx),
+                {},
+                kUninitializedStmtId,
+                {});
+
+    AuthorizationManager::get(opCtx->getServiceContext())
+        ->logOp(opCtx, "c", cmdNss, cmdObj, &indexInfo);
 }
 
-void OpObserverImpl::onRenameCollection(OperationContext* opCtx,
-                                        const NamespaceString& fromCollection,
-                                        const NamespaceString& toCollection,
-                                        OptionalCollectionUUID uuid,
-                                        bool dropTarget,
-                                        OptionalCollectionUUID dropTargetUUID,
-                                        OptionalCollectionUUID dropSourceUUID,
-                                        bool stayTemp) {
-    const NamespaceString cmdNss = fromCollection.getCommandNS();
+repl::OpTime OpObserverImpl::onRenameCollection(OperationContext* opCtx,
+                                                const NamespaceString& fromCollection,
+                                                const NamespaceString& toCollection,
+                                                OptionalCollectionUUID uuid,
+                                                bool dropTarget,
+                                                OptionalCollectionUUID dropTargetUUID,
+                                                bool stayTemp) {
+    const auto cmdNss = fromCollection.getCommandNS();
+
     BSONObjBuilder builder;
     builder.append("renameCollection", fromCollection.ns());
     builder.append("to", toCollection.ns());
     builder.append("stayTemp", stayTemp);
-    if (dropTargetUUID && enableCollectionUUIDs) {
+    if (dropTargetUUID && enableCollectionUUIDs && !isMasterSlave(opCtx)) {
         dropTargetUUID->appendToBuilder(&builder, "dropTarget");
     } else {
         builder.append("dropTarget", dropTarget);
     }
-    if (dropSourceUUID && enableCollectionUUIDs) {
-        dropSourceUUID->appendToBuilder(&builder, "dropSource");
-    }
-    BSONObj cmdObj = builder.done();
 
-    repl::logOp(opCtx, "c", cmdNss, uuid, cmdObj, nullptr, false);
-    if (fromCollection.coll() == DurableViewCatalog::viewsCollectionName() ||
-        toCollection.coll() == DurableViewCatalog::viewsCollectionName()) {
-        DurableViewCatalog::onExternalChange(
-            opCtx, NamespaceString(DurableViewCatalog::viewsCollectionName()));
-    }
+    const auto cmdObj = builder.done();
 
-    getGlobalAuthorizationManager()->logOp(opCtx, "c", cmdNss, cmdObj, nullptr);
+    const auto renameOpTime = repl::logOp(opCtx,
+                                          "c",
+                                          cmdNss,
+                                          uuid,
+                                          cmdObj,
+                                          nullptr,
+                                          false,
+                                          getWallClockTimeForOpLog(opCtx),
+                                          {},
+                                          kUninitializedStmtId,
+                                          {});
+
+    if (fromCollection.isSystemDotViews())
+        DurableViewCatalog::onExternalChange(opCtx, fromCollection);
+    if (toCollection.isSystemDotViews())
+        DurableViewCatalog::onExternalChange(opCtx, toCollection);
+
+    AuthorizationManager::get(opCtx->getServiceContext())
+        ->logOp(opCtx, "c", cmdNss, cmdObj, nullptr);
 
     // Evict namespace entry from the namespace/uuid cache if it exists.
     NamespaceUUIDCache& cache = NamespaceUUIDCache::get(opCtx);
-    cache.onRenameCollection(fromCollection);
+    cache.evictNamespace(fromCollection);
+    cache.evictNamespace(toCollection);
+    opCtx->recoveryUnit()->onRollback(
+        [&cache, toCollection]() { cache.evictNamespace(toCollection); });
+
+    return renameOpTime;
 }
 
 void OpObserverImpl::onApplyOps(OperationContext* opCtx,
                                 const std::string& dbName,
                                 const BSONObj& applyOpCmd) {
     const NamespaceString cmdNss{dbName, "$cmd"};
-    repl::logOp(opCtx, "c", cmdNss, {}, applyOpCmd, nullptr, false);
+    repl::logOp(opCtx,
+                "c",
+                cmdNss,
+                {},
+                applyOpCmd,
+                nullptr,
+                false,
+                getWallClockTimeForOpLog(opCtx),
+                {},
+                kUninitializedStmtId,
+                {});
 
-    getGlobalAuthorizationManager()->logOp(opCtx, "c", cmdNss, applyOpCmd, nullptr);
-}
-
-void OpObserverImpl::onConvertToCapped(OperationContext* opCtx,
-                                       const NamespaceString& collectionName,
-                                       OptionalCollectionUUID uuid,
-                                       double size) {
-    const NamespaceString cmdNss = collectionName.getCommandNS();
-    BSONObj cmdObj = BSON("convertToCapped" << collectionName.coll() << "size" << size);
-
-    if (!collectionName.isSystemDotProfile()) {
-        // do not replicate system.profile modifications
-        repl::logOp(opCtx, "c", cmdNss, uuid, cmdObj, nullptr, false);
-    }
-
-    getGlobalAuthorizationManager()->logOp(opCtx, "c", cmdNss, cmdObj, nullptr);
+    AuthorizationManager::get(opCtx->getServiceContext())
+        ->logOp(opCtx, "c", cmdNss, applyOpCmd, nullptr);
 }
 
 void OpObserverImpl::onEmptyCapped(OperationContext* opCtx,
                                    const NamespaceString& collectionName,
                                    OptionalCollectionUUID uuid) {
-    const NamespaceString cmdNss = collectionName.getCommandNS();
-    BSONObj cmdObj = BSON("emptycapped" << collectionName.coll());
+    const auto cmdNss = collectionName.getCommandNS();
+    const auto cmdObj = BSON("emptycapped" << collectionName.coll());
 
     if (!collectionName.isSystemDotProfile()) {
-        // do not replicate system.profile modifications
-        repl::logOp(opCtx, "c", cmdNss, uuid, cmdObj, nullptr, false);
+        // Do not replicate system.profile modifications
+        repl::logOp(opCtx,
+                    "c",
+                    cmdNss,
+                    uuid,
+                    cmdObj,
+                    nullptr,
+                    false,
+                    getWallClockTimeForOpLog(opCtx),
+                    {},
+                    kUninitializedStmtId,
+                    {});
     }
 
-    getGlobalAuthorizationManager()->logOp(opCtx, "c", cmdNss, cmdObj, nullptr);
+    AuthorizationManager::get(opCtx->getServiceContext())
+        ->logOp(opCtx, "c", cmdNss, cmdObj, nullptr);
 }
 
 }  // namespace mongo

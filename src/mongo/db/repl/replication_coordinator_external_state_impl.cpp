@@ -38,12 +38,14 @@
 #include "mongo/base/status_with.h"
 #include "mongo/bson/oid.h"
 #include "mongo/bson/util/bson_extract.h"
+#include "mongo/db/catalog/coll_mod.h"
 #include "mongo/db/catalog/database.h"
 #include "mongo/db/catalog/database_holder.h"
 #include "mongo/db/client.h"
 #include "mongo/db/commands/feature_compatibility_version.h"
 #include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
+#include "mongo/db/db_raii.h"
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/dbhelpers.h"
 #include "mongo/db/jsobj.h"
@@ -66,7 +68,6 @@
 #include "mongo/db/repl/replication_coordinator_global.h"
 #include "mongo/db/repl/replication_process.h"
 #include "mongo/db/repl/rs_sync.h"
-#include "mongo/db/repl/snapshot_thread.h"
 #include "mongo/db/repl/storage_interface.h"
 #include "mongo/db/s/balancer/balancer.h"
 #include "mongo/db/s/sharding_state.h"
@@ -74,6 +75,7 @@
 #include "mongo/db/server_options.h"
 #include "mongo/db/server_parameters.h"
 #include "mongo/db/service_context.h"
+#include "mongo/db/session_catalog.h"
 #include "mongo/db/storage/storage_engine.h"
 #include "mongo/executor/network_connection_hook.h"
 #include "mongo/executor/network_interface.h"
@@ -82,15 +84,15 @@
 #include "mongo/rpc/metadata/egress_metadata_hook_list.h"
 #include "mongo/s/catalog/sharding_catalog_manager.h"
 #include "mongo/s/catalog/type_shard.h"
-#include "mongo/s/catalog_cache.h"
+#include "mongo/s/catalog_cache_loader.h"
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/cluster_identity_loader.h"
 #include "mongo/s/grid.h"
 #include "mongo/stdx/functional.h"
 #include "mongo/stdx/memory.h"
 #include "mongo/stdx/thread.h"
+#include "mongo/transport/service_entry_point.h"
 #include "mongo/transport/session.h"
-#include "mongo/transport/transport_layer.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/concurrency/thread_pool.h"
 #include "mongo/util/exit.h"
@@ -118,11 +120,6 @@ const char tsFieldName[] = "ts";
 
 const char kCollectionOplogBufferName[] = "collection";
 const char kBlockingQueueOplogBufferName[] = "inMemoryBlockingQueue";
-
-// Set this to true to force background creation of snapshots even if --enableMajorityReadConcern
-// isn't specified. This can be used for A-B benchmarking to find how much overhead
-// repl::SnapshotThread introduces.
-MONGO_EXPORT_STARTUP_SERVER_PARAMETER(enableReplSnapshotThread, bool, false);
 
 // Set this to specify whether to use a collection to buffer the oplog on the destination server
 // during initial sync to prevent rolling over the oplog.
@@ -218,10 +215,20 @@ bool ReplicationCoordinatorExternalStateImpl::isInitialSyncFlagSet(OperationCont
     return _replicationProcess->getConsistencyMarkers()->getInitialSyncFlag(opCtx);
 }
 
+// This function acquires the LockManager locks on oplog, so it cannot be called while holding
+// ReplicationCoordinatorImpl's mutex.
 void ReplicationCoordinatorExternalStateImpl::startSteadyStateReplication(
     OperationContext* opCtx, ReplicationCoordinator* replCoord) {
 
+    // Initialize the cached pointer to the oplog collection, for writing to the oplog.
+    acquireOplogCollectionForLogging(opCtx);
+
     LockGuard lk(_threadMutex);
+
+    // We've shut down the external state, don't start again.
+    if (_inShutdown)
+        return;
+
     invariant(replCoord);
     invariant(!_bgSync);
     log() << "Starting replication fetcher thread";
@@ -235,8 +242,9 @@ void ReplicationCoordinatorExternalStateImpl::startSteadyStateReplication(
     _applierThread->startup();
     log() << "Starting replication reporter thread";
     invariant(!_syncSourceFeedbackThread);
-    _syncSourceFeedbackThread.reset(new stdx::thread(stdx::bind(
-        &SyncSourceFeedback::run, &_syncSourceFeedback, _taskExecutor.get(), _bgSync.get())));
+    _syncSourceFeedbackThread = stdx::make_unique<stdx::thread>([this, replCoord] {
+        _syncSourceFeedback.run(_taskExecutor.get(), _bgSync.get(), replCoord);
+    });
 }
 
 void ReplicationCoordinatorExternalStateImpl::stopDataReplication(OperationContext* opCtx) {
@@ -287,11 +295,6 @@ void ReplicationCoordinatorExternalStateImpl::startThreads(const ReplSettings& s
         return;
     }
 
-    if (settings.isMajorityReadConcernEnabled() || enableReplSnapshotThread) {
-        log() << "Starting replication snapshot thread";
-        _snapshotThread = SnapshotThread::start(_service);
-    }
-
     log() << "Starting replication storage threads";
     _service->getGlobalStorageEngine()->setJournalListener(this);
 
@@ -317,12 +320,8 @@ void ReplicationCoordinatorExternalStateImpl::shutdown(OperationContext* opCtx) 
         return;
     }
 
+    _inShutdown = true;
     _stopDataReplication_inlock(opCtx, &lk);
-
-    if (_snapshotThread) {
-        log() << "Stopping replication snapshot thread";
-        _snapshotThread->shutdown();
-    }
 
     if (_noopWriter) {
         LOG(1) << "Stopping noop writer";
@@ -336,12 +335,16 @@ void ReplicationCoordinatorExternalStateImpl::shutdown(OperationContext* opCtx) 
 
     // Perform additional shutdown steps below that must be done outside _threadMutex.
 
-    if (_replicationProcess->getConsistencyMarkers()->getOplogDeleteFromPoint(opCtx).isNull() &&
+    if (_replicationProcess->getConsistencyMarkers()->getOplogTruncateAfterPoint(opCtx).isNull() &&
         loadLastOpTime(opCtx) ==
             _replicationProcess->getConsistencyMarkers()->getAppliedThrough(opCtx)) {
         // Clear the appliedThrough marker to indicate we are consistent with the top of the
-        // oplog.
-        _replicationProcess->getConsistencyMarkers()->setAppliedThrough(opCtx, {});
+        // oplog. We record this update at the 'lastAppliedOpTime'. If there are any outstanding
+        // checkpoints being taken, they should only reflect this write if they see all writes up
+        // to our 'lastAppliedOpTime'.
+        auto lastAppliedOpTime = repl::getGlobalReplicationCoordinator()->getMyLastAppliedOpTime();
+        _replicationProcess->getConsistencyMarkers()->clearAppliedThrough(
+            opCtx, lastAppliedOpTime.getTimestamp());
     }
 }
 
@@ -378,23 +381,61 @@ Status ReplicationCoordinatorExternalStateImpl::initializeReplSetStorage(Operati
     try {
         createOplog(opCtx);
 
-        MONGO_WRITE_CONFLICT_RETRY_LOOP_BEGIN {
-            Lock::GlobalWrite globalWrite(opCtx);
+        writeConflictRetry(opCtx,
+                           "initiate oplog entry",
+                           NamespaceString::kRsOplogNamespace.toString(),
+                           [this, &opCtx, &config] {
+                               Lock::GlobalWrite globalWrite(opCtx);
 
-            WriteUnitOfWork wuow(opCtx);
-            Helpers::putSingleton(opCtx, configCollectionName, config);
-            const auto msgObj = BSON("msg"
-                                     << "initiating set");
-            _service->getOpObserver()->onOpMessage(opCtx, msgObj);
-            wuow.commit();
+                               WriteUnitOfWork wuow(opCtx);
+                               Helpers::putSingleton(opCtx, configCollectionName, config);
+                               const auto msgObj = BSON("msg"
+                                                        << "initiating set");
+                               _service->getOpObserver()->onOpMessage(opCtx, msgObj);
+                               wuow.commit();
+                               // ReplSetTest assumes that immediately after the replSetInitiate
+                               // command returns, it can allow other nodes to initial sync with no
+                               // retries and they will succeed.  Unfortunately, initial sync will
+                               // fail if it finds its sync source has an empty oplog.  Thus, we
+                               // need to wait here until the seed document is visible in our oplog.
+                               AutoGetCollection oplog(
+                                   opCtx, NamespaceString::kRsOplogNamespace, MODE_IS);
+                               waitForAllEarlierOplogWritesToBeVisible(opCtx);
+                           });
+
+        // Set UUIDs for all non-replicated collections. This is necessary for independent replica
+        // sets and config server replica sets started with no data files because collections in
+        // local are created prior to the featureCompatibilityVersion being set to 3.6, so the
+        // collections are not created with UUIDs. We exclude ShardServers when adding UUIDs to
+        // non-replicated collections on the primary because ShardServers are started up by default
+        // with featureCompatibilityVersion 3.4, so we don't want to assign UUIDs to them until the
+        // cluster's featureCompatibilityVersion is explicitly set to 3.6 by the config server. The
+        // below UUID addition for non-replicated collections only occurs on the primary; UUIDs are
+        // added to non-replicated collections on secondaries during InitialSync. When the config
+        // server sets the featureCompatibilityVersion to 3.6, the shard primary will add UUIDs to
+        // all the collections that need them. One special case here is if a shard is already in
+        // featureCompatibilityVersion 3.6 and a new node is started up with --shardsvr and added to
+        // that shard, the new node will still start up with featureCompatibilityVersion 3.4 and
+        // need to have UUIDs added to each collection. These UUIDs are added during InitialSync,
+        // because the new node is a secondary.
+        if (serverGlobalParams.clusterRole != ClusterRole::ShardServer &&
+            FeatureCompatibilityVersion::isCleanStartUp()) {
+            auto schemaStatus = updateUUIDSchemaVersionNonReplicated(opCtx, true);
+            if (!schemaStatus.isOK()) {
+                return schemaStatus;
+            }
         }
-        MONGO_WRITE_CONFLICT_RETRY_LOOP_END(opCtx, "initiate oplog entry", "local.oplog.rs");
-
         FeatureCompatibilityVersion::setIfCleanStartup(opCtx, _storageInterface);
     } catch (const DBException& ex) {
         return ex.toStatus();
     }
     return Status::OK();
+}
+
+void ReplicationCoordinatorExternalStateImpl::waitForAllEarlierOplogWritesToBeVisible(
+    OperationContext* opCtx) {
+    AutoGetCollection oplog(opCtx, NamespaceString::kRsOplogNamespace, MODE_IS);
+    oplog.getCollection()->getRecordStore()->waitForAllEarlierOplogWritesToBeVisible(opCtx);
 }
 
 void ReplicationCoordinatorExternalStateImpl::onDrainComplete(OperationContext* opCtx) {
@@ -414,28 +455,31 @@ OpTime ReplicationCoordinatorExternalStateImpl::onTransitionToPrimary(OperationC
 
     // Clear the appliedThrough marker so on startup we'll use the top of the oplog. This must be
     // done before we add anything to our oplog.
+    // We record this update at the 'lastAppliedOpTime'. If there are any outstanding
+    // checkpoints being taken, they should only reflect this write if they see all writes up
+    // to our 'lastAppliedOpTime'.
     invariant(
-        _replicationProcess->getConsistencyMarkers()->getOplogDeleteFromPoint(opCtx).isNull());
-    _replicationProcess->getConsistencyMarkers()->setAppliedThrough(opCtx, {});
+        _replicationProcess->getConsistencyMarkers()->getOplogTruncateAfterPoint(opCtx).isNull());
+    auto lastAppliedOpTime = repl::getGlobalReplicationCoordinator()->getMyLastAppliedOpTime();
+    _replicationProcess->getConsistencyMarkers()->clearAppliedThrough(
+        opCtx, lastAppliedOpTime.getTimestamp());
 
     if (isV1ElectionProtocol) {
-        MONGO_WRITE_CONFLICT_RETRY_LOOP_BEGIN {
+        writeConflictRetry(opCtx, "logging transition to primary to oplog", "local.oplog.rs", [&] {
             WriteUnitOfWork wuow(opCtx);
             opCtx->getClient()->getServiceContext()->getOpObserver()->onOpMessage(
                 opCtx,
                 BSON("msg"
                      << "new primary"));
             wuow.commit();
-        }
-        MONGO_WRITE_CONFLICT_RETRY_LOOP_END(
-            opCtx, "logging transition to primary to oplog", "local.oplog.rs");
+        });
     }
     const auto opTimeToReturn = fassertStatusOK(28665, loadLastOpTime(opCtx));
 
     _shardingOnTransitionToPrimaryHook(opCtx);
     _dropAllTempCollections(opCtx);
 
-    serverGlobalParams.featureCompatibility.validateFeaturesAsMaster.store(true);
+    serverGlobalParams.validateFeaturesAsMaster.store(true);
 
     return opTimeToReturn;
 }
@@ -475,7 +519,7 @@ OID ReplicationCoordinatorExternalStateImpl::ensureMe(OperationContext* opCtx) {
 StatusWith<BSONObj> ReplicationCoordinatorExternalStateImpl::loadLocalConfigDocument(
     OperationContext* opCtx) {
     try {
-        MONGO_WRITE_CONFLICT_RETRY_LOOP_BEGIN {
+        return writeConflictRetry(opCtx, "load replica set config", configCollectionName, [opCtx] {
             BSONObj config;
             if (!Helpers::getSingleton(opCtx, configCollectionName, config)) {
                 return StatusWith<BSONObj>(
@@ -484,8 +528,7 @@ StatusWith<BSONObj> ReplicationCoordinatorExternalStateImpl::loadLocalConfigDocu
                                   << configCollectionName);
             }
             return StatusWith<BSONObj>(config);
-        }
-        MONGO_WRITE_CONFLICT_RETRY_LOOP_END(opCtx, "load replica set config", configCollectionName);
+        });
     } catch (const DBException& ex) {
         return StatusWith<BSONObj>(ex.toStatus());
     }
@@ -494,12 +537,12 @@ StatusWith<BSONObj> ReplicationCoordinatorExternalStateImpl::loadLocalConfigDocu
 Status ReplicationCoordinatorExternalStateImpl::storeLocalConfigDocument(OperationContext* opCtx,
                                                                          const BSONObj& config) {
     try {
-        MONGO_WRITE_CONFLICT_RETRY_LOOP_BEGIN {
+        writeConflictRetry(opCtx, "save replica set config", configCollectionName, [&] {
             Lock::DBLock dbWriteLock(opCtx, configDatabaseName, MODE_X);
             Helpers::putSingleton(opCtx, configCollectionName, config);
-            return Status::OK();
-        }
-        MONGO_WRITE_CONFLICT_RETRY_LOOP_END(opCtx, "save replica set config", configCollectionName);
+        });
+
+        return Status::OK();
     } catch (const DBException& ex) {
         return ex.toStatus();
     }
@@ -508,18 +551,17 @@ Status ReplicationCoordinatorExternalStateImpl::storeLocalConfigDocument(Operati
 StatusWith<LastVote> ReplicationCoordinatorExternalStateImpl::loadLocalLastVoteDocument(
     OperationContext* opCtx) {
     try {
-        MONGO_WRITE_CONFLICT_RETRY_LOOP_BEGIN {
-            BSONObj lastVoteObj;
-            if (!Helpers::getSingleton(opCtx, lastVoteCollectionName, lastVoteObj)) {
-                return StatusWith<LastVote>(ErrorCodes::NoMatchingDocument,
-                                            str::stream()
-                                                << "Did not find replica set lastVote document in "
-                                                << lastVoteCollectionName);
-            }
-            return LastVote::readFromLastVote(lastVoteObj);
-        }
-        MONGO_WRITE_CONFLICT_RETRY_LOOP_END(
-            opCtx, "load replica set lastVote", lastVoteCollectionName);
+        return writeConflictRetry(
+            opCtx, "load replica set lastVote", lastVoteCollectionName, [opCtx] {
+                BSONObj lastVoteObj;
+                if (!Helpers::getSingleton(opCtx, lastVoteCollectionName, lastVoteObj)) {
+                    return StatusWith<LastVote>(
+                        ErrorCodes::NoMatchingDocument,
+                        str::stream() << "Did not find replica set lastVote document in "
+                                      << lastVoteCollectionName);
+                }
+                return LastVote::readFromLastVote(lastVoteObj);
+            });
     } catch (const DBException& ex) {
         return StatusWith<LastVote>(ex.toStatus());
     }
@@ -529,30 +571,37 @@ Status ReplicationCoordinatorExternalStateImpl::storeLocalLastVoteDocument(
     OperationContext* opCtx, const LastVote& lastVote) {
     BSONObj lastVoteObj = lastVote.toBSON();
     try {
-        MONGO_WRITE_CONFLICT_RETRY_LOOP_BEGIN {
-            Lock::DBLock dbWriteLock(opCtx, lastVoteDatabaseName, MODE_X);
+        Status status =
+            writeConflictRetry(opCtx, "save replica set lastVote", lastVoteCollectionName, [&] {
+                Lock::DBLock dbWriteLock(opCtx, lastVoteDatabaseName, MODE_X);
 
-            // If there is no last vote document, we want to store one. Otherwise, we only want to
-            // replace it if the new last vote document would have a higher term. We both check
-            // the term of the current last vote document and insert the new document under the
-            // DBLock to synchronize the two operations.
-            BSONObj result;
-            bool exists = Helpers::getSingleton(opCtx, lastVoteCollectionName, result);
-            if (!exists) {
-                Helpers::putSingleton(opCtx, lastVoteCollectionName, lastVoteObj);
-            } else {
-                StatusWith<LastVote> oldLastVoteDoc = LastVote::readFromLastVote(result);
-                if (!oldLastVoteDoc.isOK()) {
-                    return oldLastVoteDoc.getStatus();
-                }
-                if (lastVote.getTerm() > oldLastVoteDoc.getValue().getTerm()) {
+                // If there is no last vote document, we want to store one. Otherwise, we only want
+                // to replace it if the new last vote document would have a higher term. We both
+                // check the term of the current last vote document and insert the new document
+                // under the DBLock to synchronize the two operations.
+                BSONObj result;
+                bool exists = Helpers::getSingleton(opCtx, lastVoteCollectionName, result);
+                if (!exists) {
                     Helpers::putSingleton(opCtx, lastVoteCollectionName, lastVoteObj);
+                } else {
+                    StatusWith<LastVote> oldLastVoteDoc = LastVote::readFromLastVote(result);
+                    if (!oldLastVoteDoc.isOK()) {
+                        return oldLastVoteDoc.getStatus();
+                    }
+                    if (lastVote.getTerm() > oldLastVoteDoc.getValue().getTerm()) {
+                        Helpers::putSingleton(opCtx, lastVoteCollectionName, lastVoteObj);
+                    }
                 }
-            }
+
+                return Status::OK();
+            });
+
+        if (!status.isOK()) {
+            return status;
         }
-        MONGO_WRITE_CONFLICT_RETRY_LOOP_END(
-            opCtx, "save replica set lastVote", lastVoteCollectionName);
+
         opCtx->recoveryUnit()->waitUntilDurable();
+
         return Status::OK();
     } catch (const DBException& ex) {
         return ex.toStatus();
@@ -562,89 +611,6 @@ Status ReplicationCoordinatorExternalStateImpl::storeLocalLastVoteDocument(
 void ReplicationCoordinatorExternalStateImpl::setGlobalTimestamp(ServiceContext* ctx,
                                                                  const Timestamp& newTime) {
     setNewTimestamp(ctx, newTime);
-}
-
-void ReplicationCoordinatorExternalStateImpl::cleanUpLastApplyBatch(OperationContext* opCtx) {
-    if (_replicationProcess->getConsistencyMarkers()->getInitialSyncFlag(opCtx)) {
-        return;  // Initial Sync will take over so no cleanup is needed.
-    }
-
-    const auto deleteFromPoint =
-        _replicationProcess->getConsistencyMarkers()->getOplogDeleteFromPoint(opCtx);
-    const auto appliedThrough =
-        _replicationProcess->getConsistencyMarkers()->getAppliedThrough(opCtx);
-
-    const bool needToDeleteEndOfOplog = !deleteFromPoint.isNull() &&
-        // This version should never have a non-null deleteFromPoint with a null appliedThrough.
-        // This scenario means that we downgraded after unclean shutdown, then the downgraded node
-        // deleted the ragged end of our oplog, then did a clean shutdown.
-        !appliedThrough.isNull() &&
-        // Similarly we should never have an appliedThrough higher than the deleteFromPoint. This
-        // means that the downgraded node deleted our ragged end then applied ahead of our
-        // deleteFromPoint and then had an unclean shutdown before upgrading. We are ok with
-        // applying these ops because older versions wrote to the oplog from a single thread so we
-        // know they are in order.
-        !(appliedThrough.getTimestamp() >= deleteFromPoint);
-    if (needToDeleteEndOfOplog) {
-        log() << "Removing unapplied entries starting at: " << deleteFromPoint;
-        truncateOplogTo(opCtx, deleteFromPoint);
-    }
-    _replicationProcess->getConsistencyMarkers()->setOplogDeleteFromPoint(
-        opCtx, {});  // clear the deleteFromPoint
-
-    if (appliedThrough.isNull()) {
-        // No follow-up work to do.
-        return;
-    }
-
-    // Check if we have any unapplied ops in our oplog. It is important that this is done after
-    // deleting the ragged end of the oplog.
-    const auto topOfOplog = fassertStatusOK(40290, loadLastOpTime(opCtx));
-    if (appliedThrough == topOfOplog) {
-        return;  // We've applied all the valid oplog we have.
-    } else if (appliedThrough > topOfOplog) {
-        severe() << "Applied op " << appliedThrough << " not found. Top of oplog is " << topOfOplog
-                 << '.';
-        fassertFailedNoTrace(40313);
-    }
-
-    log() << "Replaying stored operations from " << appliedThrough << " (exclusive) to "
-          << topOfOplog << " (inclusive).";
-
-    DBDirectClient db(opCtx);
-    auto cursor = db.query(rsOplogName,
-                           QUERY("ts" << BSON("$gte" << appliedThrough.getTimestamp())),
-                           /*batchSize*/ 0,
-                           /*skip*/ 0,
-                           /*projection*/ nullptr,
-                           QueryOption_OplogReplay);
-
-    // Check that the first document matches our appliedThrough point then skip it since it's
-    // already been applied.
-    if (!cursor->more()) {
-        // This should really be impossible because we check above that the top of the oplog is
-        // strictly > appliedThrough. If this fails it represents a serious bug in either the
-        // storage engine or query's implementation of OplogReplay.
-        severe() << "Couldn't find any entries in the oplog >= " << appliedThrough
-                 << " which should be impossible.";
-        fassertFailedNoTrace(40293);
-    }
-    auto firstOpTimeFound = fassertStatusOK(40291, OpTime::parseFromOplogEntry(cursor->nextSafe()));
-    if (firstOpTimeFound != appliedThrough) {
-        severe() << "Oplog entry at " << appliedThrough << " is missing; actual entry found is "
-                 << firstOpTimeFound;
-        fassertFailedNoTrace(40292);
-    }
-
-    // Apply remaining ops one at at time, but don't log them because they are already logged.
-    UnreplicatedWritesBlock uwb(opCtx);
-
-    while (cursor->more()) {
-        auto entry = cursor->nextSafe();
-        fassertStatusOK(40294, SyncTail::syncApply(opCtx, entry, true));
-        _replicationProcess->getConsistencyMarkers()->setAppliedThrough(
-            opCtx, fassertStatusOK(40295, OpTime::parseFromOplogEntry(entry)));
-    }
 }
 
 StatusWith<OpTime> ReplicationCoordinatorExternalStateImpl::loadLastOpTime(
@@ -657,15 +623,16 @@ StatusWith<OpTime> ReplicationCoordinatorExternalStateImpl::loadLastOpTime(
         }
 
         BSONObj oplogEntry;
-        if (!Helpers::getLast(opCtx, rsOplogName.c_str(), oplogEntry)) {
+        if (!Helpers::getLast(opCtx, NamespaceString::kRsOplogNamespace.ns().c_str(), oplogEntry)) {
             return StatusWith<OpTime>(ErrorCodes::NoMatchingDocument,
                                       str::stream() << "Did not find any entries in "
-                                                    << rsOplogName);
+                                                    << NamespaceString::kRsOplogNamespace.ns());
         }
         BSONElement tsElement = oplogEntry[tsFieldName];
         if (tsElement.eoo()) {
             return StatusWith<OpTime>(ErrorCodes::NoSuchKey,
-                                      str::stream() << "Most recent entry in " << rsOplogName
+                                      str::stream() << "Most recent entry in "
+                                                    << NamespaceString::kRsOplogNamespace.ns()
                                                     << " missing \""
                                                     << tsFieldName
                                                     << "\" field");
@@ -674,7 +641,7 @@ StatusWith<OpTime> ReplicationCoordinatorExternalStateImpl::loadLastOpTime(
             return StatusWith<OpTime>(ErrorCodes::TypeMismatch,
                                       str::stream() << "Expected type of \"" << tsFieldName
                                                     << "\" in most recent "
-                                                    << rsOplogName
+                                                    << NamespaceString::kRsOplogNamespace.ns()
                                                     << " entry to have type Timestamp, but found "
                                                     << typeName(tsElement.type()));
         }
@@ -694,7 +661,7 @@ HostAndPort ReplicationCoordinatorExternalStateImpl::getClientHostAndPort(
 }
 
 void ReplicationCoordinatorExternalStateImpl::closeConnections() {
-    _service->getTransportLayer()->endAllSessions(transport::Session::kKeepOpen);
+    _service->getServiceEntryPoint()->endAllSessions(transport::Session::kKeepOpen);
 }
 
 void ReplicationCoordinatorExternalStateImpl::killAllUserOperations(OperationContext* opCtx) {
@@ -707,21 +674,18 @@ void ReplicationCoordinatorExternalStateImpl::shardingOnStepDownHook() {
         Balancer::get(_service)->interruptBalancer();
     } else if (ShardingState::get(_service)->enabled()) {
         invariant(serverGlobalParams.clusterRole == ClusterRole::ShardServer);
-        Grid::get(_service)->catalogCache()->onStepDown();
+        ShardingState::get(_service)->interruptChunkSplitter();
+        CatalogCacheLoader::get(_service).onStepDown();
     }
 
-    ShardingState::get(_service)->markCollectionsNotShardedAtStepdown();
+    if (auto validator = LogicalTimeValidator::get(_service)) {
+        auto opCtx = cc().getOperationContext();
 
-    if (serverGlobalParams.clusterRole == ClusterRole::ConfigServer) {
-        if (auto validator = LogicalTimeValidator::get(_service)) {
-            auto opCtx = cc().getOperationContext();
-
-            if (opCtx != nullptr) {
-                validator->enableKeyGenerator(opCtx, false);
-            } else {
-                auto opCtxPtr = cc().makeOperationContext();
-                validator->enableKeyGenerator(opCtxPtr.get(), false);
-            }
+        if (opCtx != nullptr) {
+            validator->enableKeyGenerator(opCtx, false);
+        } else {
+            auto opCtxPtr = cc().makeOperationContext();
+            validator->enableKeyGenerator(opCtxPtr.get(), false);
         }
     }
 }
@@ -739,7 +703,7 @@ void ReplicationCoordinatorExternalStateImpl::_shardingOnTransitionToPrimaryHook
     fassertStatusOK(40107, status);
 
     if (serverGlobalParams.clusterRole == ClusterRole::ConfigServer) {
-        status = Grid::get(opCtx)->catalogManager()->initializeConfigDatabaseIfNeeded(opCtx);
+        status = ShardingCatalogManager::get(opCtx)->initializeConfigDatabaseIfNeeded(opCtx);
         if (!status.isOK() && status != ErrorCodes::AlreadyInitialized) {
             if (ErrorCodes::isShutdownError(status.code())) {
                 // Don't fassert if we're mid-shutdown, let the shutdown happen gracefully.
@@ -774,7 +738,7 @@ void ReplicationCoordinatorExternalStateImpl::_shardingOnTransitionToPrimaryHook
         }
 
         // Free any leftover locks from previous instantiations.
-        auto distLockManager = Grid::get(opCtx)->catalogClient(opCtx)->getDistLockManager();
+        auto distLockManager = Grid::get(opCtx)->catalogClient()->getDistLockManager();
         distLockManager->unlockAll(opCtx, distLockManager->getProcessID());
 
         // If this is a config server node becoming a primary, start the balancer
@@ -795,12 +759,15 @@ void ReplicationCoordinatorExternalStateImpl::_shardingOnTransitionToPrimaryHook
                       << configsvrConnStr << causedBy(status);
         }
 
-        Grid::get(_service)->catalogCache()->onStepUp();
+        CatalogCacheLoader::get(_service).onStepUp();
+        ShardingState::get(_service)->initiateChunkSplitter();
+    } else {  // unsharded
+        if (auto validator = LogicalTimeValidator::get(_service)) {
+            validator->enableKeyGenerator(opCtx, true);
+        }
     }
 
-    // There is a slight chance that some stale metadata might have been loaded before the latest
-    // optime has been recovered, so throw out everything that we have up to now
-    ShardingState::get(opCtx)->markCollectionsNotShardedAtStepdown();
+    SessionCatalog::get(_service)->onStepUp(opCtx);
 }
 
 void ReplicationCoordinatorExternalStateImpl::signalApplierToChooseNewSyncSource() {
@@ -849,26 +816,17 @@ void ReplicationCoordinatorExternalStateImpl::dropAllSnapshots() {
         manager->dropAllSnapshots();
 }
 
-void ReplicationCoordinatorExternalStateImpl::updateCommittedSnapshot(SnapshotName newCommitPoint) {
+void ReplicationCoordinatorExternalStateImpl::updateCommittedSnapshot(
+    const OpTime& newCommitPoint) {
     auto manager = _service->getGlobalStorageEngine()->getSnapshotManager();
-    invariant(manager);  // This should never be called if there is no SnapshotManager.
-    manager->setCommittedSnapshot(newCommitPoint);
-}
-
-void ReplicationCoordinatorExternalStateImpl::createSnapshot(OperationContext* opCtx,
-                                                             SnapshotName name) {
-    auto manager = _service->getGlobalStorageEngine()->getSnapshotManager();
-    invariant(manager);  // This should never be called if there is no SnapshotManager.
-    manager->createSnapshot(opCtx, name);
-}
-
-void ReplicationCoordinatorExternalStateImpl::forceSnapshotCreation() {
-    if (_snapshotThread)
-        _snapshotThread->forceSnapshot();
+    if (manager) {
+        manager->setCommittedSnapshot(newCommitPoint.getTimestamp());
+    }
+    notifyOplogMetadataWaiters(newCommitPoint);
 }
 
 bool ReplicationCoordinatorExternalStateImpl::snapshotsEnabled() const {
-    return _snapshotThread != nullptr;
+    return _service->getGlobalStorageEngine()->getSnapshotManager() != nullptr;
 }
 
 void ReplicationCoordinatorExternalStateImpl::notifyOplogMetadataWaiters(
@@ -959,7 +917,7 @@ void ReplicationCoordinatorExternalStateImpl::onDurable(const JournalListener::T
 
 void ReplicationCoordinatorExternalStateImpl::startNoopWriter(OpTime opTime) {
     invariant(_noopWriter);
-    _noopWriter->startWritingPeriodicNoops(opTime);
+    _noopWriter->startWritingPeriodicNoops(opTime).transitional_ignore();
 }
 
 void ReplicationCoordinatorExternalStateImpl::stopNoopWriter() {

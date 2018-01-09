@@ -1,6 +1,16 @@
+/**
+ * This test is labeled resource intensive because its total io_write is 47MB compared to a median
+ * of 5MB across all sharding tests in wiredTiger. Its total io_write is 1540MB compared to a median
+ * of 135MB in mmapv1.
+ * @tags: [resource_intensive]
+ */
 load("jstests/replsets/rslib.js");
 
 var NODE_COUNT = 2;
+
+// Checking UUID consistency involves reading from the config server through mongos, but this test
+// sets an invalid readPreference on the connection to the mongos.
+TestData.skipCheckingUUIDsConsistentAcrossCluster = true;
 
 /**
  * Prepare to call testReadPreference() or assertFailure().
@@ -178,11 +188,23 @@ var testReadPreference = function(conn, hostList, isMongos, mode, tagSets, secEx
             formatProfileQuery({aggregate: 'mrIn'}));
 
     // Test $currentOp aggregation stage.
-    // TODO SERVER-19318: Remove check once the $currentOp stage is supported on mongos.
     if (!isMongos) {
         let curOpComment = 'agg_currentOp_' + ObjectId();
 
-        cmdTest({aggregate: 1, pipeline: [{$currentOp: {}}], comment: curOpComment, cursor: {}},
+        // A $currentOp without any foreign namespaces takes no collection locks and will not be
+        // profiled, so we add a dummy $lookup stage to force an entry in system.profile.
+        cmdTest({
+            aggregate: 1,
+            pipeline: [
+                {$currentOp: {}},
+                {
+                  $lookup:
+                      {from: "dummy", localField: "dummy", foreignField: "dummy", as: "dummy"}
+                }
+            ],
+            comment: curOpComment,
+            cursor: {}
+        },
                 true,
                 formatProfileQuery({comment: curOpComment}),
                 "admin");

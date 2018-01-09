@@ -70,6 +70,27 @@ class AuthorizationSession {
 
 public:
     /**
+     * Provides a way to swap out impersonate data for the duration of the ScopedImpersonate's
+     * lifetime.
+     */
+    class ScopedImpersonate {
+    public:
+        ScopedImpersonate(AuthorizationSession* authSession,
+                          std::vector<UserName>* users,
+                          std::vector<RoleName>* roles);
+        ~ScopedImpersonate();
+
+    private:
+        void swap();
+
+        AuthorizationSession& _authSession;
+        std::vector<UserName>& _users;
+        std::vector<RoleName>& _roles;
+    };
+
+    friend class ScopedImpersonate;
+
+    /**
      * Gets the AuthorizationSession associated with the given "client", or nullptr.
      *
      * The "client" object continues to own the returned AuthorizationSession.
@@ -118,6 +139,10 @@ public:
     // The user remains in the _authenticatedUsers set for this AuthorizationSession,
     // and ownership of the user stays with the AuthorizationManager
     User* lookupUser(const UserName& name);
+
+    // Returns the single user on this auth session. If no user is authenticated, or if
+    // multiple users are authenticated, this method will throw an exception.
+    User* getSingleUser();
 
     // Gets an iterator over the names of all authenticated users stored in this manager.
     UserNameIterator getAuthenticatedUserNames();
@@ -177,19 +202,19 @@ public:
     // Checks if this connection has the privileges necessary to perform a killCursor on
     // the identified cursor, supposing that cursor is associated with the supplied namespace
     // identifier.
-    Status checkAuthForKillCursors(const NamespaceString& ns, long long cursorID);
+    Status checkAuthForKillCursors(const NamespaceString& cursorNss, UserNameIterator cursorOwner);
 
     // Checks if this connection has the privileges necessary to run the aggregation pipeline
-    // specified in 'cmdObj' on the namespace 'ns'.
-    Status checkAuthForAggregate(const NamespaceString& ns, const BSONObj& cmdObj);
+    // specified in 'cmdObj' on the namespace 'ns' either directly on mongoD or via mongoS.
+    Status checkAuthForAggregate(const NamespaceString& ns, const BSONObj& cmdObj, bool isMongos);
 
     // Checks if this connection has the privileges necessary to create 'ns' with the options
-    // supplied in 'cmdObj'.
-    Status checkAuthForCreate(const NamespaceString& ns, const BSONObj& cmdObj);
+    // supplied in 'cmdObj' either directly on mongoD or via mongoS.
+    Status checkAuthForCreate(const NamespaceString& ns, const BSONObj& cmdObj, bool isMongos);
 
     // Checks if this connection has the privileges necessary to modify 'ns' with the options
-    // supplied in 'cmdObj'.
-    Status checkAuthForCollMod(const NamespaceString& ns, const BSONObj& cmdObj);
+    // supplied in 'cmdObj' either directly on mongoD or via mongoS.
+    Status checkAuthForCollMod(const NamespaceString& ns, const BSONObj& cmdObj, bool isMongos);
 
     // Checks if this connection has the privileges necessary to grant the given privilege
     // to a role.
@@ -198,6 +223,13 @@ public:
     // Checks if this connection has the privileges necessary to revoke the given privilege
     // from a role.
     Status checkAuthorizedToRevokePrivilege(const Privilege& privilege);
+
+    // Checks if this connection is using the localhost bypass
+    bool isUsingLocalhostBypass();
+
+    // Checks if this connection has the privileges necessary to parse a namespace from a
+    // given BSONElement.
+    bool isAuthorizedToParseNamespaceElement(const BSONElement& elem);
 
     // Checks if this connection has the privileges necessary to create a new role
     bool isAuthorizedToCreateRole(const auth::CreateOrUpdateRoleArgs& args);
@@ -301,23 +333,13 @@ protected:
 private:
     // If any users authenticated on this session are marked as invalid this updates them with
     // up-to-date information. May require a read lock on the "admin" db to read the user data.
-    //
-    // When refreshing a user document, we will use the current user's id to confirm that our
-    // user is of the same generation as the refreshed user document. If the generations don't
-    // match we will remove the outdated user document from the cache.
     void _refreshUserInfoAsNeeded(OperationContext* opCtx);
+
 
     // Checks if this connection is authorized for the given Privilege, ignoring whether or not
     // we should even be doing authorization checks in general.  Note: this may acquire a read
     // lock on the admin database (to update out-of-date user privilege information).
     bool _isAuthorizedForPrivilege(const Privilege& privilege);
-
-    // Helper for recursively checking for privileges in an aggregation pipeline.
-    void _addPrivilegesForStage(const std::string& db,
-                                const BSONObj& cmdObj,
-                                PrivilegeVector* requiredPrivileges,
-                                BSONObj stageSpec,
-                                bool haveRecursed = false);
 
     std::unique_ptr<AuthzSessionExternalState> _externalState;
 
@@ -328,4 +350,10 @@ private:
     bool _impersonationFlag;
 };
 
+// Returns a status encoding whether the current session in the specified `opCtx` has privilege to
+// access a cursor in the specified `cursorSessionId` parameter.  Returns `Status::OK()`, when the
+// session is accessible.  Returns a `mongo::Status` with information regarding the nature of
+// session inaccessibility when the session is not accessible.
+Status checkCursorSessionPrivilege(OperationContext* const opCtx,
+                                   const boost::optional<LogicalSessionId> cursorSessionId);
 }  // namespace mongo

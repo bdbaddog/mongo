@@ -16,11 +16,17 @@ env.Library(
 )
 
 env.Library(
+    target='mmap_v1_options',
+    source=[
+        'mmap_v1_options.cpp',
+    ],
+)
+
+env.Library(
     target = 'storage_mmapv1',
     source = [ "aligned_builder.cpp",
                "catalog/hashtab.cpp",
                "catalog/index_details.cpp",
-               "catalog/namespace.cpp",
                "catalog/namespace_details.cpp",
                "catalog/namespace_details_collection_entry.cpp",
                "catalog/namespace_details_rsv1_metadata.cpp",
@@ -52,6 +58,7 @@ env.Library(
         'logfile',
         'compress',
         'paths',
+        'mmap_v1_options',
         '$BUILD_DIR/mongo/db/catalog/collection_options',
         '$BUILD_DIR/mongo/db/catalog/database',
         '$BUILD_DIR/mongo/db/catalog/database_holder',
@@ -61,7 +68,6 @@ env.Library(
         '$BUILD_DIR/mongo/db/commands',
         '$BUILD_DIR/mongo/db/commands/server_status',
         '$BUILD_DIR/mongo/db/concurrency/lock_manager',
-        '$BUILD_DIR/mongo/db/diag_log',
         '$BUILD_DIR/mongo/db/index_names',
         '$BUILD_DIR/mongo/db/index/index_descriptor',
         '$BUILD_DIR/mongo/db/storage/journal_listener',
@@ -69,7 +75,7 @@ env.Library(
         '$BUILD_DIR/mongo/db/storage/storage_engine_lock_file',
         '$BUILD_DIR/mongo/db/storage/storage_engine_metadata',
         '$BUILD_DIR/mongo/db/index/index_access_methods',
-        '$BUILD_DIR/mongo/db/ops/write_ops',
+        '$BUILD_DIR/mongo/db/write_ops',
     ],
 )
 
@@ -201,6 +207,9 @@ if mmapv1:
                 ],
         LIBDEPS=[
             '$BUILD_DIR/mongo/db/serveronly',
+            '$BUILD_DIR/mongo/db/service_context',
+            '$BUILD_DIR/mongo/db/storage/storage_engine_metadata',
+            '$BUILD_DIR/mongo/db/storage/storage_options',
             ],
         )
 

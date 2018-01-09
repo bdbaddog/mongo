@@ -36,9 +36,10 @@
 #include "mongo/util/string_map.h"
 #include "mongo/util/time_support.h"
 
-struct timelib_time;
+struct _timelib_error_container;
+struct _timelib_time;
 struct _timelib_tzdb;
-struct timelib_tzinfo;
+struct _timelib_tzinfo;
 
 namespace mongo {
 
@@ -48,12 +49,13 @@ namespace mongo {
  * for the hour, minute, or second of a date, even when given the same date.
  */
 class TimeZone {
+
 public:
     /**
      * A struct with member variables describing the different parts of the date.
      */
     struct DateParts {
-        DateParts(const timelib_time&, Date_t);
+        DateParts(const _timelib_time&, Date_t);
 
         int year;
         int month;
@@ -64,19 +66,85 @@ public:
         int millisecond;
     };
 
-    explicit TimeZone(timelib_tzinfo* tzInfo);
+    /**
+     * A struct with member variables describing the different parts of the ISO8601 date.
+     */
+    struct Iso8601DateParts {
+        Iso8601DateParts(const _timelib_time&, Date_t);
+
+        int year;
+        int weekOfYear;
+        int dayOfWeek;
+        int hour;
+        int minute;
+        int second;
+        int millisecond;
+    };
+
+    /**
+     * A custom-deleter which destructs a timelib_time* when it goes out of scope.
+     */
+    struct TimelibTimeDeleter {
+        TimelibTimeDeleter() = default;
+        void operator()(_timelib_time* time);
+    };
+
+    explicit TimeZone(_timelib_tzinfo* tzInfo);
+    explicit TimeZone(Seconds utcOffsetSeconds);
     TimeZone() = default;
 
+    /**
+     * Returns a Date_t populated with the argument values for the current timezone.
+     */
+    Date_t createFromDateParts(
+        int year, int month, int day, int hour, int minute, int second, int millisecond) const;
+
+    /**
+     * Returns a Date_t populated with the argument values for the current timezone.
+     */
+    Date_t createFromIso8601DateParts(int isoYear,
+                                      int isoWeekYear,
+                                      int isoDayOfWeek,
+                                      int hour,
+                                      int minute,
+                                      int second,
+                                      int millisecond) const;
     /**
      * Returns a struct with members for each piece of the date.
      */
     DateParts dateParts(Date_t) const;
 
     /**
+     * Returns a struct with members for each piece of the ISO8601 date.
+     */
+    Iso8601DateParts dateIso8601Parts(Date_t) const;
+
+    /**
      * Returns the year according to the ISO 8601 standard. For example, Dec 31, 2014 is considered
      * part of 2014 by the ISO standard.
      */
     long long isoYear(Date_t) const;
+
+    /**
+     * Returns whether this is the zone representing UTC.
+     */
+    bool isUtcZone() const {
+        return (_tzInfo == nullptr && !durationCount<Seconds>(_utcOffset));
+    }
+
+    /**
+     * Returns whether this is a zone representing a UTC offset, like "+04:00".
+     */
+    bool isUtcOffsetZone() const {
+        return durationCount<Seconds>(_utcOffset) != 0;
+    }
+
+    /**
+     * Returns whether this is a zone representing an Olson time zone, like "Europe/London".
+     */
+    bool isTimeZoneIDZone() const {
+        return _tzInfo != nullptr;
+    }
 
     /**
      * Returns the weekday number, ranging from 1 (for Sunday) to 7 (for Saturday).
@@ -104,6 +172,16 @@ public:
      * with the week (Monday through Sunday) that contains the year’s first Thursday.
      */
     int isoWeek(Date_t) const;
+
+    /**
+     * Returns the number of seconds offset from UTC.
+     */
+    Seconds utcOffset(Date_t) const;
+
+    /**
+     * Adjusts 'timelibTime' according to this time zone definition.
+     */
+    void adjustTimeZone(_timelib_time* timelibTime) const;
 
     /**
      * Converts a date object to a string according to 'format'. 'format' can be any string literal,
@@ -134,13 +212,7 @@ public:
                     break;
                 case 'Y':  // Year
                 {
-                    auto year = parts.year;
-                    uassert(18537,
-                            str::stream() << "$dateToString is only defined on year 0-9999,"
-                                          << " tried to use year "
-                                          << year,
-                            (year >= 0) && (year <= 9999));
-                    insertPadded(os, year, 4);
+                    insertPadded(os, parts.year, 4);
                     break;
                 }
                 case 'm':  // Month
@@ -179,6 +251,17 @@ public:
                 case 'u':  // Iso day of week
                     insertPadded(os, isoDayOfWeek(date), 1);
                     break;
+                case 'z':  // UTC offset as ±hhmm.
+                {
+                    auto offset = utcOffset(date);
+                    os << ((offset.count() < 0) ? "-" : "+");                            // sign
+                    insertPadded(os, std::abs(durationCount<Hours>(offset)), 2);         // hh
+                    insertPadded(os, std::abs(durationCount<Minutes>(offset)) % 60, 2);  // mm
+                    break;
+                }
+                case 'Z':  // UTC offset in minutes.
+                    os << durationCount<Minutes>(utcOffset(date));
+                    break;
                 default:
                     // Should never happen as format is pre-validated
                     invariant(false);
@@ -193,7 +276,7 @@ public:
     static void validateFormat(StringData format);
 
 private:
-    timelib_time getTimelibTime(Date_t) const;
+    std::unique_ptr<_timelib_time, TimelibTimeDeleter> getTimelibTime(Date_t) const;
 
     /**
      * Only works with 1 <= spaces <= 4 and 0 <= number <= 9999. If spaces is less than the digit
@@ -203,8 +286,12 @@ private:
     void insertPadded(OutputStream& os, int number, int width) const {
         invariant(width >= 1);
         invariant(width <= 4);
-        invariant(number >= 0);
-        invariant(number <= 9999);
+
+        uassert(18537,
+                str::stream() << "Could not convert date to string: date component was outside "
+                              << "the supported range of 0-9999: "
+                              << number,
+                (number >= 0) && (number <= 9999));
 
         int digits = 1;
 
@@ -223,11 +310,14 @@ private:
     }
 
     struct TimelibTZInfoDeleter {
-        void operator()(timelib_tzinfo* tzInfo);
+        void operator()(_timelib_tzinfo* tzInfo);
     };
 
-    // null if this TimeZone represents the default UTC TimeZone.
-    std::shared_ptr<timelib_tzinfo> _tzInfo;
+    // null if this TimeZone represents the default UTC time zone, or a UTC-offset time zone
+    std::shared_ptr<_timelib_tzinfo> _tzInfo;
+
+    // represents the UTC offset in seconds if _tzInfo is null and it is not 0
+    Seconds _utcOffset{0};
 };
 
 /**
@@ -248,7 +338,16 @@ public:
     };
 
     /**
-     * Returns the TimeZoneDatabase object associated with the specified service context.
+     * A custom-deleter which destructs a timelib_error_container* when it goes out of scope.
+     */
+    struct TimelibErrorContainerDeleter {
+        TimelibErrorContainerDeleter() = default;
+        void operator()(_timelib_error_container* errorContainer);
+    };
+
+    /**
+     * Returns the TimeZoneDatabase object associated with the specified service context or nullptr
+     * if none exists.
      */
     static const TimeZoneDatabase* get(ServiceContext* serviceContext);
 
@@ -259,9 +358,32 @@ public:
                     std::unique_ptr<TimeZoneDatabase> timeZoneDatabase);
 
     /**
+     * Constructs a Date_t from a string description of a date.
+     *
+     * 'dateString' may contain time zone information if the information is simply an offset from
+     * UTC, in which case the returned Date_t will be adjusted accordingly.
+     *
+     * Throws a AssertionException if any of the following occur:
+     *  * The string cannot be parsed into a date.
+     *  * The string specifies a time zone that is not simply an offset from UTC, like
+     *    in the string "July 4, 2017 America/New_York".
+     *  * 'tz' is provided, but 'dateString' specifies a timezone, like 'Z' in the
+     *    string '2017-07-04T00:00:00Z'.
+     *  * 'tz' is provided, but 'dateString' specifies an offset from UTC, like '-0400'
+     *    in the string '2017-07-04 -0400'.
+     */
+    Date_t fromString(StringData dateString, boost::optional<TimeZone> tz) const;
+
+    /**
      * Returns a TimeZone object representing the UTC time zone.
      */
     static TimeZone utcZone();
+
+    /**
+     * Returns a TimeZone object representing the zone given by 'timeZoneId', or boost::none if it
+     * was not a recognized time zone.
+     */
+    TimeZone getTimeZone(StringData timeZoneId) const;
 
     /**
      * Creates a TimeZoneDatabase object with time zone data loaded from timelib's built-in timezone
@@ -280,6 +402,12 @@ private:
      * 'timeZoneDatabase'.
      */
     void loadTimeZoneInfo(std::unique_ptr<_timelib_tzdb, TimeZoneDBDeleter> timeZoneDatabase);
+
+    /**
+     * Tries to find a UTC offset in 'offsetSpec' in an ISO8601 format (±HH, ±HHMM, or ±HH:MM) and
+     * returns it as an offset to UTC in seconds.
+     */
+    boost::optional<Seconds> parseUtcOffset(StringData offsetSpec) const;
 
     // A map from the time zone name to the struct describing the timezone. These are pre-populated
     // at startup to avoid reading the source files repeatedly.

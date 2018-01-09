@@ -4,8 +4,6 @@ Import("env")
 
 env = env.Clone()
 
-env.Library('serverauth', ['mongo_authentication_session.cpp'])
-
 generateActionTypes = env.Command(
     target=['action_type.h', 'action_type.cpp'],
     source=['generate_action_types.py', 'action_types.txt'],
@@ -21,7 +19,6 @@ env.Library('auth_rolename', ['role_name.cpp'],
 env.Library(
     target = 'authentication_restriction',
     source = [
-        'restriction.cpp',
         'restriction_environment.cpp',
     ],
     LIBDEPS = [
@@ -31,40 +28,81 @@ env.Library(
     ],
 )
 
+env.Library(
+    target='user_name',
+    source=[
+        'user_name.cpp',
+    ],
+    LIBDEPS=[
+        '$BUILD_DIR/mongo/base',
+    ],
+)
+
+env.CppUnitTest(
+    target = 'restriction_test',
+    source = 'restriction_test.cpp',
+    LIBDEPS = [
+        '$BUILD_DIR/mongo/base',
+        'authentication_restriction',
+    ],
+)
+
+
 # Just the data structures used
-env.Library('authcore', ['action_set.cpp',
-                         'action_type.cpp',
-                         'authorization_manager.cpp',
-                         'authorization_session.cpp',
-                         'auth_decorations.cpp',
-                         'authz_manager_external_state.cpp',
-                         'authz_manager_external_state_local.cpp',
-                         'authz_session_external_state.cpp',
-                         'privilege.cpp',
-                         'privilege_parser.cpp',
-                         'resource_pattern.cpp',
-                         'role_graph.cpp',
-                         'role_graph_update.cpp',
-                         'role_graph_builtin_roles.cpp',
-                         'user.cpp',
-                         'user_document_parser.cpp',
-                         'user_management_commands_parser.cpp',
-                         'user_name.cpp',
-                         'user_set.cpp'],
-            LIBDEPS=['auth_rolename',
-                     'authentication_restriction',
-                     'sasl_options',
-                     '$BUILD_DIR/mongo/base',
-                     '$BUILD_DIR/mongo/bson/mutable/mutable_bson',
-                     '$BUILD_DIR/mongo/bson/util/bson_extract',
-                     '$BUILD_DIR/mongo/crypto/scramauth',
-                     '$BUILD_DIR/mongo/db/catalog/document_validation',
-                     '$BUILD_DIR/mongo/db/common',
-                     '$BUILD_DIR/mongo/db/namespace_string',
-                     '$BUILD_DIR/mongo/db/service_context',
-                     '$BUILD_DIR/mongo/db/update/update_driver',
-                     '$BUILD_DIR/mongo/util/md5',
-                     '$BUILD_DIR/mongo/util/net/network'])
+env.Library(
+    target='authcore',
+    source=[
+        'authorization_manager.cpp',
+        'authorization_session.cpp',
+        'auth_decorations.cpp',
+        'authz_manager_external_state.cpp',
+        'authz_manager_external_state_local.cpp',
+        'authz_session_external_state.cpp',
+        'role_graph.cpp',
+        'role_graph_update.cpp',
+        'role_graph_builtin_roles.cpp',
+        'user.cpp',
+        'user_document_parser.cpp',
+        'user_management_commands_parser.cpp',
+        'user_set.cpp'
+    ],
+    LIBDEPS=[
+             'address_restriction',
+             'authprivilege',
+             'auth_rolename',
+             'authentication_restriction',
+             'sasl_options',
+             'user_name',
+             '$BUILD_DIR/mongo/base',
+             '$BUILD_DIR/mongo/bson/mutable/mutable_bson',
+             '$BUILD_DIR/mongo/bson/util/bson_extract',
+             '$BUILD_DIR/mongo/crypto/scramauth',
+             '$BUILD_DIR/mongo/db/catalog/document_validation',
+             '$BUILD_DIR/mongo/db/common',
+             '$BUILD_DIR/mongo/db/mongod_options',
+             '$BUILD_DIR/mongo/db/namespace_string',
+             '$BUILD_DIR/mongo/db/pipeline/lite_parsed_document_source',
+             '$BUILD_DIR/mongo/db/service_context',
+             '$BUILD_DIR/mongo/db/update/update_driver',
+             '$BUILD_DIR/mongo/util/md5',
+             '$BUILD_DIR/mongo/util/net/network',
+    ],
+)
+
+env.Library(
+    target='authprivilege',
+    source=[
+        'action_set.cpp',
+        'action_type.cpp',
+        'privilege.cpp',
+        'privilege_parser.cpp',
+        'resource_pattern.cpp',
+    ],
+    LIBDEPS=[
+        '$BUILD_DIR/mongo/base',
+        '$BUILD_DIR/mongo/db/common',
+    ]
+)
 
 env.Library('authcommon',
             ['internal_user_auth.cpp'],
@@ -150,12 +188,10 @@ env.Library('saslauth',
 env.Library('authmongod',
             ['authz_manager_external_state_d.cpp',
              'authz_session_external_state_d.cpp',
-             'auth_index_d.cpp',
              'impersonation_session.cpp'
             ],
             LIBDEPS=[
                 'authservercommon',
-                '$BUILD_DIR/mongo/db/catalog/index_key_validate',
                 '$BUILD_DIR/mongo/db/db_raii',
                 '$BUILD_DIR/mongo/db/dbdirectclient',
                 '$BUILD_DIR/mongo/db/dbhelpers',
@@ -226,13 +262,45 @@ env.CppUnitTest(
         'authmocks',
         'saslauth',
         'authorization_session_for_test',
+        '$BUILD_DIR/mongo/db/pipeline/document_source',
+        '$BUILD_DIR/mongo/db/service_context_d_test_fixture',
+        '$BUILD_DIR/mongo/transport/transport_layer_mock',
     ]
 )
 
-env.CppUnitTest('sasl_scramsha1_test',
-                'sasl_scramsha1_test.cpp',
-                LIBDEPS=[
-                    'saslauth',
-                    '$BUILD_DIR/mongo/client/sasl_client',
-                ])
+env.Library(
+    target='address_restriction',
+    source=[
+        'address_restriction.cpp',
+        env.Idlc('address_restriction.idl')[0],
+    ],
+    LIBDEPS_PRIVATE=[
+        'authentication_restriction',
+        '$BUILD_DIR/mongo/base',
+        '$BUILD_DIR/mongo/util/net/network',
+        '$BUILD_DIR/mongo/idl/idl_parser',
+    ],
+)
+
+env.CppUnitTest(
+    target='address_restriction_test',
+    source='address_restriction_test.cpp',
+    LIBDEPS=[
+       'address_restriction',
+       '$BUILD_DIR/mongo/base',
+       '$BUILD_DIR/mongo/util/net/network',
+    ],
+)
+
+env.CppUnitTest(
+    target='sasl_scramsha1_test',
+    source=[
+        'sasl_authentication_session_test.cpp',
+        'sasl_scramsha1_test.cpp',
+    ],
+    LIBDEPS_PRIVATE=[
+        'saslauth',
+        '$BUILD_DIR/mongo/client/sasl_client',
+    ],
+)
 

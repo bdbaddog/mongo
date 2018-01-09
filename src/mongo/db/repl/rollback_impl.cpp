@@ -26,151 +26,227 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kReplication
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kReplicationRollback
 
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/repl/rollback_impl.h"
 
-#include <exception>
-
-#include "mongo/db/client.h"
 #include "mongo/db/concurrency/d_concurrency.h"
+#include "mongo/db/logical_time_validator.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/repl/replication_coordinator.h"
-#include "mongo/db/repl/rollback_impl_listener.h"
+#include "mongo/db/repl/replication_process.h"
+#include "mongo/db/repl/roll_back_local_operations.h"
+#include "mongo/db/repl/storage_interface.h"
 #include "mongo/db/s/shard_identity_rollback_notifier.h"
-#include "mongo/stdx/memory.h"
-#include "mongo/util/assert_util.h"
+#include "mongo/db/session_catalog.h"
 #include "mongo/util/log.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/scopeguard.h"
 
 namespace mongo {
 namespace repl {
 
-namespace {
-
-/**
- * Creates an operation context using the current Client.
- */
-ServiceContext::UniqueOperationContext makeOpCtx() {
-    return cc().makeOperationContext();
-}
-
-}  // namespace
-
-RollbackImpl::RollbackImpl(executor::TaskExecutor* executor,
-                           OplogInterface* localOplog,
-                           const HostAndPort& syncSource,
-                           const NamespaceString& remoteOplogNss,
-                           std::size_t maxFetcherRestarts,
-                           int requiredRollbackId,
-                           ReplicationCoordinator* replicationCoordinator,
+RollbackImpl::RollbackImpl(OplogInterface* localOplog,
+                           OplogInterface* remoteOplog,
                            StorageInterface* storageInterface,
-                           const OnCompletionFn& onCompletion)
-    : AbstractAsyncComponent(executor, "rollback"),
-      _localOplog(localOplog),
-      _syncSource(syncSource),
-      _remoteOplogNss(remoteOplogNss),
-      _maxFetcherRestarts(maxFetcherRestarts),
-      _requiredRollbackId(requiredRollbackId),
-      _replicationCoordinator(replicationCoordinator),
+                           ReplicationProcess* replicationProcess,
+                           ReplicationCoordinator* replicationCoordinator,
+                           Listener* listener)
+    : _localOplog(localOplog),
+      _remoteOplog(remoteOplog),
       _storageInterface(storageInterface),
-      _listener(stdx::make_unique<Listener>()),
-      _commonPointResolver(stdx::make_unique<RollbackCommonPointResolver>(
-          executor,
-          syncSource,
-          remoteOplogNss,
-          maxFetcherRestarts,
-          localOplog,
-          _listener.get(),
-          stdx::bind(&RollbackImpl::_commonPointResolverCallback, this, stdx::placeholders::_1))),
-      _onCompletion(onCompletion) {
-    // Task executor will be validated by AbstractAsyncComponent's constructor.
+      _replicationProcess(replicationProcess),
+      _replicationCoordinator(replicationCoordinator),
+      _listener(listener) {
+
     invariant(localOplog);
-    uassert(ErrorCodes::BadValue, "sync source must be valid", !syncSource.empty());
-    invariant(replicationCoordinator);
+    invariant(remoteOplog);
     invariant(storageInterface);
-    invariant(onCompletion);
+    invariant(replicationProcess);
+    invariant(replicationCoordinator);
+    invariant(listener);
 }
+
+RollbackImpl::RollbackImpl(OplogInterface* localOplog,
+                           OplogInterface* remoteOplog,
+                           StorageInterface* storageInterface,
+                           ReplicationProcess* replicationProcess,
+                           ReplicationCoordinator* replicationCoordinator)
+    : RollbackImpl(localOplog,
+                   remoteOplog,
+                   storageInterface,
+                   replicationProcess,
+                   replicationCoordinator,
+                   {}) {}
 
 RollbackImpl::~RollbackImpl() {
     shutdown();
-    join();
 }
 
-// static
-StatusWith<OpTime> RollbackImpl::readLocalRollbackInfoAndApplyUntilConsistentWithSyncSource(
-    ReplicationCoordinator* replicationCoordinator, StorageInterface* storageInterface) {
-    return {ErrorCodes::InternalError, "Method not implemented"};
-}
-
-Status RollbackImpl::_doStartup_inlock() noexcept {
-    return _scheduleWorkAndSaveHandle_inlock(
-        stdx::bind(&RollbackImpl::_transitionToRollbackCallback, this, stdx::placeholders::_1),
-        &_transitionToRollbackHandle,
-        str::stream() << "_transitionToRollbackCallback");
-}
-
-void RollbackImpl::_doShutdown_inlock() noexcept {
-    _cancelHandle_inlock(_transitionToRollbackHandle);
-    _shutdownComponent_inlock(_commonPointResolver);
-}
-
-stdx::mutex* RollbackImpl::_getMutex() noexcept {
-    return &_mutex;
-}
-
-void RollbackImpl::_transitionToRollbackCallback(
-    const executor::TaskExecutor::CallbackArgs& callbackArgs) {
-    auto status = _checkForShutdownAndConvertStatus(
-        callbackArgs, str::stream() << "error before transition to ROLLBACK");
+Status RollbackImpl::runRollback(OperationContext* opCtx) {
+    auto status = _transitionToRollback(opCtx);
     if (!status.isOK()) {
-        _finishCallback(nullptr, status);
-        return;
+        return status;
+    }
+    _listener->onTransitionToRollback();
+
+    auto commonPointSW = _findCommonPoint();
+    if (!commonPointSW.isOK()) {
+        return commonPointSW.getStatus();
     }
 
-    log() << "Rollback - transition to ROLLBACK";
-    auto opCtx = makeOpCtx();
-    {
-        Lock::GlobalWrite globalWrite(opCtx.get());
+    // Persist the common point to the 'oplogTruncateAfterPoint' document. We save this value so
+    // that the replication recovery logic knows where to truncate the oplog. Note that it must be
+    // saved *durably* in case a crash occurs after the storage engine recovers to the stable
+    // timestamp. Upon startup after such a crash, the standard replication recovery code will know
+    // where to truncate the oplog by observing the value of the 'oplogTruncateAfterPoint' document.
+    // Note that the storage engine timestamp recovery only restores the database *data* to a stable
+    // timestamp, but does not revert the oplog, which must be done as part of the rollback process.
+    _replicationProcess->getConsistencyMarkers()->setOplogTruncateAfterPoint(
+        opCtx, commonPointSW.getValue());
+    _listener->onCommonPointFound(commonPointSW.getValue());
 
-        if (!_replicationCoordinator->setFollowerMode(MemberState::RS_ROLLBACK)) {
-            std::string msg = str::stream()
-                << "Cannot transition from " << _replicationCoordinator->getMemberState().toString()
-                << " to " << MemberState(MemberState::RS_ROLLBACK).toString();
-            log() << msg;
-            status = Status(ErrorCodes::NotSecondary, msg);
+    // Increment the Rollback ID of this node. The Rollback ID is a natural number that it is
+    // incremented by 1 every time a rollback occurs. Note that the Rollback ID must be incremented
+    // before modifying any local data.
+    status = _replicationProcess->incrementRollbackID(opCtx);
+    if (!status.isOK()) {
+        return status;
+    }
+
+    // Recover to the stable timestamp.
+    status = _recoverToStableTimestamp(opCtx);
+    if (!status.isOK()) {
+        return status;
+    }
+    _listener->onRecoverToStableTimestamp();
+
+    // Run the oplog recovery logic.
+    status = _oplogRecovery(opCtx);
+    if (!status.isOK()) {
+        return status;
+    }
+    _listener->onRecoverFromOplog();
+
+    // At this point these functions need to always be called before returning, even on failure.
+    // These functions fassert on failure.
+    ON_BLOCK_EXIT([this, opCtx] {
+        auto validator = LogicalTimeValidator::get(opCtx);
+        if (validator) {
+            validator->resetKeyManagerCache(opCtx->getClient()->getServiceContext());
+        }
+
+        _checkShardIdentityRollback(opCtx);
+        _resetSessions(opCtx);
+        _transitionFromRollbackToSecondary(opCtx);
+    });
+
+    return Status::OK();
+}
+
+void RollbackImpl::shutdown() {
+    log() << "rollback shutting down";
+
+    stdx::lock_guard<stdx::mutex> lock(_mutex);
+    _inShutdown = true;
+}
+
+bool RollbackImpl::_isInShutdown() const {
+    stdx::lock_guard<stdx::mutex> lock(_mutex);
+    return _inShutdown;
+}
+
+Status RollbackImpl::_transitionToRollback(OperationContext* opCtx) {
+    invariant(opCtx);
+    if (_isInShutdown()) {
+        return Status(ErrorCodes::ShutdownInProgress, "rollback shutting down");
+    }
+
+    log() << "transition to ROLLBACK";
+    {
+        Lock::GlobalWrite globalWrite(opCtx);
+
+        auto status = _replicationCoordinator->setFollowerMode(MemberState::RS_ROLLBACK);
+        if (!status.isOK()) {
+            status.addContext(str::stream() << "Cannot transition from "
+                                            << _replicationCoordinator->getMemberState().toString()
+                                            << " to "
+                                            << MemberState(MemberState::RS_ROLLBACK).toString());
+            log() << status;
+            return status;
         }
     }
-    if (!status.isOK()) {
-        _finishCallback(opCtx.get(), status);
-        return;
+    return Status::OK();
+}
+
+StatusWith<Timestamp> RollbackImpl::_findCommonPoint() {
+    if (_isInShutdown()) {
+        return Status(ErrorCodes::ShutdownInProgress, "rollback shutting down");
     }
 
-    // Schedule RollbackCommonPointResolver
-    status = _startupComponent(_commonPointResolver);
-    if (!status.isOK()) {
-        _finishCallback(opCtx.get(), status);
-        return;
+    log() << "finding common point";
+
+    auto onLocalOplogEntryFn = [](const BSONObj& operation) { return Status::OK(); };
+
+    // Calls syncRollBackLocalOperations to find the common point and run onLocalOplogEntryFn on
+    // each oplog entry up until the common point. We only need the Timestamp of the common point
+    // for the oplog truncate after point.
+    auto commonPointSW =
+        syncRollBackLocalOperations(*_localOplog, *_remoteOplog, onLocalOplogEntryFn);
+    if (!commonPointSW.isOK()) {
+        return commonPointSW.getStatus();
+    }
+
+    OpTime commonPoint = commonPointSW.getValue().first;
+    OpTime lastCommittedOpTime = _replicationCoordinator->getLastCommittedOpTime();
+    OpTime committedSnapshot = _replicationCoordinator->getCurrentCommittedSnapshotOpTime();
+
+    log() << "Rollback common point is " << commonPoint;
+
+    // Rollback common point should be >= the replication commit point.
+    invariant(!_replicationCoordinator->isV1ElectionProtocol() ||
+              commonPoint.getTimestamp() >= lastCommittedOpTime.getTimestamp());
+    invariant(!_replicationCoordinator->isV1ElectionProtocol() ||
+              commonPoint >= lastCommittedOpTime);
+
+    // Rollback common point should be >= the committed snapshot optime.
+    invariant(commonPoint.getTimestamp() >= committedSnapshot.getTimestamp());
+    invariant(commonPoint >= committedSnapshot);
+
+    return commonPoint.getTimestamp();
+}
+
+Status RollbackImpl::_recoverToStableTimestamp(OperationContext* opCtx) {
+    if (_isInShutdown()) {
+        return Status(ErrorCodes::ShutdownInProgress, "rollback shutting down");
+    }
+    // Recover to the stable timestamp while holding the global exclusive lock.
+    auto serviceCtx = opCtx->getServiceContext();
+    {
+        Lock::GlobalWrite globalWrite(opCtx);
+        try {
+            return _storageInterface->recoverToStableTimestamp(serviceCtx);
+        } catch (...) {
+            return exceptionToStatus();
+        }
     }
 }
 
-void RollbackImpl::_commonPointResolverCallback(const Status& commonPointResolverStatus) {
-    auto status = _checkForShutdownAndConvertStatus(
-        commonPointResolverStatus,
-        str::stream() << "failed to find common point between local and remote oplogs");
-    if (!status.isOK()) {
-        _finishCallback(nullptr, status);
-        return;
+Status RollbackImpl::_oplogRecovery(OperationContext* opCtx) {
+    if (_isInShutdown()) {
+        return Status(ErrorCodes::ShutdownInProgress, "rollback shutting down");
     }
-
-    // Success! For now....
-    _finishCallback(nullptr, OpTime());
+    // Run the recovery process.
+    _replicationProcess->getReplicationRecovery()->recoverFromOplog(opCtx);
+    return Status::OK();
 }
+
 
 void RollbackImpl::_checkShardIdentityRollback(OperationContext* opCtx) {
     invariant(opCtx);
+
+    log() << "checking shard identity document for roll back";
 
     if (ShardIdentityRollbackNotifier::get(opCtx)->didRollbackHappen()) {
         severe() << "shardIdentity document rollback detected.  Shutting down to clear "
@@ -180,77 +256,30 @@ void RollbackImpl::_checkShardIdentityRollback(OperationContext* opCtx) {
     }
 }
 
+void RollbackImpl::_resetSessions(OperationContext* opCtx) {
+    invariant(opCtx);
+
+    log() << "resetting in-memory state of active sessions";
+
+    SessionCatalog::get(opCtx)->invalidateSessions(opCtx, boost::none);
+}
+
 void RollbackImpl::_transitionFromRollbackToSecondary(OperationContext* opCtx) {
     invariant(opCtx);
+    invariant(_replicationCoordinator->getMemberState() == MemberState(MemberState::RS_ROLLBACK));
+
+    log() << "transition to SECONDARY";
 
     Lock::GlobalWrite globalWrite(opCtx);
 
-    // If the current member state is not ROLLBACK, this means that the
-    // ReplicationCoordinator::setFollowerMode(ROLLBACK) call in _transitionToRollbackCallback()
-    // failed. In that case, there's nothing to do in this function.
-    if (MemberState(MemberState::RS_ROLLBACK) != _replicationCoordinator->getMemberState()) {
-        return;
-    }
-
-    if (!_replicationCoordinator->setFollowerMode(MemberState::RS_SECONDARY)) {
+    auto status = _replicationCoordinator->setFollowerMode(MemberState::RS_SECONDARY);
+    if (!status.isOK()) {
         severe() << "Failed to transition into " << MemberState(MemberState::RS_SECONDARY)
                  << "; expected to be in state " << MemberState(MemberState::RS_ROLLBACK)
-                 << " but found self in " << _replicationCoordinator->getMemberState();
+                 << "; found self in " << _replicationCoordinator->getMemberState()
+                 << causedBy(status);
         fassertFailedNoTrace(40408);
     }
-}
-
-void RollbackImpl::_tearDown(OperationContext* opCtx) {
-    invariant(opCtx);
-
-    _checkShardIdentityRollback(opCtx);
-    _transitionFromRollbackToSecondary(opCtx);
-}
-
-void RollbackImpl::_finishCallback(OperationContext* opCtx, StatusWith<OpTime> lastApplied) {
-    // Abort only when we are in a unrecoverable state.
-    // WARNING: these statuses sometimes have location codes which are lost with uassertStatusOK
-    // so we need to check here first.
-    if (ErrorCodes::UnrecoverableRollbackError == lastApplied.getStatus().code()) {
-        severe() << "Unable to complete rollback. A full resync may be needed: "
-                 << redact(lastApplied.getStatus());
-        fassertFailedNoTrace(40435);
-    }
-
-    // After running callback function '_onCompletion', clear '_onCompletion' to release any
-    // resources that might be held by this function object.
-    // '_onCompletion' must be moved to a temporary copy and destroyed outside the lock in case
-    // there is any logic that's invoked at the function object's destruction that might call into
-    // this RollbackImpl. 'onCompletion' must be destroyed outside the lock and this should happen
-    // before we transition the state to Complete.
-    decltype(_onCompletion) onCompletion;
-    {
-        stdx::lock_guard<stdx::mutex> lock(_mutex);
-        invariant(_onCompletion);
-        std::swap(_onCompletion, onCompletion);
-    }
-
-    // If 'opCtx' is null, lazily create OperationContext using makeOpCtx() that will last for the
-    // duration of this function call.
-    _tearDown(opCtx ? opCtx : makeOpCtx().get());
-
-    // Completion callback must be invoked outside mutex.
-    try {
-        onCompletion(lastApplied);
-    } catch (...) {
-        severe() << "rollback finish callback threw exception: " << redact(exceptionToStatus());
-        // This exception handling block should be unreachable because OnCompletionFn is declared
-        // noexcept. This is purely a defensive mechanism to guard against C++ runtime
-        // implementations that have less than ideal support for noexcept.
-        MONGO_UNREACHABLE;
-    }
-
-    // Destroy the remaining reference to the completion callback before we transition the state to
-    // Complete so that callers can expect any resources bound to '_onCompletion' to be released
-    // before RollbackImpl::join() returns.
-    onCompletion = {};
-
-    _transitionToComplete();
 }
 
 }  // namespace repl

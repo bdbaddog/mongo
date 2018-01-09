@@ -38,6 +38,7 @@
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/database.h"
 #include "mongo/db/catalog/database_catalog_entry.h"
+#include "mongo/db/catalog/index_catalog.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/exec/working_set_common.h"
@@ -46,15 +47,16 @@
 #include "mongo/stdx/mutex.h"
 #include "mongo/util/log.h"
 #include "mongo/util/md5.hpp"
+#include "mongo/util/net/sock.h"
 #include "mongo/util/timer.h"
 
 namespace mongo {
 
 namespace {
 
-class DBHashCmd : public Command {
+class DBHashCmd : public ErrmsgCommandDeprecated {
 public:
-    DBHashCmd() : Command("dbHash", "dbhash") {}
+    DBHashCmd() : ErrmsgCommandDeprecated("dbHash", "dbhash") {}
 
     virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
         return false;
@@ -72,11 +74,11 @@ public:
         out->push_back(Privilege(ResourcePattern::forDatabaseName(dbname), actions));
     }
 
-    virtual bool run(OperationContext* opCtx,
-                     const std::string& dbname,
-                     const BSONObj& cmdObj,
-                     std::string& errmsg,
-                     BSONObjBuilder& result) {
+    virtual bool errmsgRun(OperationContext* opCtx,
+                           const std::string& dbname,
+                           const BSONObj& cmdObj,
+                           std::string& errmsg,
+                           BSONObjBuilder& result) {
         Timer timer;
 
         std::set<std::string> desiredCollections;

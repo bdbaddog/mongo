@@ -71,29 +71,8 @@ SubplanStage::SubplanStage(OperationContext* opCtx,
       _plannerParams(params),
       _query(cq) {
     invariant(_collection);
+    invariant(_query->root()->matchType() == MatchExpression::OR);
 }
-
-namespace {
-
-/**
- * Returns true if 'expr' is an AND that contains a single OR child.
- */
-bool isContainedOr(const MatchExpression* expr) {
-    if (MatchExpression::AND != expr->matchType()) {
-        return false;
-    }
-
-    size_t numOrs = 0;
-    for (size_t i = 0; i < expr->numChildren(); ++i) {
-        if (MatchExpression::OR == expr->getChild(i)->matchType()) {
-            ++numOrs;
-        }
-    }
-
-    return (numOrs == 1U);
-}
-
-}  // namespace
 
 bool SubplanStage::canUseSubplanning(const CanonicalQuery& query) {
     const QueryRequest& qr = query.getQueryRequest();
@@ -126,61 +105,17 @@ bool SubplanStage::canUseSubplanning(const CanonicalQuery& query) {
         return false;
     }
 
-    // TODO: For now we only allow rooted OR. We should consider also allowing contained OR that
-    // does not have a TEXT or GEO_NEAR node.
+    // We can only subplan rooted $or queries.
     return MatchExpression::OR == expr->matchType();
-}
-
-std::unique_ptr<MatchExpression> SubplanStage::rewriteToRootedOr(
-    std::unique_ptr<MatchExpression> root) {
-    dassert(isContainedOr(root.get()));
-
-    // Detach the OR from the root.
-    std::vector<MatchExpression*>& rootChildren = *root->getChildVector();
-    std::unique_ptr<MatchExpression> orChild;
-    for (size_t i = 0; i < rootChildren.size(); ++i) {
-        if (MatchExpression::OR == rootChildren[i]->matchType()) {
-            orChild.reset(rootChildren[i]);
-            rootChildren.erase(rootChildren.begin() + i);
-            break;
-        }
-    }
-
-    // We should have found an OR, and the OR should have at least 2 children.
-    invariant(orChild);
-    invariant(orChild->getChildVector());
-    invariant(orChild->getChildVector()->size() > 1U);
-
-    // AND the existing root with each OR child.
-    std::vector<MatchExpression*>& orChildren = *orChild->getChildVector();
-    for (size_t i = 0; i < orChildren.size(); ++i) {
-        std::unique_ptr<AndMatchExpression> ama = stdx::make_unique<AndMatchExpression>();
-        ama->add(orChildren[i]);
-        ama->add(root->shallowClone().release());
-        orChildren[i] = ama.release();
-    }
-
-    // Normalize and sort the resulting match expression.
-    orChild = std::unique_ptr<MatchExpression>(CanonicalQuery::normalizeTree(orChild.release()));
-    CanonicalQuery::sortTree(orChild.get());
-
-    return orChild;
 }
 
 Status SubplanStage::planSubqueries() {
     _orExpression = _query->root()->shallowClone();
-    if (isContainedOr(_orExpression.get())) {
-        _orExpression = rewriteToRootedOr(std::move(_orExpression));
-        invariant(CanonicalQuery::isValid(_orExpression.get(), _query->getQueryRequest()).isOK());
-    }
-
     for (size_t i = 0; i < _plannerParams.indices.size(); ++i) {
         const IndexEntry& ie = _plannerParams.indices[i];
         _indexMap[ie.name] = i;
         LOG(5) << "Subplanner: index " << i << " is " << ie;
     }
-
-    const ExtensionsCallbackReal extensionsCallback(getOpCtx(), &_collection->ns());
 
     for (size_t i = 0; i < _orExpression->numChildren(); ++i) {
         // We need a place to shove the results from planning this branch.
@@ -190,8 +125,7 @@ Status SubplanStage::planSubqueries() {
         MatchExpression* orChild = _orExpression->getChild(i);
 
         // Turn the i-th child into its own query.
-        auto statusWithCQ =
-            CanonicalQuery::canonicalize(getOpCtx(), *_query, orChild, extensionsCallback);
+        auto statusWithCQ = CanonicalQuery::canonicalize(getOpCtx(), *_query, orChild);
         if (!statusWithCQ.isOK()) {
             mongoutils::str::stream ss;
             ss << "Can't canonicalize subchild " << orChild->toString() << " "
@@ -506,9 +440,11 @@ Status SubplanStage::pickBestPlan(PlanYieldPolicy* yieldPolicy) {
     // Plan each branch of the $or.
     Status subplanningStatus = planSubqueries();
     if (!subplanningStatus.isOK()) {
-        if (subplanningStatus == ErrorCodes::QueryPlanKilled) {
+        if (subplanningStatus == ErrorCodes::QueryPlanKilled ||
+            subplanningStatus == ErrorCodes::ExceededTimeLimit) {
             // Query planning cannot continue if the plan for one of the subqueries was killed
-            // because the collection or a candidate index may have been dropped.
+            // because the collection or a candidate index may have been dropped, or if we've
+            // exceeded the operation's time limit.
             return subplanningStatus;
         }
         return choosePlanWholeQuery(yieldPolicy);
@@ -518,9 +454,11 @@ Status SubplanStage::pickBestPlan(PlanYieldPolicy* yieldPolicy) {
     // the overall winning plan from the resulting index tags.
     Status subplanSelectStat = choosePlanForSubqueries(yieldPolicy);
     if (!subplanSelectStat.isOK()) {
-        if (subplanSelectStat == ErrorCodes::QueryPlanKilled) {
-            // Query planning cannot continue if the plan was killed because the collection or a
-            // candidate index may have been dropped.
+        if (subplanSelectStat == ErrorCodes::QueryPlanKilled ||
+            subplanSelectStat == ErrorCodes::ExceededTimeLimit) {
+            // Query planning cannot continue if the plan for one of the subqueries was killed
+            // because the collection or a candidate index may have been dropped, or if we've
+            // exceeded the operation's time limit.
             return subplanSelectStat;
         }
         return choosePlanWholeQuery(yieldPolicy);

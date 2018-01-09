@@ -30,6 +30,7 @@
 
 #include "mongo/bson/bsonobj.h"
 #include "mongo/bson/simple_bsonobj_comparator.h"
+#include "mongo/db/logical_session_id.h"
 #include "mongo/db/repl/oplog_entry_gen.h"
 #include "mongo/db/repl/optime.h"
 
@@ -38,6 +39,7 @@ namespace repl {
 
 /**
  * A parsed oplog entry that inherits from the OplogEntryBase parsed by the IDL.
+ * This class is immutable.
  */
 class OplogEntry : public OplogEntryBase {
 public:
@@ -45,13 +47,14 @@ public:
         kNotCommand,
         kCreate,
         kRenameCollection,
+        kDbCheck,
         kDrop,
         kCollMod,
         kApplyOps,
         kDropDatabase,
         kEmptyCapped,
         kConvertToCapped,
-        kCreateIndex,
+        kCreateIndexes,
         kDropIndexes
     };
 
@@ -63,27 +66,18 @@ public:
     OplogEntry(OpTime opTime,
                long long hash,
                OpTypeEnum opType,
-               NamespaceString nss,
+               const NamespaceString& nss,
+               const boost::optional<UUID>& uuid,
+               const boost::optional<bool>& fromMigrate,
                int version,
                const BSONObj& oField,
-               const BSONObj& o2Field);
-    OplogEntry(OpTime opTime,
-               long long hash,
-               OpTypeEnum opType,
-               NamespaceString nss,
-               int version,
-               const BSONObj& oField);
-    OplogEntry(OpTime opTime,
-               long long hash,
-               OpTypeEnum opType,
-               NamespaceString nss,
-               const BSONObj& oField);
-    OplogEntry(OpTime opTime,
-               long long hash,
-               OpTypeEnum opType,
-               NamespaceString nss,
-               const BSONObj& oField,
-               const BSONObj& o2Field);
+               const boost::optional<BSONObj>& o2Field,
+               const OperationSessionInfo& sessionInfo,
+               const boost::optional<mongo::Date_t>& wallClockTime,
+               const boost::optional<StmtId>& statementId,
+               const boost::optional<OpTime>& prevWriteOpTimeInTransaction,
+               const boost::optional<OpTime>& preImageOpTime,
+               const boost::optional<OpTime>& postImageOpTime);
 
     // DEPRECATED: This constructor can throw. Use static parse method instead.
     explicit OplogEntry(BSONObj raw);

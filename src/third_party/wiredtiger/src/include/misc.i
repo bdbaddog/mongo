@@ -1,5 +1,5 @@
 /*-
- * Copyright (c) 2014-2017 MongoDB, Inc.
+ * Copyright (c) 2014-2018 MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -30,6 +30,33 @@ __wt_hex(int c)
 }
 
 /*
+ * __wt_rdtsc --
+ *      Get a timestamp from CPU registers.
+ */
+static inline uint64_t
+__wt_rdtsc(WT_SESSION_IMPL *session) {
+	if (__wt_process.use_epochtime)
+		return (__wt_tsc_get_expensive_timestamp(session));
+#if defined (__i386)
+	{
+	uint64_t x;
+
+	__asm__ volatile ("rdtsc" : "=A" (x));
+	return (x);
+	}
+#elif defined (__amd64)
+	{
+	uint64_t a, d;
+
+	__asm__ volatile ("rdtsc" : "=a" (a), "=d" (d));
+	return ((d << 32) | a);
+	}
+#else
+	return (__wt_tsc_get_expensive_timestamp(session));
+#endif
+}
+
+/*
  * __wt_strdup --
  *	ANSI strdup function.
  */
@@ -41,75 +68,17 @@ __wt_strdup(WT_SESSION_IMPL *session, const char *str, void *retp)
 }
 
 /*
- * __wt_seconds --
- *	Return the seconds since the Epoch.
+ * __wt_strnlen --
+ *      Determine the length of a fixed-size string
  */
-static inline void
-__wt_seconds(WT_SESSION_IMPL *session, time_t *timep)
+static inline size_t
+__wt_strnlen(const char *s, size_t maxlen)
 {
-	struct timespec t;
+	size_t i;
 
-	__wt_epoch(session, &t);
-
-	*timep = t.tv_sec;
-}
-
-/*
- * __wt_time_check_monotonic --
- *	Check and prevent time running backward.  If we detect that it has, we
- *	set the time structure to the previous values, making time stand still
- *	until we see a time in the future of the highest value seen so far.
- */
-static inline void
-__wt_time_check_monotonic(WT_SESSION_IMPL *session, struct timespec *tsp)
-{
-	/*
-	 * Detect time going backward.  If so, use the last
-	 * saved timestamp.
-	 */
-	if (session == NULL)
-		return;
-
-	if (tsp->tv_sec < session->last_epoch.tv_sec ||
-	     (tsp->tv_sec == session->last_epoch.tv_sec &&
-	     tsp->tv_nsec < session->last_epoch.tv_nsec)) {
-		WT_STAT_CONN_INCR(session, time_travel);
-		*tsp = session->last_epoch;
-	} else
-		session->last_epoch = *tsp;
-}
-
-/*
- * __wt_verbose --
- * 	Verbose message.
- *
- * Inline functions are not parsed for external prototypes, so in cases where we
- * want GCC attributes attached to the functions, we have to do so explicitly.
- */
-static inline void
-__wt_verbose(WT_SESSION_IMPL *session, int flag, const char *fmt, ...)
-WT_GCC_FUNC_DECL_ATTRIBUTE((format (printf, 3, 4)));
-
-/*
- * __wt_verbose --
- * 	Verbose message.
- */
-static inline void
-__wt_verbose(WT_SESSION_IMPL *session, int flag, const char *fmt, ...)
-{
-#ifdef HAVE_VERBOSE
-	va_list ap;
-
-	if (WT_VERBOSE_ISSET(session, flag)) {
-		va_start(ap, fmt);
-		WT_IGNORE_RET(__wt_eventv(session, true, 0, NULL, 0, fmt, ap));
-		va_end(ap);
-	}
-#else
-	WT_UNUSED(session);
-	WT_UNUSED(flag);
-	WT_UNUSED(fmt);
-#endif
+	for (i = 0; i < maxlen && *s != '\0'; i++, s++)
+		;
+	return (i);
 }
 
 /*

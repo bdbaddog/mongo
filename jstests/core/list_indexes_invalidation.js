@@ -1,6 +1,6 @@
 // Cannot implicitly shard accessed collections because renameCollection command not supported
 // on sharded collections.
-// @tags: [assumes_unsharded_collection]
+// @tags: [assumes_unsharded_collection, requires_non_retryable_commands]
 
 // SERVER-24963/SERVER-27930 Missing invalidation for system.indexes writes
 (function() {
@@ -23,7 +23,7 @@
         printjson(res);
 
         // Ensure the cursor has data, rename or drop the collection, and exhaust the cursor.
-        let cursor = new DBCommandCursor(db.getMongo(), res);
+        let cursor = new DBCommandCursor(db, res);
         let errMsg =
             'expected more data from command ' + tojson(cmd) + ', with result ' + tojson(res);
         assert(cursor.hasNext(), errMsg);

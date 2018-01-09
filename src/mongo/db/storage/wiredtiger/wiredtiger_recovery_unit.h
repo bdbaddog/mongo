@@ -1,5 +1,3 @@
-// wiredtiger_recovery_unit.h
-
 /**
  *    Copyright (C) 2014 MongoDB Inc.
  *
@@ -32,19 +30,17 @@
 
 #include <wiredtiger.h>
 
-#include <memory.h>
-
+#include <boost/optional.hpp>
+#include <cstdint>
 #include <memory>
 #include <vector>
 
 #include "mongo/base/checked_cast.h"
-#include "mongo/base/owned_pointer_vector.h"
+#include "mongo/bson/timestamp.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/record_id.h"
 #include "mongo/db/storage/recovery_unit.h"
-#include "mongo/db/storage/snapshot_name.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_session_cache.h"
-#include "mongo/util/concurrency/ticketholder.h"
 #include "mongo/util/timer.h"
 
 namespace mongo {
@@ -55,41 +51,65 @@ class WiredTigerRecoveryUnit final : public RecoveryUnit {
 public:
     WiredTigerRecoveryUnit(WiredTigerSessionCache* sc);
 
-    virtual ~WiredTigerRecoveryUnit();
+    /**
+     * It's expected a consumer would want to call the constructor that simply takes a
+     * `WiredTigerSessionCache`. That constructor accesses the `WiredTigerKVEngine` to find the
+     * `WiredTigerOplogManager`. However, unit tests construct `WiredTigerRecoveryUnits` with a
+     * `WiredTigerSessionCache` that do not have a valid `WiredTigerKVEngine`. This constructor is
+     * expected to only be useful in those cases.
+     */
+    WiredTigerRecoveryUnit(WiredTigerSessionCache* sc, WiredTigerOplogManager* oplogManager);
+    ~WiredTigerRecoveryUnit();
 
-    void beginUnitOfWork(OperationContext* opCtx) final;
-    void commitUnitOfWork() final;
-    void abortUnitOfWork() final;
+    void beginUnitOfWork(OperationContext* opCtx) override;
+    void commitUnitOfWork() override;
+    void abortUnitOfWork() override;
 
-    virtual bool waitUntilDurable();
+    bool waitUntilDurable() override;
 
-    virtual void registerChange(Change* change);
+    void registerChange(Change* change) override;
 
-    virtual void abandonSnapshot();
+    void abandonSnapshot() override;
+    void prepareSnapshot() override;
 
-    virtual void* writingPtr(void* data, size_t len);
-
-    virtual void setRollbackWritesDisabled() {}
-
-    virtual SnapshotId getSnapshotId() const;
-
-    Status setReadFromMajorityCommittedSnapshot() final;
-    bool isReadingFromMajorityCommittedSnapshot() const final {
+    Status setReadFromMajorityCommittedSnapshot() override;
+    bool isReadingFromMajorityCommittedSnapshot() const override {
         return _readFromMajorityCommittedSnapshot;
     }
 
-    boost::optional<SnapshotName> getMajorityCommittedSnapshot() const final;
+    boost::optional<Timestamp> getMajorityCommittedSnapshot() const override;
+
+    SnapshotId getSnapshotId() const override;
+
+    Status setTimestamp(Timestamp timestamp) override;
+
+    void setCommitTimestamp(Timestamp timestamp) override;
+    void clearCommitTimestamp() override;
+    Timestamp getCommitTimestamp() override;
+
+    Status selectSnapshot(Timestamp timestamp) override;
+
+    void* writingPtr(void* data, size_t len) override;
+
+    void setRollbackWritesDisabled() override {}
 
     // ---- WT STUFF
 
-    WiredTigerSession* getSession(OperationContext* opCtx);
+    WiredTigerSession* getSession();
+    void setIsOplogReader();
+
+    /**
+     * Enter a period of wait or computation during which there are no WT calls.
+     * Any non-relevant cached handles can be closed.
+     */
+    void beginIdle();
 
     /**
      * Returns a session without starting a new WT txn on the session. Will not close any already
      * running session.
      */
 
-    WiredTigerSession* getSessionNoTxn(OperationContext* opCtx);
+    WiredTigerSession* getSessionNoTxn();
 
     WiredTigerSessionCache* getSessionCache() {
         return _sessionCache;
@@ -98,11 +118,6 @@ public:
         return _active;
     }
     void assertInActiveTxn() const;
-
-    void setOplogReadTill(const RecordId& id);
-    RecordId getOplogReadTill() const {
-        return _oplogReadTill;
-    }
 
     static WiredTigerRecoveryUnit* get(OperationContext* opCtx) {
         return checked_cast<WiredTigerRecoveryUnit*>(opCtx->recoveryUnit());
@@ -124,19 +139,24 @@ private:
 
     void _ensureSession();
     void _txnClose(bool commit);
-    void _txnOpen(OperationContext* opCtx);
+    void _txnOpen();
+
+    char* _getOplogReaderConfigString();
 
     WiredTigerSessionCache* _sessionCache;  // not owned
+    WiredTigerOplogManager* _oplogManager;  // not owned
     UniqueWiredTigerSession _session;
     bool _areWriteUnitOfWorksBanned = false;
     bool _inUnitOfWork;
     bool _active;
+    bool _isTimestamped = false;
+    Timestamp _commitTimestamp;
     uint64_t _mySnapshotId;
-    RecordId _oplogReadTill;
     bool _readFromMajorityCommittedSnapshot = false;
-    SnapshotName _majorityCommittedSnapshot = SnapshotName::min();
+    Timestamp _majorityCommittedSnapshot;
+    Timestamp _readAtTimestamp;
     std::unique_ptr<Timer> _timer;
-
+    bool _isOplogReader = false;
     typedef std::vector<std::unique_ptr<Change>> Changes;
     Changes _changes;
 };

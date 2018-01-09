@@ -36,11 +36,8 @@
 #include "mongo/db/auth/authorization_manager.h"
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/commands.h"
-#include "mongo/db/db_raii.h"
 #include "mongo/db/repl/repl_client_info.h"
 #include "mongo/db/s/chunk_move_write_concern_options.h"
-#include "mongo/db/s/collection_metadata.h"
-#include "mongo/db/s/collection_sharding_state.h"
 #include "mongo/db/s/migration_source_manager.h"
 #include "mongo/db/s/move_timing_helper.h"
 #include "mongo/db/s/sharding_state.h"
@@ -53,9 +50,6 @@
 #include "mongo/util/log.h"
 
 namespace mongo {
-
-using std::string;
-
 namespace {
 
 /**
@@ -78,9 +72,9 @@ MONGO_FP_DECLARE(moveChunkHangAtStep5);
 MONGO_FP_DECLARE(moveChunkHangAtStep6);
 MONGO_FP_DECLARE(moveChunkHangAtStep7);
 
-class MoveChunkCommand : public Command {
+class MoveChunkCommand : public BasicCommand {
 public:
-    MoveChunkCommand() : Command("moveChunk") {}
+    MoveChunkCommand() : BasicCommand("moveChunk") {}
 
     void help(std::stringstream& help) const override {
         help << "should not be calling this directly";
@@ -99,7 +93,7 @@ public:
     }
 
     Status checkAuthForCommand(Client* client,
-                               const string& dbname,
+                               const std::string& dbname,
                                const BSONObj& cmdObj) override {
         if (!AuthorizationSession::get(client)->isAuthorizedForActionsOnResource(
                 ResourcePattern::forClusterResource(), ActionType::internal)) {
@@ -108,14 +102,13 @@ public:
         return Status::OK();
     }
 
-    string parseNs(const string& dbname, const BSONObj& cmdObj) const override {
+    std::string parseNs(const std::string& dbname, const BSONObj& cmdObj) const override {
         return parseNsFullyQualified(dbname, cmdObj);
     }
 
     bool run(OperationContext* opCtx,
-             const string& dbname,
+             const std::string& dbname,
              const BSONObj& cmdObj,
-             string& errmsg,
              BSONObjBuilder& result) override {
         auto shardingState = ShardingState::get(opCtx);
         uassertStatusOK(shardingState->canAcceptShardedCommands());
@@ -162,6 +155,17 @@ public:
         }
 
         uassertStatusOK(status);
+
+        if (moveChunkRequest.getWaitForDelete()) {
+            // Ensure we capture the latest opTime in the system, since range deletion happens
+            // asynchronously with a different OperationContext. This must be done after the above
+            // join, because each caller must set the opTime to wait for writeConcern for on its own
+            // OperationContext.
+            // TODO (SERVER-30183): If this moveChunk joined an active moveChunk that did not have
+            // waitForDelete=true, the captured opTime may not reflect all the deletes.
+            repl::ReplClientInfo::forClient(opCtx->getClient()).setLastOpToSystemLastOpTime(opCtx);
+        }
+
         return true;
     }
 
@@ -185,13 +189,13 @@ private:
                 ReadPreferenceSetting{ReadPreference::PrimaryOnly});
         }());
 
-        string unusedErrMsg;
+        std::string unusedErrMsg;
         MoveTimingHelper moveTimingHelper(opCtx,
                                           "from",
                                           moveChunkRequest.getNss().ns(),
                                           moveChunkRequest.getMinKey(),
                                           moveChunkRequest.getMaxKey(),
-                                          7,  // Total number of steps
+                                          6,  // Total number of steps
                                           &unusedErrMsg,
                                           moveChunkRequest.getToShardId(),
                                           moveChunkRequest.getFromShardId());
@@ -199,48 +203,28 @@ private:
         moveTimingHelper.done(1);
         MONGO_FAIL_POINT_PAUSE_WHILE_SET(moveChunkHangAtStep1);
 
-        BSONObj shardKeyPattern;
+        MigrationSourceManager migrationSourceManager(
+            opCtx, moveChunkRequest, donorConnStr, recipientHost);
 
-        {
-            MigrationSourceManager migrationSourceManager(
-                opCtx, moveChunkRequest, donorConnStr, recipientHost);
+        moveTimingHelper.done(2);
+        MONGO_FAIL_POINT_PAUSE_WHILE_SET(moveChunkHangAtStep2);
 
-            shardKeyPattern = migrationSourceManager.getKeyPattern().getOwned();
+        uassertStatusOKWithWarning(migrationSourceManager.startClone(opCtx));
+        moveTimingHelper.done(3);
+        MONGO_FAIL_POINT_PAUSE_WHILE_SET(moveChunkHangAtStep3);
 
-            moveTimingHelper.done(2);
-            MONGO_FAIL_POINT_PAUSE_WHILE_SET(moveChunkHangAtStep2);
+        uassertStatusOKWithWarning(migrationSourceManager.awaitToCatchUp(opCtx));
+        moveTimingHelper.done(4);
+        MONGO_FAIL_POINT_PAUSE_WHILE_SET(moveChunkHangAtStep4);
 
-            uassertStatusOKWithWarning(migrationSourceManager.startClone(opCtx));
-            moveTimingHelper.done(3);
-            MONGO_FAIL_POINT_PAUSE_WHILE_SET(moveChunkHangAtStep3);
+        uassertStatusOKWithWarning(migrationSourceManager.enterCriticalSection(opCtx));
+        uassertStatusOKWithWarning(migrationSourceManager.commitChunkOnRecipient(opCtx));
+        moveTimingHelper.done(5);
+        MONGO_FAIL_POINT_PAUSE_WHILE_SET(moveChunkHangAtStep5);
 
-            uassertStatusOKWithWarning(migrationSourceManager.awaitToCatchUp(opCtx));
-            moveTimingHelper.done(4);
-            MONGO_FAIL_POINT_PAUSE_WHILE_SET(moveChunkHangAtStep4);
-
-            uassertStatusOKWithWarning(migrationSourceManager.enterCriticalSection(opCtx));
-            uassertStatusOKWithWarning(migrationSourceManager.commitChunkOnRecipient(opCtx));
-            moveTimingHelper.done(5);
-            MONGO_FAIL_POINT_PAUSE_WHILE_SET(moveChunkHangAtStep5);
-
-            uassertStatusOKWithWarning(migrationSourceManager.commitChunkMetadataOnConfig(opCtx));
-        }
+        uassertStatusOKWithWarning(migrationSourceManager.commitChunkMetadataOnConfig(opCtx));
         moveTimingHelper.done(6);
         MONGO_FAIL_POINT_PAUSE_WHILE_SET(moveChunkHangAtStep6);
-
-        auto range = ChunkRange(moveChunkRequest.getMinKey(), moveChunkRequest.getMaxKey());
-        if (moveChunkRequest.getWaitForDelete()) {
-            CollectionShardingState::waitForClean(
-                opCtx, moveChunkRequest.getNss(), moveChunkRequest.getVersionEpoch(), range);
-            // Ensure that wait for write concern for the chunk cleanup will include
-            // the deletes performed by the range deleter thread.
-            repl::ReplClientInfo::forClient(opCtx->getClient()).setLastOpToSystemLastOpTime(opCtx);
-        } else {
-            log() << "Leaving cleanup of " << moveChunkRequest.getNss().ns() << " range "
-                  << redact(range.toString()) << " to complete in background";
-        }
-        moveTimingHelper.done(7);
-        MONGO_FAIL_POINT_PAUSE_WHILE_SET(moveChunkHangAtStep7);
     }
 
 } moveChunkCmd;

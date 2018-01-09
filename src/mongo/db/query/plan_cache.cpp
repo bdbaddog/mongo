@@ -89,91 +89,150 @@ void encodeUserString(StringData s, StringBuilder* keyBuilder) {
 }
 
 /**
- * 2-character encoding of MatchExpression::MatchType.
+ * String encoding of MatchExpression::MatchType.
  */
 const char* encodeMatchType(MatchExpression::MatchType mt) {
     switch (mt) {
         case MatchExpression::AND:
             return "an";
-            break;
+
         case MatchExpression::OR:
             return "or";
-            break;
+
         case MatchExpression::NOR:
             return "nr";
-            break;
+
         case MatchExpression::NOT:
             return "nt";
-            break;
+
         case MatchExpression::ELEM_MATCH_OBJECT:
             return "eo";
-            break;
+
         case MatchExpression::ELEM_MATCH_VALUE:
             return "ev";
-            break;
+
         case MatchExpression::SIZE:
             return "sz";
-            break;
+
         case MatchExpression::LTE:
             return "le";
-            break;
+
         case MatchExpression::LT:
             return "lt";
-            break;
+
         case MatchExpression::EQ:
             return "eq";
-            break;
+
         case MatchExpression::GT:
             return "gt";
-            break;
+
         case MatchExpression::GTE:
             return "ge";
-            break;
+
         case MatchExpression::REGEX:
             return "re";
-            break;
+
         case MatchExpression::MOD:
             return "mo";
-            break;
+
         case MatchExpression::EXISTS:
             return "ex";
-            break;
+
         case MatchExpression::MATCH_IN:
             return "in";
-            break;
+
         case MatchExpression::TYPE_OPERATOR:
             return "ty";
-            break;
+
         case MatchExpression::GEO:
             return "go";
-            break;
+
         case MatchExpression::WHERE:
             return "wh";
-            break;
+
         case MatchExpression::ALWAYS_FALSE:
             return "af";
-            break;
+
+        case MatchExpression::ALWAYS_TRUE:
+            return "at";
+
         case MatchExpression::GEO_NEAR:
             return "gn";
-            break;
+
         case MatchExpression::TEXT:
             return "te";
-            break;
+
         case MatchExpression::BITS_ALL_SET:
             return "ls";
-            break;
+
         case MatchExpression::BITS_ALL_CLEAR:
             return "lc";
-            break;
+
         case MatchExpression::BITS_ANY_SET:
             return "ys";
-            break;
+
         case MatchExpression::BITS_ANY_CLEAR:
             return "yc";
-            break;
+
+        case MatchExpression::EXPRESSION:
+            return "xp";
+
+        case MatchExpression::INTERNAL_EXPR_EQ:
+            return "ee";
+
+        case MatchExpression::INTERNAL_SCHEMA_ALL_ELEM_MATCH_FROM_INDEX:
+            return "internalSchemaAllElemMatchFromIndex";
+
+        case MatchExpression::INTERNAL_SCHEMA_ALLOWED_PROPERTIES:
+            return "internalSchemaAllowedProperties";
+
+        case MatchExpression::INTERNAL_SCHEMA_COND:
+            return "internalSchemaCond";
+
+        case MatchExpression::INTERNAL_SCHEMA_EQ:
+            return "internalSchemaEq";
+
+        case MatchExpression::INTERNAL_SCHEMA_FMOD:
+            return "internalSchemaFmod";
+
+        case MatchExpression::INTERNAL_SCHEMA_MIN_ITEMS:
+            return "internalSchemaMinItems";
+
+        case MatchExpression::INTERNAL_SCHEMA_MAX_ITEMS:
+            return "internalSchemaMaxItems";
+
+        case MatchExpression::INTERNAL_SCHEMA_UNIQUE_ITEMS:
+            return "internalSchemaUniqueItems";
+
+        case MatchExpression::INTERNAL_SCHEMA_XOR:
+            return "internalSchemaXor";
+
+        case MatchExpression::INTERNAL_SCHEMA_OBJECT_MATCH:
+            return "internalSchemaObjectMatch";
+
+        case MatchExpression::INTERNAL_SCHEMA_ROOT_DOC_EQ:
+            return "internalSchemaRootDocEq";
+
+        case MatchExpression::INTERNAL_SCHEMA_MIN_LENGTH:
+            return "internalSchemaMinLength";
+
+        case MatchExpression::INTERNAL_SCHEMA_MAX_LENGTH:
+            return "internalSchemaMaxLength";
+
+        case MatchExpression::INTERNAL_SCHEMA_MIN_PROPERTIES:
+            return "internalSchemaMinProperties";
+
+        case MatchExpression::INTERNAL_SCHEMA_MAX_PROPERTIES:
+            return "internalSchemaMaxProperties";
+
+        case MatchExpression::INTERNAL_SCHEMA_MATCH_ARRAY_INDEX:
+            return "internalSchemaMatchArrayIndex";
+
+        case MatchExpression::INTERNAL_SCHEMA_TYPE:
+            return "internalSchemaType";
+
         default:
-            verify(0);
-            return "";
+            MONGO_UNREACHABLE;
     }
 }
 
@@ -377,6 +436,7 @@ PlanCacheEntry* PlanCacheEntry::clone() const {
     entry->sort = sort.getOwned();
     entry->projection = projection.getOwned();
     entry->collation = collation.getOwned();
+    entry->timeOfCreation = timeOfCreation;
 
     // Copy performance stats.
     for (size_t i = 0; i < feedback.size(); ++i) {
@@ -392,7 +452,8 @@ std::string PlanCacheEntry::toString() const {
     return str::stream() << "(query: " << query.toString() << ";sort: " << sort.toString()
                          << ";projection: " << projection.toString()
                          << ";collation: " << collation.toString()
-                         << ";solutions: " << plannerData.size() << ")";
+                         << ";solutions: " << plannerData.size()
+                         << ";timeOfCreation: " << timeOfCreation.toString() << ")";
 }
 
 std::string CachedSolution::toString() const {
@@ -638,7 +699,8 @@ void PlanCache::encodeKeyForProj(const BSONObj& projObj, StringBuilder* keyBuild
 
 Status PlanCache::add(const CanonicalQuery& query,
                       const std::vector<QuerySolution*>& solns,
-                      PlanRankingDecision* why) {
+                      PlanRankingDecision* why,
+                      Date_t now) {
     invariant(why);
 
     if (solns.empty()) {
@@ -665,6 +727,8 @@ Status PlanCache::add(const CanonicalQuery& query,
     if (query.getCollator()) {
         entry->collation = query.getCollator()->getSpec().toBSON();
     }
+    entry->timeOfCreation = now;
+
 
     // Strip projections on $-prefixed fields, as these are added by internal callers of the query
     // system and are not considered part of the user projection.

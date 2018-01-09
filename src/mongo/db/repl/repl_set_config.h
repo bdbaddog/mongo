@@ -60,12 +60,15 @@ public:
     static const size_t kMaxMembers = 50;
     static const size_t kMaxVotingMembers = 7;
     static const Milliseconds kInfiniteCatchUpTimeout;
+    static const Milliseconds kCatchUpDisabled;
+    static const Milliseconds kCatchUpTakeoverDisabled;
 
     static const Milliseconds kDefaultElectionTimeoutPeriod;
     static const Milliseconds kDefaultHeartbeatInterval;
     static const Seconds kDefaultHeartbeatTimeoutPeriod;
     static const Milliseconds kDefaultCatchUpTimeoutPeriod;
     static const bool kDefaultChainingAllowed;
+    static const Milliseconds kDefaultCatchUpTakeoverDelay;
 
     /**
      * Initializes this ReplSetConfig from the contents of "cfg".
@@ -340,16 +343,24 @@ public:
      */
     Milliseconds getPriorityTakeoverDelay(int memberIdx) const;
 
+    /**
+     * Returns the duration to wait before running for election when this node
+     * sees that it is more caught up than the current primary.
+     */
+    Milliseconds getCatchUpTakeoverDelay() const {
+        return _catchUpTakeoverDelay;
+    }
+
+    /**
+     * Return the number of members with a priority greater than "priority".
+     */
+    int calculatePriorityRank(double priority) const;
+
 private:
     /**
      * Parses the "settings" subdocument of a replica set configuration.
      */
     Status _parseSettingsSubdocument(const BSONObj& settings);
-
-    /**
-     * Return the number of members with a priority greater than "priority".
-     */
-    int _calculatePriorityRank(double priority) const;
 
     /**
      * Calculates and stores the majority for electing a primary (_majorityVoteCount).
@@ -384,6 +395,7 @@ private:
     Milliseconds _heartbeatInterval = kDefaultHeartbeatInterval;
     Seconds _heartbeatTimeoutPeriod = kDefaultHeartbeatTimeoutPeriod;
     Milliseconds _catchUpTimeoutPeriod = kDefaultCatchUpTimeoutPeriod;
+    Milliseconds _catchUpTakeoverDelay = kDefaultCatchUpTakeoverDelay;
     bool _chainingAllowed = kDefaultChainingAllowed;
     bool _writeConcernMajorityJournalDefault = false;
     int _majorityVoteCount = 0;

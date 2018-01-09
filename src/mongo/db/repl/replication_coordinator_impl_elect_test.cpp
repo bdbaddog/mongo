@@ -39,7 +39,7 @@
 #include "mongo/db/repl/replication_coordinator_external_state_mock.h"
 #include "mongo/db/repl/replication_coordinator_impl.h"
 #include "mongo/db/repl/replication_coordinator_test_fixture.h"
-#include "mongo/db/repl/topology_coordinator_impl.h"
+#include "mongo/db/repl/topology_coordinator.h"
 #include "mongo/executor/network_interface_mock.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/fail_point_service.h"
@@ -105,7 +105,7 @@ TEST_F(ReplCoordElectTest, StartElectionDoesNotStartAnElectionWhenNodeHasNoOplog
                                           << BSON("_id" << 2 << "host"
                                                         << "node2:12345"))),
                        HostAndPort("node1", 12345));
-    ASSERT(getReplCoord()->setFollowerMode(MemberState::RS_SECONDARY));
+    ASSERT_OK(getReplCoord()->setFollowerMode(MemberState::RS_SECONDARY));
     simulateEnoughHeartbeatsForAllNodesUp();
     stopCapturingLogMessages();
     ASSERT_EQUALS(1, countLogLinesContaining("node has no applied oplog entries"));
@@ -133,14 +133,14 @@ TEST_F(ReplCoordElectTest, ElectionSucceedsWhenNodeIsTheOnlyElectableNode) {
                                                         << 0))),
                        HostAndPort("node1", 12345));
 
-    getReplCoord()->setFollowerMode(MemberState::RS_SECONDARY);
+    ASSERT_OK(getReplCoord()->setFollowerMode(MemberState::RS_SECONDARY));
     // Fake OpTime from initiate, or a write op.
-    getExternalState()->setLastOpTime(OpTime{{0, 0}, 0});
+    getExternalState()->setLastOpTime(OpTime{{0, 0}, -1});
 
     ASSERT(getReplCoord()->getMemberState().secondary())
         << getReplCoord()->getMemberState().toString();
 
-    getReplCoord()->setMyLastAppliedOpTime(OpTime(Timestamp(10, 0), 0));
+    getReplCoord()->setMyLastAppliedOpTime(OpTime(Timestamp(10, 0), -1));
 
     NetworkInterfaceMock* net = getNet();
     net->enterNetwork();
@@ -185,10 +185,10 @@ TEST_F(ReplCoordElectTest, ElectionSucceedsWhenNodeIsTheOnlyNode) {
                                                      << "node1:12345"))),
                        HostAndPort("node1", 12345));
 
-    getReplCoord()->setFollowerMode(MemberState::RS_SECONDARY);
+    ASSERT_OK(getReplCoord()->setFollowerMode(MemberState::RS_SECONDARY));
 
     // Fake OpTime from initiate, or a write op.
-    getExternalState()->setLastOpTime(OpTime{{0, 0}, 0});
+    getExternalState()->setLastOpTime(OpTime{{0, 0}, -1});
 
     ASSERT(getReplCoord()->getMemberState().primary())
         << getReplCoord()->getMemberState().toString();
@@ -222,10 +222,10 @@ TEST_F(ReplCoordElectTest, ElectionSucceedsWhenAllNodesVoteYea) {
                                                          << "node3:12345")));
     assertStartSuccess(configObj, HostAndPort("node1", 12345));
     OperationContextNoop opCtx;
-    getReplCoord()->setMyLastAppliedOpTime(OpTime{{100, 1}, 0});
-    getExternalState()->setLastOpTime(OpTime{{100, 1}, 0});
+    getReplCoord()->setMyLastAppliedOpTime(OpTime{{100, 1}, -1});
+    getExternalState()->setLastOpTime(OpTime{{100, 1}, -1});
 
-    ASSERT(getReplCoord()->setFollowerMode(MemberState::RS_SECONDARY));
+    ASSERT_OK(getReplCoord()->setFollowerMode(MemberState::RS_SECONDARY));
     startCapturingLogMessages();
     simulateSuccessfulElection();
     stopCapturingLogMessages();
@@ -252,7 +252,7 @@ TEST_F(ReplCoordElectTest, ElectionFailsWhenOneNodeVotesNay) {
     OperationContextNoop opCtx;
     OpTime time1(Timestamp(100, 1), 0);
     getReplCoord()->setMyLastAppliedOpTime(time1);
-    ASSERT(getReplCoord()->setFollowerMode(MemberState::RS_SECONDARY));
+    ASSERT_OK(getReplCoord()->setFollowerMode(MemberState::RS_SECONDARY));
 
     simulateEnoughHeartbeatsForAllNodesUp();
     simulateFreshEnoughForElectability();
@@ -299,7 +299,7 @@ TEST_F(ReplCoordElectTest, VotesWithStringValuesAreNotCountedAsYeas) {
     OperationContextNoop opCtx;
     OpTime time1(Timestamp(100, 1), 0);
     getReplCoord()->setMyLastAppliedOpTime(time1);
-    ASSERT(getReplCoord()->setFollowerMode(MemberState::RS_SECONDARY));
+    ASSERT_OK(getReplCoord()->setFollowerMode(MemberState::RS_SECONDARY));
 
     simulateEnoughHeartbeatsForAllNodesUp();
     simulateFreshEnoughForElectability();
@@ -329,7 +329,7 @@ TEST_F(ReplCoordElectTest, VotesWithStringValuesAreNotCountedAsYeas) {
                   countLogLinesContaining("wrong type for vote argument in replSetElect command"));
 }
 
-TEST_F(ReplCoordElectTest, ElectionsAbortWhenNodeTransitionsToRollbackState) {
+TEST_F(ReplCoordElectTest, TransitionToRollbackFailsWhenElectionInProgress) {
     BSONObj configObj = BSON("_id"
                              << "mySet"
                              << "version"
@@ -347,16 +347,18 @@ TEST_F(ReplCoordElectTest, ElectionsAbortWhenNodeTransitionsToRollbackState) {
     OperationContextNoop opCtx;
     OpTime time1(Timestamp(100, 1), 0);
     getReplCoord()->setMyLastAppliedOpTime(time1);
-    ASSERT(getReplCoord()->setFollowerMode(MemberState::RS_SECONDARY));
+    ASSERT_OK(getReplCoord()->setFollowerMode(MemberState::RS_SECONDARY));
 
     simulateEnoughHeartbeatsForAllNodesUp();
     simulateFreshEnoughForElectability();
 
-    ASSERT_TRUE(getReplCoord()->setFollowerMode(MemberState::RS_ROLLBACK));
+    ASSERT_EQUALS(ErrorCodes::ElectionInProgress,
+                  getReplCoord()->setFollowerMode(MemberState::RS_ROLLBACK));
+
+    ASSERT_FALSE(getReplCoord()->getMemberState().rollback());
 
     // We do not need to respond to any pending network operations because setFollowerMode() will
     // cancel the freshness checker and election command runner.
-    ASSERT_TRUE(getReplCoord()->getMemberState().rollback());
 }
 
 TEST_F(ReplCoordElectTest, NodeWillNotStandForElectionDuringHeartbeatReconfig) {
@@ -379,7 +381,7 @@ TEST_F(ReplCoordElectTest, NodeWillNotStandForElectionDuringHeartbeatReconfig) {
                                           << BSON("_id" << 5 << "host"
                                                         << "node5:12345"))),
                        HostAndPort("node1", 12345));
-    ASSERT(getReplCoord()->setFollowerMode(MemberState::RS_SECONDARY));
+    ASSERT_OK(getReplCoord()->setFollowerMode(MemberState::RS_SECONDARY));
     getReplCoord()->setMyLastAppliedOpTime(OpTime(Timestamp(100, 0), 0));
 
     getGlobalFailPointRegistry()
@@ -391,15 +393,17 @@ TEST_F(ReplCoordElectTest, NodeWillNotStandForElectionDuringHeartbeatReconfig) {
     net->enterNetwork();
     ReplSetHeartbeatResponse hbResp2;
     ReplSetConfig config;
-    config.initialize(BSON("_id"
-                           << "mySet"
-                           << "version"
-                           << 3
-                           << "members"
-                           << BSON_ARRAY(BSON("_id" << 1 << "host"
-                                                    << "node1:12345")
-                                         << BSON("_id" << 2 << "host"
-                                                       << "node2:12345"))));
+    config
+        .initialize(BSON("_id"
+                         << "mySet"
+                         << "version"
+                         << 3
+                         << "members"
+                         << BSON_ARRAY(BSON("_id" << 1 << "host"
+                                                  << "node1:12345")
+                                       << BSON("_id" << 2 << "host"
+                                                     << "node2:12345"))))
+        .transitional_ignore();
     hbResp2.setConfig(config);
     hbResp2.setConfigVersion(3);
     hbResp2.setSetName("mySet");
@@ -482,7 +486,7 @@ TEST_F(ReplCoordElectTest, StepsDownRemoteIfNodeHasHigherPriorityThanCurrentPrim
     OperationContextNoop opCtx;
     OpTime time1(Timestamp(100, 1), 0);
     getReplCoord()->setMyLastAppliedOpTime(time1);
-    ASSERT(getReplCoord()->setFollowerMode(MemberState::RS_SECONDARY));
+    ASSERT_OK(getReplCoord()->setFollowerMode(MemberState::RS_SECONDARY));
 
     auto net = getNet();
     net->enterNetwork();
@@ -553,17 +557,17 @@ TEST_F(ReplCoordElectTest, NodeCancelsElectionUponReceivingANewConfigDuringFresh
                             << "settings"
                             << BSON("heartbeatIntervalMillis" << 100)),
                        HostAndPort("node1", 12345));
-    ASSERT(getReplCoord()->setFollowerMode(MemberState::RS_SECONDARY));
+    ASSERT_OK(getReplCoord()->setFollowerMode(MemberState::RS_SECONDARY));
     getReplCoord()->setMyLastAppliedOpTime(OpTime(Timestamp(100, 0), 0));
     getReplCoord()->setMyLastDurableOpTime(OpTime(Timestamp(100, 0), 0));
     simulateEnoughHeartbeatsForAllNodesUp();
     simulateFreshEnoughForElectability();
-    ASSERT(TopologyCoordinator::Role::candidate == getTopoCoord().getRole());
+    ASSERT(TopologyCoordinator::Role::kCandidate == getTopoCoord().getRole());
 
     // Advance to freshness checker request phase.
     NetworkInterfaceMock* net = getNet();
     net->enterNetwork();
-    while (TopologyCoordinator::Role::candidate != getTopoCoord().getRole()) {
+    while (TopologyCoordinator::Role::kCandidate != getTopoCoord().getRole()) {
         net->runUntil(net->now() + Seconds(1));
         if (!net->hasReadyRequests()) {
             continue;
@@ -571,7 +575,7 @@ TEST_F(ReplCoordElectTest, NodeCancelsElectionUponReceivingANewConfigDuringFresh
         net->blackHole(net->getNextReadyRequest());
     }
     net->exitNetwork();
-    ASSERT(TopologyCoordinator::Role::candidate == getTopoCoord().getRole());
+    ASSERT(TopologyCoordinator::Role::kCandidate == getTopoCoord().getRole());
 
     // Submit a reconfig and confirm it cancels the election.
     ReplicationCoordinatorImpl::ReplSetReconfigArgs config = {
@@ -593,7 +597,7 @@ TEST_F(ReplCoordElectTest, NodeCancelsElectionUponReceivingANewConfigDuringFresh
     net->enterNetwork();
     net->runReadyNetworkOperations();
     net->exitNetwork();
-    ASSERT(TopologyCoordinator::Role::follower == getTopoCoord().getRole());
+    ASSERT(TopologyCoordinator::Role::kFollower == getTopoCoord().getRole());
 }
 
 TEST_F(ReplCoordElectTest, NodeCancelsElectionUponReceivingANewConfigDuringElectionPhase) {
@@ -612,12 +616,12 @@ TEST_F(ReplCoordElectTest, NodeCancelsElectionUponReceivingANewConfigDuringElect
                             << "settings"
                             << BSON("heartbeatIntervalMillis" << 100)),
                        HostAndPort("node1", 12345));
-    ASSERT(getReplCoord()->setFollowerMode(MemberState::RS_SECONDARY));
+    ASSERT_OK(getReplCoord()->setFollowerMode(MemberState::RS_SECONDARY));
     getReplCoord()->setMyLastAppliedOpTime(OpTime(Timestamp(100, 0), 0));
     getReplCoord()->setMyLastDurableOpTime(OpTime(Timestamp(100, 0), 0));
     simulateEnoughHeartbeatsForAllNodesUp();
     simulateFreshEnoughForElectability();
-    ASSERT(TopologyCoordinator::Role::candidate == getTopoCoord().getRole());
+    ASSERT(TopologyCoordinator::Role::kCandidate == getTopoCoord().getRole());
 
     // Submit a reconfig and confirm it cancels the election.
     ReplicationCoordinatorImpl::ReplSetReconfigArgs config = {
@@ -639,7 +643,7 @@ TEST_F(ReplCoordElectTest, NodeCancelsElectionUponReceivingANewConfigDuringElect
     getNet()->enterNetwork();
     getNet()->runReadyNetworkOperations();
     getNet()->exitNetwork();
-    ASSERT(TopologyCoordinator::Role::follower == getTopoCoord().getRole());
+    ASSERT(TopologyCoordinator::Role::kFollower == getTopoCoord().getRole());
 }
 
 }  // namespace

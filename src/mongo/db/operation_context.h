@@ -84,7 +84,29 @@ public:
         kFailedUnitOfWork   // in a unit of work that has failed and must be aborted
     };
 
-    OperationContext(Client* client, unsigned int opId, boost::optional<LogicalSessionId> lsid);
+    /**
+     * An RAII type that will temporarily suspend any deadline on this operation. Resets the
+     * deadline to the previous value upon destruction.
+     */
+    class DeadlineStash {
+    public:
+        /**
+         * Clears any deadline set on this operation.
+         */
+        DeadlineStash(OperationContext* opCtx);
+
+        /**
+         * Resets the deadline on '_opCtx' to the original deadline present at the time this
+         * DeadlineStash was constructed.
+         */
+        ~DeadlineStash();
+
+    private:
+        OperationContext* _opCtx;
+        Date_t _originalDeadline;
+    };
+
+    OperationContext(Client* client, unsigned int opId);
 
     virtual ~OperationContext() = default;
 
@@ -137,7 +159,7 @@ public:
     std::unique_ptr<Locker> releaseLockState();
 
     /**
-     * Raises a UserException if this operation is in a killed state.
+     * Raises a AssertionException if this operation is in a killed state.
      */
     void checkForInterrupt();
 
@@ -159,7 +181,7 @@ public:
     /**
      * Waits for either the condition "cv" to be signaled, this operation to be interrupted, or the
      * deadline on this operation to expire.  In the event of interruption or operation deadline
-     * expiration, raises a UserException with an error code indicating the interruption type.
+     * expiration, raises a AssertionException with an error code indicating the interruption type.
      */
     void waitForConditionOrInterrupt(stdx::condition_variable& cv,
                                      stdx::unique_lock<stdx::mutex>& m);
@@ -240,9 +262,14 @@ public:
         stdx::condition_variable& cv, stdx::unique_lock<stdx::mutex>& m, Date_t deadline) noexcept;
 
     /**
-     * Returns the service context under which this operation context runs.
+     * Returns the service context under which this operation context runs, or nullptr if there is
+     * no such service context.
      */
     ServiceContext* getServiceContext() const {
+        if (!_client) {
+            return nullptr;
+        }
+
         return _client->getServiceContext();
     }
 
@@ -266,6 +293,26 @@ public:
     boost::optional<LogicalSessionId> getLogicalSessionId() const {
         return _lsid;
     }
+
+    /**
+     * Associates a logical session id with this operation context. May only be called once for the
+     * lifetime of the operation.
+     */
+    void setLogicalSessionId(LogicalSessionId lsid);
+
+    /**
+     * Returns the transaction number associated with thes operation. The combination of logical
+     * session id + transaction number is what constitutes the operation transaction id.
+     */
+    boost::optional<TxnNumber> getTxnNumber() const {
+        return _txnNumber;
+    }
+
+    /**
+     * Associates a transaction number with this operation context. May only be called once for the
+     * lifetime of the operation and the operation must have a logical session id assigned.
+     */
+    void setTxnNumber(TxnNumber txnNumber);
 
     /**
      * Returns WriteConcernOptions of the current operation
@@ -364,6 +411,14 @@ public:
     }
 
     /**
+     * Reset the deadline for this operation.
+     */
+    void clearDeadline() {
+        _deadline = Date_t::max();
+        _maxTime = computeMaxTimeFromDeadline(_deadline);
+    }
+
+    /**
      * Returns the number of milliseconds remaining for this operation's time limit or
      * Milliseconds::max() if the operation has no time limit.
      */
@@ -392,6 +447,11 @@ private:
     void setDeadlineAndMaxTime(Date_t when, Microseconds maxTime);
 
     /**
+     * Compute maxTime based on the given deadline.
+     */
+    Microseconds computeMaxTimeFromDeadline(Date_t when);
+
+    /**
      * Returns the timepoint that is "waitFor" ms after now according to the
      * ServiceContext's precise clock.
      */
@@ -404,11 +464,14 @@ private:
         _writesAreReplicated = writesAreReplicated;
     }
 
+    friend class DeadlineStash;
     friend class WriteUnitOfWork;
     friend class repl::UnreplicatedWritesBlock;
     Client* const _client;
     const unsigned int _opId;
+
     boost::optional<LogicalSessionId> _lsid;
+    boost::optional<TxnNumber> _txnNumber;
 
     std::unique_ptr<Locker> _locker;
 
@@ -525,5 +588,4 @@ private:
     const bool _shouldReplicateWrites;
 };
 }  // namespace repl
-
 }  // namespace mongo

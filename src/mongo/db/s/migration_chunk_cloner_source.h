@@ -36,6 +36,11 @@ namespace mongo {
 class BSONObj;
 class OperationContext;
 class Status;
+class Timestamp;
+
+namespace repl {
+class OpTime;
+}  // namespace repl
 
 /**
  * This class is responsible for producing chunk documents to be moved from donor to a recipient
@@ -109,7 +114,7 @@ public:
      *
      * NOTE: Must be called with at least IS lock held on the collection.
      */
-    virtual bool isDocumentInMigratingChunk(OperationContext* opCtx, const BSONObj& doc) = 0;
+    virtual bool isDocumentInMigratingChunk(const BSONObj& doc) = 0;
 
     /**
      * Notifies this cloner that an insert happened to the collection, which it owns. It is up to
@@ -118,7 +123,9 @@ public:
      *
      * NOTE: Must be called with at least IX lock held on the collection.
      */
-    virtual void onInsertOp(OperationContext* opCtx, const BSONObj& insertedDoc) = 0;
+    virtual void onInsertOp(OperationContext* opCtx,
+                            const BSONObj& insertedDoc,
+                            const repl::OpTime& opTime) = 0;
 
     /**
      * Notifies this cloner that an update happened to the collection, which it owns. It is up to
@@ -127,7 +134,10 @@ public:
      *
      * NOTE: Must be called with at least IX lock held on the collection.
      */
-    virtual void onUpdateOp(OperationContext* opCtx, const BSONObj& updatedDoc) = 0;
+    virtual void onUpdateOp(OperationContext* opCtx,
+                            const BSONObj& updatedDoc,
+                            const repl::OpTime& opTime,
+                            const repl::OpTime& prePostImageOpTime) = 0;
 
     /**
      * Notifies this cloner that a delede happened to the collection, which it owns. It is up to the
@@ -136,7 +146,10 @@ public:
      *
      * NOTE: Must be called with at least IX lock held on the collection.
      */
-    virtual void onDeleteOp(OperationContext* opCtx, const BSONObj& deletedDocId) = 0;
+    virtual void onDeleteOp(OperationContext* opCtx,
+                            const BSONObj& deletedDocId,
+                            const repl::OpTime& opTime,
+                            const repl::OpTime& preImageOpTime) = 0;
 
 protected:
     MigrationChunkClonerSource();

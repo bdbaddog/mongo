@@ -35,12 +35,14 @@
 #include "mongo/db/auth/authorization_manager.h"
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/auth/privilege.h"
+#include "mongo/db/catalog/catalog_raii.h"
 #include "mongo/db/commands.h"
-#include "mongo/db/db_raii.h"
+#include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/s/collection_sharding_state.h"
 #include "mongo/db/s/migration_chunk_cloner_source_legacy.h"
 #include "mongo/db/s/migration_source_manager.h"
 #include "mongo/db/s/sharding_state.h"
+#include "mongo/db/write_concern.h"
 
 /**
  * This file contains commands, which are specific to the legacy chunk cloner source.
@@ -111,9 +113,9 @@ private:
     MigrationChunkClonerSourceLegacy* _chunkCloner;
 };
 
-class InitialCloneCommand : public Command {
+class InitialCloneCommand : public BasicCommand {
 public:
-    InitialCloneCommand() : Command("_migrateClone") {}
+    InitialCloneCommand() : BasicCommand("_migrateClone") {}
 
     void help(std::stringstream& h) const {
         h << "internal";
@@ -142,7 +144,6 @@ public:
     bool run(OperationContext* opCtx,
              const std::string&,
              const BSONObj& cmdObj,
-             std::string& errmsg,
              BSONObjBuilder& result) {
         const MigrationSessionId migrationSessionId(
             uassertStatusOK(MigrationSessionId::extractFromBSON(cmdObj)));
@@ -174,9 +175,9 @@ public:
 
 } initialCloneCommand;
 
-class TransferModsCommand : public Command {
+class TransferModsCommand : public BasicCommand {
 public:
-    TransferModsCommand() : Command("_transferMods") {}
+    TransferModsCommand() : BasicCommand("_transferMods") {}
 
     void help(std::stringstream& h) const {
         h << "internal";
@@ -205,7 +206,6 @@ public:
     bool run(OperationContext* opCtx,
              const std::string&,
              const BSONObj& cmdObj,
-             std::string& errmsg,
              BSONObjBuilder& result) {
         const MigrationSessionId migrationSessionId(
             uassertStatusOK(MigrationSessionId::extractFromBSON(cmdObj)));
@@ -217,6 +217,71 @@ public:
     }
 
 } transferModsCommand;
+
+/**
+ * Command for extracting the oplog entries that needs to be migrated for the given migration
+ * session id.
+ * Note: this command is not stateless. Calling this command has a side-effect of gradually
+ * depleting the buffer that contains the oplog entries to be transfered.
+ */
+class MigrateSessionCommand : public BasicCommand {
+public:
+    MigrateSessionCommand() : BasicCommand("_getNextSessionMods") {}
+
+    void help(std::stringstream& h) const {
+        h << "internal";
+    }
+
+    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
+        return false;
+    }
+
+    virtual bool slaveOk() const {
+        return false;
+    }
+
+    virtual bool adminOnly() const {
+        return true;
+    }
+
+    virtual void addRequiredPrivileges(const std::string& dbname,
+                                       const BSONObj& cmdObj,
+                                       std::vector<Privilege>* out) {
+        ActionSet actions;
+        actions.addAction(ActionType::internal);
+        out->push_back(Privilege(ResourcePattern::forClusterResource(), actions));
+    }
+
+    bool run(OperationContext* opCtx,
+             const std::string&,
+             const BSONObj& cmdObj,
+             BSONObjBuilder& result) {
+        const MigrationSessionId migrationSessionId(
+            uassertStatusOK(MigrationSessionId::extractFromBSON(cmdObj)));
+
+        BSONArrayBuilder arrBuilder;
+
+        repl::OpTime opTime;
+
+        writeConflictRetry(opCtx,
+                           "Fetching session related oplogs for migration",
+                           NamespaceString::kRsOplogNamespace.ns(),
+                           [&]() {
+                               AutoGetActiveCloner autoCloner(opCtx, migrationSessionId);
+                               opTime = autoCloner.getCloner()->nextSessionMigrationBatch(
+                                   opCtx, &arrBuilder);
+                           });
+
+        WriteConcernResult wcResult;
+        WriteConcernOptions majorityWC(
+            WriteConcernOptions::kMajority, WriteConcernOptions::SyncMode::UNSET, 0);
+        uassertStatusOK(waitForWriteConcern(opCtx, opTime, majorityWC, &wcResult));
+
+        result.appendArray("oplog", arrBuilder.arr());
+        return true;
+    }
+
+} migrateSessionCommand;
 
 }  // namespace
 }  // namespace mongo

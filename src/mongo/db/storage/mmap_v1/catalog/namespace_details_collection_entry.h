@@ -33,6 +33,7 @@
 #include "mongo/base/string_data.h"
 #include "mongo/bson/bsonobj.h"
 #include "mongo/db/catalog/collection_catalog_entry.h"
+#include "mongo/db/server_options.h"
 #include "mongo/db/storage/mmap_v1/diskloc.h"
 
 namespace mongo {
@@ -64,6 +65,8 @@ public:
     int getMaxAllowedIndexes() const final;
 
     void getAllIndexes(OperationContext* opCtx, std::vector<std::string>* names) const final;
+
+    void getReadyIndexes(OperationContext* opCtx, std::vector<std::string>* names) const final;
 
     BSONObj getIndexSpec(OperationContext* opCtx, StringData idxName) const final;
 
@@ -97,10 +100,20 @@ public:
 
     void updateFlags(OperationContext* opCtx, int newValue) final;
 
+    void addUUID(OperationContext* opCtx, CollectionUUID uuid, Collection* coll) final;
+
+    void removeUUID(OperationContext* opCtx) final;
+
+    bool isEqualToMetadataUUID(OperationContext* opCtx, OptionalCollectionUUID uuid) final;
+
     void updateValidator(OperationContext* opCtx,
                          const BSONObj& validator,
                          StringData validationLevel,
                          StringData validationAction) final;
+
+    void setIsTemp(OperationContext* opCtx, bool isTemp) final;
+
+    void updateCappedSize(OperationContext* opCtx, long long size) final;
 
     // not part of interface, but available to my storage engine
 

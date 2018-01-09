@@ -33,10 +33,10 @@
 
 #include <boost/algorithm/string.hpp>
 #include <boost/date_time/posix_time/posix_time.hpp>
-#include <boost/thread/recursive_mutex.hpp>
-#include <boost/thread/thread.hpp>
+#include <fstream>
 #include <iostream>
 #include <sstream>
+#include <stack>
 #include <string>
 #include <vector>
 
@@ -48,14 +48,13 @@
 #include "mongo/stdx/memory.h"
 #include "mongo/transport/session.h"
 #include "mongo/util/concurrency/mutex.h"
-#include "mongo/util/concurrency/threadlocal.h"
 #include "mongo/util/debug_util.h"
 #include "mongo/util/exit.h"
 #include "mongo/util/log.h"
 #include "mongo/util/mongoutils/str.h"
+#include "mongo/util/net/private/ssl_expiration.h"
 #include "mongo/util/net/sock.h"
 #include "mongo/util/net/socket_exception.h"
-#include "mongo/util/net/ssl_expiration.h"
 #include "mongo/util/net/ssl_options.h"
 #include "mongo/util/net/ssl_types.h"
 #include "mongo/util/scopeguard.h"
@@ -78,9 +77,43 @@ namespace mongo {
 
 namespace {
 
+std::string removeFQDNRoot(std::string name) {
+    if (name.back() == '.') {
+        name.pop_back();
+    }
+    return name;
+};
+
+
+// Because the hostname having a slash is used by `mongo::SockAddr` to determine if a hostname is a
+// Unix Domain Socket endpoint, this function uses the same logic.  (See
+// `mongo::SockAddr::Sockaddr(StringData, int, sa_family_t)`).  A user explicitly specifying a Unix
+// Domain Socket in the present working directory, through a code path which supplies `sa_family_t`
+// as `AF_UNIX` will cause this code to lie.  This will, in turn, cause the
+// `SSLManager::parseAndValidatePeerCertificate` code to believe a socket is a host, which will then
+// cause a connection failure if and only if that domain socket also has a certificate for SSL and
+// the connection is an SSL connection.
+bool isUnixDomainSocket(const std::string& hostname) {
+    return end(hostname) != std::find(begin(hostname), end(hostname), '/');
+}
+
 const transport::Session::Decoration<SSLPeerInfo> peerInfoForSession =
     transport::Session::declareDecoration<SSLPeerInfo>();
 
+/**
+ * Configurable via --setParameter disableNonSSLConnectionLogging=true. If false (default)
+ * if the sslMode is set to preferSSL, we will log connections that are not using SSL.
+ * If true, such log messages will be suppressed.
+ */
+ExportedServerParameter<bool, ServerParameterType::kStartupOnly>
+    disableNonSSLConnectionLoggingParameter(ServerParameterSet::getGlobal(),
+                                            "disableNonSSLConnectionLogging",
+                                            &sslGlobalParams.disableNonSSLConnectionLogging);
+
+ExportedServerParameter<std::string, ServerParameterType::kStartupOnly>
+    setDiffieHellmanParameterPEMFile(ServerParameterSet::getGlobal(),
+                                     "opensslDiffieHellmanParameters",
+                                     &sslGlobalParams.sslPEMTempDHParam);
 }  // namespace
 
 SSLPeerInfo& SSLPeerInfo::forSession(const transport::SessionHandle& session) {
@@ -93,17 +126,85 @@ const SSLParams& getSSLGlobalParams() {
     return sslGlobalParams;
 }
 
-/**
- * Configurable via --setParameter disableNonSSLConnectionLogging=true. If false (default)
- * if the sslMode is set to preferSSL, we will log connections that are not using SSL.
- * If true, such log messages will be suppressed.
- */
-ExportedServerParameter<bool, ServerParameterType::kStartupOnly>
-    disableNonSSLConnectionLoggingParameter(ServerParameterSet::getGlobal(),
-                                            "disableNonSSLConnectionLogging",
-                                            &sslGlobalParams.disableNonSSLConnectionLogging);
+class OpenSSLCipherConfigParameter
+    : public ExportedServerParameter<std::string, ServerParameterType::kStartupOnly> {
+public:
+    OpenSSLCipherConfigParameter()
+        : ExportedServerParameter<std::string, ServerParameterType::kStartupOnly>(
+              ServerParameterSet::getGlobal(),
+              "opensslCipherConfig",
+              &sslGlobalParams.sslCipherConfig) {}
+    Status validate(const std::string& potentialNewValue) final {
+        if (!sslGlobalParams.sslCipherConfig.empty()) {
+            return Status(
+                ErrorCodes::BadValue,
+                "opensslCipherConfig setParameter is incompatible with net.ssl.sslCipherConfig");
+        }
+        // Note that there is very little validation that we can do here.
+        // OpenSSL exposes no API to validate a cipher config string. The only way to figure out
+        // what a string maps to is to make an SSL_CTX object, set the string on it, then parse the
+        // resulting STACK_OF object. If provided an invalid entry in the string, it will silently
+        // ignore it. Because an entry in the string may map to multiple ciphers, or remove ciphers
+        // from the final set produced by the full string, we can't tell if any entry failed
+        // to parse.
+        return Status::OK();
+    }
+} openSSLCipherConfig;
+}  // namespace mongo
 
 #ifdef MONGO_CONFIG_SSL
+namespace mongo {
+namespace {
+
+// If the underlying SSL supports auto-configuration of ECDH parameters, this function will select
+// it, otherwise this function will do nothing.
+void setECDHModeAuto(SSL_CTX* const ctx) {
+#ifdef MONGO_CONFIG_HAVE_SSL_SET_ECDH_AUTO
+    ::SSL_CTX_set_ecdh_auto(ctx, true);
+#endif
+    std::ignore = ctx;
+}
+
+struct DHFreer {
+    void operator()(DH* const dh) noexcept {
+        if (dh) {
+            ::DH_free(dh);
+        }
+    }
+};
+using UniqueDHParams = std::unique_ptr<DH, DHFreer>;
+
+struct BIOFree {
+    void operator()(BIO* const p) noexcept {
+        // Assumes that BIO_free succeeds.
+        if (p) {
+            ::BIO_free(p);
+        }
+    }
+};
+using UniqueBIO = std::unique_ptr<BIO, BIOFree>;
+
+UniqueBIO makeUniqueMemBio(std::vector<std::uint8_t>& v) {
+    UniqueBIO rv(::BIO_new_mem_buf(v.data(), v.size()));
+    if (!rv) {
+        class ssl_bad_alloc : public std::bad_alloc {
+        private:
+            std::string message;
+
+        public:
+            explicit ssl_bad_alloc(std::string m) : message(std::move(m)) {}
+
+            const char* what() const noexcept override {
+                return message.c_str();
+            }
+        };
+        throw ssl_bad_alloc(str::stream()
+                            << "Error allocating SSL BIO: "
+                            << SSLManagerInterface::getSSLErrorMessage(ERR_get_error()));
+    }
+    return rv;
+}
+
 // Old copies of OpenSSL will not have constants to disable protocols they don't support.
 // Define them to values we can OR together safely to generically disable these protocols across
 // all versions of OpenSSL.
@@ -113,8 +214,6 @@ ExportedServerParameter<bool, ServerParameterType::kStartupOnly>
 #ifndef SSL_OP_NO_TLSv1_2
 #define SSL_OP_NO_TLSv1_2 0
 #endif
-
-namespace {
 
 // clang-format off
 #ifndef MONGO_CONFIG_HAVE_ASN1_ANY_DEFINITIONS
@@ -138,7 +237,7 @@ IMPLEMENT_ASN1_ENCODE_FUNCTIONS_const_fname(ASN1_SEQUENCE_ANY, ASN1_SET_ANY, ASN
 #endif // MONGO_CONFIG_NEEDS_ASN1_ANY_DEFINITIONS
 // clang-format on
 
-#if OPENSSL_VERSION_NUMBER < 0x10100000L
+#if OPENSSL_VERSION_NUMBER < 0x10100000L || defined(LIBRESSL_VERSION_NUMBER)
 // Copies of OpenSSL after 1.1.0 define new functions for interaction with
 // X509 structure. We must polyfill used definitions to interact with older
 // OpenSSL versions.
@@ -159,21 +258,35 @@ const STACK_OF(X509_EXTENSION) * X509_get0_extensions(const X509* peerCert) {
  * OpenSSL before version 1.1.0 requires applications provide a callback which emits a thread
  * identifier. This ID is used to store thread specific ERR information. When a thread is
  * terminated, it must call ERR_remove_state or ERR_remove_thread_state. These functions may
- * themselves invoke the application provided callback.
+ * themselves invoke the application provided callback. These IDs are stored in a hashtable with
+ * a questionable hash function. They must be uniformly distributed to prevent collisions.
  */
 class SSLThreadInfo {
 public:
     static unsigned long getID() {
-        enforceCleanupOnShutdown();
+        struct CallErrRemoveState {
+            explicit CallErrRemoveState(ThreadIDManager& manager, unsigned long id)
+                : _manager(manager), id(id) {}
 
-#ifdef _WIN32
-        return GetCurrentThreadId();
-#else
-        static_assert(sizeof(void*) == sizeof(unsigned long),
-                      "OpenSSL needs the address of a thread-unique object to be castable to"
-                      "unsigned long");
-        return reinterpret_cast<unsigned long>(&errno);
-#endif
+            ~CallErrRemoveState() {
+                ERR_remove_state(0);
+                _manager.releaseID(id);
+            };
+
+            ThreadIDManager& _manager;
+            unsigned long id;
+        };
+
+        // NOTE: This logic is fully intentional. Because ERR_remove_state (called within
+        // the destructor of the kRemoveStateFromThread object) re-enters this function,
+        // we must have a two phase protection, otherwise we would access a thread local
+        // during its destruction.
+        static thread_local boost::optional<CallErrRemoveState> threadLocalState;
+        if (!threadLocalState) {
+            threadLocalState.emplace(_idManager, _idManager.reserveID());
+        }
+
+        return threadLocalState->id;
     }
 
     static void lockingCallback(int mode, int type, const char* file, int line) {
@@ -196,35 +309,55 @@ public:
 private:
     SSLThreadInfo() = delete;
 
-    // When called, ensures that this thread will, on termination, call ERR_remove_state.
-    static void enforceCleanupOnShutdown() {
-        static MONGO_TRIVIALLY_CONSTRUCTIBLE_THREAD_LOCAL bool firstCall = true;
-        if (firstCall) {
-            boost::this_thread::at_thread_exit([] { ERR_remove_state(0); });
-            firstCall = false;
-        }
-    }
-
     // Note: see SERVER-8734 for why we are using a recursive mutex here.
     // Once the deadlock fix in OpenSSL is incorporated into most distros of
     // Linux, this can be changed back to a nonrecursive mutex.
     static std::vector<std::unique_ptr<stdx::recursive_mutex>> _mutex;
+
+    class ThreadIDManager {
+    public:
+        unsigned long reserveID() {
+            stdx::unique_lock<stdx::mutex> lock(_idMutex);
+            if (!_idLast.empty()) {
+                unsigned long ret = _idLast.top();
+                _idLast.pop();
+                return ret;
+            }
+            return ++_idNext;
+        }
+
+        void releaseID(unsigned long id) {
+            stdx::unique_lock<stdx::mutex> lock(_idMutex);
+            _idLast.push(id);
+        }
+
+    private:
+        // Machinery for producing IDs that are unique for the life of a thread.
+        stdx::mutex _idMutex;       // Protects _idNext and _idLast.
+        unsigned long _idNext = 0;  // Stores the next thread ID to use, if none already allocated.
+        std::stack<unsigned long, std::vector<unsigned long>>
+            _idLast;  // Stores old thread IDs, for reuse.
+    };
+    static ThreadIDManager _idManager;
 };
 std::vector<std::unique_ptr<stdx::recursive_mutex>> SSLThreadInfo::_mutex;
+SSLThreadInfo::ThreadIDManager SSLThreadInfo::_idManager;
 
+namespace {
 // We only want to free SSL_CTX objects if they have been populated. OpenSSL seems to perform this
 // check before freeing them, but because it does not document this, we should protect ourselves.
-void _free_ssl_context(SSL_CTX* ctx) {
+void free_ssl_context(SSL_CTX* ctx) {
     if (ctx != nullptr) {
         SSL_CTX_free(ctx);
     }
 }
+}  // namespace
 
 ////////////////////////////////////////////////////////////////
 
 SimpleMutex sslManagerMtx;
 SSLManagerInterface* theSSLManager = NULL;
-using UniqueSSLContext = std::unique_ptr<SSL_CTX, decltype(&_free_ssl_context)>;
+using UniqueSSLContext = std::unique_ptr<SSL_CTX, decltype(&free_ssl_context)>;
 static const int BUFFER_SIZE = 8 * 1024;
 static const int DATE_LEN = 128;
 
@@ -287,7 +420,7 @@ private:
 
     /**
      * Given an error code from an SSL-type IO function, logs an
-     * appropriate message and throws a SocketException
+     * appropriate message and throws a SocketException.
      */
     MONGO_COMPILER_NORETURN void _handleSSLError(int code, int ret);
 
@@ -352,13 +485,8 @@ private:
      */
     void _flushNetworkBIO(SSLConnection* conn);
 
-    /*
-     * match a remote host name to an x.509 host name
-     */
-    bool _hostNameMatch(const char* nameToMatch, const char* certHostName);
-
     /**
-     * Callbacks for SSL functions
+     * Callbacks for SSL functions.
      */
     static int password_cb(char* buf, int num, int rwflag, void* userdata);
     static int verify_cb(int ok, X509_STORE_CTX* ctx);
@@ -488,7 +616,7 @@ void canonicalizeClusterDN(std::vector<std::string>* dn) {
     }
     std::stable_sort(dn->begin(), dn->end());
 }
-}
+}  // namespace
 
 bool SSLConfiguration::isClusterMember(StringData subjectName) const {
     std::vector<std::string> clientRDN = StringSplitter::split(subjectName.toString(), ",");
@@ -520,8 +648,8 @@ BSONObj SSLConfiguration::getServerStatusBSON() const {
 SSLManagerInterface::~SSLManagerInterface() {}
 
 SSLManager::SSLManager(const SSLParams& params, bool isServer)
-    : _serverContext(nullptr, _free_ssl_context),
-      _clientContext(nullptr, _free_ssl_context),
+    : _serverContext(nullptr, free_ssl_context),
+      _clientContext(nullptr, free_ssl_context),
       _weakValidation(params.sslWeakCertificateValidation),
       _allowInvalidCertificates(params.sslAllowInvalidCertificates),
       _allowInvalidHostnames(params.sslAllowInvalidHostnames) {
@@ -640,15 +768,13 @@ Status SSLManager::initSSLContext(SSL_CTX* context,
 
     // Set the supported TLS protocols. Allow --sslDisabledProtocols to disable selected
     // ciphers.
-    if (!params.sslDisabledProtocols.empty()) {
-        for (const SSLParams::Protocols& protocol : params.sslDisabledProtocols) {
-            if (protocol == SSLParams::Protocols::TLS1_0) {
-                supportedProtocols |= SSL_OP_NO_TLSv1;
-            } else if (protocol == SSLParams::Protocols::TLS1_1) {
-                supportedProtocols |= SSL_OP_NO_TLSv1_1;
-            } else if (protocol == SSLParams::Protocols::TLS1_2) {
-                supportedProtocols |= SSL_OP_NO_TLSv1_2;
-            }
+    for (const SSLParams::Protocols& protocol : params.sslDisabledProtocols) {
+        if (protocol == SSLParams::Protocols::TLS1_0) {
+            supportedProtocols |= SSL_OP_NO_TLSv1;
+        } else if (protocol == SSLParams::Protocols::TLS1_1) {
+            supportedProtocols |= SSL_OP_NO_TLSv1_1;
+        } else if (protocol == SSLParams::Protocols::TLS1_2) {
+            supportedProtocols |= SSL_OP_NO_TLSv1_2;
         }
     }
     ::SSL_CTX_set_options(context, supportedProtocols);
@@ -702,13 +828,45 @@ Status SSLManager::initSSLContext(SSL_CTX* context,
         }
     }
 
+    if (!params.sslPEMTempDHParam.empty()) {
+        try {
+            std::ifstream dhparamPemFile(params.sslPEMTempDHParam, std::ios_base::binary);
+            if (dhparamPemFile.fail() || dhparamPemFile.bad()) {
+                return Status(ErrorCodes::InvalidSSLConfiguration,
+                              str::stream() << "Cannot open PEM DHParams file.");
+            }
+
+            std::vector<std::uint8_t> paramData{std::istreambuf_iterator<char>(dhparamPemFile),
+                                                std::istreambuf_iterator<char>()};
+            auto bio = makeUniqueMemBio(paramData);
+
+            UniqueDHParams dhparams(::PEM_read_bio_DHparams(bio.get(), nullptr, nullptr, nullptr));
+            if (!dhparams) {
+                return Status(ErrorCodes::InvalidSSLConfiguration,
+                              str::stream() << "Error reading DHParams file."
+                                            << getSSLErrorMessage(ERR_get_error()));
+            }
+
+            if (::SSL_CTX_set_tmp_dh(context, dhparams.get()) != 1) {
+                return Status(ErrorCodes::InvalidSSLConfiguration,
+                              str::stream() << "Failure to set PFS DH parameters: "
+                                            << getSSLErrorMessage(ERR_get_error()));
+            }
+        } catch (const std::exception& ex) {
+            return Status(ErrorCodes::InvalidSSLConfiguration, ex.what());
+        }
+    }
+
+    // We always set ECDH mode anyhow, if available.
+    setECDHModeAuto(context);
+
     return Status::OK();
 }
 
 bool SSLManager::_initSynchronousSSLContext(UniqueSSLContext* contextPtr,
                                             const SSLParams& params,
                                             ConnectionDirection direction) {
-    *contextPtr = UniqueSSLContext(SSL_CTX_new(SSLv23_method()), _free_ssl_context);
+    *contextPtr = UniqueSSLContext(SSL_CTX_new(SSLv23_method()), free_ssl_context);
 
     uassertStatusOK(initSSLContext(contextPtr->get(), params, direction));
 
@@ -904,8 +1062,11 @@ inline Status checkX509_STORE_error() {
 Status importCertStoreToX509_STORE(const wchar_t* storeName,
                                    DWORD storeLocation,
                                    X509_STORE* verifyStore) {
-    HCERTSTORE systemStore = CertOpenStore(
-        CERT_STORE_PROV_SYSTEM_W, 0, NULL, storeLocation, const_cast<LPWSTR>(storeName));
+    HCERTSTORE systemStore = CertOpenStore(CERT_STORE_PROV_SYSTEM_W,
+                                           0,
+                                           NULL,
+                                           storeLocation | CERT_STORE_READONLY_FLAG,
+                                           const_cast<LPWSTR>(storeName));
     if (systemStore == NULL) {
         return {ErrorCodes::InvalidSSLConfiguration,
                 str::stream() << "error opening system CA store: " << errnoWithDescription()};
@@ -1129,7 +1290,8 @@ SSLConnection* SSLManager::connect(Socket* socket) {
     std::unique_ptr<SSLConnection> sslConn =
         stdx::make_unique<SSLConnection>(_clientContext.get(), socket, (const char*)NULL, 0);
 
-    int ret = ::SSL_set_tlsext_host_name(sslConn->ssl, socket->remoteAddr().hostOrIp().c_str());
+    const auto undotted = removeFQDNRoot(socket->remoteAddr().hostOrIp());
+    int ret = ::SSL_set_tlsext_host_name(sslConn->ssl, undotted.c_str());
     if (ret != 1)
         _handleSSLError(SSL_get_error(sslConn.get(), ret), ret);
 
@@ -1156,22 +1318,6 @@ SSLConnection* SSLManager::accept(Socket* socket, const char* initialBytes, int 
         _handleSSLError(SSL_get_error(sslConn.get(), ret), ret);
 
     return sslConn.release();
-}
-
-// TODO SERVER-11601 Use NFC Unicode canonicalization
-bool SSLManager::_hostNameMatch(const char* nameToMatch, const char* certHostName) {
-    if (strlen(certHostName) < 2) {
-        return false;
-    }
-
-    // match wildcard DNS names
-    if (certHostName[0] == '*' && certHostName[1] == '.') {
-        // allow name.example.com if the cert is *.example.com, '*' does not match '.'
-        const char* subName = strchr(nameToMatch, '.');
-        return subName && !strcasecmp(certHostName + 1, subName);
-    } else {
-        return !strcasecmp(nameToMatch, certHostName);
-    }
 }
 
 StatusWith<boost::optional<SSLPeerInfo>> SSLManager::parseAndValidatePeerCertificate(
@@ -1243,7 +1389,7 @@ StatusWith<boost::optional<SSLPeerInfo>> SSLManager::parseAndValidatePeerCertifi
             const GENERAL_NAME* currentName = sk_GENERAL_NAME_value(sanNames, i);
             if (currentName && currentName->type == GEN_DNS) {
                 char* dnsName = reinterpret_cast<char*>(ASN1_STRING_data(currentName->d.dNSName));
-                if (_hostNameMatch(remoteHost.c_str(), dnsName)) {
+                if (hostNameMatchForX509Certificates(remoteHost, dnsName)) {
                     sanMatch = true;
                     break;
                 }
@@ -1258,7 +1404,7 @@ StatusWith<boost::optional<SSLPeerInfo>> SSLManager::parseAndValidatePeerCertifi
         int cnEnd = peerSubjectName.find(",", cnBegin);
         std::string commonName = peerSubjectName.substr(cnBegin, cnEnd - cnBegin);
 
-        if (_hostNameMatch(remoteHost.c_str(), commonName.c_str())) {
+        if (hostNameMatchForX509Certificates(remoteHost, commonName)) {
             cnMatch = true;
         }
         certificateNames << "CN: " << commonName;
@@ -1271,7 +1417,7 @@ StatusWith<boost::optional<SSLPeerInfo>> SSLManager::parseAndValidatePeerCertifi
         msgBuilder << "The server certificate does not match the host name. Hostname: "
                    << remoteHost << " does not match " << certificateNames.str();
         std::string msg = msgBuilder.str();
-        if (_allowInvalidCertificates || _allowInvalidHostnames) {
+        if (_allowInvalidCertificates || _allowInvalidHostnames || isUnixDomainSocket(remoteHost)) {
             warning() << msg;
         } else {
             error() << msg;
@@ -1463,13 +1609,37 @@ void SSLManager::_handleSSLError(int code, int ret) {
     }
     throw SocketException(SocketException::CONNECT_ERROR, "");
 }
+}  // namespace mongo
+
+// TODO SERVER-11601 Use NFC Unicode canonicalization
+bool mongo::hostNameMatchForX509Certificates(std::string nameToMatch, std::string certHostName) {
+    nameToMatch = removeFQDNRoot(std::move(nameToMatch));
+    certHostName = removeFQDNRoot(std::move(certHostName));
+
+    if (certHostName.size() < 2) {
+        return false;
+    }
+
+    // match wildcard DNS names
+    if (certHostName[0] == '*' && certHostName[1] == '.') {
+        // allow name.example.com if the cert is *.example.com, '*' does not match '.'
+        const char* subName = strchr(nameToMatch.c_str(), '.');
+        return subName && !strcasecmp(certHostName.c_str() + 1, subName);
+    } else {
+        return !strcasecmp(nameToMatch.c_str(), certHostName.c_str());
+    }
+}
+
 #else
 
+namespace mongo {
+namespace {
 MONGO_INITIALIZER(SSLManager)(InitializerContext*) {
     // we need a no-op initializer so that we can depend on SSLManager as a prerequisite in
     // non-SSL builds.
     return Status::OK();
 }
+}  // namespace
+}  // namespace mongo
 
 #endif  // #ifdef MONGO_CONFIG_SSL
-}

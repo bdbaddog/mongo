@@ -63,9 +63,9 @@ void appendParameterNames(stringstream& help) {
 }
 }
 
-class CmdGet : public Command {
+class CmdGet : public ErrmsgCommandDeprecated {
 public:
-    CmdGet() : Command("getParameter") {}
+    CmdGet() : ErrmsgCommandDeprecated("getParameter") {}
     virtual bool slaveOk() const {
         return true;
     }
@@ -88,11 +88,11 @@ public:
         appendParameterNames(help);
         help << "{ getParameter:'*' } to get everything\n";
     }
-    bool run(OperationContext* opCtx,
-             const string& dbname,
-             const BSONObj& cmdObj,
-             string& errmsg,
-             BSONObjBuilder& result) {
+    bool errmsgRun(OperationContext* opCtx,
+                   const string& dbname,
+                   const BSONObj& cmdObj,
+                   string& errmsg,
+                   BSONObjBuilder& result) {
         bool all = *cmdObj.firstElement().valuestrsafe() == '*';
 
         int before = result.len();
@@ -112,9 +112,9 @@ public:
     }
 } cmdGet;
 
-class CmdSet : public Command {
+class CmdSet : public ErrmsgCommandDeprecated {
 public:
-    CmdSet() : Command("setParameter") {}
+    CmdSet() : ErrmsgCommandDeprecated("setParameter") {}
     virtual bool slaveOk() const {
         return true;
     }
@@ -136,11 +136,11 @@ public:
         help << "{ setParameter:1, <param>:<value> }\n";
         appendParameterNames(help);
     }
-    bool run(OperationContext* opCtx,
-             const string& dbname,
-             const BSONObj& cmdObj,
-             string& errmsg,
-             BSONObjBuilder& result) {
+    bool errmsgRun(OperationContext* opCtx,
+                   const string& dbname,
+                   const BSONObj& cmdObj,
+                   string& errmsg,
+                   BSONObjBuilder& result) {
         int numSet = 0;
         bool found = false;
 
@@ -216,15 +216,8 @@ public:
                 foundParameter->second->append(opCtx, result, "was");
             }
 
-            Status status = foundParameter->second->set(parameter);
-            if (status.isOK()) {
-                numSet++;
-                continue;
-            }
-
-            errmsg = status.reason();
-            result.append("code", status.code());
-            return false;
+            uassertStatusOK(foundParameter->second->set(parameter));
+            numSet++;
         }
 
         if (numSet == 0 && !found) {
@@ -335,15 +328,15 @@ private:
 
             // Save LogComponent::kDefault LogSeverity at root
             if (component == LogComponent::kDefault) {
-                doc.root().appendInt("verbosity", severity);
+                doc.root().appendInt("verbosity", severity).transitional_ignore();
                 continue;
             }
 
             mutablebson::Element element = doc.makeElementObject(component.getShortName());
-            element.appendInt("verbosity", severity);
+            element.appendInt("verbosity", severity).transitional_ignore();
 
             mutablebson::Element parentElement = _getParentElement(doc, component);
-            parentElement.pushBack(element);
+            parentElement.pushBack(element).transitional_ignore();
         }
 
         BSONObj result = doc.getObject();
@@ -466,7 +459,7 @@ public:
     virtual Status set(const BSONElement& newValueElement) {
         try {
             return setFromString(newValueElement.String());
-        } catch (const MsgAssertionException& msg) {
+        } catch (const AssertionException& msg) {
             return Status(ErrorCodes::BadValue,
                           mongoutils::str::stream()
                               << "Invalid value for sslMode via setParameter command: "
@@ -537,7 +530,7 @@ public:
     virtual Status set(const BSONElement& newValueElement) {
         try {
             return setFromString(newValueElement.String());
-        } catch (const MsgAssertionException& msg) {
+        } catch (const AssertionException& msg) {
             return Status(ErrorCodes::BadValue,
                           mongoutils::str::stream()
                               << "Invalid value for clusterAuthMode via setParameter command: "

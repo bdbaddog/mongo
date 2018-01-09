@@ -64,29 +64,6 @@ public:
 
     friend class Session;
 
-    /**
-     * Stats for sessions open in the Transport Layer.
-     */
-    struct Stats {
-        /**
-         * Returns the number of sessions currently open in the transport layer.
-         */
-        size_t numOpenSessions = 0;
-
-        /**
-         * Returns the total number of sessions that have ever been created by this TransportLayer.
-         */
-        size_t numCreatedSessions = 0;
-
-        /**
-         * Returns the number of available sessions we could still open. Only relevant
-         * when we are operating under a transport::Session limit (for example, in the
-         * legacy implementation, we respect a maximum number of connections). If there
-         * is no session limit, returns std::numeric_limits<int>::max().
-         */
-        size_t numAvailableSessions = 0;
-    };
-
     virtual ~TransportLayer() = default;
 
     /**
@@ -148,11 +125,6 @@ public:
     virtual void asyncWait(Ticket&& ticket, TicketCallback callback) = 0;
 
     /**
-     * Returns the number of sessions currently open in the transport layer.
-     */
-    virtual Stats sessionStats() = 0;
-
-    /**
      * End the given Session. Tickets for this Session that have already been
      * started via wait() or asyncWait() will complete, but may return a failed Status.
      * Future calls to wait() or asyncWait() for this Session will fail. If this
@@ -164,16 +136,6 @@ public:
      * This method is idempotent and synchronous.
      */
     virtual void end(const SessionHandle& session) = 0;
-
-    /**
-     * End all active sessions in the TransportLayer. Tickets that have already been started via
-     * wait() or asyncWait() will complete, but may return a failed Status.  This method is
-     * asynchronous and will return after all sessions have been notified to end.
-     *
-     * If a non-empty TagMask is provided, endAllSessions() will skip over sessions with matching
-     * tags and leave them open.
-     */
-    virtual void endAllSessions(Session::TagMask tags) = 0;
 
     /**
      * Start the TransportLayer. After this point, the TransportLayer will begin accepting active
@@ -190,6 +152,12 @@ public:
      */
     virtual void shutdown() = 0;
 
+    /**
+     * Optional method for subclasses to setup their state before being ready to accept
+     * connections.
+     */
+    virtual Status setup() = 0;
+
 protected:
     TransportLayer() = default;
 
@@ -198,6 +166,10 @@ protected:
      */
     TicketImpl* getTicketImpl(const Ticket& ticket) {
         return ticket.impl();
+    }
+
+    std::unique_ptr<TicketImpl> getOwnedTicketImpl(Ticket&& ticket) {
+        return std::move(ticket).releaseImpl();
     }
 
     /**

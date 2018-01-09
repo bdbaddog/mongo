@@ -107,15 +107,36 @@ TEST_F(DropPendingCollectionReaperTest, AddDropPendingNamespaceAcceptsNullDropOp
     ASSERT_EQUALS(nullDropOpTime, *reaper.getEarliestDropOpTime());
 }
 
+TEST_F(DropPendingCollectionReaperTest,
+       AddDropPendingNamespaceWithDuplicateDropOpTimeButDifferentNamespace) {
+    StorageInterfaceMock storageInterfaceMock;
+    std::size_t numCollectionsDropped = 0U;
+    storageInterfaceMock.dropCollFn = [&](OperationContext*, const NamespaceString&) {
+        numCollectionsDropped++;
+        return Status::OK();
+    };
+    DropPendingCollectionReaper reaper(&storageInterfaceMock);
+
+    OpTime opTime({Seconds(100), 0}, 1LL);
+    auto dpns = NamespaceString("test.foo").makeDropPendingNamespace(opTime);
+    reaper.addDropPendingNamespace(opTime, dpns);
+    reaper.addDropPendingNamespace(opTime,
+                                   NamespaceString("test.bar").makeDropPendingNamespace(opTime));
+
+    // Drop all collections managed by reaper and confirm number of drops.
+    auto opCtx = makeOpCtx();
+    reaper.dropCollectionsOlderThan(opCtx.get(), opTime);
+    ASSERT_EQUALS(2U, numCollectionsDropped);
+}
+
 DEATH_TEST_F(DropPendingCollectionReaperTest,
-             AddDropPendingNamespaceTerminatesOnDuplicateDropOpTime,
+             AddDropPendingNamespaceTerminatesOnDuplicateDropOpTimeAndNamespace,
              "Failed to add drop-pending collection") {
     OpTime opTime({Seconds(100), 0}, 1LL);
     auto dpns = NamespaceString("test.foo").makeDropPendingNamespace(opTime);
     DropPendingCollectionReaper reaper(_storageInterface.get());
     reaper.addDropPendingNamespace(opTime, dpns);
-    reaper.addDropPendingNamespace(opTime,
-                                   NamespaceString("test.bar").makeDropPendingNamespace(opTime));
+    reaper.addDropPendingNamespace(opTime, dpns);
 }
 
 TEST_F(DropPendingCollectionReaperTest,
@@ -132,7 +153,7 @@ TEST_F(DropPendingCollectionReaperTest,
         opTime[i] = OpTime({Seconds((i + 1) * 10), 0}, 1LL);
         ns[i] = NamespaceString("test", str::stream() << "coll" << i);
         dpns[i] = ns[i].makeDropPendingNamespace(opTime[i]);
-        _storageInterface->createCollection(opCtx.get(), dpns[i], {});
+        _storageInterface->createCollection(opCtx.get(), dpns[i], {}).transitional_ignore();
     }
 
     // Add drop-pending namespaces with drop optimes out of order and check that
@@ -229,6 +250,68 @@ TEST_F(DropPendingCollectionReaperTest,
 
     ASSERT_EQUALS(dpns, droppedNss);
     ASSERT_FALSE(writesAreReplicatedDuringDrop);
+}
+
+TEST_F(DropPendingCollectionReaperTest, RollBackDropPendingCollection) {
+    auto opCtx = makeOpCtx();
+
+    // Generates optimes with secs: 10, 20, 30.
+    // Creates corresponding drop-pending collections.
+    const int n = 3U;
+    OpTime opTime[n];
+    NamespaceString ns[n];
+    NamespaceString dpns[n];
+    for (int i = 0; i < n; ++i) {
+        opTime[i] = OpTime({Seconds((i + 1) * 10), 0}, 1LL);
+        ns[i] = NamespaceString("test", str::stream() << "coll" << i);
+        dpns[i] = ns[i].makeDropPendingNamespace(opTime[i]);
+        ASSERT_OK(_storageInterface->createCollection(opCtx.get(), dpns[i], {}));
+    }
+
+    DropPendingCollectionReaper reaper(_storageInterface.get());
+    reaper.addDropPendingNamespace(opTime[0], dpns[0]);
+    reaper.addDropPendingNamespace(opTime[1], dpns[1]);
+    reaper.addDropPendingNamespace(opTime[2], dpns[2]);
+
+    // Rolling back at an optime not in the list returns false.
+    ASSERT_FALSE(
+        reaper.rollBackDropPendingCollection(opCtx.get(), OpTime({Seconds(5), 0}, 1LL), ns[0]));
+    ASSERT_EQUALS(opTime[0], *reaper.getEarliestDropOpTime());
+    ASSERT_TRUE(collectionExists(opCtx.get(), dpns[0]));
+    ASSERT_TRUE(collectionExists(opCtx.get(), dpns[1]));
+    ASSERT_TRUE(collectionExists(opCtx.get(), dpns[2]));
+    ASSERT_FALSE(collectionExists(opCtx.get(), ns[0]));
+    ASSERT_FALSE(collectionExists(opCtx.get(), ns[1]));
+    ASSERT_FALSE(collectionExists(opCtx.get(), ns[2]));
+
+    // Rolling back removes the collection from the list of drop-pending namespaces
+    // but does not rename the collection.
+    ASSERT_TRUE(reaper.rollBackDropPendingCollection(opCtx.get(), opTime[0], ns[0]));
+    ASSERT_NOT_EQUALS(opTime[0], *reaper.getEarliestDropOpTime());
+    ASSERT_EQUALS(opTime[1], *reaper.getEarliestDropOpTime());
+    ASSERT_TRUE(collectionExists(opCtx.get(), dpns[0]));
+    ASSERT_TRUE(collectionExists(opCtx.get(), dpns[1]));
+    ASSERT_TRUE(collectionExists(opCtx.get(), dpns[2]));
+    ASSERT_FALSE(collectionExists(opCtx.get(), ns[0]));
+    ASSERT_FALSE(collectionExists(opCtx.get(), ns[1]));
+    ASSERT_FALSE(collectionExists(opCtx.get(), ns[2]));
+
+    // Rolling back collection that has the same opTime as another drop-pending collection
+    // only removes a single collection from the list of drop-pending namespaces
+    NamespaceString ns4 = NamespaceString("test", "coll4");
+    NamespaceString dpns4 = ns4.makeDropPendingNamespace(opTime[1]);
+    ASSERT_OK(_storageInterface->createCollection(opCtx.get(), dpns4, {}));
+    reaper.addDropPendingNamespace(opTime[1], dpns4);
+    ASSERT_TRUE(reaper.rollBackDropPendingCollection(opCtx.get(), opTime[1], ns[1]));
+    ASSERT_EQUALS(opTime[1], *reaper.getEarliestDropOpTime());
+    ASSERT_TRUE(collectionExists(opCtx.get(), dpns[0]));
+    ASSERT_TRUE(collectionExists(opCtx.get(), dpns[1]));
+    ASSERT_TRUE(collectionExists(opCtx.get(), dpns[2]));
+    ASSERT_TRUE(collectionExists(opCtx.get(), dpns4));
+    ASSERT_FALSE(collectionExists(opCtx.get(), ns[0]));
+    ASSERT_FALSE(collectionExists(opCtx.get(), ns[1]));
+    ASSERT_FALSE(collectionExists(opCtx.get(), ns[2]));
+    ASSERT_FALSE(collectionExists(opCtx.get(), ns4));
 }
 
 }  // namespace

@@ -74,7 +74,7 @@ namespace {
  *   ]
  * }
  */
-class CmdListIndexes : public Command {
+class CmdListIndexes : public BasicCommand {
 public:
     virtual bool slaveOk() const {
         return false;
@@ -98,9 +98,13 @@ public:
                                        const BSONObj& cmdObj) {
         AuthorizationSession* authzSession = AuthorizationSession::get(client);
 
+        if (!authzSession->isAuthorizedToParseNamespaceElement(cmdObj.firstElement())) {
+            return Status(ErrorCodes::Unauthorized, "Unauthorized");
+        }
+
         // Check for the listIndexes ActionType on the database, or find on system.indexes for pre
         // 3.0 systems.
-        const NamespaceString ns(parseNsCollectionRequired(dbname, cmdObj));
+        const NamespaceString ns(parseNsOrUUID(client->getOperationContext(), dbname, cmdObj));
         if (authzSession->isAuthorizedForActionsOnResource(ResourcePattern::forExactNamespace(ns),
                                                            ActionType::listIndexes) ||
             authzSession->isAuthorizedForActionsOnResource(
@@ -114,13 +118,13 @@ public:
                                     << ns.coll());
     }
 
-    CmdListIndexes() : Command("listIndexes") {}
+    CmdListIndexes() : BasicCommand("listIndexes") {}
 
     bool run(OperationContext* opCtx,
              const string& dbname,
              const BSONObj& cmdObj,
-             string& errmsg,
              BSONObjBuilder& result) {
+        Lock::DBLock dbSLock(opCtx, dbname, MODE_IS);
         const NamespaceString ns(parseNsOrUUID(opCtx, dbname, cmdObj));
         const long long defaultBatchSize = std::numeric_limits<long long>::max();
         long long batchSize;
@@ -130,7 +134,7 @@ public:
             return appendCommandStatus(result, parseCursorStatus);
         }
 
-        AutoGetCollectionForReadCommand autoColl(opCtx, ns);
+        AutoGetCollectionForReadCommand autoColl(opCtx, ns, std::move(dbSLock));
         if (!autoColl.getDb()) {
             return appendCommandStatus(
                 result,
@@ -148,21 +152,19 @@ public:
         invariant(cce);
 
         vector<string> indexNames;
-        MONGO_WRITE_CONFLICT_RETRY_LOOP_BEGIN {
+        writeConflictRetry(opCtx, "listIndexes", ns.ns(), [&indexNames, &cce, &opCtx] {
             indexNames.clear();
-            cce->getAllIndexes(opCtx, &indexNames);
-        }
-        MONGO_WRITE_CONFLICT_RETRY_LOOP_END(opCtx, "listIndexes", ns.ns());
+            cce->getReadyIndexes(opCtx, &indexNames);
+        });
 
         auto ws = make_unique<WorkingSet>();
         auto root = make_unique<QueuedDataStage>(opCtx, ws.get());
 
         for (size_t i = 0; i < indexNames.size(); i++) {
-            BSONObj indexSpec;
-            MONGO_WRITE_CONFLICT_RETRY_LOOP_BEGIN {
-                indexSpec = cce->getIndexSpec(opCtx, indexNames[i]);
-            }
-            MONGO_WRITE_CONFLICT_RETRY_LOOP_END(opCtx, "listIndexes", ns.ns());
+            BSONObj indexSpec =
+                writeConflictRetry(opCtx, "listIndexes", ns.ns(), [&cce, &opCtx, &indexNames, i] {
+                    return cce->getIndexSpec(opCtx, indexNames[i]);
+                });
 
             WorkingSetID id = ws->allocate();
             WorkingSetMember* member = ws->get(id);

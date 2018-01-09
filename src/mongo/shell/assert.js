@@ -416,13 +416,16 @@ assert.commandFailedWithCode = function(res, code, msg) {
     if (assert._debug && msg)
         print("in assert for: " + msg);
 
+    if (!Array.isArray(code)) {
+        code = [code];
+    }
+
     assert(!res.ok,
-           "Command result indicates success, but expected failure with code " + code + ": " +
+           "Command result indicates success, but expected failure with code " + tojson(code) +
+               ": " + tojson(res) + " : " + msg);
+    assert(code.indexOf(res.code) >= 0,
+           "Expected failure code " + tojson(code) + " did not match actual in command result: " +
                tojson(res) + " : " + msg);
-    assert.eq(res.code,
-              code,
-              "Expected failure code did not match actual in command result: " + tojson(res) +
-                  " : " + msg);
     return res;
 };
 
@@ -568,6 +571,8 @@ assert.writeError = function(res, msg) {
     return assert.writeErrorWithCode(res, null, msg);
 };
 
+// If expectedCode is an array then this asserts that the found code is one of the codes in
+// the expectedCode array.
 assert.writeErrorWithCode = function(res, expectedCode, msg) {
 
     var errMsg = null;
@@ -604,7 +609,12 @@ assert.writeErrorWithCode = function(res, expectedCode, msg) {
     }
 
     if (!errMsg && expectedCode) {
-        if (foundCode != expectedCode) {
+        if (Array.isArray(expectedCode)) {
+            if (!expectedCode.includes(foundCode)) {
+                errMsg = "found code " + foundCode + " does not match any of the expected codes " +
+                    tojson(expectedCode);
+            }
+        } else if (foundCode != expectedCode) {
             errMsg = "found code " + foundCode + " does not match expected code " + expectedCode;
         }
     }

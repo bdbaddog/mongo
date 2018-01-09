@@ -31,8 +31,13 @@
 #include "mongo/transport/transport_layer_manager.h"
 
 #include "mongo/base/status.h"
+#include "mongo/db/server_options.h"
+#include "mongo/db/service_context.h"
 #include "mongo/stdx/memory.h"
+#include "mongo/transport/service_executor_adaptive.h"
+#include "mongo/transport/service_executor_synchronous.h"
 #include "mongo/transport/session.h"
+#include "mongo/transport/transport_layer_asio.h"
 #include "mongo/util/net/ssl_types.h"
 #include "mongo/util/time_support.h"
 #include <limits>
@@ -65,7 +70,7 @@ void TransportLayerManager::asyncWait(Ticket&& ticket, TicketCallback callback) 
 }
 
 template <typename Callable>
-void TransportLayerManager::_foreach(Callable&& cb) {
+void TransportLayerManager::_foreach(Callable&& cb) const {
     {
         stdx::lock_guard<stdx::mutex> lk(_tlsMutex);
         for (auto&& tl : _tls) {
@@ -74,39 +79,39 @@ void TransportLayerManager::_foreach(Callable&& cb) {
     }
 }
 
-TransportLayer::Stats TransportLayerManager::sessionStats() {
-    Stats stats;
-
-    _foreach([&](TransportLayer* tl) {
-        Stats s = tl->sessionStats();
-
-        stats.numOpenSessions += s.numOpenSessions;
-        stats.numCreatedSessions += s.numCreatedSessions;
-        if (std::numeric_limits<size_t>::max() - stats.numAvailableSessions <
-            s.numAvailableSessions) {
-            stats.numAvailableSessions = std::numeric_limits<size_t>::max();
-        } else {
-            stats.numAvailableSessions += s.numAvailableSessions;
-        }
-    });
-
-    return stats;
-}
-
 void TransportLayerManager::end(const SessionHandle& session) {
     session->getTransportLayer()->end(session);
 }
 
-void TransportLayerManager::endAllSessions(Session::TagMask tags) {
-    _foreach([&tags](TransportLayer* tl) { tl->endAllSessions(tags); });
-}
-
+// TODO Right now this and setup() leave TLs started if there's an error. In practice the server
+// exits with an error and this isn't an issue, but we should make this more robust.
 Status TransportLayerManager::start() {
+    for (auto&& tl : _tls) {
+        auto status = tl->start();
+        if (!status.isOK()) {
+            _tls.clear();
+            return status;
+        }
+    }
+
     return Status::OK();
 }
 
 void TransportLayerManager::shutdown() {
     _foreach([](TransportLayer* tl) { tl->shutdown(); });
+}
+
+// TODO Same comment as start()
+Status TransportLayerManager::setup() {
+    for (auto&& tl : _tls) {
+        auto status = tl->setup();
+        if (!status.isOK()) {
+            _tls.clear();
+            return status;
+        }
+    }
+
+    return Status::OK();
 }
 
 Status TransportLayerManager::addAndStartTransportLayer(std::unique_ptr<TransportLayer> tl) {
@@ -116,6 +121,35 @@ Status TransportLayerManager::addAndStartTransportLayer(std::unique_ptr<Transpor
         _tls.emplace_back(std::move(tl));
     }
     return ptr->start();
+}
+
+std::unique_ptr<TransportLayer> TransportLayerManager::createWithConfig(
+    const ServerGlobalParams* config, ServiceContext* ctx) {
+    std::unique_ptr<TransportLayer> transportLayer;
+    auto sep = ctx->getServiceEntryPoint();
+
+    transport::TransportLayerASIO::Options opts(config);
+    if (config->serviceExecutor == "adaptive") {
+        opts.transportMode = transport::Mode::kAsynchronous;
+    } else if (config->serviceExecutor == "synchronous") {
+        opts.transportMode = transport::Mode::kSynchronous;
+    } else {
+        MONGO_UNREACHABLE;
+    }
+
+    auto transportLayerASIO = stdx::make_unique<transport::TransportLayerASIO>(opts, sep);
+
+    if (config->serviceExecutor == "adaptive") {
+        ctx->setServiceExecutor(
+            stdx::make_unique<ServiceExecutorAdaptive>(ctx, transportLayerASIO->getIOContext()));
+    } else if (config->serviceExecutor == "synchronous") {
+        ctx->setServiceExecutor(stdx::make_unique<ServiceExecutorSynchronous>(ctx));
+    }
+    transportLayer = std::move(transportLayerASIO);
+
+    std::vector<std::unique_ptr<TransportLayer>> retVector;
+    retVector.emplace_back(std::move(transportLayer));
+    return stdx::make_unique<TransportLayerManager>(std::move(retVector));
 }
 
 }  // namespace transport

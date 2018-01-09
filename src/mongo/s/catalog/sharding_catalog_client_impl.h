@@ -48,7 +48,18 @@ class TaskExecutor;
  * Implements the catalog client for reading from replica set config servers.
  */
 class ShardingCatalogClientImpl final : public ShardingCatalogClient {
+
 public:
+    /*
+     * Updates (or if "upsert" is true, creates) catalog data for the sharded collection "collNs" by
+     * writing a document to the "config.collections" collection with the catalog information
+     * described by "coll."
+     */
+    static Status updateShardingCatalogEntryForCollection(OperationContext* opCtx,
+                                                          const std::string& collNs,
+                                                          const CollectionType& coll,
+                                                          const bool upsert);
+
     explicit ShardingCatalogClientImpl(std::unique_ptr<DistLockManager> distLockManager);
     virtual ~ShardingCatalogClientImpl();
 
@@ -56,17 +67,13 @@ public:
      * Safe to call multiple times as long as the calls are externally synchronized to be
      * non-overlapping.
      */
-    Status startup() override;
+    void startup() override;
 
     void shutDown(OperationContext* opCtx) override;
-
-    Status enableSharding(OperationContext* opCtx, const std::string& dbName) override;
 
     Status updateDatabase(OperationContext* opCtx,
                           const std::string& dbName,
                           const DatabaseType& db) override;
-
-    Status createDatabase(OperationContext* opCtx, const std::string& dbName) override;
 
     Status logAction(OperationContext* opCtx,
                      const std::string& what,
@@ -79,45 +86,36 @@ public:
                      const BSONObj& detail,
                      const WriteConcernOptions& writeConcern) override;
 
-    Status shardCollection(OperationContext* opCtx,
-                           const std::string& ns,
-                           const ShardKeyPattern& fieldsAndOrder,
-                           const BSONObj& defaultCollation,
-                           bool unique,
-                           const std::vector<BSONObj>& initPoints,
-                           const std::set<ShardId>& initShardsIds) override;
+    StatusWith<repl::OpTimeWith<DatabaseType>> getDatabase(
+        OperationContext* opCtx,
+        const std::string& dbName,
+        repl::ReadConcernLevel readConcernLevel) override;
 
-    StatusWith<ShardDrainingStatus> removeShard(OperationContext* opCtx,
-                                                const ShardId& name) override;
+    StatusWith<repl::OpTimeWith<CollectionType>> getCollection(
+        OperationContext* opCtx,
+        const std::string& collNs,
+        repl::ReadConcernLevel readConcernLevel) override;
 
-    StatusWith<repl::OpTimeWith<DatabaseType>> getDatabase(OperationContext* opCtx,
-                                                           const std::string& dbName) override;
+    StatusWith<std::vector<CollectionType>> getCollections(OperationContext* opCtx,
+                                                           const std::string* dbName,
+                                                           repl::OpTime* optime) override;
 
-    StatusWith<repl::OpTimeWith<CollectionType>> getCollection(OperationContext* opCtx,
-                                                               const std::string& collNs) override;
+    Status dropCollection(OperationContext* opCtx,
+                          const NamespaceString& ns,
+                          repl::ReadConcernLevel readConcernLevel) override;
 
-    Status getCollections(OperationContext* opCtx,
-                          const std::string* dbName,
-                          std::vector<CollectionType>* collections,
-                          repl::OpTime* optime) override;
+    StatusWith<std::vector<std::string>> getDatabasesForShard(OperationContext* opCtx,
+                                                              const ShardId& shardName) override;
 
-    Status dropCollection(OperationContext* opCtx, const NamespaceString& ns) override;
+    StatusWith<std::vector<ChunkType>> getChunks(OperationContext* opCtx,
+                                                 const BSONObj& query,
+                                                 const BSONObj& sort,
+                                                 boost::optional<int> limit,
+                                                 repl::OpTime* opTime,
+                                                 repl::ReadConcernLevel readConcern) override;
 
-    Status getDatabasesForShard(OperationContext* opCtx,
-                                const ShardId& shardName,
-                                std::vector<std::string>* dbs) override;
-
-    Status getChunks(OperationContext* opCtx,
-                     const BSONObj& query,
-                     const BSONObj& sort,
-                     boost::optional<int> limit,
-                     std::vector<ChunkType>* chunks,
-                     repl::OpTime* opTime,
-                     repl::ReadConcernLevel readConcern) override;
-
-    Status getTagsForCollection(OperationContext* opCtx,
-                                const std::string& collectionNs,
-                                std::vector<TagsType>* tags) override;
+    StatusWith<std::vector<TagsType>> getTagsForCollection(
+        OperationContext* opCtx, const std::string& collectionNs) override;
 
     StatusWith<repl::OpTimeWith<std::vector<ShardType>>> getAllShards(
         OperationContext* opCtx, repl::ReadConcernLevel readConcern) override;
@@ -169,10 +167,6 @@ public:
 
     DistLockManager* getDistLockManager() override;
 
-    Status appendInfoForConfigServerDatabases(OperationContext* opCtx,
-                                              const BSONObj& listDatabasesCmd,
-                                              BSONArrayBuilder* builder) override;
-
     /**
      * Runs a read command against the config server with majority read concern.
      */
@@ -189,25 +183,23 @@ public:
 
 private:
     /**
-     * Selects an optimal shard on which to place a newly created database from the set of
-     * available shards. Will return ShardNotFound if shard could not be found.
-     */
-    static StatusWith<ShardId> _selectShardForNewDatabase(OperationContext* opCtx,
-                                                          ShardRegistry* shardRegistry);
-
-    /**
-     * Checks that the given database name doesn't already exist in the config.databases
-     * collection, including under different casing. Optional db can be passed and will
-     * be set with the database details if the given dbName exists.
+     * Updates a single document in the specified namespace on the config server. The document must
+     * have an _id index. Must only be used for updates to the 'config' database.
      *
-     * Returns OK status if the db does not exist.
-     * Some known errors include:
-     *  NamespaceExists if it exists with the same casing
-     *  DatabaseDifferCase if it exists under different casing.
+     * This method retries the operation on NotMaster or network errors, so it should only be used
+     * with modifications which are idempotent.
+     *
+     * Returns non-OK status if the command failed to run for some reason. If the command was
+     * successful, returns true if a document was actually modified (that is, it did not exist and
+     * was upserted or it existed and any of the fields changed) and false otherwise (basically
+     * returns whether the update command's response update.n value is > 0).
      */
-    Status _checkDbDoesNotExist(OperationContext* opCtx,
-                                const std::string& dbName,
-                                DatabaseType* db);
+    static StatusWith<bool> _updateConfigDocument(OperationContext* opCtx,
+                                                  const std::string& ns,
+                                                  const BSONObj& query,
+                                                  const BSONObj& update,
+                                                  bool upsert,
+                                                  const WriteConcernOptions& writeConcern);
 
     /**
      * Creates the specified collection name in the config database.
@@ -217,30 +209,14 @@ private:
                                          int cappedSize,
                                          const WriteConcernOptions& writeConcern);
 
-    /**
-     * Helper method for running a count command against the config server with appropriate
-     * error handling.
-     */
-    StatusWith<long long> _runCountCommandOnConfig(OperationContext* opCtx,
-                                                   const NamespaceString& ns,
-                                                   BSONObj query);
-
-    /**
-     * Updates the metadata for the specified collection.
-     */
-    Status _updateCollection(OperationContext* opCtx,
-                             const std::string& collNs,
-                             const CollectionType& coll,
-                             bool upsert);
-
     StatusWith<repl::OpTimeWith<std::vector<BSONObj>>> _exhaustiveFindOnConfig(
         OperationContext* opCtx,
         const ReadPreferenceSetting& readPref,
-        repl::ReadConcernLevel readConcern,
+        const repl::ReadConcernLevel& readConcern,
         const NamespaceString& nss,
         const BSONObj& query,
         const BSONObj& sort,
-        boost::optional<long long> limit);
+        boost::optional<long long> limit) override;
 
     /**
      * Appends a read committed read concern to the request object.
@@ -252,7 +228,10 @@ private:
      * given read preference.  Returns NamespaceNotFound if no database metadata is found.
      */
     StatusWith<repl::OpTimeWith<DatabaseType>> _fetchDatabaseMetadata(
-        OperationContext* opCtx, const std::string& dbName, const ReadPreferenceSetting& readPref);
+        OperationContext* opCtx,
+        const std::string& dbName,
+        const ReadPreferenceSetting& readPref,
+        repl::ReadConcernLevel readConcernLevel);
 
     /**
      * Best effort method, which logs diagnostic events on the config server. If the config server

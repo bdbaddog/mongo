@@ -33,21 +33,8 @@
 namespace mongo {
 
 MockSessionsCollectionImpl::MockSessionsCollectionImpl()
-    : _sessions(),
-      _fetch(stdx::bind(&MockSessionsCollectionImpl::_fetchRecord, this, stdx::placeholders::_1)),
-      _insert(stdx::bind(&MockSessionsCollectionImpl::_insertRecord, this, stdx::placeholders::_1)),
-      _refresh(
-          stdx::bind(&MockSessionsCollectionImpl::_refreshSessions, this, stdx::placeholders::_1)),
-      _remove(
-          stdx::bind(&MockSessionsCollectionImpl::_removeRecords, this, stdx::placeholders::_1)) {}
-
-void MockSessionsCollectionImpl::setFetchHook(FetchHook hook) {
-    _fetch = std::move(hook);
-}
-
-void MockSessionsCollectionImpl::setInsertHook(InsertHook hook) {
-    _insert = std::move(hook);
-}
+    : _refresh([=](const LogicalSessionRecordSet& sessions) { return _refreshSessions(sessions); }),
+      _remove([=](const LogicalSessionIdSet& sessions) { return _removeRecords(sessions); }) {}
 
 void MockSessionsCollectionImpl::setRefreshHook(RefreshHook hook) {
     _refresh = std::move(hook);
@@ -58,32 +45,21 @@ void MockSessionsCollectionImpl::setRemoveHook(RemoveHook hook) {
 }
 
 void MockSessionsCollectionImpl::clearHooks() {
-    _fetch = stdx::bind(&MockSessionsCollectionImpl::_fetchRecord, this, stdx::placeholders::_1);
-    _insert = stdx::bind(&MockSessionsCollectionImpl::_insertRecord, this, stdx::placeholders::_1);
-    _refresh =
-        stdx::bind(&MockSessionsCollectionImpl::_refreshSessions, this, stdx::placeholders::_1);
-    _remove = stdx::bind(&MockSessionsCollectionImpl::_removeRecords, this, stdx::placeholders::_1);
+    _refresh = [=](const LogicalSessionRecordSet& sessions) { return _refreshSessions(sessions); };
+    _remove = [=](const LogicalSessionIdSet& sessions) { return _removeRecords(sessions); };
 }
 
-StatusWith<LogicalSessionRecord> MockSessionsCollectionImpl::fetchRecord(LogicalSessionId lsid) {
-    return _fetch(std::move(lsid));
+Status MockSessionsCollectionImpl::refreshSessions(const LogicalSessionRecordSet& sessions) {
+    return _refresh(sessions);
 }
 
-Status MockSessionsCollectionImpl::insertRecord(LogicalSessionRecord record) {
-    return _insert(std::move(record));
-}
-
-LogicalSessionIdSet MockSessionsCollectionImpl::refreshSessions(LogicalSessionIdSet sessions) {
-    return _refresh(std::move(sessions));
-}
-
-void MockSessionsCollectionImpl::removeRecords(LogicalSessionIdSet sessions) {
-    _remove(std::move(sessions));
+Status MockSessionsCollectionImpl::removeRecords(const LogicalSessionIdSet& sessions) {
+    return _remove(std::move(sessions));
 }
 
 void MockSessionsCollectionImpl::add(LogicalSessionRecord record) {
     stdx::unique_lock<stdx::mutex> lk(_mutex);
-    _sessions.insert({record.getLsid(), std::move(record)});
+    _sessions.insert({record.getId(), std::move(record)});
 }
 
 void MockSessionsCollectionImpl::remove(LogicalSessionId lsid) {
@@ -105,52 +81,34 @@ const MockSessionsCollectionImpl::SessionMap& MockSessionsCollectionImpl::sessio
     return _sessions;
 }
 
-StatusWith<LogicalSessionRecord> MockSessionsCollectionImpl::_fetchRecord(LogicalSessionId lsid) {
-    stdx::unique_lock<stdx::mutex> lk(_mutex);
-
-    // If we do not have this record, return an error
-    auto it = _sessions.find(lsid);
-    if (it == _sessions.end()) {
-        return {ErrorCodes::NoSuchSession, "No matching record in the sessions collection"};
+Status MockSessionsCollectionImpl::_refreshSessions(const LogicalSessionRecordSet& sessions) {
+    for (auto& record : sessions) {
+        if (!has(record.getId())) {
+            _sessions.insert({record.getId(), record});
+        }
     }
-
-    return it->second;
+    return Status::OK();
 }
 
-Status MockSessionsCollectionImpl::_insertRecord(LogicalSessionRecord record) {
+Status MockSessionsCollectionImpl::_removeRecords(const LogicalSessionIdSet& sessions) {
     stdx::unique_lock<stdx::mutex> lk(_mutex);
-    auto res = _sessions.insert({record.getLsid(), std::move(record)});
-
-    // We should never try to insert the same record twice. In theory this could
-    // happen because of a UUID conflict.
-    if (!res.second) {
-        return {ErrorCodes::DuplicateSession, "Session already exists in the sessions collection"};
+    for (auto& lsid : sessions) {
+        _sessions.erase(lsid);
     }
 
     return Status::OK();
 }
 
-LogicalSessionIdSet MockSessionsCollectionImpl::_refreshSessions(LogicalSessionIdSet sessions) {
-    LogicalSessionIdSet notFound{};
-
-    {
-        stdx::unique_lock<stdx::mutex> lk(_mutex);
-        for (auto& lsid : sessions) {
-            auto it = _sessions.find(lsid);
-            if (it == _sessions.end()) {
-                notFound.insert(lsid);
-            }
-        }
-    }
-
-    return notFound;
-}
-
-void MockSessionsCollectionImpl::_removeRecords(LogicalSessionIdSet sessions) {
+StatusWith<LogicalSessionIdSet> MockSessionsCollectionImpl::findRemovedSessions(
+    OperationContext* opCtx, const LogicalSessionIdSet& sessions) {
+    LogicalSessionIdSet lsids;
     stdx::unique_lock<stdx::mutex> lk(_mutex);
     for (auto& lsid : sessions) {
-        _sessions.erase(lsid);
+        if (_sessions.find(lsid) == _sessions.end()) {
+            lsids.emplace(lsid);
+        }
     }
+    return lsids;
 }
 
 }  // namespace mongo

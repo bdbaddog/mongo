@@ -42,8 +42,13 @@ var runner = (function() {
     }
 
     function validateExecutionOptions(mode, options) {
-        var allowedKeys =
-            ['backgroundWorkloads', 'dbNamePrefix', 'iterationMultiplier', 'threadMultiplier'];
+        var allowedKeys = [
+            'backgroundWorkloads',
+            'dbNamePrefix',
+            'iterationMultiplier',
+            'sessionOptions',
+            'threadMultiplier'
+        ];
 
         if (mode.parallel || mode.composed) {
             allowedKeys.push('numSubsets');
@@ -111,7 +116,7 @@ var runner = (function() {
     }
 
     function validateCleanupOptions(options) {
-        var allowedKeys = ['dropDatabaseBlacklist', 'keepExistingDatabases'];
+        var allowedKeys = ['dropDatabaseBlacklist', 'keepExistingDatabases', 'validateCollections'];
 
         Object.keys(options).forEach(function(option) {
             assert.contains(option,
@@ -130,6 +135,12 @@ var runner = (function() {
                       typeof options.keepExistingDatabases,
                       'expected keepExistingDatabases to be a boolean');
         }
+
+        options.validateCollections =
+            options.hasOwnProperty('validateCollections') ? options.validateCollections : true;
+        assert.eq('boolean',
+                  typeof options.validateCollections,
+                  'expected validateCollections to be a boolean');
 
         return options;
     }
@@ -209,7 +220,6 @@ var runner = (function() {
                     dbName = uniqueDBName(executionOptions.dbNamePrefix);
                 }
                 collName = uniqueCollName();
-
                 myDB = cluster.getDB(dbName);
                 myDB[collName].drop();
 
@@ -404,8 +414,8 @@ var runner = (function() {
         // lock is already held by the balancer or by a workload operation. The increased wait
         // is shorter than the distributed-lock-takeover period because otherwise the node
         // would be assumed to be down and the lock would be overtaken.
-        clusterOptions.setupFunctions.mongos.push(increaseDropDistLockTimeout);
-        clusterOptions.teardownFunctions.mongos.push(resetDropDistLockTimeout);
+        clusterOptions.setupFunctions.config.push(increaseDropDistLockTimeout);
+        clusterOptions.teardownFunctions.config.push(resetDropDistLockTimeout);
     }
 
     function loadWorkloadContext(workloads, context, executionOptions, applyMultipliers) {
@@ -436,7 +446,8 @@ var runner = (function() {
         jsTest.log('End of schedule');
     }
 
-    function cleanupWorkload(workload, context, cluster, errors, header, dbHashBlacklist) {
+    function cleanupWorkload(
+        workload, context, cluster, errors, header, dbHashBlacklist, cleanupOptions) {
         // Returns true if the workload's teardown succeeds and false if the workload's
         // teardown fails.
 
@@ -453,7 +464,9 @@ var runner = (function() {
         }
 
         try {
-            cluster.validateAllCollections(phase);
+            if (cleanupOptions.validateCollections) {
+                cluster.validateAllCollections(phase);
+            }
         } catch (e) {
             errors.push(new WorkloadFailure(
                 e.toString(), e.stack, 'main', header + ' validating collections'));
@@ -504,7 +517,8 @@ var runner = (function() {
                               errors,
                               maxAllowedThreads,
                               dbHashBlacklist,
-                              configServerData) {
+                              configServerData,
+                              cleanupOptions) {
         var cleanup = [];
         var teardownFailed = false;
         var startTime = Date.now();  // Initialize in case setupWorkload fails below.
@@ -532,25 +546,64 @@ var runner = (function() {
                 cleanup.push(workload);
             });
 
+            // Since the worker threads may be running with causal consistency enabled, we set the
+            // initial clusterTime and initial operationTime for the sessions they'll create so that
+            // they are guaranteed to observe the effects of the workload's $config.setup() function
+            // being called.
+            if (typeof executionOptions.sessionOptions === 'object' &&
+                executionOptions.sessionOptions !== null) {
+                // We only start a session for the worker threads and never start one for the main
+                // thread. We can therefore get the clusterTime and operationTime tracked by the
+                // underlying DummyDriverSession through any DB instance (i.e. the "test" database
+                // here was chosen arbitrarily).
+                const session = cluster.getDB('test').getSession();
+
+                // JavaScript objects backed by C++ objects (e.g. BSON values from a command
+                // response) do not serialize correctly when passed through the ScopedThread
+                // constructor. To work around this behavior, we instead pass a stringified form of
+                // the JavaScript object through the ScopedThread constructor and use eval() to
+                // rehydrate it.
+                executionOptions.sessionOptions.initialClusterTime =
+                    tojson(session.getClusterTime());
+                executionOptions.sessionOptions.initialOperationTime =
+                    tojson(session.getOperationTime());
+            }
+
+            if (cluster.shouldPerformContinuousStepdowns()) {
+                cluster.startContinuousFailover();
+            }
+
             try {
-                // Start this set of foreground workload threads.
-                threadMgr.spawnAll(cluster, executionOptions);
-                // Allow 20% of foreground threads to fail. This allows the workloads to run on
-                // underpowered test hosts.
-                threadMgr.checkFailed(0.2);
+                try {
+                    // Start this set of foreground workload threads.
+                    threadMgr.spawnAll(cluster, executionOptions);
+                    // Allow 20% of foreground threads to fail. This allows the workloads to run on
+                    // underpowered test hosts.
+                    threadMgr.checkFailed(0.2);
+                } finally {
+                    // Threads must be joined before destruction, so do this
+                    // even in the presence of exceptions.
+                    errors.push(...threadMgr.joinAll().map(
+                        e => new WorkloadFailure(
+                            e.err, e.stack, e.tid, 'Foreground ' + e.workloads.join(' '))));
+                }
             } finally {
-                // Threads must be joined before destruction, so do this
-                // even in the presence of exceptions.
-                errors.push(...threadMgr.joinAll().map(
-                    e => new WorkloadFailure(
-                        e.err, e.stack, e.tid, 'Foreground ' + e.workloads.join(' '))));
+                if (cluster.shouldPerformContinuousStepdowns()) {
+                    // Suspend the stepdown threads prior to calling cleanupWorkload() to avoid
+                    // causing a failover to happen while the data consistency checks are running.
+                    cluster.stopContinuousFailover();
+                }
             }
         } finally {
             // Call each foreground workload's teardown function. After all teardowns have completed
             // check if any of them failed.
-            var cleanupResults =
-                cleanup.map(workload => cleanupWorkload(
-                                workload, context, cluster, errors, 'Foreground', dbHashBlacklist));
+            var cleanupResults = cleanup.map(workload => cleanupWorkload(workload,
+                                                                         context,
+                                                                         cluster,
+                                                                         errors,
+                                                                         'Foreground',
+                                                                         dbHashBlacklist,
+                                                                         cleanupOptions));
             teardownFailed = cleanupResults.some(success => (success === false));
 
             totalTime = Date.now() - startTime;
@@ -582,8 +635,8 @@ var runner = (function() {
         validateExecutionOptions(executionMode, executionOptions);
         Object.freeze(executionOptions);  // immutable after validation (and normalization)
 
-        Object.freeze(cleanupOptions);  // immutable prior to validation
         validateCleanupOptions(cleanupOptions);
+        Object.freeze(cleanupOptions);  // immutable after validation (and normalization)
 
         if (executionMode.composed) {
             clusterOptions.sameDB = true;
@@ -703,7 +756,8 @@ var runner = (function() {
                                      errors,
                                      maxAllowedThreads,
                                      dbHashBlacklist,
-                                     configServerData);
+                                     configServerData,
+                                     cleanupOptions);
                 });
             } finally {
                 // Set a flag so background threads know to terminate.
@@ -715,9 +769,13 @@ var runner = (function() {
         } finally {
             try {
                 // Call each background workload's teardown function.
-                bgCleanup.forEach(
-                    bgWorkload => cleanupWorkload(
-                        bgWorkload, bgContext, cluster, errors, 'Background', dbHashBlacklist));
+                bgCleanup.forEach(bgWorkload => cleanupWorkload(bgWorkload,
+                                                                bgContext,
+                                                                cluster,
+                                                                errors,
+                                                                'Background',
+                                                                dbHashBlacklist,
+                                                                cleanupOptions));
                 // TODO: Call cleanupWorkloadData() on background workloads here if no background
                 // workload teardown functions fail.
 

@@ -1,16 +1,28 @@
+/**
+ * This test is labeled resource intensive because its total io_write is 90MB compared to a median
+ * of 5MB across all sharding tests in wiredTiger.
+ * @tags: [resource_intensive]
+ */
 function shardSetup(shardConfig, dbName, collName) {
     var st = new ShardingTest(shardConfig);
     var db = st.getDB(dbName);
 
     // Set the balancer mode to only balance on autoSplit
     assert.writeOK(st.s.getDB('config').settings.update(
-        {_id: 'balancer'}, {'$unset': {stopped: ''}, '$set': {mode: 'autoSplitOnly'}}));
+        {_id: 'balancer'},
+        {'$unset': {stopped: ''}, '$set': {mode: 'autoSplitOnly'}},
+        {writeConcern: {w: 'majority'}}));
     return st;
 }
 
-function getShardWithTopChunk(configDB, lowOrHigh) {
+function getShardWithTopChunk(configDB, lowOrHigh, ns) {
     // lowOrHigh: 1 low "top chunk", -1 high "top chunk"
-    return configDB.chunks.find({}).sort({min: lowOrHigh}).limit(1).next().shard;
+    print(ns);
+    print(configDB.chunks.count({"ns": ns}));
+    print(configDB.chunks.count());
+    print(JSON.stringify(configDB.chunks.findOne()));
+    print(JSON.stringify(configDB.chunks.findOne({"ns": {$ne: "config.system.sessions"}})));
+    return configDB.chunks.find({"ns": ns}).sort({min: lowOrHigh}).limit(1).next().shard;
 }
 
 function getNumberOfChunks(configDB) {
@@ -77,8 +89,9 @@ function runTest(test) {
         xval += test.inserts.inc;
     } while (getNumberOfChunks(configDB) <= numChunks);
 
+    printShardingStatus(configDB);
     // Test for where new top chunk should reside
-    assert.eq(getShardWithTopChunk(configDB, test.lowOrHigh),
+    assert.eq(getShardWithTopChunk(configDB, test.lowOrHigh, db + "." + collName),
               test.movedToShard,
               test.name + " chunk in the wrong shard");
 

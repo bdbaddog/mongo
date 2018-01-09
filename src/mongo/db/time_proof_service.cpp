@@ -57,11 +57,11 @@ TimeProofService::Key TimeProofService::generateRandomKey() {
 
 TimeProofService::TimeProof TimeProofService::getProof(LogicalTime time, const Key& key) {
     stdx::lock_guard<stdx::mutex> lk(_cacheMutex);
-    if (_cache && _cache->hasProof(time, key)) {
+    auto timeCeil = LogicalTime(Timestamp(time.asTimestamp().asULL() | kRangeMask));
+    if (_cache && _cache->hasProof(timeCeil, key)) {
         return _cache->_proof;
     }
 
-    auto timeCeil = LogicalTime(Timestamp(time.asTimestamp().asULL() | kRangeMask));
     auto unsignedTimeArray = timeCeil.toUnsignedArray();
     // update cache
     _cache =
@@ -75,9 +75,16 @@ TimeProofService::TimeProof TimeProofService::getProof(LogicalTime time, const K
 Status TimeProofService::checkProof(LogicalTime time, const TimeProof& proof, const Key& key) {
     auto myProof = getProof(time, key);
     if (myProof != proof) {
-        return Status(ErrorCodes::TimeProofMismatch, "Proof does not match the logical time");
+        return Status(ErrorCodes::TimeProofMismatch, "Proof does not match the cluster time");
     }
     return Status::OK();
+}
+
+void TimeProofService::resetCache() {
+    stdx::lock_guard<stdx::mutex> lk(_cacheMutex);
+    if (_cache) {
+        _cache = boost::none;
+    }
 }
 
 }  // namespace mongo

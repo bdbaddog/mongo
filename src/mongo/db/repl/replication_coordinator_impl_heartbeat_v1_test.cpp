@@ -39,7 +39,7 @@
 #include "mongo/db/repl/replication_coordinator_external_state_mock.h"
 #include "mongo/db/repl/replication_coordinator_impl.h"
 #include "mongo/db/repl/replication_coordinator_test_fixture.h"
-#include "mongo/db/repl/topology_coordinator_impl.h"
+#include "mongo/db/repl/topology_coordinator.h"
 #include "mongo/executor/network_interface_mock.h"
 #include "mongo/rpc/metadata/repl_set_metadata.h"
 #include "mongo/unittest/unittest.h"
@@ -114,10 +114,11 @@ TEST_F(ReplCoordHBV1Test,
     NetworkInterfaceMock::NetworkOperationIterator noi = net->getNextReadyRequest();
     const RemoteCommandRequest& request = noi->getRequest();
     ASSERT_EQUALS(HostAndPort("h1", 1), request.target);
-    ReplSetHeartbeatArgs hbArgs;
+    ReplSetHeartbeatArgsV1 hbArgs;
     ASSERT_OK(hbArgs.initialize(request.cmdObj));
     ASSERT_EQUALS("mySet", hbArgs.getSetName());
     ASSERT_EQUALS(-2, hbArgs.getConfigVersion());
+    ASSERT_EQUALS(OpTime::kInitialTerm, hbArgs.getTerm());
     ReplSetHeartbeatResponse hbResp;
     hbResp.setSetName("mySet");
     hbResp.setState(MemberState::RS_PRIMARY);
@@ -183,10 +184,11 @@ TEST_F(ReplCoordHBV1Test,
     NetworkInterfaceMock::NetworkOperationIterator noi = net->getNextReadyRequest();
     const RemoteCommandRequest& request = noi->getRequest();
     ASSERT_EQUALS(HostAndPort("h1", 1), request.target);
-    ReplSetHeartbeatArgs hbArgs;
+    ReplSetHeartbeatArgsV1 hbArgs;
     ASSERT_OK(hbArgs.initialize(request.cmdObj));
     ASSERT_EQUALS("mySet", hbArgs.getSetName());
     ASSERT_EQUALS(-2, hbArgs.getConfigVersion());
+    ASSERT_EQUALS(OpTime::kInitialTerm, hbArgs.getTerm());
     ReplSetHeartbeatResponse hbResp;
     hbResp.setSetName("mySet");
     hbResp.setState(MemberState::RS_PRIMARY);
@@ -252,10 +254,11 @@ TEST_F(ReplCoordHBV1Test,
     NetworkInterfaceMock::NetworkOperationIterator noi = net->getNextReadyRequest();
     const RemoteCommandRequest& request = noi->getRequest();
     ASSERT_EQUALS(HostAndPort("h1", 1), request.target);
-    ReplSetHeartbeatArgs hbArgs;
+    ReplSetHeartbeatArgsV1 hbArgs;
     ASSERT_OK(hbArgs.initialize(request.cmdObj));
     ASSERT_EQUALS("mySet", hbArgs.getSetName());
     ASSERT_EQUALS(-2, hbArgs.getConfigVersion());
+    ASSERT_EQUALS(OpTime::kInitialTerm, hbArgs.getTerm());
     ReplSetHeartbeatResponse hbResp;
     hbResp.setSetName("mySet");
     hbResp.setState(MemberState::RS_PRIMARY);
@@ -314,7 +317,7 @@ TEST_F(ReplCoordHBV1Test,
                                           << BSON("_id" << 2 << "host"
                                                         << "node2:12345"))),
                        HostAndPort("node1", 12345));
-    ASSERT(getReplCoord()->setFollowerMode(MemberState::RS_SECONDARY));
+    ASSERT_OK(getReplCoord()->setFollowerMode(MemberState::RS_SECONDARY));
 
     // process heartbeat
     enterNetwork();
@@ -358,7 +361,7 @@ TEST_F(ReplCoordHBV1Test, IgnoreTheContentsOfMetadataWhenItsReplicaSetIdDoesNotM
                             << "protocolVersion"
                             << 1),
                        HostAndPort("node1", 12345));
-    ASSERT(getReplCoord()->setFollowerMode(MemberState::RS_SECONDARY));
+    ASSERT_OK(getReplCoord()->setFollowerMode(MemberState::RS_SECONDARY));
 
     auto rsConfig = getReplCoord()->getConfig();
 
@@ -379,7 +382,7 @@ TEST_F(ReplCoordHBV1Test, IgnoreTheContentsOfMetadataWhenItsReplicaSetIdDoesNotM
         rpc::ReplSetMetadata metadata(
             opTime.getTerm(), opTime, opTime, rsConfig.getConfigVersion(), unexpectedId, 1, -1);
         BSONObjBuilder metadataBuilder;
-        metadata.writeToMetadata(&metadataBuilder);
+        metadata.writeToMetadata(&metadataBuilder).transitional_ignore();
 
         heartbeatResponse = makeResponseStatus(responseBuilder.obj(), metadataBuilder.obj());
     }

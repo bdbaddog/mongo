@@ -79,26 +79,6 @@ var RandomOps = {
         return created;
     },
 
-    /*
-     * Return a random non-system.indexes collection from the 'user created' collections.
-     */
-    getRandomExistingCollection: function(conn) {
-        var dbs = this.getCreatedDatabases(conn);
-        if (dbs.length === 0) {
-            return null;
-        }
-        var dbName = this.randomChoice(dbs);
-        var db = conn.getDB(dbName);
-        if (db.getCollectionNames().length <= 1) {
-            return null;
-        }
-        var coll = this.randomChoice(db.getCollectionNames());
-        while (coll == "system.indexes") {
-            coll = this.randomChoice(db.getCollectionNames());
-        }
-        return db[coll];
-    },
-
     getRandomDoc: function(collection) {
         try {
             var randIndex = Random.randInt(0, collection.find().count());
@@ -109,21 +89,33 @@ var RandomOps = {
     },
 
     /*
-     * Returns a random user defined collection, selecting from only those for which filterFn
-     * returns true, or null if there are none.
+     * Returns a random user defined collection.
+     *
+     * The second parameter is a function that should return false if it wants to filter out
+     * a collection from the list.
+     *
+     * If no collections exist, this returns null.
      */
-    getRandomCollectionWFilter: function(conn, filterFn) {
+    getRandomExistingCollection: function(conn, filterFn) {
         var matched = [];
         var dbs = this.getCreatedDatabases(conn);
         for (var i in dbs) {
             var dbName = dbs[i];
-            var colls = conn.getDB(dbName).getCollectionNames();
-            for (var j in colls) {
-                var coll = colls[j];
-                if (filterFn(dbName, coll)) {
-                    matched.push(coll);
-                }
-            }
+            var colls = conn.getDB(dbName)
+                            .getCollectionNames()
+                            .filter(function(collName) {
+                                if (collName == "system.indexes") {
+                                    return false;
+                                } else if (filterFn && !filterFn(dbName, collName)) {
+                                    return false;
+                                } else {
+                                    return true;
+                                }
+                            })
+                            .map(function(collName) {
+                                return conn.getDB(dbName).getCollection(collName);
+                            });
+            Array.prototype.push.apply(matched, colls);
         }
         if (matched.length === 0) {
             return null;
@@ -245,30 +237,12 @@ var RandomOps = {
         if (coll === null) {
             return null;
         }
-        var newName = coll.getDB() + "." + new ObjectId().str;
+        var newName = coll.getDB().getName() + "." + new ObjectId().str;
         if (this.verbose) {
             print("renaming collection " + coll.getFullName() + " to " + newName);
         }
         assert.commandWorked(
             conn.getDB("admin").runCommand({renameCollection: coll.getFullName(), to: newName}));
-        if (this.verbose) {
-            print("done.");
-        }
-    },
-
-    /*
-     * Randomly drop a user created database.
-     */
-    dropDatabase: function(conn) {
-        var dbs = this.getCreatedDatabases(conn);
-        if (dbs.length === 0) {
-            return null;
-        }
-        var dbName = this.randomChoice(dbs);
-        if (this.verbose) {
-            print("Dropping database " + dbName);
-        }
-        assert.commandWorked(conn.getDB(dbName).runCommand({dropDatabase: 1}));
         if (this.verbose) {
             print("done.");
         }
@@ -285,7 +259,7 @@ var RandomOps = {
         if (this.verbose) {
             print("Dropping collection " + coll.getFullName());
         }
-        assert.commandWorked(conn.getDB(coll.getDB()).runCommand({drop: coll.getName()}));
+        assert.commandWorked(coll.runCommand({drop: coll.getName()}));
         if (this.verbose) {
             print("done.");
         }
@@ -344,7 +318,7 @@ var RandomOps = {
             print("Modifying usePowerOf2Sizes to " + toggle + " on collection " +
                   coll.getFullName());
         }
-        conn.getDB(coll.getDB()).runCommand({collMod: coll.getName(), usePowerOf2Sizes: toggle});
+        coll.runCommand({collMod: coll.getName(), usePowerOf2Sizes: toggle});
         if (this.verbose) {
             print("done.");
         }
@@ -357,14 +331,14 @@ var RandomOps = {
         var isCapped = function(dbName, coll) {
             return conn.getDB(dbName)[coll].isCapped();
         };
-        var coll = this.getRandomCollectionWFilter(conn, isCapped);
+        var coll = this.getRandomExistingCollection(conn, isCapped);
         if (coll === null) {
             return null;
         }
         if (this.verbose) {
             print("Emptying capped collection: " + coll.getFullName());
         }
-        assert.commandWorked(conn.getDB(coll.getDB()).runCommand({emptycapped: coll.getName()}));
+        assert.commandWorked(coll.runCommand({emptycapped: coll.getName()}));
         if (this.verbose) {
             print("done.");
         }
@@ -422,17 +396,16 @@ var RandomOps = {
      */
     convertToCapped: function(conn) {
         var isNotCapped = function(dbName, coll) {
-            return conn.getDB(dbName)[coll].isCapped();
+            return !conn.getDB(dbName)[coll].isCapped();
         };
-        var coll = this.getRandomCollectionWFilter(conn, isNotCapped);
+        var coll = this.getRandomExistingCollection(conn, isNotCapped);
         if (coll === null) {
             return null;
         }
         if (this.verbose) {
             print("Converting " + coll.getFullName() + " to a capped collection.");
         }
-        assert.commandWorked(conn.getDB(coll.getDB())
-                                 .runCommand({convertToCapped: coll.getName(), size: 1024 * 1024}));
+        assert.commandWorked(coll.runCommand({convertToCapped: coll.getName(), size: 1024 * 1024}));
         if (this.verbose) {
             print("done.");
         }
@@ -457,7 +430,12 @@ var RandomOps = {
     doRandomWork: function(conn, numOps, possibleOps) {
         for (var i = 0; i < numOps; i++) {
             op = this.randomChoice(possibleOps);
-            this[op](conn);
+            try {
+                this[op](conn);
+            } catch (ex) {
+                print('doRandomWork - ' + op + ': failed: ' + ex);
+                throw ex;
+            }
         }
     }
 
@@ -594,7 +572,6 @@ function startCmds(randomOps, host) {
         "remove",
         "update",
         "renameCollection",
-        "dropDatabase",
         "dropCollection",
         "createIndex",
         "dropIndex",

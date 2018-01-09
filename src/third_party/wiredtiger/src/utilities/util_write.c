@@ -1,5 +1,5 @@
 /*-
- * Copyright (c) 2014-2017 MongoDB, Inc.
+ * Copyright (c) 2014-2018 MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -17,8 +17,8 @@ util_write(WT_SESSION *session, int argc, char *argv[])
 	WT_DECL_RET;
 	uint64_t recno;
 	int ch;
-	bool append, overwrite, rkey;
 	char *uri, config[100];
+	bool append, overwrite, rkey;
 
 	append = overwrite = false;
 	uri = NULL;
@@ -92,7 +92,7 @@ util_write(WT_SESSION *session, int argc, char *argv[])
 	while (*++argv != NULL) {
 		if (!append) {
 			if (rkey) {
-				if (util_str2recno(session, *argv, &recno))
+				if (util_str2num(session, *argv, true, &recno))
 					return (1);
 				cursor->set_key(cursor, recno);
 			} else

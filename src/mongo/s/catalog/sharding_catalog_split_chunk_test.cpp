@@ -55,14 +55,15 @@ TEST_F(SplitChunkTest, SplitExistingChunkCorrectlyShouldSucceed) {
     auto chunkSplitPoint = BSON("a" << 5);
     std::vector<BSONObj> splitPoints{chunkSplitPoint};
 
-    setupChunks({chunk});
+    setupChunks({chunk}).transitional_ignore();
 
-    ASSERT_OK(catalogManager()->commitChunkSplit(operationContext(),
-                                                 NamespaceString("TestDB.TestColl"),
-                                                 origVersion.epoch(),
-                                                 ChunkRange(chunkMin, chunkMax),
-                                                 splitPoints,
-                                                 "shard0000"));
+    ASSERT_OK(ShardingCatalogManager::get(operationContext())
+                  ->commitChunkSplit(operationContext(),
+                                     NamespaceString("TestDB.TestColl"),
+                                     origVersion.epoch(),
+                                     ChunkRange(chunkMin, chunkMax),
+                                     splitPoints,
+                                     "shard0000"));
 
     // First chunkDoc should have range [chunkMin, chunkSplitPoint]
     auto chunkDocStatus = getChunkDoc(operationContext(), chunkMin);
@@ -104,14 +105,15 @@ TEST_F(SplitChunkTest, MultipleSplitsOnExistingChunkShouldSucceed) {
     auto chunkSplitPoint2 = BSON("a" << 7);
     std::vector<BSONObj> splitPoints{chunkSplitPoint, chunkSplitPoint2};
 
-    setupChunks({chunk});
+    setupChunks({chunk}).transitional_ignore();
 
-    ASSERT_OK(catalogManager()->commitChunkSplit(operationContext(),
-                                                 NamespaceString("TestDB.TestColl"),
-                                                 origVersion.epoch(),
-                                                 ChunkRange(chunkMin, chunkMax),
-                                                 splitPoints,
-                                                 "shard0000"));
+    ASSERT_OK(ShardingCatalogManager::get(operationContext())
+                  ->commitChunkSplit(operationContext(),
+                                     NamespaceString("TestDB.TestColl"),
+                                     origVersion.epoch(),
+                                     ChunkRange(chunkMin, chunkMax),
+                                     splitPoints,
+                                     "shard0000"));
 
     // First chunkDoc should have range [chunkMin, chunkSplitPoint]
     auto chunkDocStatus = getChunkDoc(operationContext(), chunkMin);
@@ -174,14 +176,15 @@ TEST_F(SplitChunkTest, NewSplitShouldClaimHighestVersion) {
     chunk2.setMin(BSON("a" << 10));
     chunk2.setMax(BSON("a" << 20));
 
-    setupChunks({chunk, chunk2});
+    setupChunks({chunk, chunk2}).transitional_ignore();
 
-    ASSERT_OK(catalogManager()->commitChunkSplit(operationContext(),
-                                                 NamespaceString("TestDB.TestColl"),
-                                                 collEpoch,
-                                                 ChunkRange(chunkMin, chunkMax),
-                                                 splitPoints,
-                                                 "shard0000"));
+    ASSERT_OK(ShardingCatalogManager::get(operationContext())
+                  ->commitChunkSplit(operationContext(),
+                                     NamespaceString("TestDB.TestColl"),
+                                     collEpoch,
+                                     ChunkRange(chunkMin, chunkMax),
+                                     splitPoints,
+                                     "shard0000"));
 
     // First chunkDoc should have range [chunkMin, chunkSplitPoint]
     auto chunkDocStatus = getChunkDoc(operationContext(), chunkMin);
@@ -223,14 +226,15 @@ TEST_F(SplitChunkTest, PreConditionFailErrors) {
     auto chunkSplitPoint = BSON("a" << 5);
     splitPoints.push_back(chunkSplitPoint);
 
-    setupChunks({chunk});
+    setupChunks({chunk}).transitional_ignore();
 
-    auto splitStatus = catalogManager()->commitChunkSplit(operationContext(),
-                                                          NamespaceString("TestDB.TestColl"),
-                                                          origVersion.epoch(),
-                                                          ChunkRange(chunkMin, BSON("a" << 7)),
-                                                          splitPoints,
-                                                          "shard0000");
+    auto splitStatus = ShardingCatalogManager::get(operationContext())
+                           ->commitChunkSplit(operationContext(),
+                                              NamespaceString("TestDB.TestColl"),
+                                              origVersion.epoch(),
+                                              ChunkRange(chunkMin, BSON("a" << 7)),
+                                              splitPoints,
+                                              "shard0000");
     ASSERT_EQ(ErrorCodes::BadValue, splitStatus);
 }
 
@@ -249,14 +253,15 @@ TEST_F(SplitChunkTest, NonExisingNamespaceErrors) {
 
     std::vector<BSONObj> splitPoints{BSON("a" << 5)};
 
-    setupChunks({chunk});
+    setupChunks({chunk}).transitional_ignore();
 
-    auto splitStatus = catalogManager()->commitChunkSplit(operationContext(),
-                                                          NamespaceString("TestDB.NonExistingColl"),
-                                                          origVersion.epoch(),
-                                                          ChunkRange(chunkMin, chunkMax),
-                                                          splitPoints,
-                                                          "shard0000");
+    auto splitStatus = ShardingCatalogManager::get(operationContext())
+                           ->commitChunkSplit(operationContext(),
+                                              NamespaceString("TestDB.NonExistingColl"),
+                                              origVersion.epoch(),
+                                              ChunkRange(chunkMin, chunkMax),
+                                              splitPoints,
+                                              "shard0000");
     ASSERT_EQ(ErrorCodes::IllegalOperation, splitStatus);
 }
 
@@ -275,14 +280,15 @@ TEST_F(SplitChunkTest, NonMatchingEpochsOfChunkAndRequestErrors) {
 
     std::vector<BSONObj> splitPoints{BSON("a" << 5)};
 
-    setupChunks({chunk});
+    setupChunks({chunk}).transitional_ignore();
 
-    auto splitStatus = catalogManager()->commitChunkSplit(operationContext(),
-                                                          NamespaceString("TestDB.TestColl"),
-                                                          OID::gen(),
-                                                          ChunkRange(chunkMin, chunkMax),
-                                                          splitPoints,
-                                                          "shard0000");
+    auto splitStatus = ShardingCatalogManager::get(operationContext())
+                           ->commitChunkSplit(operationContext(),
+                                              NamespaceString("TestDB.TestColl"),
+                                              OID::gen(),
+                                              ChunkRange(chunkMin, chunkMax),
+                                              splitPoints,
+                                              "shard0000");
     ASSERT_EQ(ErrorCodes::StaleEpoch, splitStatus);
 }
 
@@ -301,14 +307,15 @@ TEST_F(SplitChunkTest, SplitPointsOutOfOrderShouldFail) {
 
     std::vector<BSONObj> splitPoints{BSON("a" << 5), BSON("a" << 4)};
 
-    setupChunks({chunk});
+    setupChunks({chunk}).transitional_ignore();
 
-    auto splitStatus = catalogManager()->commitChunkSplit(operationContext(),
-                                                          NamespaceString("TestDB.TestColl"),
-                                                          origVersion.epoch(),
-                                                          ChunkRange(chunkMin, chunkMax),
-                                                          splitPoints,
-                                                          "shard0000");
+    auto splitStatus = ShardingCatalogManager::get(operationContext())
+                           ->commitChunkSplit(operationContext(),
+                                              NamespaceString("TestDB.TestColl"),
+                                              origVersion.epoch(),
+                                              ChunkRange(chunkMin, chunkMax),
+                                              splitPoints,
+                                              "shard0000");
     ASSERT_EQ(ErrorCodes::InvalidOptions, splitStatus);
 }
 
@@ -327,14 +334,15 @@ TEST_F(SplitChunkTest, SplitPointsOutOfRangeAtMinShouldFail) {
 
     std::vector<BSONObj> splitPoints{BSON("a" << 0), BSON("a" << 5)};
 
-    setupChunks({chunk});
+    setupChunks({chunk}).transitional_ignore();
 
-    auto splitStatus = catalogManager()->commitChunkSplit(operationContext(),
-                                                          NamespaceString("TestDB.TestColl"),
-                                                          origVersion.epoch(),
-                                                          ChunkRange(chunkMin, chunkMax),
-                                                          splitPoints,
-                                                          "shard0000");
+    auto splitStatus = ShardingCatalogManager::get(operationContext())
+                           ->commitChunkSplit(operationContext(),
+                                              NamespaceString("TestDB.TestColl"),
+                                              origVersion.epoch(),
+                                              ChunkRange(chunkMin, chunkMax),
+                                              splitPoints,
+                                              "shard0000");
     ASSERT_EQ(ErrorCodes::InvalidOptions, splitStatus);
 }
 
@@ -353,14 +361,15 @@ TEST_F(SplitChunkTest, SplitPointsOutOfRangeAtMaxShouldFail) {
 
     std::vector<BSONObj> splitPoints{BSON("a" << 5), BSON("a" << 15)};
 
-    setupChunks({chunk});
+    setupChunks({chunk}).transitional_ignore();
 
-    auto splitStatus = catalogManager()->commitChunkSplit(operationContext(),
-                                                          NamespaceString("TestDB.TestColl"),
-                                                          origVersion.epoch(),
-                                                          ChunkRange(chunkMin, chunkMax),
-                                                          splitPoints,
-                                                          "shard0000");
+    auto splitStatus = ShardingCatalogManager::get(operationContext())
+                           ->commitChunkSplit(operationContext(),
+                                              NamespaceString("TestDB.TestColl"),
+                                              origVersion.epoch(),
+                                              ChunkRange(chunkMin, chunkMax),
+                                              splitPoints,
+                                              "shard0000");
     ASSERT_EQ(ErrorCodes::InvalidOptions, splitStatus);
 }
 

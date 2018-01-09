@@ -38,6 +38,7 @@
 #include "mongo/util/concurrency/idle_thread_block.h"
 #include "mongo/util/destructor_guard.h"
 #include "mongo/util/quick_exit.h"
+#include "mongo/util/scopeguard.h"
 
 namespace mongo {
 namespace mozjs {
@@ -120,6 +121,10 @@ void MozJSProxyScope::gc() {
 
 void MozJSProxyScope::advanceGeneration() {
     run([&] { _implScope->advanceGeneration(); });
+}
+
+void MozJSProxyScope::requireOwnedObjects() {
+    run([&] { _implScope->requireOwnedObjects(); });
 }
 
 double MozJSProxyScope::getNumber(const char* field) {
@@ -337,6 +342,11 @@ void MozJSProxyScope::implThread(void* arg) {
     } catch (...) {
         proxy->_status = exceptionToStatus();
     }
+
+    // This is mostly to silence coverity, so that it sees that the
+    // ProxyScope doesn't hold a reference to the ImplScope after it
+    // is deleted by the unique_ptr.
+    const auto unbindImplScope = MakeGuard([&proxy] { proxy->_implScope = nullptr; });
 
     while (true) {
         stdx::unique_lock<stdx::mutex> lk(proxy->_mutex);

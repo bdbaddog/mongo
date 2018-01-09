@@ -8,83 +8,46 @@
 
     load("jstests/replsets/rslib.js");  // For startSetIfSupportsReadMajority.
 
-    // Verifies causal consistency is either enabled or disabled for each given command name.
-    function checkCausalConsistencySupportForCommandNames(cmdNames, isEnabled) {
-        cmdNames.forEach(function(cmdName) {
-            assert.eq(testDB.getMongo().isCausalConsistencyEnabled(cmdName, {}),
-                      isEnabled,
-                      "expected causal consistency support for command, " + cmdName + ", to be " +
-                          isEnabled);
-        });
-    }
-
     // Verifies the command works and properly updates operation or cluster time.
     function runCommandAndCheckLogicalTimes(cmdObj, db, shouldAdvance) {
-        const mongo = db.getMongo();
+        const session = db.getSession();
 
         // Extract initial operation and cluster time.
-        let operationTime = mongo.getOperationTime();
-        let clusterTimeObj = mongo.getClusterTime();
+        let operationTime = session.getOperationTime();
+        let clusterTimeObj = session.getClusterTime();
 
         assert.commandWorked(db.runCommand(cmdObj));
 
         // Verify cluster and operation time.
         if (shouldAdvance) {
-            assert(bsonWoCompare(mongo.getOperationTime(), operationTime) > 0,
+            assert(bsonWoCompare(session.getOperationTime(), operationTime) > 0,
                    "expected the shell's operationTime to increase after running command: " +
                        tojson(cmdObj));
             assert(
-                bsonWoCompare(mongo.getClusterTime().clusterTime, clusterTimeObj.clusterTime) > 0,
+                bsonWoCompare(session.getClusterTime().clusterTime, clusterTimeObj.clusterTime) > 0,
                 "expected the shell's clusterTime value to increase after running command: " +
                     tojson(cmdObj));
         } else {
-            assert(bsonWoCompare(mongo.getOperationTime(), operationTime) == 0,
-                   "expected the shell's operationTime to not change after running command: " +
-                       tojson(cmdObj));
-            // Don't check clusterTime, because during a slow operation clusterTime may be
+            // Don't expect either clusterTime or operationTime to not change, because they may be
             // incremented by unrelated activity in the cluster.
         }
     }
 
     // Verifies the command works and its response satisfies the callback.
     function commandReturnsExpectedResult(cmdObj, db, resCallback) {
-        const mongo = db.getMongo();
+        const session = db.getSession();
 
-        // Use the latest logical time returned as a new operationTime and run command.
-        const clusterTimeObj = mongo.getClusterTime();
-        mongo.setOperationTime(clusterTimeObj.clusterTime);
+        // Use the latest cluster time returned as a new operationTime and run command.
+        const clusterTimeObj = session.getClusterTime();
+        session.advanceOperationTime(clusterTimeObj.clusterTime);
         const res = assert.commandWorked(testDB.runCommand(cmdObj));
 
         // Verify the response contents and that new operation time is >= passed in time.
-        assert(bsonWoCompare(mongo.getOperationTime(), clusterTimeObj.clusterTime) >= 0,
+        assert(bsonWoCompare(session.getOperationTime(), clusterTimeObj.clusterTime) >= 0,
                "expected the shell's operationTime to be >= to:" + clusterTimeObj.clusterTime +
                    " after running command: " + tojson(cmdObj));
         resCallback(res);
     }
-
-    // All commands currently enabled to use causal consistency in the shell.
-    const supportedCommandNames = [
-        "aggregate",
-        "count",
-        "distinct",
-        "find",
-        "geoNear",
-        "geoSearch",
-        "mapReduce",
-        "parallelCollectionScan"
-    ];
-
-    // Omitting some commands for simplicity. Every command not listed above should be unsupported.
-    const unsupportedCommandNames = [
-        "delete",
-        "findAndModify",
-        "getLastError",
-        "getMore",
-        "getPrevError",
-        "insert",
-        "resetError",
-        "update"
-    ];
 
     // Manually create a shard so tests on storage engines that don't support majority readConcern
     // can exit early.
@@ -106,60 +69,46 @@
 
     // Start the sharding test and add the majority readConcern enabled replica set.
     const name = "causal_consistency_shell_support";
-    const st = new ShardingTest({
-        name: name,
-        shards: 1,
-        manualAddShard: true,
-    });
+    const st =
+        new ShardingTest({name: name, shards: 1, manualAddShard: true, mongosWaitsForKeys: true});
     assert.commandWorked(st.s.adminCommand({addShard: rst.getURL()}));
 
     const testDB = st.s.getDB("test");
-    const mongo = testDB.getMongo();
+    const session = testDB.getSession();
 
     // Verify causal consistency is disabled unless explicitly set.
-    assert.eq(!!mongo._isCausal, false);
-    checkCausalConsistencySupportForCommandNames(supportedCommandNames, false);
-    checkCausalConsistencySupportForCommandNames(unsupportedCommandNames, false);
-
-    // Enable causal consistency.
-    mongo.setCausalConsistency(true);
+    assert.eq(testDB.getMongo()._causalConsistency,
+              false,
+              "causal consistency should be disabled by default");
+    testDB.getMongo().setCausalConsistency(true);
 
     // Verify causal consistency is enabled for the connection and for each supported command.
-    assert.eq(!!mongo._isCausal, true);
-    checkCausalConsistencySupportForCommandNames(supportedCommandNames, true);
-    checkCausalConsistencySupportForCommandNames(unsupportedCommandNames, false);
+    assert.eq(testDB.getMongo()._causalConsistency,
+              true,
+              "calling setCausalConsistency() didn't enable causal consistency");
 
-    // Verify causal consistency can be disabled.
-    mongo.setCausalConsistency(false);
-
-    assert.eq(!!mongo._isCausal, false);
-    checkCausalConsistencySupportForCommandNames(supportedCommandNames, false);
-    checkCausalConsistencySupportForCommandNames(unsupportedCommandNames, false);
-
-    // Verify logical times are tracked even before causal consistency is set (so the first
-    // operation with causal consistency set can use valid logical times).
-    mongo._operationTime = null;
-    mongo._clusterTime = null;
+    // Verify cluster times are tracked even before causal consistency is set (so the first
+    // operation with causal consistency set can use valid cluster times).
+    session.resetOperationTime_forTesting();
 
     assert.commandWorked(testDB.runCommand({insert: "foo", documents: [{x: 1}]}));
-    assert.neq(mongo.getOperationTime(), null);
-    assert.neq(mongo.getClusterTime(), null);
+    assert.neq(session.getOperationTime(), null);
+    assert.neq(session.getClusterTime(), null);
 
-    mongo._operationTime = null;
-    mongo._clusterTime = null;
+    session.resetOperationTime_forTesting();
 
     assert.commandWorked(testDB.runCommand({find: "foo"}));
-    assert.neq(mongo.getOperationTime(), null);
-    assert.neq(mongo.getClusterTime(), null);
+    assert.neq(session.getOperationTime(), null);
+    assert.neq(session.getClusterTime(), null);
 
     // Test that write commands advance both operation and cluster time.
     runCommandAndCheckLogicalTimes({insert: "foo", documents: [{x: 2}]}, testDB, true);
     runCommandAndCheckLogicalTimes(
         {update: "foo", updates: [{q: {x: 2}, u: {$set: {x: 3}}}]}, testDB, true);
 
-    // Test that each supported command works as expected and the shell's logical times are properly
+    // Test that each supported command works as expected and the shell's cluster times are properly
     // forwarded to the server and updated based on the response.
-    mongo.setCausalConsistency(true);
+    testDB.getMongo().setCausalConsistency(true);
 
     // Aggregate command.
     let aggColl = "aggColl";
@@ -233,7 +182,7 @@
 
     // Verify that the server rejects commands when operation time is invalid by running a command
     // with an afterClusterTime value one day ahead.
-    const invalidTime = new Timestamp(mongo.getOperationTime().getTime() + (60 * 60 * 24), 0);
+    const invalidTime = new Timestamp(session.getOperationTime().getTime() + (60 * 60 * 24), 0);
     const invalidCmd = {
         find: "foo",
         readConcern: {level: "majority", afterClusterTime: invalidTime}
@@ -243,7 +192,7 @@
         ErrorCodes.InvalidOptions,
         "expected command, " + tojson(invalidCmd) + ", to fail with code, " +
             ErrorCodes.InvalidOptions + ", because the afterClusterTime value, " + invalidTime +
-            ", should not be ahead of the clusterTime, " + mongo.getClusterTime().clusterTime);
+            ", should not be ahead of the clusterTime, " + session.getClusterTime().clusterTime);
 
     st.stop();
 })();

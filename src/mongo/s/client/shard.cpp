@@ -98,14 +98,10 @@ bool Shard::shouldErrorBePropagated(ErrorCodes::Error code) {
     return std::find(RemoteCommandRetryScheduler::kAllRetriableErrors.begin(),
                      RemoteCommandRetryScheduler::kAllRetriableErrors.end(),
                      code) == RemoteCommandRetryScheduler::kAllRetriableErrors.end() &&
-        code != ErrorCodes::ExceededTimeLimit;
+        code != ErrorCodes::NetworkInterfaceExceededTimeLimit;
 }
 
 Shard::Shard(const ShardId& id) : _id(id) {}
-
-const ShardId Shard::getId() const {
-    return _id;
-}
 
 bool Shard::isConfig() const {
     return _id == "config";
@@ -186,11 +182,6 @@ BatchedCommandResponse Shard::runBatchWriteCommand(OperationContext* opCtx,
                                                    const Milliseconds maxTimeMS,
                                                    const BatchedCommandRequest& batchRequest,
                                                    RetryPolicy retryPolicy) {
-    // Cluster metadata writes are not done in batches.
-    if (isConfig()) {
-        invariant(batchRequest.sizeWriteOps() == 1);
-    }
-
     const std::string dbname = batchRequest.getNS().db().toString();
 
     const BSONObj cmdObj = batchRequest.toBSON();

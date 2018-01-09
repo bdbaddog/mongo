@@ -33,8 +33,6 @@
 #include "mongo/db/catalog/drop_collection.h"
 
 #include "mongo/db/background.h"
-#include "mongo/db/catalog/collection.h"
-#include "mongo/db/catalog/database.h"
 #include "mongo/db/catalog/index_catalog.h"
 #include "mongo/db/client.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
@@ -51,21 +49,16 @@ namespace mongo {
 
 Status dropCollection(OperationContext* opCtx,
                       const NamespaceString& collectionName,
-                      BSONObjBuilder& result) {
-    return dropCollection(opCtx, collectionName, result, {});
-}
-
-Status dropCollection(OperationContext* opCtx,
-                      const NamespaceString& collectionName,
                       BSONObjBuilder& result,
-                      const repl::OpTime& dropOpTime) {
+                      const repl::OpTime& dropOpTime,
+                      DropCollectionSystemCollectionMode systemCollectionMode) {
     if (!serverGlobalParams.quiet.load()) {
         log() << "CMD: drop " << collectionName;
     }
 
     const std::string dbname = collectionName.db().toString();
 
-    MONGO_WRITE_CONFLICT_RETRY_LOOP_BEGIN {
+    return writeConflictRetry(opCtx, "drop", collectionName.ns(), [&] {
         AutoGetDb autoDb(opCtx, dbname, MODE_X);
         Database* const db = autoDb.getDb();
         Collection* coll = db ? db->getCollection(opCtx, collectionName) : nullptr;
@@ -97,7 +90,10 @@ Status dropCollection(OperationContext* opCtx,
 
             BackgroundOperation::assertNoBgOpInProgForNs(collectionName.ns());
 
-            Status s = db->dropCollection(opCtx, collectionName.ns(), dropOpTime);
+            Status s = systemCollectionMode ==
+                    DropCollectionSystemCollectionMode::kDisallowSystemCollectionDrops
+                ? db->dropCollection(opCtx, collectionName.ns(), dropOpTime)
+                : db->dropCollectionEvenIfSystem(opCtx, collectionName, dropOpTime);
 
             if (!s.isOK()) {
                 return s;
@@ -112,10 +108,9 @@ Status dropCollection(OperationContext* opCtx,
             }
         }
         wunit.commit();
-    }
-    MONGO_WRITE_CONFLICT_RETRY_LOOP_END(opCtx, "drop", collectionName.ns());
 
-    return Status::OK();
+        return Status::OK();
+    });
 }
 
 }  // namespace mongo

@@ -33,6 +33,7 @@
 #include "mongo/client/dbclientcursor.h"
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/database.h"
+#include "mongo/db/catalog/index_catalog.h"
 #include "mongo/db/client.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/dbdirectclient.h"
@@ -376,7 +377,8 @@ public:
         DBDirectClient db(&opCtx);
 
         db.createIndex(ns(), IndexSpec().addKey("aField"));
-        ASSERT_THROWS(db.createIndex(ns(), IndexSpec().addKey("aField").unique()), UserException);
+        ASSERT_THROWS(db.createIndex(ns(), IndexSpec().addKey("aField").unique()),
+                      AssertionException);
     }
 };
 

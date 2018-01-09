@@ -28,7 +28,7 @@
 
 #pragma once
 
-#include "mongo/db/update/path_creating_node.h"
+#include "mongo/db/update/modifier_node.h"
 #include "mongo/stdx/memory.h"
 
 namespace mongo {
@@ -36,13 +36,13 @@ namespace mongo {
 /**
  * Represents the application of $inc or $mul to the value at the end of a path.
  */
-class ArithmeticNode : public PathCreatingNode {
+class ArithmeticNode : public ModifierNode {
 public:
     enum class ArithmeticOp { kAdd, kMultiply };
 
-    ArithmeticNode(ArithmeticOp op) : _op(op) {}
+    explicit ArithmeticNode(ArithmeticOp op) : _op(op) {}
 
-    Status init(BSONElement modExpr, const CollatorInterface* collator) final;
+    Status init(BSONElement modExpr, const boost::intrusive_ptr<ExpressionContext>& expCtx) final;
 
     std::unique_ptr<UpdateNode> clone() const final {
         return stdx::make_unique<ArithmeticNode>(*this);
@@ -51,8 +51,13 @@ public:
     void setCollator(const CollatorInterface* collator) final {}
 
 protected:
-    void updateExistingElement(mutablebson::Element* element, bool* noop) const final;
+    ModifyResult updateExistingElement(mutablebson::Element* element,
+                                       std::shared_ptr<FieldRef> elementPath) const final;
     void setValueForNewElement(mutablebson::Element* element) const final;
+
+    bool allowCreation() const final {
+        return true;
+    }
 
 private:
     ArithmeticOp _op;

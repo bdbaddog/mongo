@@ -41,6 +41,9 @@
 
 namespace mongo {
 
+namespace moe = mongo::optionenvironment;
+
+
 using std::string;
 
 Status addSSLServerOptions(moe::OptionSection* options) {
@@ -267,6 +270,13 @@ Status storeSSLServerOptions(const moe::Environment& params) {
     }
 
     if (params.count("net.ssl.sslCipherConfig")) {
+        warning()
+            << "net.ssl.sslCipherConfig is deprecated. It will be removed in a future release.";
+        if (!sslGlobalParams.sslCipherConfig.empty()) {
+            return Status(ErrorCodes::BadValue,
+                          "net.ssl.sslCipherConfig is incompatible with the openSSLCipherConfig "
+                          "setParameter");
+        }
         sslGlobalParams.sslCipherConfig = params["net.ssl.sslCipherConfig"].as<string>();
     }
 

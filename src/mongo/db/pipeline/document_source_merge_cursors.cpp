@@ -39,6 +39,8 @@ using std::make_pair;
 using std::string;
 using std::vector;
 
+constexpr StringData DocumentSourceMergeCursors::kStageName;
+
 DocumentSourceMergeCursors::DocumentSourceMergeCursors(
     std::vector<CursorDescriptor> cursorDescriptors,
     const intrusive_ptr<ExpressionContext>& pExpCtx)
@@ -47,10 +49,6 @@ DocumentSourceMergeCursors::DocumentSourceMergeCursors(
 REGISTER_DOCUMENT_SOURCE(mergeCursors,
                          LiteParsedDocumentSourceDefault::parse,
                          DocumentSourceMergeCursors::createFromBson);
-
-const char* DocumentSourceMergeCursors::getSourceName() const {
-    return "$mergeCursors";
-}
 
 intrusive_ptr<DocumentSource> DocumentSourceMergeCursors::create(
     std::vector<CursorDescriptor> cursorDescriptors,
@@ -96,7 +94,7 @@ Value DocumentSourceMergeCursors::serialize(
                              << "id"
                              << _cursorDescriptors[i].cursorId)));
     }
-    return Value(DOC(getSourceName() << Value(cursors)));
+    return Value(DOC(kStageName << Value(cursors)));
 }
 
 DocumentSourceMergeCursors::CursorAndConnection::CursorAndConnection(
@@ -152,6 +150,8 @@ Document DocumentSourceMergeCursors::nextSafeFrom(DBClientCursor* cursor) {
 }
 
 DocumentSource::GetNextResult DocumentSourceMergeCursors::getNext() {
+    pExpCtx->checkForInterrupt();
+
     if (_unstarted)
         start();
 
@@ -174,11 +174,19 @@ DocumentSource::GetNextResult DocumentSourceMergeCursors::getNext() {
     return std::move(next);
 }
 
+bool DocumentSourceMergeCursors::remotesExhausted() const {
+    return std::all_of(_cursors.begin(), _cursors.end(), [](const auto& cursorAndConn) {
+        return cursorAndConn->cursor.isDead();
+    });
+}
+
 void DocumentSourceMergeCursors::doDispose() {
-    // Note it is an error to call done() on a connection before consuming the response from a
-    // request. Therefore it is an error to call dispose() if there are any outstanding connections
-    // which have not received a reply.
     for (auto&& cursorAndConn : _cursors) {
+        // Note it is an error to call done() on a connection before consuming the reply from a
+        // request.
+        if (cursorAndConn->cursor.connectionHasPendingReplies()) {
+            continue;
+        }
         cursorAndConn->cursor.kill();
         cursorAndConn->connection.done();
     }

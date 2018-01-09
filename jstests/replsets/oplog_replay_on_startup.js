@@ -45,6 +45,7 @@
         assert.neq(null, conn, "failed to restart");
         var oplog = conn.getCollection('local.oplog.rs');
         var minValidColl = conn.getCollection('local.replset.minvalid');
+        var oplogTruncateAfterColl = conn.getCollection('local.replset.oplogTruncateAfterPoint');
         var coll = conn.getCollection(ns);
 
         // Reset state to empty.
@@ -57,7 +58,7 @@
         oplogEntries.forEach((num) => {
             assert.writeOK(oplog.insert({
                 ts: ts(num),
-                t: term,
+                t: NumberLong(term),
                 h: 1,
                 op: 'i',
                 ns: ns,
@@ -72,17 +73,20 @@
         var injectedMinValidDoc = {
             _id: ObjectId(),
 
-            // minvalid:
-            ts: ts(minValid),
-            t: term,
-
             // appliedThrough
             begin: {
                 ts: ts(begin),
-                t: term,
+                t: NumberLong(term),
             },
 
-            oplogDeleteFromPoint: ts(deletePoint),
+            // minvalid:
+            t: NumberLong(term),
+            ts: ts(minValid),
+        };
+
+        var injectedOplogTruncateAfterPointDoc = {
+            _id: "oplogTruncateAfterPoint",
+            oplogTruncateAfterPoint: ts(deletePoint)
         };
 
         // This weird mechanism is the only way to bypass mongod's attempt to fill in null
@@ -91,6 +95,13 @@
         assert.writeOK(minValidColl.update({}, {$set: injectedMinValidDoc}, {upsert: true}));
         assert.eq(minValidColl.findOne(),
                   injectedMinValidDoc,
+                  "If the Timestamps differ, the server may be filling in the null timestamps");
+
+        assert.writeOK(oplogTruncateAfterColl.remove({}));
+        assert.writeOK(oplogTruncateAfterColl.update(
+            {}, {$set: injectedOplogTruncateAfterPointDoc}, {upsert: true}));
+        assert.eq(oplogTruncateAfterColl.findOne(),
+                  injectedOplogTruncateAfterPointDoc,
                   "If the Timestamps differ, the server may be filling in the null timestamps");
 
         try {
@@ -240,114 +251,6 @@
     });
 
     //
-    // 3.2 -> 3.4 upgrade cases
-    //
-
-    runTest({
-        oplogEntries: [1, 2, 3],
-        collectionContents: [1, 2, 3],
-        deletePoint: null,
-        begin: 3,
-        minValid: 6,
-        expectedState: 'RECOVERING',
-        expectedApplied: [1, 2, 3],
-    });
-
-    runTest({
-        oplogEntries: [1, 2, 3, 4, 5],
-        collectionContents: [1, 2, 3],
-        deletePoint: null,
-        begin: 3,
-        minValid: 6,
-        expectedState: 'RECOVERING',
-        expectedApplied: [1, 2, 3, 4, 5],
-    });
-
-    runTest({
-        oplogEntries: [1, 2, 3, 4, 5],
-        collectionContents: [1, 2, 3, 4, 5],
-        deletePoint: null,
-        begin: null,
-        minValid: 6,
-        expectedState: 'RECOVERING',
-        expectedApplied: [1, 2, 3, 4, 5],
-    });
-
-    //
-    // 3.4 -> 3.2 -> 3.4 downgrade/reupgrade cases
-    //
-
-    runTest({
-        oplogEntries: [1, 2, 3],
-        collectionContents: [1, 2, 3],
-        deletePoint: 4,
-        begin: 3,
-        minValid: 6,
-        expectedState: 'RECOVERING',
-        expectedApplied: [1, 2, 3],
-    });
-
-    runTest({
-        oplogEntries: [1, 2, 3, 4, 5],
-        collectionContents: [1, 2, 3],
-        deletePoint: 4,
-        begin: 3,
-        minValid: 6,
-        expectedState: 'RECOVERING',
-        expectedApplied: [1, 2, 3],
-    });
-
-    runTest({
-        oplogEntries: [1, 2, 3, /*4,*/ 5, 6],
-        collectionContents: [1, 2, 3],
-        deletePoint: 4,
-        begin: 3,
-        minValid: 6,
-        expectedState: 'RECOVERING',
-        expectedApplied: [1, 2, 3],
-    });
-
-    runTest({
-        oplogEntries: [1, 2, 3],
-        collectionContents: [1, 2, 3],
-        deletePoint: 2,
-        begin: null,
-        minValid: 3,
-        expectedState: 'SECONDARY',
-        expectedApplied: [1, 2, 3],
-    });
-
-    runTest({
-        oplogEntries: [1, 2, 3],
-        collectionContents: [1, 2, 3],
-        deletePoint: 2,
-        begin: 3,
-        minValid: 6,
-        expectedState: 'RECOVERING',
-        expectedApplied: [1, 2, 3],
-    });
-
-    runTest({
-        oplogEntries: [1, 2, 3, 4, 5],
-        collectionContents: [1, 2, 3],
-        deletePoint: 2,
-        begin: 3,
-        minValid: 6,
-        expectedState: 'RECOVERING',
-        expectedApplied: [1, 2, 3, 4, 5],
-    });
-
-    runTest({
-        oplogEntries: [1, 2, 3, 4, 5, 6],
-        collectionContents: [1, 2, 3],
-        deletePoint: 2,
-        begin: 3,
-        minValid: 6,
-        expectedState: 'SECONDARY',
-        expectedApplied: [1, 2, 3, 4, 5, 6],
-    });
-
-    //
     // These states should be impossible to get into.
     //
 
@@ -376,16 +279,6 @@
         begin: 3,
         minValid: null,  // doesn't matter.
         expectedState: 'FATAL',
-    });
-
-    runTest({
-        oplogEntries: [1, 2, 3, 4, 5, 6],
-        collectionContents: [1, 2, 3],
-        deletePoint: 2,
-        begin: 3,
-        minValid: 3,
-        expectedState: 'SECONDARY',
-        expectedApplied: [1, 2, 3, 4, 5, 6],
     });
 
     runTest({

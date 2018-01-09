@@ -50,11 +50,6 @@ namespace mongo {
 class OldThreadPool;
 
 namespace repl {
-namespace {
-
-using UniqueLock = stdx::unique_lock<stdx::mutex>;
-
-}  // namespace
 
 class StorageInterface;
 
@@ -178,6 +173,11 @@ private:
     bool _isActive_inlock() const;
 
     /**
+     * Returns whether the DatabaseCloner is in shutdown.
+     */
+    bool _isShuttingDown() const;
+
+    /**
      * Read collection names and options from listCollections result.
      */
     void _listCollectionsCallback(const StatusWith<Fetcher::QueryResponse>& fetchResult,
@@ -199,7 +199,7 @@ private:
     /**
      * Calls the above method after unlocking.
      */
-    void _finishCallback_inlock(UniqueLock& lk, const Status& status);
+    void _finishCallback_inlock(stdx::unique_lock<stdx::mutex>& lk, const Status& status);
 
     //
     // All member variables are labeled with one of the following codes indicating the

@@ -41,6 +41,7 @@
 #include "mongo/db/catalog/collection_catalog_entry.h"
 #include "mongo/db/catalog/database_catalog_entry.h"
 #include "mongo/db/catalog/database_holder.h"
+#include "mongo/db/catalog/index_catalog.h"
 #include "mongo/db/client.h"
 #include "mongo/db/commands/fsync.h"
 #include "mongo/db/commands/server_status_metric.h"
@@ -48,7 +49,6 @@
 #include "mongo/db/db_raii.h"
 #include "mongo/db/exec/delete.h"
 #include "mongo/db/index/index_descriptor.h"
-#include "mongo/db/matcher/extensions_callback_disallow_extensions.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/ops/insert.h"
 #include "mongo/db/query/internal_plans.h"
@@ -109,7 +109,7 @@ public:
 
             try {
                 doTTLPass();
-            } catch (const WriteConflictException& e) {
+            } catch (const WriteConflictException&) {
                 LOG(1) << "got WriteConflictException";
             }
         }
@@ -170,6 +170,9 @@ private:
      */
     void doTTLForIndex(OperationContext* opCtx, BSONObj idx) {
         const NamespaceString collectionNSS(idx["ns"].String());
+        if (collectionNSS.isDropPendingNamespace()) {
+            return;
+        }
         if (!userAllowedWriteNS(collectionNSS).isOK()) {
             error() << "namespace '" << collectionNSS
                     << "' doesn't allow deletes, skipping ttl job for: " << idx;
@@ -239,8 +242,7 @@ private:
             BSON(keyFieldName << BSON("$gte" << kDawnOfTime << "$lte" << expirationTime));
         auto qr = stdx::make_unique<QueryRequest>(collectionNSS);
         qr->setFilter(query);
-        auto canonicalQuery = CanonicalQuery::canonicalize(
-            opCtx, std::move(qr), ExtensionsCallbackDisallowExtensions());
+        auto canonicalQuery = CanonicalQuery::canonicalize(opCtx, std::move(qr));
         invariantOK(canonicalQuery.getStatus());
 
         DeleteStageParams params;

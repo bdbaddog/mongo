@@ -23,7 +23,6 @@ selector:
   - jstests/core/eval9.js # db.eval() used
   - jstests/core/evala.js # db.eval() used
   - jstests/core/evalb.js # db.eval() used
-  - jstests/core/evalc.js # db.eval() used
   - jstests/core/evald.js # db.eval() used
   - jstests/core/evale.js # db.eval() used
   - jstests/core/evalg.js # db.eval() used
@@ -74,6 +73,9 @@ selector:
   # Comments list possible problem point under review.
   - jstests/core/capped6.js # Uses captrunc test command.
   - jstests/core/stages_delete.js # Uses stageDebug command for deletes.
+  - jstests/core/list_all_local_cursors.js # collectionless aggregation stage
+  - jstests/core/list_all_local_sessions.js # collectionless aggregation stage
+  - jstests/core/list_local_sessions.js # collectionless aggregation stage
 
 executor:
   config:
@@ -87,6 +89,7 @@ executor:
   # The CheckReplDBHash hook waits until all operations have replicated to and have been applied
   # on the secondaries, so we run the ValidateCollections hook after it to ensure we're
   # validating the entire contents of the collection.
+  - class: CheckPrimary
   - class: CheckReplOplogs
   - class: CheckReplDBHash
   - class: ValidateCollections
@@ -95,7 +98,6 @@ executor:
   fixture:
     class: ReplicaSetFixture
     mongod_options:
-      bind_ip_all: ''
       oplogSize: 511
       set_parameters:
         enableTestCommands: 1

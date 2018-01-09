@@ -1058,7 +1058,7 @@ Status BtreeLogic<BtreeLayout>::_find(OperationContext* opCtx,
                         dupsCheckedYet = true;
                         if (exists(opCtx, key)) {
                             if (wouldCreateDup(opCtx, key, genericRecordLoc)) {
-                                return Status(ErrorCodes::DuplicateKey, dupKeyError(key), 11000);
+                                return Status(ErrorCodes::DuplicateKey, dupKeyError(key));
                             } else {
                                 return Status(ErrorCodes::DuplicateKeyValue,
                                               "key/value already in index");
@@ -1069,7 +1069,7 @@ Status BtreeLogic<BtreeLayout>::_find(OperationContext* opCtx,
                     if (fullKey.recordLoc == recordLoc) {
                         return Status(ErrorCodes::DuplicateKeyValue, "key/value already in index");
                     } else {
-                        return Status(ErrorCodes::DuplicateKey, dupKeyError(key), 11000);
+                        return Status(ErrorCodes::DuplicateKey, dupKeyError(key));
                     }
                 }
             }
@@ -1811,7 +1811,8 @@ void BtreeLogic<BtreeLayout>::split(OperationContext* opCtx,
                 splitkey.recordLoc,
                 true,  // dupsallowed
                 bucketLoc,
-                rLoc);
+                rLoc)
+            .transitional_ignore();
     }
 
     int newpos = keypos;
@@ -1854,7 +1855,8 @@ Status BtreeLogic<BtreeLayout>::initAsEmpty(OperationContext* opCtx) {
 template <class BtreeLayout>
 DiskLoc BtreeLogic<BtreeLayout>::_addBucket(OperationContext* opCtx) {
     DummyDocWriter docWriter(BtreeLayout::BucketSize);
-    StatusWith<RecordId> loc = _recordStore->insertRecordWithDocWriter(opCtx, &docWriter);
+    StatusWith<RecordId> loc =
+        _recordStore->insertRecordWithDocWriter(opCtx, &docWriter, Timestamp());
     // XXX: remove this(?) or turn into massert or sanely bubble it back up.
     uassertStatusOK(loc.getStatus());
 
@@ -2336,7 +2338,7 @@ DiskLoc BtreeLogic<BtreeLayout>::_locate(OperationContext* opCtx,
     int position;
     BucketType* bucket = getBucket(opCtx, bucketLoc);
     // XXX: owned to not owned conversion(?)
-    _find(opCtx, bucket, key, recordLoc, false, &position, foundOut);
+    _find(opCtx, bucket, key, recordLoc, false, &position, foundOut).transitional_ignore();
 
     // Look in our current bucket.
     if (*foundOut) {

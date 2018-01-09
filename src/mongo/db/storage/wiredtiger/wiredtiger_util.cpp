@@ -425,9 +425,9 @@ int WiredTigerUtil::verifyTable(OperationContext* opCtx,
     ErrorAccumulator eventHandler(errors);
 
     // Try to close as much as possible to avoid EBUSY errors.
-    WiredTigerRecoveryUnit::get(opCtx)->getSession(opCtx)->closeAllCursors();
+    WiredTigerRecoveryUnit::get(opCtx)->getSession()->closeAllCursors(uri);
     WiredTigerSessionCache* sessionCache = WiredTigerRecoveryUnit::get(opCtx)->getSessionCache();
-    sessionCache->closeAllCursors();
+    sessionCache->closeAllCursors(uri);
 
     // Open a new session with custom error handlers.
     WT_CONNECTION* conn = WiredTigerRecoveryUnit::get(opCtx)->getSessionCache()->conn();
@@ -437,6 +437,60 @@ int WiredTigerUtil::verifyTable(OperationContext* opCtx,
 
     // Do the verify. Weird parens prevent treating "verify" as a macro.
     return (session->verify)(session, uri.c_str(), NULL);
+}
+
+bool WiredTigerUtil::useTableLogging(NamespaceString ns, bool replEnabled) {
+    if (!replEnabled) {
+        // All tables on standalones are logged.
+        return true;
+    }
+
+    // Of the replica set configurations:
+    if (ns.db() != "local") {
+        // All replicated collections are not logged.
+        return false;
+    }
+
+    if (ns.coll() == "replset.checkpointTimestamp" || ns.coll() == "replset.minvalid") {
+        // Of local collections, these two are derived from the state of the data and therefore
+        // are not logged.
+        return false;
+    }
+
+    // The remainder of local gets logged. In particular, the oplog and user created collections.
+    return true;
+}
+
+Status WiredTigerUtil::setTableLogging(OperationContext* opCtx, const std::string& uri, bool on) {
+    WiredTigerRecoveryUnit* recoveryUnit = WiredTigerRecoveryUnit::get(opCtx);
+    return setTableLogging(recoveryUnit->getSession()->getSession(), uri, on);
+}
+
+Status WiredTigerUtil::setTableLogging(WT_SESSION* session, const std::string& uri, bool on) {
+    const bool keepOldBehavior = true;
+    if (keepOldBehavior) {
+        return Status::OK();
+    }
+
+    LOG(3) << "Changing logging values. Uri: " << uri << " Enabled? " << on;
+    int ret;
+    if (on) {
+        ret = session->alter(session, uri.c_str(), "log=(enabled=true)");
+    } else {
+        ret = session->alter(session, uri.c_str(), "log=(enabled=false)");
+    }
+
+    if (ret) {
+        return Status(ErrorCodes::WriteConflict,
+                      str::stream() << "Failed to update log setting. Uri: " << uri << " Enable? "
+                                    << on
+                                    << " Ret: "
+                                    << ret
+                                    << " Msg: "
+                                    << session->strerror(session, ret));
+    }
+
+    return Status::OK();
 }
 
 Status WiredTigerUtil::exportTableToBSON(WT_SESSION* session,

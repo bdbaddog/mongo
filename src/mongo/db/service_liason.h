@@ -29,11 +29,14 @@
 #pragma once
 
 #include "mongo/db/logical_session_id.h"
+#include "mongo/db/session_killer.h"
 #include "mongo/stdx/functional.h"
 #include "mongo/util/periodic_runner.h"
 #include "mongo/util/time_support.h"
 
 namespace mongo {
+
+class ServiceContext;
 
 /**
  * A service-dependent type for the LogicalSessionCache to use to find the
@@ -50,7 +53,12 @@ public:
      * Return a list of sessions that are currently being used to run operations
      * on this service.
      */
-    virtual LogicalSessionIdSet getActiveSessions() const = 0;
+    virtual LogicalSessionIdSet getActiveOpSessions() const = 0;
+
+    /**
+     * Return a list of sessions that are currently attached to open cursors
+     */
+    virtual LogicalSessionIdSet getOpenCursorSessions() const = 0;
 
     /**
      * Schedule a job to be run at regular intervals until the server shuts down.
@@ -73,6 +81,18 @@ public:
      * Return the current time.
      */
     virtual Date_t now() const = 0;
+
+    /**
+     * Deligates to a similarly named function on a cursor manager.
+     */
+    virtual std::pair<Status, int> killCursorsWithMatchingSessions(
+        OperationContext* opCtx, const SessionKiller::Matcher& matcher) = 0;
+
+protected:
+    /**
+     * Returns the service context.
+     */
+    virtual ServiceContext* _context() = 0;
 };
 
 }  // namespace mongo

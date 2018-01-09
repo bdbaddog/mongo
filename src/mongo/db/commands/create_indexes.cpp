@@ -73,6 +73,7 @@ const StringData kCommandName = "createIndexes"_sd;
  * malformed, then an error status is returned.
  */
 StatusWith<std::vector<BSONObj>> parseAndValidateIndexSpecs(
+    OperationContext* opCtx,
     const NamespaceString& ns,
     const BSONObj& cmdObj,
     const ServerGlobalParams::FeatureCompatibility& featureCompatibility) {
@@ -99,7 +100,7 @@ StatusWith<std::vector<BSONObj>> parseAndValidateIndexSpecs(
                 }
 
                 auto indexSpecStatus = index_key_validate::validateIndexSpec(
-                    indexesElem.Obj(), ns, featureCompatibility);
+                    opCtx, indexesElem.Obj(), ns, featureCompatibility);
                 if (!indexSpecStatus.isOK()) {
                     return indexSpecStatus.getStatus();
                 }
@@ -116,6 +117,11 @@ StatusWith<std::vector<BSONObj>> parseAndValidateIndexSpecs(
                             str::stream() << "The index name '_id_' is reserved for the _id index, "
                                              "which must have key pattern {_id: 1}, found "
                                           << indexSpec[IndexDescriptor::kKeyPatternFieldName]};
+                } else if (indexSpec[IndexDescriptor::kIndexNameFieldName].String() == "*"_sd) {
+                    // An index named '*' cannot be dropped on its own, because a dropIndex oplog
+                    // entry with a '*' as an index name means "drop all indexes in this
+                    // collection".  We disallow creation of such indexes to avoid this conflict.
+                    return {ErrorCodes::BadValue, "The index name '*' is not valid."};
                 }
 
                 indexSpecs.push_back(std::move(indexSpec));
@@ -203,9 +209,9 @@ StatusWith<std::vector<BSONObj>> resolveCollectionDefaultProperties(
 /**
  * { createIndexes : "bar", indexes : [ { ns : "test.bar", key : { x : 1 }, name: "x_1" } ] }
  */
-class CmdCreateIndex : public Command {
+class CmdCreateIndex : public ErrmsgCommandDeprecated {
 public:
-    CmdCreateIndex() : Command(kCommandName) {}
+    CmdCreateIndex() : ErrmsgCommandDeprecated(kCommandName) {}
 
     virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
         return true;
@@ -225,19 +231,25 @@ public:
         return Status(ErrorCodes::Unauthorized, "Unauthorized");
     }
 
-    virtual bool run(OperationContext* opCtx,
-                     const string& dbname,
-                     const BSONObj& cmdObj,
-                     string& errmsg,
-                     BSONObjBuilder& result) {
+    virtual bool errmsgRun(OperationContext* opCtx,
+                           const string& dbname,
+                           const BSONObj& cmdObj,
+                           string& errmsg,
+                           BSONObjBuilder& result) {
         const NamespaceString ns(parseNsCollectionRequired(dbname, cmdObj));
 
         Status status = userAllowedWriteNS(ns);
         if (!status.isOK())
             return appendCommandStatus(result, status);
 
+        // Disallow users from creating new indexes on config.transactions since the sessions
+        // code was optimized to not update indexes.
+        uassert(ErrorCodes::IllegalOperation,
+                str::stream() << "not allowed to create index on " << ns.ns(),
+                ns != NamespaceString::kSessionTransactionsTableNamespace);
+
         auto specsWithStatus =
-            parseAndValidateIndexSpecs(ns, cmdObj, serverGlobalParams.featureCompatibility);
+            parseAndValidateIndexSpecs(opCtx, ns, cmdObj, serverGlobalParams.featureCompatibility);
         if (!specsWithStatus.isOK()) {
             return appendCommandStatus(result, specsWithStatus.getStatus());
         }
@@ -267,13 +279,12 @@ public:
                 return appendCommandStatus(result, {ErrorCodes::CommandNotSupportedOnView, errmsg});
             }
 
-            MONGO_WRITE_CONFLICT_RETRY_LOOP_BEGIN {
+            writeConflictRetry(opCtx, kCommandName, ns.ns(), [&] {
                 WriteUnitOfWork wunit(opCtx);
                 collection = db->createCollection(opCtx, ns.ns(), CollectionOptions());
                 invariant(collection);
                 wunit.commit();
-            }
-            MONGO_WRITE_CONFLICT_RETRY_LOOP_END(opCtx, kCommandName, ns.ns());
+            });
             result.appendBool("createdCollectionAutomatically", true);
         }
 
@@ -286,12 +297,6 @@ public:
 
         const int numIndexesBefore = collection->getIndexCatalog()->numIndexesTotal(opCtx);
         result.append("numIndexesBefore", numIndexesBefore);
-
-        auto client = opCtx->getClient();
-        ScopeGuard lastOpSetterGuard =
-            MakeObjGuard(repl::ReplClientInfo::forClient(client),
-                         &repl::ReplClientInfo::setLastOpToSystemLastOpTime,
-                         opCtx);
 
         MultiIndexBlock indexer(opCtx, collection);
         indexer.allowBackgroundBuilding();
@@ -321,11 +326,10 @@ public:
             }
         }
 
-        std::vector<BSONObj> indexInfoObjs;
-        MONGO_WRITE_CONFLICT_RETRY_LOOP_BEGIN {
-            indexInfoObjs = uassertStatusOK(indexer.init(specs));
-        }
-        MONGO_WRITE_CONFLICT_RETRY_LOOP_END(opCtx, kCommandName, ns.ns());
+        std::vector<BSONObj> indexInfoObjs =
+            writeConflictRetry(opCtx, kCommandName, ns.ns(), [&indexer, &specs] {
+                return uassertStatusOK(indexer.init(specs));
+            });
 
         // If we're a background index, replace exclusive db lock with an intent lock, so that
         // other readers and writers can proceed during this phase.
@@ -345,7 +349,7 @@ public:
             Lock::CollectionLock colLock(opCtx->lockState(), ns.ns(), MODE_IX);
             uassertStatusOK(indexer.insertAllDocumentsInCollection());
         } catch (const DBException& e) {
-            invariant(e.getCode() != ErrorCodes::WriteConflict);
+            invariant(e.code() != ErrorCodes::WriteConflict);
             // Must have exclusive DB lock before we clean up the index build via the
             // destructor of 'indexer'.
             if (indexer.getBuildInBackground()) {
@@ -383,7 +387,7 @@ public:
             uassert(28552, "collection dropped during index build", db->getCollection(opCtx, ns));
         }
 
-        MONGO_WRITE_CONFLICT_RETRY_LOOP_BEGIN {
+        writeConflictRetry(opCtx, kCommandName, ns.ns(), [&] {
             WriteUnitOfWork wunit(opCtx);
 
             indexer.commit();
@@ -394,12 +398,9 @@ public:
             }
 
             wunit.commit();
-        }
-        MONGO_WRITE_CONFLICT_RETRY_LOOP_END(opCtx, kCommandName, ns.ns());
+        });
 
         result.append("numIndexesAfter", collection->getIndexCatalog()->numIndexesTotal(opCtx));
-
-        lastOpSetterGuard.Dismiss();
 
         return true;
     }

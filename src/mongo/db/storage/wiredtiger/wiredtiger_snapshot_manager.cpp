@@ -31,7 +31,11 @@
 
 #include "mongo/platform/basic.h"
 
+#include <algorithm>
+
 #include "mongo/base/checked_cast.h"
+#include "mongo/db/concurrency/write_conflict_exception.h"
+#include "mongo/db/storage/wiredtiger/wiredtiger_oplog_manager.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_record_store.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_recovery_unit.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_session_cache.h"
@@ -46,35 +50,18 @@ Status WiredTigerSnapshotManager::prepareForCreateSnapshot(OperationContext* opC
     return Status::OK();
 }
 
-Status WiredTigerSnapshotManager::createSnapshot(OperationContext* opCtx,
-                                                 const SnapshotName& name) {
-    auto session = WiredTigerRecoveryUnit::get(opCtx)->getSession(opCtx)->getSession();
-    const std::string config = str::stream() << "name=" << name.asU64();
-    return wtRCToStatus(session->snapshot(session, config.c_str()));
-}
-
-void WiredTigerSnapshotManager::setCommittedSnapshot(const SnapshotName& name) {
+void WiredTigerSnapshotManager::setCommittedSnapshot(const Timestamp& timestamp) {
     stdx::lock_guard<stdx::mutex> lock(_mutex);
 
-    invariant(!_committedSnapshot || *_committedSnapshot <= name);
-    _committedSnapshot = name;
+    invariant(!_committedSnapshot || *_committedSnapshot <= timestamp);
+    _committedSnapshot = timestamp;
 }
 
-void WiredTigerSnapshotManager::cleanupUnneededSnapshots() {
-    stdx::lock_guard<stdx::mutex> lock(_mutex);
-
-    if (!_committedSnapshot)
-        return;
-
-    const std::string config = str::stream() << "drop=(before=" << _committedSnapshot->asU64()
-                                             << ')';
-    invariantWTOK(_session->snapshot(_session, config.c_str()));
-}
+void WiredTigerSnapshotManager::cleanupUnneededSnapshots() {}
 
 void WiredTigerSnapshotManager::dropAllSnapshots() {
     stdx::lock_guard<stdx::mutex> lock(_mutex);
     _committedSnapshot = boost::none;
-    invariantWTOK(_session->snapshot(_session, "drop=(all)"));
 }
 
 void WiredTigerSnapshotManager::shutdown() {
@@ -85,13 +72,28 @@ void WiredTigerSnapshotManager::shutdown() {
     _session = nullptr;
 }
 
-boost::optional<SnapshotName> WiredTigerSnapshotManager::getMinSnapshotForNextCommittedRead()
-    const {
+boost::optional<Timestamp> WiredTigerSnapshotManager::getMinSnapshotForNextCommittedRead() const {
     stdx::lock_guard<stdx::mutex> lock(_mutex);
     return _committedSnapshot;
 }
 
-SnapshotName WiredTigerSnapshotManager::beginTransactionOnCommittedSnapshot(
+Status WiredTigerSnapshotManager::beginTransactionAtTimestamp(Timestamp pointInTime,
+                                                              WT_SESSION* session) const {
+    char readTSConfigString[15 /* read_timestamp= */ + (8 * 2) /* 8 hexadecimal characters */ +
+                            1 /* trailing null */];
+    auto size = std::snprintf(
+        readTSConfigString, sizeof(readTSConfigString), "read_timestamp=%llx", pointInTime.asULL());
+    if (size < 0) {
+        int e = errno;
+        error() << "error snprintf " << errnoWithDescription(e);
+        fassertFailedNoTrace(40664);
+    }
+    invariant(static_cast<std::size_t>(size) < sizeof(readTSConfigString));
+
+    return wtRCToStatus(session->begin_transaction(session, readTSConfigString));
+}
+
+Timestamp WiredTigerSnapshotManager::beginTransactionOnCommittedSnapshot(
     WT_SESSION* session) const {
     stdx::lock_guard<stdx::mutex> lock(_mutex);
 
@@ -99,11 +101,38 @@ SnapshotName WiredTigerSnapshotManager::beginTransactionOnCommittedSnapshot(
             "Committed view disappeared while running operation",
             _committedSnapshot);
 
-    StringBuilder config;
-    config << "snapshot=" << _committedSnapshot->asU64();
-    invariantWTOK(session->begin_transaction(session, config.str().c_str()));
-
+    auto status = beginTransactionAtTimestamp(_committedSnapshot.get(), session);
+    fassertStatusOK(30635, status);
     return *_committedSnapshot;
+}
+
+void WiredTigerSnapshotManager::beginTransactionOnOplog(WiredTigerOplogManager* oplogManager,
+                                                        WT_SESSION* session) const {
+    stdx::lock_guard<stdx::mutex> lock(_mutex);
+    auto allCommittedTimestamp = oplogManager->getOplogReadTimestamp();
+    char readTSConfigString[15 /* read_timestamp= */ + (8 * 2) /* 16 hexadecimal digits */ +
+                            1 /* trailing null */];
+    auto size = std::snprintf(readTSConfigString,
+                              sizeof(readTSConfigString),
+                              "read_timestamp=%llx",
+                              static_cast<unsigned long long>(allCommittedTimestamp));
+    if (size < 0) {
+        int e = errno;
+        error() << "error snprintf " << errnoWithDescription(e);
+        fassertFailedNoTrace(40663);
+    }
+    invariant(static_cast<std::size_t>(size) < sizeof(readTSConfigString));
+
+    int status = session->begin_transaction(session, readTSConfigString);
+
+    // If begin_transaction returns EINVAL, we will assume it is due to the oldest_timestamp
+    // racing ahead of the read_timestamp.  Rather than synchronizing for this rare case, throw a
+    // WriteConflictException which will presumably be retried.
+    if (status == EINVAL) {
+        throw WriteConflictException();
+    }
+
+    invariantWTOK(status);
 }
 
 }  // namespace mongo

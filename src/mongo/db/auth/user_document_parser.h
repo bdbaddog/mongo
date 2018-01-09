@@ -36,20 +36,6 @@
 
 namespace mongo {
 
-class V1UserDocumentParser {
-    MONGO_DISALLOW_COPYING(V1UserDocumentParser);
-
-public:
-    V1UserDocumentParser() {}
-    std::string extractUserNameFromUserDocument(const BSONObj& doc) const;
-
-    Status initializeUserCredentialsFromUserDocument(User* user, const BSONObj& privDoc) const;
-
-    Status initializeUserRolesFromUserDocument(User* user,
-                                               const BSONObj& privDoc,
-                                               StringData dbname) const;
-};
-
 class V2UserDocumentParser {
     MONGO_DISALLOW_COPYING(V2UserDocumentParser);
 
@@ -68,13 +54,13 @@ public:
 
     std::string extractUserNameFromUserDocument(const BSONObj& doc) const;
 
-    boost::optional<OID> extractUserIDFromUserDocument(const BSONObj& doc) const;
-
     Status initializeUserCredentialsFromUserDocument(User* user, const BSONObj& privDoc) const;
 
     Status initializeUserRolesFromUserDocument(const BSONObj& doc, User* user) const;
     Status initializeUserIndirectRolesFromUserDocument(const BSONObj& doc, User* user) const;
     Status initializeUserPrivilegesFromUserDocument(const BSONObj& doc, User* user) const;
+    Status initializeAuthenticationRestrictionsFromUserDocument(const BSONObj& doc,
+                                                                User* user) const;
 };
 
 }  // namespace mongo

@@ -37,15 +37,11 @@ namespace mongo {
  */
 class RouterStageSkip final : public RouterExecStage {
 public:
-    RouterStageSkip(std::unique_ptr<RouterExecStage> child, long long skip);
+    RouterStageSkip(OperationContext* opCtx,
+                    std::unique_ptr<RouterExecStage> child,
+                    long long skip);
 
-    StatusWith<ClusterQueryResult> next(OperationContext* opCtx) final;
-
-    void kill(OperationContext* opCtx) final;
-
-    bool remotesExhausted() final;
-
-    Status setAwaitDataTimeout(Milliseconds awaitDataTimeout) final;
+    StatusWith<ClusterQueryResult> next(ExecContext) final;
 
 private:
     long long _skip;

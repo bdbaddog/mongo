@@ -63,19 +63,8 @@ UpdateResult update(OperationContext* opCtx, Database* db, const UpdateRequest& 
     // Explain should never use this helper.
     invariant(!request.isExplain());
 
-    auto client = opCtx->getClient();
-    auto lastOpAtOperationStart = repl::ReplClientInfo::forClient(client).getLastOp();
-    ScopeGuard lastOpSetterGuard = MakeObjGuard(repl::ReplClientInfo::forClient(client),
-                                                &repl::ReplClientInfo::setLastOpToSystemLastOpTime,
-                                                opCtx);
-
     const NamespaceString& nsString = request.getNamespaceString();
     Collection* collection = db->getCollection(opCtx, nsString);
-
-    // If this is the local database, don't set last op.
-    if (db->name() == "local") {
-        lastOpSetterGuard.Dismiss();
-    }
 
     // The update stage does not create its own collection.  As such, if the update is
     // an upsert, create the collection that the update stage inserts into beforehand.
@@ -86,7 +75,7 @@ UpdateResult update(OperationContext* opCtx, Database* db, const UpdateRequest& 
         invariant(locker->isW() ||
                   locker->isLockHeldForMode(ResourceId(RESOURCE_DATABASE, nsString.db()), MODE_X));
 
-        MONGO_WRITE_CONFLICT_RETRY_LOOP_BEGIN {
+        writeConflictRetry(opCtx, "createCollection", nsString.ns(), [&] {
             Lock::DBLock lk(opCtx, nsString.db(), MODE_X);
 
             const bool userInitiatedWritesAndNotPrimary = opCtx->writesAreReplicated() &&
@@ -102,8 +91,7 @@ UpdateResult update(OperationContext* opCtx, Database* db, const UpdateRequest& 
             collection = db->createCollection(opCtx, nsString.ns(), CollectionOptions());
             invariant(collection);
             wuow.commit();
-        }
-        MONGO_WRITE_CONFLICT_RETRY_LOOP_END(opCtx, "createCollection", nsString.ns());
+        });
     }
 
     // Parse the update, get an executor for it, run the executor, get stats out.
@@ -114,28 +102,29 @@ UpdateResult update(OperationContext* opCtx, Database* db, const UpdateRequest& 
     auto exec = uassertStatusOK(getExecutorUpdate(opCtx, nullOpDebug, collection, &parsedUpdate));
 
     uassertStatusOK(exec->executePlan());
-    if (repl::ReplClientInfo::forClient(client).getLastOp() != lastOpAtOperationStart) {
-        // If this operation has already generated a new lastOp, don't bother setting it here.
-        // No-op updates will not generate a new lastOp, so we still need the guard to fire in that
-        // case.
-        lastOpSetterGuard.Dismiss();
-    }
 
     const UpdateStats* updateStats = UpdateStage::getUpdateStats(exec.get());
 
     return UpdateStage::makeUpdateResult(updateStats);
 }
 
-BSONObj applyUpdateOperators(const BSONObj& from, const BSONObj& operators) {
-    UpdateDriver::Options opts;
-    UpdateDriver driver(opts);
-    Status status = driver.parse(operators);
+BSONObj applyUpdateOperators(OperationContext* opCtx,
+                             const BSONObj& from,
+                             const BSONObj& operators) {
+    const CollatorInterface* collator = nullptr;
+    boost::intrusive_ptr<ExpressionContext> expCtx(new ExpressionContext(opCtx, collator));
+    UpdateDriver driver(std::move(expCtx));
+    std::map<StringData, std::unique_ptr<ExpressionWithPlaceholder>> arrayFilters;
+    Status status = driver.parse(operators, arrayFilters);
     if (!status.isOK()) {
         uasserted(16838, status.reason());
     }
 
     mutablebson::Document doc(from, mutablebson::Document::kInPlaceDisabled);
-    status = driver.update(StringData(), &doc);
+
+    const bool validateForStorage = false;
+    const FieldRefSet emptyImmutablePaths;
+    status = driver.update(StringData(), &doc, validateForStorage, emptyImmutablePaths);
     if (!status.isOK()) {
         uasserted(16839, status.reason());
     }

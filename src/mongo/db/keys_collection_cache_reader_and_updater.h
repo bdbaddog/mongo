@@ -35,11 +35,11 @@
 
 namespace mongo {
 
-class ShardingCatalogClient;
+class KeysCollectionClient;
 
 /**
  * Keeps a local cache of the keys with the ability to refresh. The refresh method also makes sure
- * that there will be valid keys available to sign the current logical time and there will be
+ * that there will be valid keys available to sign the current cluster time and there will be
  * another key ready after the current key expires.
  *
  * Assumptions and limitations:
@@ -49,7 +49,7 @@ class ShardingCatalogClient;
 class KeysCollectionCacheReaderAndUpdater : public KeysCollectionCacheReader {
 public:
     KeysCollectionCacheReaderAndUpdater(std::string purpose,
-                                        ShardingCatalogClient* client,
+                                        KeysCollectionClient* client,
                                         Seconds keyValidForInterval);
     ~KeysCollectionCacheReaderAndUpdater() = default;
 
@@ -64,10 +64,9 @@ public:
                                                   const LogicalTime& forThisTime) override;
 
 private:
+    KeysCollectionClient* const _client;
     const std::string _purpose;
     const Seconds _keyValidForInterval;
-
-    ShardingCatalogClient* const _catalogClient;
 };
 
 }  // namespace mongo

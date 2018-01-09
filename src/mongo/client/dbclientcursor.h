@@ -41,28 +41,13 @@ namespace mongo {
 
 class AScopedConnection;
 
-/** for mock purposes only -- do not create variants of DBClientCursor, nor hang code here
-    @see DBClientMockCursor
- */
-class DBClientCursorInterface {
-    MONGO_DISALLOW_COPYING(DBClientCursorInterface);
-
-public:
-    virtual ~DBClientCursorInterface() {}
-    virtual bool more() = 0;
-    virtual BSONObj next() = 0;
-    // TODO bring more of the DBClientCursor interface to here
-protected:
-    DBClientCursorInterface() {}
-};
-
 /** Queries return a cursor object */
-class DBClientCursor : public DBClientCursorInterface {
+class DBClientCursor {
     MONGO_DISALLOW_COPYING(DBClientCursor);
 
 public:
     /** If true, safe to call next().  Requests more from server if necessary. */
-    bool more();
+    virtual bool more();
 
     /** If true, there is more in our local buffers to be fetched via next(). Returns
         false when a getMore request back to server would be required.  You can use this
@@ -70,7 +55,7 @@ public:
         then perhaps stop.
     */
     int objsLeftInBatch() const {
-        return _putBack.size() + batch.nReturned - batch.pos;
+        return _putBack.size() + batch.objs.size() - batch.pos;
     }
     bool moreInCurrentBatch() {
         return objsLeftInBatch() > 0;
@@ -81,11 +66,8 @@ public:
        on an error at the remote server, you will get back:
          { $err: <std::string> }
        if you do not want to handle that yourself, call nextSafe().
-
-       Warning: The returned BSONObj will become invalid after the next batch
-           is fetched or when this cursor is destroyed.
     */
-    BSONObj next();
+    virtual BSONObj next();
 
     /**
         restore an object previously returned by next() to the cursor
@@ -96,11 +78,6 @@ public:
 
     /** throws AssertionException if get back { $err : ... } */
     BSONObj nextSafe();
-    BSONObj nextSafeOwned() {
-        BSONObj out = nextSafe();
-        out.shareOwnershipWith(batch.m.sharedBuffer());
-        return out;
-    }
 
     /** peek ahead at items buffered for future next() calls.
         never requests new data from the server.  so peek only effective
@@ -155,6 +132,13 @@ public:
         batchSize = newBatchSize;
     }
 
+
+    /**
+     * Fold this in with queryOptions to force the use of legacy query operations.
+     * This flag is never sent over the wire and is only used locally.
+     */
+    enum { QueryOptionLocal_forceOpQuery = 1 << 30 };
+
     DBClientCursor(DBClientBase* client,
                    const std::string& ns,
                    const BSONObj& query,
@@ -190,11 +174,7 @@ public:
     }
 
     std::string getns() const {
-        return ns;
-    }
-
-    Message* getMessage() {
-        return &batch.m;
+        return ns.ns();
     }
 
     /**
@@ -204,19 +184,6 @@ public:
 
     void initLazy(bool isRetry = false);
     bool initLazyFinish(bool& retry);
-
-    class Batch {
-        MONGO_DISALLOW_COPYING(Batch);
-        friend class DBClientCursor;
-        Message m;
-        int nReturned{0};
-        int pos{0};
-        const char* data{nullptr};
-        int remainingBytes{0};
-
-    public:
-        Batch() = default;
-    };
 
     /**
      * For exhaust. Used in DBClientConnection.
@@ -235,6 +202,19 @@ public:
      */
     void kill();
 
+    /**
+     * Returns true if the connection this cursor is using has pending replies.
+     *
+     * If true, you should not try to use the connection for any other purpose or return it to a
+     * pool.
+     *
+     * This can happen if either initLazy() was called without initLazyFinish() or an exhaust query
+     * was started but not completed.
+     */
+    bool connectionHasPendingReplies() const {
+        return _connectionHasPendingReplies;
+    }
+
 private:
     DBClientCursor(DBClientBase* client,
                    const std::string& ns,
@@ -248,10 +228,15 @@ private:
 
     int nextBatchSize();
 
+    struct Batch {
+        std::vector<BSONObj> objs;
+        size_t pos = 0;
+    };
+
     Batch batch;
     DBClientBase* _client;
     std::string _originalHost;
-    const std::string ns;
+    NamespaceString ns;
     const bool _isCommand;
     BSONObj query;
     int nToReturn;
@@ -268,25 +253,28 @@ private:
     std::string _lazyHost;
     bool wasError;
     BSONVersion _enabledBSONVersion;
+    bool _useFindCommand = true;
+    bool _connectionHasPendingReplies = false;
+    int _lastRequestId = 0;
 
-    void dataReceived() {
+    void dataReceived(const Message& reply) {
         bool retry;
         std::string lazyHost;
-        dataReceived(retry, lazyHost);
+        dataReceived(reply, retry, lazyHost);
     }
-    void dataReceived(bool& retry, std::string& lazyHost);
+    void dataReceived(const Message& reply, bool& retry, std::string& lazyHost);
 
     /**
-     * Called by dataReceived when the query was actually a command. Parses the command reply
-     * according to the RPC protocol used to send it, and then fills in the internal field
-     * of this cursor with the received data.
+     * Parses and returns command replies regardless of which command protocol was used.
+     * Does *not* parse replies from non-command OP_QUERY finds.
      */
-    void commandDataReceived();
+    BSONObj commandDataReceived(const Message& reply);
 
     void requestMore();
 
     // init pieces
-    void _assembleInit(Message& toSend);
+    Message _assembleInit();
+    Message _assembleGetMore();
 };
 
 /** iterate over objects in current batch only - will not cause a network call

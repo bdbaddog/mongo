@@ -42,37 +42,32 @@ namespace mongo {
 const std::string ShardCollectionType::ConfigNS =
     NamespaceString::kShardConfigCollectionsCollectionName.toString();
 
-const BSONField<std::string> ShardCollectionType::uuid("_id");
-const BSONField<std::string> ShardCollectionType::ns("ns");
+const BSONField<std::string> ShardCollectionType::ns("_id");
+const BSONField<UUID> ShardCollectionType::uuid("uuid");
 const BSONField<OID> ShardCollectionType::epoch("epoch");
 const BSONField<BSONObj> ShardCollectionType::keyPattern("key");
 const BSONField<BSONObj> ShardCollectionType::defaultCollation("defaultCollation");
 const BSONField<bool> ShardCollectionType::unique("unique");
 const BSONField<bool> ShardCollectionType::refreshing("refreshing");
-const BSONField<long long> ShardCollectionType::refreshSequenceNumber("refreshSequenceNumber");
+const BSONField<Date_t> ShardCollectionType::lastRefreshedCollectionVersion(
+    "lastRefreshedCollectionVersion");
+const BSONField<int> ShardCollectionType::enterCriticalSectionCounter(
+    "enterCriticalSectionCounter");
 
-ShardCollectionType::ShardCollectionType(const NamespaceString& uuid,
-                                         const NamespaceString& nss,
-                                         const OID& epoch,
+ShardCollectionType::ShardCollectionType(NamespaceString nss,
+                                         boost::optional<UUID> uuid,
+                                         OID epoch,
                                          const KeyPattern& keyPattern,
                                          const BSONObj& defaultCollation,
-                                         const bool& unique)
-    : _uuid(uuid),
-      _nss(nss),
-      _epoch(epoch),
+                                         bool unique)
+    : _nss(std::move(nss)),
+      _uuid(uuid),
+      _epoch(std::move(epoch)),
       _keyPattern(keyPattern.toBSON()),
       _defaultCollation(defaultCollation.getOwned()),
       _unique(unique) {}
 
 StatusWith<ShardCollectionType> ShardCollectionType::fromBSON(const BSONObj& source) {
-    NamespaceString uuid;
-    {
-        std::string ns;
-        Status status = bsonExtractStringField(source, ShardCollectionType::uuid.name(), &ns);
-        if (!status.isOK())
-            return status;
-        uuid = NamespaceString{ns};
-    }
 
     NamespaceString nss;
     {
@@ -82,6 +77,23 @@ StatusWith<ShardCollectionType> ShardCollectionType::fromBSON(const BSONObj& sou
             return status;
         }
         nss = NamespaceString{ns};
+    }
+
+    boost::optional<UUID> uuid;
+    {
+        BSONElement uuidElem;
+        Status status = bsonExtractTypedField(
+            source, ShardCollectionType::uuid.name(), BSONType::BinData, &uuidElem);
+        if (status.isOK()) {
+            auto uuidWith = UUID::parse(uuidElem);
+            if (!uuidWith.isOK())
+                return uuidWith.getStatus();
+            uuid = uuidWith.getValue();
+        } else if (status == ErrorCodes::NoSuchKey) {
+            // The field is not set, which is okay.
+        } else {
+            return status;
+        }
     }
 
     OID epoch;
@@ -133,12 +145,13 @@ StatusWith<ShardCollectionType> ShardCollectionType::fromBSON(const BSONObj& sou
         }
     }
 
-    ShardCollectionType shardCollectionType(uuid, nss, epoch, pattern, collation, unique);
+    ShardCollectionType shardCollectionType(
+        std::move(nss), uuid, std::move(epoch), pattern, collation, unique);
 
     // Below are optional fields.
 
-    bool refreshing;
     {
+        bool refreshing;
         Status status =
             bsonExtractBooleanField(source, ShardCollectionType::refreshing.name(), &refreshing);
         if (status.isOK()) {
@@ -150,16 +163,16 @@ StatusWith<ShardCollectionType> ShardCollectionType::fromBSON(const BSONObj& sou
         }
     }
 
-    long long refreshSequenceNumber;
     {
-        Status status = bsonExtractIntegerField(
-            source, ShardCollectionType::refreshSequenceNumber.name(), &refreshSequenceNumber);
-        if (status.isOK()) {
-            shardCollectionType.setRefreshSequenceNumber(refreshSequenceNumber);
-        } else if (status == ErrorCodes::NoSuchKey) {
-            // The field is not set yet, which is okay.
-        } else {
-            return status;
+        if (!source[lastRefreshedCollectionVersion.name()].eoo()) {
+            auto statusWithLastRefreshedCollectionVersion =
+                ChunkVersion::parseFromBSONWithFieldAndSetEpoch(
+                    source, lastRefreshedCollectionVersion.name(), epoch);
+            if (!statusWithLastRefreshedCollectionVersion.isOK()) {
+                return statusWithLastRefreshedCollectionVersion.getStatus();
+            }
+            shardCollectionType.setLastRefreshedCollectionVersion(
+                std::move(statusWithLastRefreshedCollectionVersion.getValue()));
         }
     }
 
@@ -169,8 +182,10 @@ StatusWith<ShardCollectionType> ShardCollectionType::fromBSON(const BSONObj& sou
 BSONObj ShardCollectionType::toBSON() const {
     BSONObjBuilder builder;
 
-    builder.append(uuid.name(), _uuid.ns());
     builder.append(ns.name(), _nss.ns());
+    if (_uuid) {
+        _uuid->appendToBuilder(&builder, uuid.name());
+    }
     builder.append(epoch.name(), _epoch);
     builder.append(keyPattern.name(), _keyPattern.toBSON());
 
@@ -183,8 +198,9 @@ BSONObj ShardCollectionType::toBSON() const {
     if (_refreshing) {
         builder.append(refreshing.name(), _refreshing.get());
     }
-    if (_refreshSequenceNumber) {
-        builder.append(refreshSequenceNumber.name(), _refreshSequenceNumber.get());
+    if (_lastRefreshedCollectionVersion) {
+        builder.appendTimestamp(lastRefreshedCollectionVersion.name(),
+                                _lastRefreshedCollectionVersion->toLong());
     }
 
     return builder.obj();
@@ -194,19 +210,18 @@ std::string ShardCollectionType::toString() const {
     return toBSON().toString();
 }
 
-void ShardCollectionType::setUUID(const NamespaceString& uuid) {
-    invariant(uuid.isValid());
+void ShardCollectionType::setUUID(UUID uuid) {
     _uuid = uuid;
 }
 
-void ShardCollectionType::setNss(const NamespaceString& nss) {
+void ShardCollectionType::setNss(NamespaceString nss) {
     invariant(nss.isValid());
-    _nss = nss;
+    _nss = std::move(nss);
 }
 
-void ShardCollectionType::setEpoch(const OID& epoch) {
+void ShardCollectionType::setEpoch(OID epoch) {
     invariant(epoch.isSet());
-    _epoch = epoch;
+    _epoch = std::move(epoch);
 }
 
 void ShardCollectionType::setKeyPattern(const KeyPattern& keyPattern) {
@@ -214,13 +229,14 @@ void ShardCollectionType::setKeyPattern(const KeyPattern& keyPattern) {
     _keyPattern = keyPattern;
 }
 
-const bool ShardCollectionType::getRefreshing() const {
+bool ShardCollectionType::getRefreshing() const {
     invariant(_refreshing);
     return _refreshing.get();
 }
-const long long ShardCollectionType::getRefreshSequenceNumber() const {
-    invariant(_refreshSequenceNumber);
-    return _refreshSequenceNumber.get();
+
+const ChunkVersion& ShardCollectionType::getLastRefreshedCollectionVersion() const {
+    invariant(_lastRefreshedCollectionVersion);
+    return _lastRefreshedCollectionVersion.get();
 }
 
 }  // namespace mongo

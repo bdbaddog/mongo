@@ -58,7 +58,8 @@ const char* getModifierNameForOp(ArithmeticNode::ArithmeticOp op) {
 }
 }  // namespace
 
-Status ArithmeticNode::init(BSONElement modExpr, const CollatorInterface* collator) {
+Status ArithmeticNode::init(BSONElement modExpr,
+                            const boost::intrusive_ptr<ExpressionContext>& expCtx) {
     invariant(modExpr.ok());
 
     if (!modExpr.isNumber()) {
@@ -73,14 +74,14 @@ Status ArithmeticNode::init(BSONElement modExpr, const CollatorInterface* collat
     return Status::OK();
 }
 
-void ArithmeticNode::updateExistingElement(mutablebson::Element* element, bool* noop) const {
+ModifierNode::ModifyResult ArithmeticNode::updateExistingElement(
+    mutablebson::Element* element, std::shared_ptr<FieldRef> elementPath) const {
     if (!element->isNumeric()) {
-        mutablebson::Element idElem =
-            mutablebson::findFirstChildNamed(element->getDocument().root(), "_id");
+        auto idElem = mutablebson::findFirstChildNamed(element->getDocument().root(), "_id");
         uasserted(ErrorCodes::TypeMismatch,
                   str::stream() << "Cannot apply " << getModifierNameForOp(_op)
                                 << " to a value of non-numeric type. {"
-                                << idElem.toString()
+                                << (idElem.ok() ? idElem.toString() : "no id")
                                 << "} has the field '"
                                 << element->getFieldName()
                                 << "' of non-numeric type "
@@ -101,9 +102,19 @@ void ArithmeticNode::updateExistingElement(mutablebson::Element* element, bool* 
     // If the updated value is identical to the original value, treat this as a no-op. Caveat:
     // if the found element is in a deserialized state, we can't do that.
     if (element->getValue().ok() && valueToSet.isIdentical(originalValue)) {
-        *noop = true;
+        return ModifyResult::kNoOp;
+    } else if (!valueToSet.isValid()) {
+        auto idElem = mutablebson::findFirstChildNamed(element->getDocument().root(), "_id");
+        uasserted(ErrorCodes::BadValue,
+                  str::stream() << "Failed to apply " << getModifierNameForOp(_op)
+                                << " operations to current value ("
+                                << originalValue.debugString()
+                                << ") for document {"
+                                << (idElem.ok() ? idElem.toString() : "no id")
+                                << "}");
     } else {
         invariantOK(element->setValueSafeNum(valueToSet));
+        return ModifyResult::kNormalUpdate;
     }
 }
 
@@ -119,7 +130,9 @@ void ArithmeticNode::setValueForNewElement(mutablebson::Element* element) const 
             valueToSet *= SafeNum(static_cast<int32_t>(0));
             break;
     }
-    invariantOK(element->setValueSafeNum(valueToSet));
+
+    // This can fail if 'valueToSet' is not representable as a 64-bit integer.
+    uassertStatusOK(element->setValueSafeNum(valueToSet));
 }
 
 }  // namespace mongo

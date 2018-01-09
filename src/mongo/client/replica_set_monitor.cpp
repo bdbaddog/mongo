@@ -88,6 +88,7 @@ const int64_t unknownLatency = numeric_limits<int64_t>::max();
 
 const ReadPreferenceSetting kPrimaryOnlyReadPreference(ReadPreference::PrimaryOnly, TagSet());
 const Milliseconds kFindHostMaxBackOffTime(500);
+AtomicBool areRefreshRetriesDisabledForTest{false};  // Only true in tests.
 
 // TODO: Move to ReplicaSetMonitorManager
 ReplicaSetMonitor::ConfigChangeHook asyncConfigChangeHook;
@@ -227,44 +228,44 @@ void ReplicaSetMonitor::_refresh(const CallbackArgs& cbArgs) {
     Timer t;
     startOrContinueRefresh().refreshAll();
     LOG(1) << "Refreshing replica set " << getName() << " took " << t.millis() << " msec";
-    {
-        // reschedule itself
-        invariant(_executor);
-        if (_isRemovedFromManager.load()) {  // already removed so no need to refresh
-            LOG(1) << "Stopping refresh for replica set " << getName() << " because its removed";
-            return;
-        }
 
-        stdx::lock_guard<stdx::mutex> lk(_mutex);
-        std::weak_ptr<ReplicaSetMonitor> that(shared_from_this());
-        auto status = _executor->scheduleWorkAt(_executor->now() + kRefreshPeriod,
-                                                [=](const CallbackArgs& cbArgs) {
-                                                    if (auto ptr = that.lock()) {
-                                                        ptr->_refresh(cbArgs);
-                                                    }
-                                                });
+    // Reschedule the refresh
+    invariant(_executor);
 
-        if (status.getStatus() == ErrorCodes::ShutdownInProgress) {
-            LOG(1) << "Cant schedule refresh for " << getName()
-                   << ". Executor shutdown in progress";
-            return;
-        }
-
-        if (!status.isOK()) {
-            severe() << "Can't continue refresh for replica set " << getName() << " due to "
-                     << redact(status.getStatus());
-            fassertFailed(40140);
-        }
-
-        _refresherHandle = status.getValue();
+    if (_isRemovedFromManager.load()) {  // already removed so no need to refresh
+        LOG(1) << "Stopping refresh for replica set " << getName() << " because its removed";
+        return;
     }
+
+    stdx::lock_guard<stdx::mutex> lk(_mutex);
+
+    std::weak_ptr<ReplicaSetMonitor> that(shared_from_this());
+    auto status = _executor->scheduleWorkAt(_executor->now() + kRefreshPeriod,
+                                            [=](const CallbackArgs& cbArgs) {
+                                                if (auto ptr = that.lock()) {
+                                                    ptr->_refresh(cbArgs);
+                                                }
+                                            });
+
+    if (status.getStatus() == ErrorCodes::ShutdownInProgress) {
+        LOG(1) << "Cant schedule refresh for " << getName() << ". Executor shutdown in progress";
+        return;
+    }
+
+    if (!status.isOK()) {
+        severe() << "Can't continue refresh for replica set " << getName() << " due to "
+                 << redact(status.getStatus());
+        fassertFailed(40140);
+    }
+
+    _refresherHandle = status.getValue();
 }
 
 StatusWith<HostAndPort> ReplicaSetMonitor::getHostOrRefresh(const ReadPreferenceSetting& criteria,
                                                             Milliseconds maxWait) {
     if (_isRemovedFromManager.load()) {
-        return Status(ErrorCodes::ReplicaSetMonitorRemoved,
-                      str::stream() << "ReplicaSetMonitor for set " << getName() << " is removed");
+        return {ErrorCodes::ReplicaSetMonitorRemoved,
+                str::stream() << "ReplicaSetMonitor for set " << getName() << " is removed"};
     }
 
     {
@@ -272,7 +273,7 @@ StatusWith<HostAndPort> ReplicaSetMonitor::getHostOrRefresh(const ReadPreference
         stdx::lock_guard<stdx::mutex> lk(_state->mutex);
         HostAndPort out = _state->getMatchingHost(criteria);
         if (!out.empty())
-            return out;
+            return {std::move(out)};
     }
 
     const auto startTimeMs = Date_t::now();
@@ -286,11 +287,15 @@ StatusWith<HostAndPort> ReplicaSetMonitor::getHostOrRefresh(const ReadPreference
 
         HostAndPort out = refresher.refreshUntilMatches(criteria);
         if (!out.empty())
-            return out;
+            return {std::move(out)};
+
+        if (globalInShutdownDeprecated()) {
+            return {ErrorCodes::ShutdownInProgress, str::stream() << "Server is shutting down"};
+        }
 
         const Milliseconds remaining = maxWait - (Date_t::now() - startTimeMs);
 
-        if (remaining < kFindHostMaxBackOffTime) {
+        if (remaining < kFindHostMaxBackOffTime || areRefreshRetriesDisabledForTest.load()) {
             break;
         }
 
@@ -298,11 +303,10 @@ StatusWith<HostAndPort> ReplicaSetMonitor::getHostOrRefresh(const ReadPreference
         sleepFor(kFindHostMaxBackOffTime);
     }
 
-    return Status(ErrorCodes::FailedToSatisfyReadPreference,
-                  str::stream() << "could not find host matching read preference "
-                                << criteria.toString()
-                                << " for set "
-                                << getName());
+    return {ErrorCodes::FailedToSatisfyReadPreference,
+            str::stream() << "Could not find host matching read preference " << criteria.toString()
+                          << " for set "
+                          << getName()};
 }
 
 HostAndPort ReplicaSetMonitor::getMasterOrUassert() {
@@ -452,6 +456,10 @@ void ReplicaSetMonitor::cleanup() {
     syncConfigChangeHook = ReplicaSetMonitor::ConfigChangeHook();
 }
 
+void ReplicaSetMonitor::disableRefreshRetries_forTest() {
+    areRefreshRetriesDisabledForTest.store(true);
+}
+
 bool ReplicaSetMonitor::isKnownToHaveGoodPrimary() const {
     stdx::lock_guard<stdx::mutex> lk(_state->mutex);
 
@@ -468,15 +476,21 @@ void ReplicaSetMonitor::markAsRemoved() {
     _isRemovedFromManager.store(true);
 }
 
-Refresher::Refresher(const SetStatePtr& setState)
-    : _set(setState), _scan(setState->currentScan), _startedNewScan(false) {
+Refresher::Refresher(const SetStatePtr& setState) : _set(setState), _scan(setState->currentScan) {
     if (_scan)
         return;  // participate in in-progress scan
 
     LOG(2) << "Starting new refresh of replica set " << _set->name;
     _scan = startNewScan(_set.get());
     _set->currentScan = _scan;
-    _startedNewScan = true;
+}
+
+HostAndPort Refresher::refreshUntilMatches(const ReadPreferenceSetting& criteria) {
+    return _refreshUntilMatches(&criteria);
+};
+
+void Refresher::refreshAll() {
+    _refreshUntilMatches(nullptr);
 }
 
 Refresher::NextStep Refresher::getNextStep() {
@@ -499,7 +513,7 @@ Refresher::NextStep Refresher::getNextStep() {
     if (_scan->hostsToScan.empty()) {
         // We've tried all hosts we can, so nothing more to do in this round.
         if (!_scan->foundUpMaster) {
-            warning() << "No primary detected for set " << _set->name;
+            warning() << "Unable to reach primary for set " << _set->name;
 
             // Since we've talked to everyone we could but still didn't find a primary, we
             // do the best we can, and assume all unconfirmedReplies are actually from nodes
@@ -532,7 +546,8 @@ Refresher::NextStep Refresher::getNextStep() {
         } else {
             auto nScans = _set->consecutiveFailedScans++;
             if (nScans <= 10 || nScans % 10 == 0) {
-                log() << "All nodes for set " << _set->name << " are down. "
+                log() << "Cannot reach any nodes for set " << _set->name
+                      << ". Please check network connectivity and the status of the set. "
                       << "This has happened for " << _set->consecutiveFailedScans
                       << " checks in a row.";
             }

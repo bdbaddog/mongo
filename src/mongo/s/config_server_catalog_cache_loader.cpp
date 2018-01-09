@@ -79,9 +79,9 @@ struct QueryAndSort {
  * current position in the chunk cursor.
  */
 QueryAndSort createConfigDiffQuery(const NamespaceString& nss, ChunkVersion collectionVersion) {
-    return {BSON(ChunkType::ns() << nss.ns() << ChunkType::DEPRECATED_lastmod() << GTE
+    return {BSON(ChunkType::ns() << nss.ns() << ChunkType::lastmod() << GTE
                                  << Timestamp(collectionVersion.toLong())),
-            BSON(ChunkType::DEPRECATED_lastmod() << 1)};
+            BSON(ChunkType::lastmod() << 1)};
 }
 
 /**
@@ -90,7 +90,7 @@ QueryAndSort createConfigDiffQuery(const NamespaceString& nss, ChunkVersion coll
 CollectionAndChangedChunks getChangedChunks(OperationContext* opCtx,
                                             const NamespaceString& nss,
                                             ChunkVersion sinceVersion) {
-    const auto catalogClient = Grid::get(opCtx)->catalogClient(opCtx);
+    const auto catalogClient = Grid::get(opCtx)->catalogClient();
 
     // Decide whether to do a full or partial load based on the state of the collection
     const auto coll = uassertStatusOK(catalogClient->getCollection(opCtx, nss.ns())).value;
@@ -107,26 +107,25 @@ CollectionAndChangedChunks getChangedChunks(OperationContext* opCtx,
     const auto diffQuery = createConfigDiffQuery(nss, startingCollectionVersion);
 
     // Query the chunks which have changed
-    std::vector<ChunkType> changedChunks;
     repl::OpTime opTime;
-    uassertStatusOK(Grid::get(opCtx)->catalogClient(opCtx)->getChunks(
-        opCtx,
-        diffQuery.query,
-        diffQuery.sort,
-        boost::none,
-        &changedChunks,
-        &opTime,
-        repl::ReadConcernLevel::kMajorityReadConcern));
+    const std::vector<ChunkType> changedChunks = uassertStatusOK(
+        Grid::get(opCtx)->catalogClient()->getChunks(opCtx,
+                                                     diffQuery.query,
+                                                     diffQuery.sort,
+                                                     boost::none,
+                                                     &opTime,
+                                                     repl::ReadConcernLevel::kMajorityReadConcern));
 
     uassert(ErrorCodes::ConflictingOperationInProgress,
             "No chunks were found for the collection",
             !changedChunks.empty());
 
-    return {coll.getEpoch(),
-            coll.getKeyPattern().toBSON(),
-            coll.getDefaultCollation(),
-            coll.getUnique(),
-            std::move(changedChunks)};
+    return CollectionAndChangedChunks(coll.getUUID(),
+                                      coll.getEpoch(),
+                                      coll.getKeyPattern().toBSON(),
+                                      coll.getDefaultCollation(),
+                                      coll.getUnique(),
+                                      std::move(changedChunks));
 }
 
 }  // namespace
@@ -153,6 +152,15 @@ void ConfigServerCatalogCacheLoader::onStepUp() {
     MONGO_UNREACHABLE;
 }
 
+void ConfigServerCatalogCacheLoader::notifyOfCollectionVersionUpdate(const NamespaceString& nss) {
+    MONGO_UNREACHABLE;
+}
+
+void ConfigServerCatalogCacheLoader::waitForCollectionFlush(OperationContext* opCtx,
+                                                            const NamespaceString& nss) {
+    MONGO_UNREACHABLE;
+}
+
 std::shared_ptr<Notification<void>> ConfigServerCatalogCacheLoader::getChunksSince(
     const NamespaceString& nss,
     ChunkVersion version,
@@ -160,7 +168,7 @@ std::shared_ptr<Notification<void>> ConfigServerCatalogCacheLoader::getChunksSin
 
     auto notify = std::make_shared<Notification<void>>();
 
-    uassertStatusOK(_threadPool.schedule([ this, nss, version, notify, callbackFn ]() noexcept {
+    uassertStatusOK(_threadPool.schedule([ nss, version, notify, callbackFn ]() noexcept {
         auto opCtx = Client::getCurrent()->makeOperationContext();
 
         auto swCollAndChunks = [&]() -> StatusWith<CollectionAndChangedChunks> {

@@ -43,16 +43,23 @@ namespace repl {
 
 class OpTime;
 class StorageInterface;
+struct TimestampedBSONObj;
 
 class ReplicationConsistencyMarkersImpl : public ReplicationConsistencyMarkers {
     MONGO_DISALLOW_COPYING(ReplicationConsistencyMarkersImpl);
 
 public:
     static constexpr StringData kDefaultMinValidNamespace = "local.replset.minvalid"_sd;
+    static constexpr StringData kDefaultOplogTruncateAfterPointNamespace =
+        "local.replset.oplogTruncateAfterPoint"_sd;
+    static constexpr StringData kDefaultCheckpointTimestampNamespace =
+        "local.replset.checkpointTimestamp"_sd;
 
     explicit ReplicationConsistencyMarkersImpl(StorageInterface* storageInterface);
     ReplicationConsistencyMarkersImpl(StorageInterface* storageInterface,
-                                      NamespaceString minValidNss);
+                                      NamespaceString minValidNss,
+                                      NamespaceString oplogTruncateAfterNss,
+                                      NamespaceString checkpointTimestampNss);
 
     void initializeMinValidDocument(OperationContext* opCtx) override;
 
@@ -64,11 +71,17 @@ public:
     void setMinValid(OperationContext* opCtx, const OpTime& minValid) override;
     void setMinValidToAtLeast(OperationContext* opCtx, const OpTime& minValid) override;
 
-    void setOplogDeleteFromPoint(OperationContext* opCtx, const Timestamp& timestamp) override;
-    Timestamp getOplogDeleteFromPoint(OperationContext* opCtx) const override;
+    void setOplogTruncateAfterPoint(OperationContext* opCtx, const Timestamp& timestamp) override;
+    Timestamp getOplogTruncateAfterPoint(OperationContext* opCtx) const override;
+
+    void removeOldOplogDeleteFromPointField(OperationContext* opCtx) override;
 
     void setAppliedThrough(OperationContext* opCtx, const OpTime& optime) override;
+    void clearAppliedThrough(OperationContext* opCtx, const Timestamp& writeTimestamp) override;
     OpTime getAppliedThrough(OperationContext* opCtx) const override;
+
+    void writeCheckpointTimestamp(OperationContext* opCtx, const Timestamp& timestamp);
+    Timestamp getCheckpointTimestamp(OperationContext* opCtx);
 
 private:
     /**
@@ -83,10 +96,52 @@ private:
      *
      * This fasserts on failure.
      */
-    void _updateMinValidDocument(OperationContext* opCtx, const BSONObj& updateSpec);
+    void _updateMinValidDocument(OperationContext* opCtx, const TimestampedBSONObj& updateSpec);
+
+    /**
+     * Reads the OplogTruncateAfterPoint document from disk.
+     * Returns boost::none if not present.
+     */
+    boost::optional<OplogTruncateAfterPointDocument> _getOplogTruncateAfterPointDocument(
+        OperationContext* opCtx) const;
+
+    /**
+     * Returns the old oplog delete from point from the minValid document. Returns an empty
+     * timestamp if the field does not exist. This is used to fallback in FCV 3.4 if the oplog
+     * truncate after point document does not exist.
+     */
+    Timestamp _getOldOplogDeleteFromPoint(OperationContext* opCtx) const;
+
+    /**
+     * Reads the CheckpointTimestamp document from disk.
+     * Returns boost::none if not present.
+     */
+    boost::optional<CheckpointTimestampDocument> _getCheckpointTimestampDocument(
+        OperationContext* opCtx) const;
+
+    /**
+     * Upserts the OplogTruncateAfterPoint document according to the provided update spec.
+     * If the collection does not exist, it is created. If the document does not exist,
+     * it is upserted.
+     *
+     * This fasserts on failure.
+     */
+    void _upsertOplogTruncateAfterPointDocument(OperationContext* opCtx, const BSONObj& updateSpec);
+
+    /**
+     * Upserts the CheckpointTimestamp document according to the provided update spec.
+     * If the collection does not exist, it is created. If the document does not exist,
+     * it is upserted.
+     *
+     * This fasserts on failure.
+     */
+    void _upsertCheckpointTimestampDocument(OperationContext* opCtx, const BSONObj& updateSpec);
+
 
     StorageInterface* _storageInterface;
     const NamespaceString _minValidNss;
+    const NamespaceString _oplogTruncateAfterPointNss;
+    const NamespaceString _checkpointTimestampNss;
 };
 
 }  // namespace repl

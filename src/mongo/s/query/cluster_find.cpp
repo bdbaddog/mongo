@@ -44,6 +44,7 @@
 #include "mongo/db/query/canonical_query.h"
 #include "mongo/db/query/find_common.h"
 #include "mongo/db/query/getmore_request.h"
+#include "mongo/db/query/query_planner_common.h"
 #include "mongo/executor/task_executor_pool.h"
 #include "mongo/platform/overflow_arithmetic.h"
 #include "mongo/s/catalog_cache.h"
@@ -57,6 +58,7 @@
 #include "mongo/stdx/memory.h"
 #include "mongo/util/fail_point_service.h"
 #include "mongo/util/log.h"
+#include "mongo/util/scopeguard.h"
 
 namespace mongo {
 
@@ -64,6 +66,8 @@ namespace {
 
 static const BSONObj kSortKeyMetaProjection = BSON("$meta"
                                                    << "sortKey");
+static const BSONObj kGeoNearDistanceMetaProjection = BSON("$meta"
+                                                           << "geoNearDistance");
 
 // We must allow some amount of overhead per result document, since when we make a cursor response
 // the documents are elements of a BSONArray. The overhead is 1 byte/doc for the type + 1 byte/doc
@@ -75,7 +79,8 @@ static const int kPerDocumentOverheadBytesUpperBound = 10;
  * Given the QueryRequest 'qr' being executed by mongos, returns a copy of the query which is
  * suitable for forwarding to the targeted hosts.
  */
-StatusWith<std::unique_ptr<QueryRequest>> transformQueryForShards(const QueryRequest& qr) {
+StatusWith<std::unique_ptr<QueryRequest>> transformQueryForShards(
+    const QueryRequest& qr, bool appendGeoNearDistanceProjection) {
     // If there is a limit, we forward the sum of the limit and the skip.
     boost::optional<long long> newLimit;
     if (qr.getLimit()) {
@@ -131,6 +136,15 @@ StatusWith<std::unique_ptr<QueryRequest>> transformQueryForShards(const QueryReq
         BSONObjBuilder projectionBuilder;
         projectionBuilder.appendElements(qr.getProj());
         projectionBuilder.append(ClusterClientCursorParams::kSortKeyField, kSortKeyMetaProjection);
+        newProjection = projectionBuilder.obj();
+    }
+
+    if (appendGeoNearDistanceProjection) {
+        invariant(qr.getSort().isEmpty());
+        BSONObjBuilder projectionBuilder;
+        projectionBuilder.appendElements(qr.getProj());
+        projectionBuilder.append(ClusterClientCursorParams::kSortKeyField,
+                                 kGeoNearDistanceMetaProjection);
         newProjection = projectionBuilder.obj();
     }
 
@@ -190,8 +204,7 @@ StatusWith<CursorId> runQueryWithoutRetrying(OperationContext* opCtx,
     params.limit = query.getQueryRequest().getLimit();
     params.batchSize = query.getQueryRequest().getEffectiveBatchSize();
     params.skip = query.getQueryRequest().getSkip();
-    params.isTailable = query.getQueryRequest().isTailable();
-    params.isAwaitData = query.getQueryRequest().isAwaitData();
+    params.tailableMode = query.getQueryRequest().getTailableMode();
     params.isAllowPartialResults = query.getQueryRequest().isAllowPartialResults();
 
     // This is the batchSize passed to each subsequent getMore command issued by the cursor. We
@@ -208,10 +221,23 @@ StatusWith<CursorId> runQueryWithoutRetrying(OperationContext* opCtx,
         params.sort = FindCommon::transformSortSpec(query.getQueryRequest().getSort());
     }
 
-    // Tailable cursors can't have a sort, which should have already been validated.
-    invariant(params.sort.isEmpty() || !params.isTailable);
+    bool appendGeoNearDistanceProjection = false;
+    if (query.getQueryRequest().getSort().isEmpty() &&
+        QueryPlannerCommon::hasNode(query.root(), MatchExpression::GEO_NEAR)) {
+        // There is no specified sort, and there is a GEO_NEAR node. This means we should merge sort
+        // by the geoNearDistance. Request the projection {$sortKey: <geoNearDistance>} from the
+        // shards. Indicate to the AsyncResultsMerger that it should extract the sort key
+        // {"$sortKey": <geoNearDistance>} and sort by the order {"$sortKey": 1}.
+        params.sort = ClusterClientCursorParams::kWholeSortKeySortPattern;
+        params.compareWholeSortKey = true;
+        appendGeoNearDistanceProjection = true;
+    }
 
-    const auto qrToForward = transformQueryForShards(query.getQueryRequest());
+    // Tailable cursors can't have a sort, which should have already been validated.
+    invariant(params.sort.isEmpty() || !query.getQueryRequest().isTailable());
+
+    const auto qrToForward =
+        transformQueryForShards(query.getQueryRequest(), appendGeoNearDistanceProjection);
     if (!qrToForward.isOK()) {
         return qrToForward.getStatus();
     }
@@ -257,6 +283,12 @@ StatusWith<CursorId> runQueryWithoutRetrying(OperationContext* opCtx,
         return swCursors.getStatus();
     }
 
+    // Determine whether the cursor we may eventually register will be single- or multi-target.
+
+    const auto cursorType = swCursors.getValue().size() > 1
+        ? ClusterCursorManager::CursorType::MultiTarget
+        : ClusterCursorManager::CursorType::SingleTarget;
+
     // Transfer the established cursors to a ClusterClientCursor.
 
     params.remotes = std::move(swCursors.getValue());
@@ -267,8 +299,9 @@ StatusWith<CursorId> runQueryWithoutRetrying(OperationContext* opCtx,
 
     auto cursorState = ClusterCursorManager::CursorState::NotExhausted;
     int bytesBuffered = 0;
+
     while (!FindCommon::enoughForFirstBatch(query.getQueryRequest(), results->size())) {
-        auto next = ccc->next(opCtx);
+        auto next = ccc->next(RouterExecStage::ExecContext::kInitialFind);
 
         if (!next.isOK()) {
             return next.getStatus();
@@ -300,6 +333,8 @@ StatusWith<CursorId> runQueryWithoutRetrying(OperationContext* opCtx,
         results->push_back(std::move(nextObj));
     }
 
+    ccc->detachFromOperationContext();
+
     if (!query.getQueryRequest().wantMore() && !ccc->isTailable()) {
         cursorState = ClusterCursorManager::CursorState::Exhausted;
     }
@@ -313,8 +348,6 @@ StatusWith<CursorId> runQueryWithoutRetrying(OperationContext* opCtx,
     // Register the cursor with the cursor manager for subsequent getMore's.
 
     auto cursorManager = Grid::get(opCtx)->getCursorManager();
-    const auto cursorType = chunkManager ? ClusterCursorManager::CursorType::NamespaceSharded
-                                         : ClusterCursorManager::CursorType::NamespaceNotSharded;
     const auto cursorLifetime = query.getQueryRequest().isNoCursorTimeout()
         ? ClusterCursorManager::CursorLifetime::Immortal
         : ClusterCursorManager::CursorLifetime::Mortal;
@@ -415,11 +448,21 @@ StatusWith<CursorResponse> ClusterFind::runGetMore(OperationContext* opCtx,
                               << " was not created by the authenticated user"};
     }
 
-    if (request.awaitDataTimeout) {
-        auto status = pinnedCursor.getValue().setAwaitDataTimeout(*request.awaitDataTimeout);
-        if (!status.isOK()) {
-            return status;
+    if (auto readPref = pinnedCursor.getValue().getReadPreference()) {
+        ReadPreferenceSetting::get(opCtx) = *readPref;
+    }
+    if (pinnedCursor.getValue().isTailableAndAwaitData()) {
+        // Default to 1-second timeout for tailable awaitData cursors. If an explicit maxTimeMS has
+        // been specified, do not apply it to the opCtx, since its deadline will already have been
+        // set during command processing.
+        auto timeout = request.awaitDataTimeout.value_or(Milliseconds{1000});
+        if (!request.awaitDataTimeout) {
+            opCtx->setDeadlineAfterNowBy(timeout);
         }
+        invariant(pinnedCursor.getValue().setAwaitDataTimeout(timeout).isOK());
+    } else if (request.awaitDataTimeout) {
+        return {ErrorCodes::BadValue,
+                "maxTimeMS can only be used with getMore for tailable, awaitData cursors"};
     }
 
     std::vector<BSONObj> batch;
@@ -427,15 +470,44 @@ StatusWith<CursorResponse> ClusterFind::runGetMore(OperationContext* opCtx,
     long long batchSize = request.batchSize.value_or(0);
     long long startingFrom = pinnedCursor.getValue().getNumReturnedSoFar();
     auto cursorState = ClusterCursorManager::CursorState::NotExhausted;
+
+    pinnedCursor.getValue().reattachToOperationContext(opCtx);
+
+    // A pinned cursor will not be destroyed immediately if an exception is thrown. Instead it will
+    // be marked as killed, then reaped by a background thread later. If this happens, we want to be
+    // sure the cursor does not have a pointer to this OperationContext, since it will be destroyed
+    // as soon as we return, but the cursor will live on a bit longer.
+    ScopeGuard cursorDetach =
+        MakeGuard([&pinnedCursor]() { pinnedCursor.getValue().detachFromOperationContext(); });
+
     while (!FindCommon::enoughForGetMore(batchSize, batch.size())) {
-        auto next = pinnedCursor.getValue().next(opCtx);
+        auto context = batch.empty()
+            ? RouterExecStage::ExecContext::kGetMoreNoResultsYet
+            : RouterExecStage::ExecContext::kGetMoreWithAtLeastOneResultInBatch;
+
+        StatusWith<ClusterQueryResult> next =
+            Status{ErrorCodes::InternalError, "uninitialized cluster query result"};
+        try {
+            next = pinnedCursor.getValue().next(context);
+        } catch (const ExceptionFor<ErrorCodes::CloseChangeStream>&) {
+            // This exception is thrown when a $changeStream stage encounters an event
+            // that invalidates the cursor. We should close the cursor and return without
+            // error.
+            cursorState = ClusterCursorManager::CursorState::Exhausted;
+            break;
+        }
+
         if (!next.isOK()) {
             return next.getStatus();
         }
 
         if (next.getValue().isEOF()) {
-            // We reached end-of-stream.
-            if (!pinnedCursor.getValue().isTailable()) {
+            // We reached end-of-stream. If the cursor is not tailable, then we mark it as
+            // exhausted. If it is tailable, usually we keep it open (i.e. "NotExhausted") even when
+            // we reach end-of-stream. However, if all the remote cursors are exhausted, there is no
+            // hope of returning data and thus we need to close the mongos cursor as well.
+            if (!pinnedCursor.getValue().isTailable() ||
+                pinnedCursor.getValue().remotesExhausted()) {
                 cursorState = ClusterCursorManager::CursorState::Exhausted;
             }
             break;
@@ -454,7 +526,10 @@ StatusWith<CursorResponse> ClusterFind::runGetMore(OperationContext* opCtx,
         batch.push_back(std::move(*next.getValue().getResult()));
     }
 
-    // Transfer ownership of the cursor back to the cursor manager.
+    // Upon successful completion, we need to detach from the operation and transfer ownership of
+    // the cursor back to the cursor manager.
+    cursorDetach.Dismiss();
+    pinnedCursor.getValue().detachFromOperationContext();
     pinnedCursor.getValue().returnCursor(cursorState);
 
     CursorId idToReturn = (cursorState == ClusterCursorManager::CursorState::Exhausted)

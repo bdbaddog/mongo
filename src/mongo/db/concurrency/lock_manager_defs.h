@@ -188,8 +188,6 @@ public:
         SINGLETON_PARALLEL_BATCH_WRITER_MODE,
         SINGLETON_GLOBAL,
         SINGLETON_MMAPV1_FLUSH,
-        SINGLETON_CAPPED_IN_FLIGHT_OTHER_DB,
-        SINGLETON_CAPPED_IN_FLIGHT_LOCAL_DB,
     };
 
     ResourceId() : _fullHash(0) {}
@@ -264,18 +262,6 @@ extern const ResourceId resourceIdAdminDB;
 // lock.
 // TODO: Merge this with resourceIdGlobal
 extern const ResourceId resourceIdParallelBatchWriterMode;
-
-// Everywhere that starts in-flight capped inserts which allocate capped collection RecordIds in
-// a way that could trigger hiding of newer records takes this lock in MODE_IX and holds it
-// until the end of their WriteUnitOfWork. The localDb resource is for capped collections in the
-// local database (including the oplog). The otherDb resource is for capped collections in any other
-// database.
-//
-// Threads that need a consistent view of the world can lock both of these in MODE_X to prevent
-// concurrent in-flight capped inserts. The otherDb resource must be acquired before the localDb
-// resource.
-extern const ResourceId resourceCappedInFlightForLocalDb;
-extern const ResourceId resourceCappedInFlightForOtherDb;
 
 /**
  * Interface on which granted lock requests will be notified. See the contract for the notify

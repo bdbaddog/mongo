@@ -53,8 +53,8 @@ std::regex uuidRegex("[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4
 StatusWith<UUID> UUID::parse(BSONElement from) {
     try {
         return UUID{from.uuid()};
-    } catch (const UserException& e) {
-        return exceptionToStatus();
+    } catch (const AssertionException& e) {
+        return e.toStatus();
     }
 }
 
@@ -83,12 +83,16 @@ StatusWith<UUID> UUID::parse(const std::string& s) {
 
 UUID UUID::parse(const BSONObj& obj) {
     auto res = parse(obj.getField("uuid"));
-    invariant(res.isOK());
+    uassert(40566, res.getStatus().reason(), res.isOK());
     return res.getValue();
 }
 
 bool UUID::isUUIDString(const std::string& s) {
     return std::regex_match(s, uuidRegex);
+}
+
+bool UUID::isRFC4122v4() const {
+    return (_uuid[6] & ~0x0f) == 0x40 && (_uuid[8] & ~0x3f) == 0x80;  // See RFC 4122, section 4.4.
 }
 
 UUID UUID::gen() {

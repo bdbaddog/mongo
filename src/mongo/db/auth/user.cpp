@@ -41,7 +41,17 @@
 
 namespace mongo {
 
-User::User(const UserName& name) : _name(name), _id(), _refCount(0), _isValid(1) {}
+namespace {
+
+SHA256Block computeDigest(const UserName& name) {
+    const auto& fn = name.getFullName();
+    return SHA256Block::computeHash({ConstDataRange(fn.c_str(), fn.size())});
+};
+
+}  // namespace
+
+User::User(const UserName& name)
+    : _name(name), _digest(computeDigest(_name)), _refCount(0), _isValid(1) {}
 
 User::~User() {
     dassert(_refCount == 0);
@@ -51,8 +61,8 @@ const UserName& User::getName() const {
     return _name;
 }
 
-const boost::optional<OID>& User::getID() const {
-    return _id;
+const SHA256Block& User::getDigest() const {
+    return _digest;
 }
 
 RoleNameIterator User::getRoles() const {
@@ -85,19 +95,6 @@ const ActionSet User::getActionsForResource(const ResourcePattern& resource) con
         return ActionSet();
     }
     return it->second.getActions();
-}
-
-User* User::clone() const {
-    std::unique_ptr<User> result(new User(_name));
-    result->_id = _id;
-    result->_privileges = _privileges;
-    result->_roles = _roles;
-    result->_credentials = _credentials;
-    return result.release();
-}
-
-void User::setID(boost::optional<OID> id) {
-    _id = std::move(id);
 }
 
 void User::setCredentials(const CredentialData& credentials) {
@@ -151,6 +148,10 @@ void User::addPrivileges(const PrivilegeVector& privileges) {
     for (PrivilegeVector::const_iterator it = privileges.begin(); it != privileges.end(); ++it) {
         addPrivilege(*it);
     }
+}
+
+void User::setRestrictions(RestrictionDocuments restrictions)& {
+    _restrictions = std::move(restrictions);
 }
 
 void User::invalidate() {

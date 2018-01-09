@@ -1,4 +1,4 @@
-// Test stepdown dring drain mode
+// Test stepdown during drain mode
 // 1. Set up a 3-node set. Assume Node 1 is the primary at the beginning for simplicity.
 // 2. Prevent applying retrieved ops on all secondaries, including Node 2.
 // 3. Insert data to ensure Node 2 has ops to apply in its queue.
@@ -50,12 +50,15 @@ load("jstests/replsets/rslib.js");
             node.adminCommand({configureFailPoint: 'rsSyncApplyStop', mode: 'off'}));
     }
 
+    // Since this test blocks a node in drain mode, we cannot use the ReplSetTest stepUp helper
+    // that waits for a node to leave drain mode.
     function stepUpNode(node) {
         assert.soonNoExcept(function() {
             assert.commandWorked(node.adminCommand({replSetStepUp: 1}));
-            replSet.awaitNodesAgreeOnPrimary(
-                replSet.kDefaultTimeoutMS, replSet.nodes, replSet.getNodeId(node));
-            return node.adminCommand('replSetGetStatus').myState == ReplSetTest.State.PRIMARY;
+            // We do not specify a specific primary so that if a different primary gets elected
+            // due to unfortunate timing we can try again.
+            replSet.awaitNodesAgreeOnPrimary();
+            return node.adminCommand('replSetGetStatus').myState === ReplSetTest.State.PRIMARY;
         }, 'failed to step up node ' + node.host, replSet.kDefaultTimeoutMS);
     }
 
@@ -117,7 +120,7 @@ load("jstests/replsets/rslib.js");
     assert.commandWorked(
         secondary.adminCommand({
             replSetTest: 1,
-            waitForDrainFinish: 5000,
+            waitForDrainFinish: replSet.kDefaultTimeoutMS,
         }),
         'replSetTest waitForDrainFinish should work when draining is allowed to complete');
 

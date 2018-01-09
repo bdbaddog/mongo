@@ -30,8 +30,300 @@
 
 #include "mongo/db/sessions_collection.h"
 
+#include <memory>
+#include <vector>
+
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/client/dbclientinterface.h"
+#include "mongo/db/create_indexes_gen.h"
+#include "mongo/db/logical_session_id.h"
+#include "mongo/db/ops/write_ops.h"
+#include "mongo/db/refresh_sessions_gen.h"
+#include "mongo/rpc/get_status_from_command_result.h"
+#include "mongo/s/write_ops/batched_command_response.h"
+#include "mongo/stdx/functional.h"
+#include "mongo/stdx/memory.h"
+
 namespace mongo {
+
+namespace {
+
+BSONObj lsidQuery(const LogicalSessionId& lsid) {
+    return BSON(LogicalSessionRecord::kIdFieldName << lsid.toBSON());
+}
+
+BSONObj lsidQuery(const LogicalSessionRecord& record) {
+    return lsidQuery(record.getId());
+}
+
+BSONObj updateQuery(const LogicalSessionRecord& record) {
+    // { $max : { lastUse : <time> }, $setOnInsert : { user : <user> } }
+
+    // Build our update doc.
+    BSONObjBuilder updateBuilder;
+
+    {
+        BSONObjBuilder maxBuilder(updateBuilder.subobjStart("$currentDate"));
+        maxBuilder.append(LogicalSessionRecord::kLastUseFieldName, true);
+    }
+
+    if (record.getUser()) {
+        BSONObjBuilder setBuilder(updateBuilder.subobjStart("$setOnInsert"));
+        setBuilder.append(LogicalSessionRecord::kUserFieldName, BSON("name" << *record.getUser()));
+    }
+
+    return updateBuilder.obj();
+}
+
+template <typename TFactory, typename AddLineFn, typename SendFn, typename Container>
+Status runBulkGeneric(TFactory makeT, AddLineFn addLine, SendFn sendBatch, const Container& items) {
+    using T = decltype(makeT());
+
+    size_t i = 0;
+    boost::optional<T> thing;
+
+    auto setupBatch = [&] {
+        i = 0;
+        thing.emplace(makeT());
+    };
+
+    auto sendLocalBatch = [&] { return sendBatch(thing.value()); };
+
+    setupBatch();
+
+    for (const auto& item : items) {
+        addLine(*thing, item);
+
+        if (++i >= write_ops::kMaxWriteBatchSize) {
+            auto res = sendLocalBatch();
+            if (!res.isOK()) {
+                return res;
+            }
+
+            setupBatch();
+        }
+    }
+
+    if (i > 0) {
+        return sendLocalBatch();
+    } else {
+        return Status::OK();
+    }
+}
+
+template <typename InitBatchFn, typename AddLineFn, typename SendBatchFn, typename Container>
+Status runBulkCmd(StringData label,
+                  InitBatchFn&& initBatch,
+                  AddLineFn&& addLine,
+                  SendBatchFn&& sendBatch,
+                  const Container& items) {
+    BufBuilder buf;
+
+    boost::optional<BSONObjBuilder> batchBuilder;
+    boost::optional<BSONArrayBuilder> entries;
+
+    auto makeBatch = [&] {
+        buf.reset();
+        batchBuilder.emplace(buf);
+        initBatch(&(batchBuilder.get()));
+        entries.emplace(batchBuilder->subarrayStart(label));
+
+        return &(entries.get());
+    };
+
+    auto sendLocalBatch = [&](BSONArrayBuilder*) {
+        entries->done();
+        return sendBatch(batchBuilder->done());
+    };
+
+    return runBulkGeneric(makeBatch, addLine, sendLocalBatch, items);
+}
+
+}  // namespace
+
+
+constexpr StringData SessionsCollection::kSessionsDb;
+constexpr StringData SessionsCollection::kSessionsCollection;
+constexpr StringData SessionsCollection::kSessionsFullNS;
+const NamespaceString SessionsCollection::kSessionsNamespaceString =
+    NamespaceString{SessionsCollection::kSessionsFullNS};
+
 
 SessionsCollection::~SessionsCollection() = default;
 
+SessionsCollection::SendBatchFn SessionsCollection::makeSendFnForBatchWrite(
+    const NamespaceString& ns, DBClientBase* client) {
+    auto send = [client, ns](BSONObj batch) -> Status {
+        BSONObj res;
+        if (!client->runCommand(ns.db().toString(), batch, res)) {
+            return getStatusFromCommandResult(res);
+        }
+
+        BatchedCommandResponse response;
+        std::string errmsg;
+        if (!response.parseBSON(res, &errmsg)) {
+            return {ErrorCodes::FailedToParse, errmsg};
+        }
+
+        return response.toStatus();
+    };
+
+    return send;
+}
+
+SessionsCollection::SendBatchFn SessionsCollection::makeSendFnForCommand(const NamespaceString& ns,
+                                                                         DBClientBase* client) {
+    auto send = [client, ns](BSONObj cmd) -> Status {
+        BSONObj res;
+        if (!client->runCommand(ns.db().toString(), cmd, res)) {
+            return getStatusFromCommandResult(res);
+        }
+
+        return Status::OK();
+    };
+
+    return send;
+}
+
+SessionsCollection::FindBatchFn SessionsCollection::makeFindFnForCommand(const NamespaceString& ns,
+                                                                         DBClientBase* client) {
+    auto send = [client, ns](BSONObj cmd) -> StatusWith<BSONObj> {
+        BSONObj res;
+        if (!client->runCommand(ns.db().toString(), cmd, res)) {
+            return getStatusFromCommandResult(res);
+        }
+
+        return res;
+    };
+
+    return send;
+}
+
+Status SessionsCollection::doRefresh(const NamespaceString& ns,
+                                     const LogicalSessionRecordSet& sessions,
+                                     SendBatchFn send) {
+    auto init = [ns](BSONObjBuilder* batch) {
+        batch->append("update", ns.coll());
+        batch->append("ordered", false);
+        batch->append("allowImplicitCollectionCreation", false);
+    };
+
+    auto add = [](BSONArrayBuilder* entries, const LogicalSessionRecord& record) {
+        entries->append(
+            BSON("q" << lsidQuery(record) << "u" << updateQuery(record) << "upsert" << true));
+    };
+
+    return runBulkCmd("updates", init, add, send, sessions);
+}
+
+Status SessionsCollection::doRefreshExternal(const NamespaceString& ns,
+                                             const LogicalSessionRecordSet& sessions,
+                                             SendBatchFn send) {
+    auto makeT = [] { return std::vector<LogicalSessionRecord>{}; };
+
+    auto add = [](std::vector<LogicalSessionRecord>& batch, const LogicalSessionRecord& record) {
+        batch.push_back(record);
+    };
+
+    auto sendLocal = [&](std::vector<LogicalSessionRecord>& batch) {
+        RefreshSessionsCmdFromClusterMember idl;
+        idl.setRefreshSessionsInternal(batch);
+        return send(idl.toBSON());
+    };
+
+    return runBulkGeneric(makeT, add, sendLocal, sessions);
+}
+
+Status SessionsCollection::doRemove(const NamespaceString& ns,
+                                    const LogicalSessionIdSet& sessions,
+                                    SendBatchFn send) {
+    auto init = [ns](BSONObjBuilder* batch) {
+        batch->append("delete", ns.coll());
+        batch->append("ordered", false);
+    };
+
+    auto add = [](BSONArrayBuilder* builder, const LogicalSessionId& lsid) {
+        builder->append(BSON("q" << lsidQuery(lsid) << "limit" << 0));
+    };
+
+    return runBulkCmd("deletes", init, add, send, sessions);
+}
+
+Status SessionsCollection::doRemoveExternal(const NamespaceString& ns,
+                                            const LogicalSessionIdSet& sessions,
+                                            SendBatchFn send) {
+    // TODO SERVER-28335 Implement endSessions, with internal counterpart.
+    return Status::OK();
+}
+
+StatusWith<LogicalSessionIdSet> SessionsCollection::doFetch(const NamespaceString& ns,
+                                                            const LogicalSessionIdSet& sessions,
+                                                            FindBatchFn send) {
+    auto makeT = [] { return std::vector<LogicalSessionId>{}; };
+
+    auto add = [](std::vector<LogicalSessionId>& batch, const LogicalSessionId& record) {
+        batch.push_back(record);
+    };
+
+    LogicalSessionIdSet removed = sessions;
+
+    auto wrappedSend = [&](BSONObj batch) {
+        auto swBatchResult = send(batch);
+
+        if (!swBatchResult.isOK()) {
+            return swBatchResult.getStatus();
+        } else {
+            auto result = SessionsCollectionFetchResult::parse("SessionsCollectionFetchResult"_sd,
+                                                               swBatchResult.getValue());
+
+            for (const auto& lsid : result.getCursor().getFirstBatch()) {
+                removed.erase(lsid.get_id());
+            }
+
+            return Status::OK();
+        }
+    };
+
+    auto sendLocal = [&](std::vector<LogicalSessionId>& batch) {
+        SessionsCollectionFetchRequest request;
+
+        request.setFind(ns.coll());
+        request.setFilter({});
+        request.getFilter().set_id({});
+        request.getFilter().get_id().setIn(batch);
+
+        request.setProjection({});
+        request.getProjection().set_id(1);
+        request.setBatchSize(batch.size());
+        request.setLimit(batch.size());
+        request.setAllowPartialResults(true);
+        request.setSingleBatch(true);
+
+        return wrappedSend(request.toBSON());
+    };
+
+    auto status = runBulkGeneric(makeT, add, sendLocal, sessions);
+
+    if (!status.isOK()) {
+        return status;
+    }
+
+    return removed;
+}
+
+BSONObj SessionsCollection::generateCreateIndexesCmd() {
+    NewIndexSpec index;
+    index.setKey(BSON("lastUse" << 1));
+    index.setName("lsidTTLIndex");
+    index.setExpireAfterSeconds(localLogicalSessionTimeoutMinutes * 60);
+
+    std::vector<NewIndexSpec> indexes;
+    indexes.push_back(std::move(index));
+
+    CreateIndexesCmd createIndexes;
+    createIndexes.setCreateIndexes(kSessionsCollection.toString());
+    createIndexes.setIndexes(std::move(indexes));
+
+    return createIndexes.toBSON();
+}
 }  // namespace mongo

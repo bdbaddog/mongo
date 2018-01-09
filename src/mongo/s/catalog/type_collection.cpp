@@ -33,6 +33,7 @@
 #include "mongo/base/status_with.h"
 #include "mongo/bson/bsonobj.h"
 #include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/simple_bsonobj_comparator.h"
 #include "mongo/bson/util/bson_extract.h"
 #include "mongo/util/assert_util.h"
 
@@ -52,6 +53,7 @@ const BSONField<Date_t> CollectionType::updatedAt("lastmod");
 const BSONField<BSONObj> CollectionType::keyPattern("key");
 const BSONField<BSONObj> CollectionType::defaultCollation("defaultCollation");
 const BSONField<bool> CollectionType::unique("unique");
+const BSONField<UUID> CollectionType::uuid("uuid");
 
 StatusWith<CollectionType> CollectionType::fromBSON(const BSONObj& source) {
     CollectionType coll;
@@ -148,6 +150,23 @@ StatusWith<CollectionType> CollectionType::fromBSON(const BSONObj& source) {
     }
 
     {
+        BSONElement uuidElem;
+        Status status = bsonExtractField(source, uuid.name(), &uuidElem);
+        if (status.isOK()) {
+            auto swUUID = UUID::parse(uuidElem);
+            if (!swUUID.isOK()) {
+                return swUUID.getStatus();
+            }
+            coll._uuid = swUUID.getValue();
+        } else if (status == ErrorCodes::NoSuchKey) {
+            // UUID can be missing in 3.6, because featureCompatibilityVersion can be 3.4, in which
+            // case it remains boost::none.
+        } else {
+            return status;
+        }
+    }
+
+    {
         bool collNoBalance;
         Status status = bsonExtractBooleanField(source, kNoBalance.name(), &collNoBalance);
         if (status.isOK()) {
@@ -224,6 +243,10 @@ BSONObj CollectionType::toBSON() const {
         builder.append(unique.name(), _unique.get());
     }
 
+    if (_uuid.is_initialized()) {
+        _uuid->appendToBuilder(&builder, uuid.name());
+    }
+
     if (_allowBalance.is_initialized()) {
         builder.append(kNoBalance.name(), !_allowBalance.get());
     }
@@ -251,6 +274,18 @@ void CollectionType::setUpdatedAt(Date_t updatedAt) {
 void CollectionType::setKeyPattern(const KeyPattern& keyPattern) {
     invariant(!keyPattern.toBSON().isEmpty());
     _keyPattern = keyPattern;
+}
+
+bool CollectionType::hasSameOptions(CollectionType& other) {
+    // The relevant options must have been set on this CollectionType.
+    invariant(_fullNs && _keyPattern && _unique);
+
+    return *_fullNs == other.getNs() &&
+        SimpleBSONObjComparator::kInstance.evaluate(_keyPattern->toBSON() ==
+                                                    other.getKeyPattern().toBSON()) &&
+        SimpleBSONObjComparator::kInstance.evaluate(_defaultCollation ==
+                                                    other.getDefaultCollation()) &&
+        *_unique == other.getUnique();
 }
 
 }  // namespace mongo

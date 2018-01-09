@@ -34,6 +34,7 @@
 
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/database.h"
+#include "mongo/db/catalog/index_catalog.h"
 #include "mongo/db/client.h"
 #include "mongo/db/exec/and_hash.h"
 #include "mongo/db/exec/and_sorted.h"
@@ -77,6 +78,7 @@ PlanStage* buildStages(OperationContext* opCtx,
             CollectionScanParams params;
             params.collection = collection;
             params.tailable = csn->tailable;
+            params.shouldTrackLatestOplogTimestamp = csn->shouldTrackLatestOplogTimestamp;
             params.direction = (csn->direction == 1) ? CollectionScanParams::FORWARD
                                                      : CollectionScanParams::BACKWARD;
             params.maxScan = csn->maxScan;
@@ -129,12 +131,8 @@ PlanStage* buildStages(OperationContext* opCtx,
             if (nullptr == childStage) {
                 return nullptr;
             }
-            return new SortKeyGeneratorStage(opCtx,
-                                             childStage,
-                                             ws,
-                                             keyGenNode->sortSpec,
-                                             keyGenNode->queryObj,
-                                             cq.getCollator());
+            return new SortKeyGeneratorStage(
+                opCtx, childStage, ws, keyGenNode->sortSpec, cq.getCollator());
         }
         case STAGE_PROJECTION: {
             const ProjectionNode* pn = static_cast<const ProjectionNode*>(root);
@@ -143,7 +141,7 @@ PlanStage* buildStages(OperationContext* opCtx,
                 return nullptr;
             }
 
-            ProjectionStageParams params(ExtensionsCallbackReal(opCtx, &collection->ns()));
+            ProjectionStageParams params;
             params.projObj = pn->projection;
             params.collator = cq.getCollator();
 
@@ -287,6 +285,7 @@ PlanStage* buildStages(OperationContext* opCtx,
             // planning a query that contains "no-op" expressions. TODO: make StageBuilder::build()
             // fail in this case (this improvement is being tracked by SERVER-21510).
             params.query = static_cast<FTSQueryImpl&>(*node->ftsQuery);
+            params.wantTextScore = (cq.getProj() && cq.getProj()->wantTextScore());
             return new TextStage(opCtx, params, ws, node->filter.get());
         }
         case STAGE_SHARDING_FILTER: {
@@ -393,7 +392,7 @@ bool StageBuilder::build(OperationContext* opCtx,
     // queries that disallow extensions, can be properly executed. If the query does not have
     // $text/$where context (and $text/$where are allowed), then no attempt should be made to
     // execute the query.
-    invariant(!cq.hasNoopExtensions());
+    invariant(!cq.canHaveNoopMatchNodes());
 
     if (nullptr == wsIn || nullptr == rootOut) {
         return false;

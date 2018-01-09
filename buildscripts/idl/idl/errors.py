@@ -76,6 +76,16 @@ ERROR_ID_ENUM_NON_CONTINUOUS_RANGE = "ID0039"
 ERROR_ID_FIELD_MUST_BE_EMPTY_FOR_ENUM = "ID0040"
 ERROR_ID_BAD_COMMAND_NAMESPACE = "ID0041"
 ERROR_ID_FIELD_NO_COMMAND = "ID0042"
+ERROR_ID_NO_ARRAY_OF_CHAIN = "ID0043"
+ERROR_ID_ILLEGAL_FIELD_DEFAULT_AND_OPTIONAL = "ID0044"
+ERROR_ID_STRUCT_NO_DOC_SEQUENCE = "ID0045"
+ERROR_ID_NO_DOC_SEQUENCE_FOR_NON_ARRAY = "ID0046"
+ERROR_ID_NO_DOC_SEQUENCE_FOR_NON_OBJECT = "ID0047"
+ERROR_ID_COMMAND_DUPLICATES_FIELD = "ID0048"
+ERROR_ID_IS_NODE_VALID_INT = "ID0049"
+ERROR_ID_IS_NODE_VALID_NON_NEGATIVE_INT = "ID0050"
+ERROR_ID_IS_DUPLICATE_COMPARISON_ORDER = "ID0051"
+ERROR_ID_IS_COMMAND_TYPE_EXTRANEOUS = "ID0052"
 
 
 class IDLError(Exception):
@@ -314,7 +324,7 @@ class ParserContext(object):
         """Add an error about a struct without fields."""
         self._add_node_error(node, ERROR_ID_EMPTY_FIELDS,
                              ("Struct '%s' must either have fields, chained_types, or " +
-                              " chained_structs specified but neither were found") % (name))
+                              "chained_structs specified but neither were found") % (name))
 
     def add_missing_required_field_error(self, node, node_parent, node_name):
         # type: (yaml.nodes.Node, unicode, unicode) -> None
@@ -564,6 +574,99 @@ class ParserContext(object):
         self._add_error(location, ERROR_ID_FIELD_NO_COMMAND,
                         ("Command '%s' cannot be used as a field type'. Commands must be top-level"
                          + " types due to their serialization rules.") % (command_name))
+
+    def add_bad_array_of_chain(self, location, field_name):
+        # type: (common.SourceLocation, unicode) -> None
+        """Add an error about a field being an array of chain_types."""
+        self._add_error(location, ERROR_ID_NO_ARRAY_OF_CHAIN,
+                        "Field '%s' cannot be an array of chained types" % (field_name))
+
+    def add_bad_field_default_and_optional(self, location, field_name):
+        # type: (common.SourceLocation, unicode) -> None
+        """Add an error about a field being optional and having a default value."""
+        # pylint: disable=invalid-name
+        self._add_error(location, ERROR_ID_ILLEGAL_FIELD_DEFAULT_AND_OPTIONAL, (
+            "Field '%s' can only be marked as optional or have a default value," + " not both.") %
+                        (field_name))
+
+    def add_bad_struct_field_as_doc_sequence_error(self, location, struct_name, field_name):
+        # type: (common.SourceLocation, unicode, unicode) -> None
+        """Add an error about using a field in a struct being marked with supports_doc_sequence."""
+        # pylint: disable=invalid-name
+        self._add_error(location, ERROR_ID_STRUCT_NO_DOC_SEQUENCE,
+                        ("Field '%s' in struct '%s' cannot be used as a Command Document Sequence"
+                         " type. They are only supported in commands.") % (field_name, struct_name))
+
+    def add_bad_non_array_as_doc_sequence_error(self, location, struct_name, field_name):
+        # type: (common.SourceLocation, unicode, unicode) -> None
+        """Add an error about using a non-array type field being marked with supports_doc_sequence."""
+        # pylint: disable=invalid-name
+        self._add_error(location, ERROR_ID_NO_DOC_SEQUENCE_FOR_NON_ARRAY,
+                        ("Field '%s' in command '%s' cannot be used as a Command Document Sequence"
+                         " type since it is not an array.") % (field_name, struct_name))
+
+    def add_bad_non_object_as_doc_sequence_error(self, location, field_name):
+        # type: (common.SourceLocation, unicode) -> None
+        """Add an error about using a non-struct or BSON object for a doc sequence."""
+        # pylint: disable=invalid-name
+        self._add_error(location, ERROR_ID_NO_DOC_SEQUENCE_FOR_NON_OBJECT,
+                        ("Field '%s' cannot be used as a Command Document Sequence"
+                         " type since it is not a BSON object or struct.") % (field_name))
+
+    def add_bad_command_name_duplicates_field(self, location, command_name):
+        # type: (common.SourceLocation, unicode) -> None
+        """Add an error about a command and field having the same name."""
+        # pylint: disable=invalid-name
+        self._add_error(location, ERROR_ID_COMMAND_DUPLICATES_FIELD,
+                        ("Command '%s' cannot have the same name as a field.") % (command_name))
+
+    def is_scalar_non_negative_int_node(self, node, node_name):
+        # type: (Union[yaml.nodes.MappingNode, yaml.nodes.ScalarNode, yaml.nodes.SequenceNode], unicode) -> bool
+        """Return True if this YAML node is a Scalar and a valid non-negative int."""
+        if not self._is_node_type(node, node_name, "scalar"):
+            return False
+
+        try:
+            value = int(node.value)
+            if value < 0:
+                self._add_node_error(
+                    node, ERROR_ID_IS_NODE_VALID_NON_NEGATIVE_INT,
+                    "Illegal negative integer value for '%s', expected 0 or positive integer." %
+                    (node_name))
+                return False
+
+        except ValueError as value_error:
+            self._add_node_error(node, ERROR_ID_IS_NODE_VALID_INT,
+                                 "Illegal integer value for '%s', message '%s'." %
+                                 (node_name, value_error))
+            return False
+
+        return True
+
+    def get_non_negative_int(self, node):
+        # type: (Union[yaml.nodes.MappingNode, yaml.nodes.ScalarNode, yaml.nodes.SequenceNode]) -> int
+        """Convert a scalar to an int."""
+        assert self.is_scalar_non_negative_int_node(node, "unknown")
+
+        return int(node.value)
+
+    def add_duplicate_comparison_order_field_error(self, location, struct_name, comparison_order):
+        # type: (common.SourceLocation, unicode, int) -> None
+        """Add an error about fields having duplicate comparison_orders."""
+        # pylint: disable=invalid-name
+        self._add_error(
+            location, ERROR_ID_IS_DUPLICATE_COMPARISON_ORDER,
+            ("Struct '%s' cannot have two fields with the same comparison_order value '%d'.") %
+            (struct_name, comparison_order))
+
+    def add_extranous_command_type(self, location, command_name):
+        # type: (common.SourceLocation, unicode) -> None
+        """Add an error about commands having type when not needed."""
+        # pylint: disable=invalid-name
+        self._add_error(
+            location, ERROR_ID_IS_COMMAND_TYPE_EXTRANEOUS,
+            ("Command '%s' cannot have a 'type' property unless namespace equals 'type'.") %
+            (command_name))
 
 
 def _assert_unique_error_messages():

@@ -1,5 +1,5 @@
 /*-
- * Public Domain 2014-2017 MongoDB, Inc.
+ * Public Domain 2014-2018 MongoDB, Inc.
  * Public Domain 2008-2014 WiredTiger, Inc.
  *
  * This is free and unencumbered software released into the public domain.
@@ -335,9 +335,7 @@ main(int argc, char *argv[])
 	run(opts->conn, "file:file.ru", "key_format=r,value_format=u");
 
 	run(opts->conn, "lsm:lsm.SS", "key_format=S,value_format=S");
-	run(opts->conn, "lsm:lsm.Su", "key_format=S,value_format=S");
-	run(opts->conn, "lsm:lsm.rS", "key_format=r,value_format=S");
-	run(opts->conn, "lsm:lsm.ru", "key_format=r,value_format=S");
+	run(opts->conn, "lsm:lsm.Su", "key_format=S,value_format=u");
 
 	run(opts->conn, "table:table.SS", "key_format=S,value_format=S");
 	run(opts->conn, "table:table.Su", "key_format=S,value_format=u");

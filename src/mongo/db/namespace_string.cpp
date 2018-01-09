@@ -1,39 +1,36 @@
-// namespace_string.cpp
-
 /**
-*    Copyright (C) 2014 MongoDB Inc.
-*
-*    This program is free software: you can redistribute it and/or  modify
-*    it under the terms of the GNU Affero General Public License, version 3,
-*    as published by the Free Software Foundation.
-*
-*    This program is distributed in the hope that it will be useful,
-*    but WITHOUT ANY WARRANTY; without even the implied warranty of
-*    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-*    GNU Affero General Public License for more details.
-*
-*    You should have received a copy of the GNU Affero General Public License
-*    along with this program.  If not, see <http://www.gnu.org/licenses/>.
-*
-*    As a special exception, the copyright holders give permission to link the
-*    code of portions of this program with the OpenSSL library under certain
-*    conditions as described in each individual source file and distribute
-*    linked combinations including the program with the OpenSSL library. You
-*    must comply with the GNU Affero General Public License in all respects for
-*    all of the code used other than as permitted herein. If you modify file(s)
-*    with this exception, you may extend this exception to your version of the
-*    file(s), but you are not obligated to do so. If you do not wish to do so,
-*    delete this exception statement from your version. If you delete this
-*    exception statement from all source files in the program, then also delete
-*    it in the license file.
-*/
+ *    Copyright (C) 2017 MongoDB, Inc.
+ *
+ *    This program is free software: you can redistribute it and/or  modify
+ *    it under the terms of the GNU Affero General Public License, version 3,
+ *    as published by the Free Software Foundation.
+ *
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    GNU Affero General Public License for more details.
+ *
+ *    You should have received a copy of the GNU Affero General Public License
+ *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the GNU Affero General Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
+ */
 
 #include "mongo/platform/basic.h"
 
-#include <algorithm>
-#include <ostream>
-
 #include "mongo/db/namespace_string.h"
+
+#include <ostream>
 
 #include "mongo/base/parse_number.h"
 #include "mongo/util/mongoutils/str.h"
@@ -73,7 +70,6 @@ const string escapeTable[256] = {
     ".252", ".253", ".254", ".255"};
 
 const char kServerConfiguration[] = "admin.system.version";
-const char kLogicalTimeKeysCollection[] = "admin.system.keys";
 
 constexpr auto listCollectionsCursorCol = "$cmd.listCollections"_sd;
 constexpr auto listIndexesCursorNSPrefix = "$cmd.listIndexes."_sd;
@@ -82,40 +78,17 @@ constexpr auto dropPendingNSPrefix = "system.drop."_sd;
 
 }  // namespace
 
-bool legalClientSystemNS(StringData ns) {
-    if (ns == "local.system.replset")
-        return true;
-
-    if (ns.find(".system.users") != string::npos)
-        return true;
-
-    if (ns == "admin.system.roles")
-        return true;
-    if (ns == kServerConfiguration)
-        return true;
-    if (ns == kLogicalTimeKeysCollection)
-        return true;
-    if (ns == "admin.system.new_users")
-        return true;
-    if (ns == "admin.system.backup_users")
-        return true;
-
-    if (ns.find(".system.js") != string::npos)
-        return true;
-
-    if (nsToCollectionSubstring(ns) == NamespaceString::kSystemDotViewsCollectionName)
-        return true;
-
-    return false;
-}
-
 constexpr StringData NamespaceString::kAdminDb;
 constexpr StringData NamespaceString::kLocalDb;
 constexpr StringData NamespaceString::kConfigDb;
 constexpr StringData NamespaceString::kSystemDotViewsCollectionName;
 constexpr StringData NamespaceString::kShardConfigCollectionsCollectionName;
+constexpr StringData NamespaceString::kSystemKeysCollectionName;
 
 const NamespaceString NamespaceString::kServerConfigurationNamespace(kServerConfiguration);
+const NamespaceString NamespaceString::kSessionTransactionsTableNamespace(
+    NamespaceString::kConfigDb, "transactions");
+const NamespaceString NamespaceString::kRsOplogNamespace(NamespaceString::kLocalDb, "oplog.rs");
 
 bool NamespaceString::isListCollectionsCursorNS() const {
     return coll() == listCollectionsCursorCol;
@@ -128,6 +101,36 @@ bool NamespaceString::isListIndexesCursorNS() const {
 
 bool NamespaceString::isCollectionlessAggregateNS() const {
     return coll() == collectionlessAggregateCursorCol;
+}
+
+bool NamespaceString::isLegalClientSystemNS() const {
+    if (db() == "admin") {
+        if (ns() == "admin.system.roles")
+            return true;
+        if (ns() == kServerConfiguration)
+            return true;
+        if (ns() == kSystemKeysCollectionName)
+            return true;
+        if (ns() == "admin.system.new_users")
+            return true;
+        if (ns() == "admin.system.backup_users")
+            return true;
+    } else if (db() == "config") {
+        if (ns() == "config.system.sessions")
+            return true;
+    }
+    if (ns() == "local.system.replset")
+        return true;
+
+    if (coll() == "system.users")
+        return true;
+    if (coll() == "system.js")
+        return true;
+
+    if (coll() == kSystemDotViewsCollectionName)
+        return true;
+
+    return false;
 }
 
 NamespaceString NamespaceString::makeListCollectionsNSS(StringData dbName) {

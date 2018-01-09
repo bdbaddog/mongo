@@ -49,15 +49,11 @@
 #include "mongo/util/timer.h"
 
 namespace mongo {
-
-using std::shared_ptr;
-using std::string;
-
 namespace {
 
-class MoveChunkCmd : public Command {
+class MoveChunkCmd : public ErrmsgCommandDeprecated {
 public:
-    MoveChunkCmd() : Command("moveChunk", "movechunk") {}
+    MoveChunkCmd() : ErrmsgCommandDeprecated("moveChunk", "movechunk") {}
 
     bool slaveOk() const override {
         return true;
@@ -95,11 +91,11 @@ public:
         return parseNsFullyQualified(dbname, cmdObj);
     }
 
-    bool run(OperationContext* opCtx,
-             const std::string& dbname,
-             const BSONObj& cmdObj,
-             std::string& errmsg,
-             BSONObjBuilder& result) override {
+    bool errmsgRun(OperationContext* opCtx,
+                   const std::string& dbname,
+                   const BSONObj& cmdObj,
+                   std::string& errmsg,
+                   BSONObjBuilder& result) override {
         Timer t;
 
         const NamespaceString nss(parseNs(dbname, cmdObj));
@@ -121,9 +117,10 @@ public:
 
         const auto toStatus = Grid::get(opCtx)->shardRegistry()->getShard(opCtx, toString);
         if (!toStatus.isOK()) {
-            string msg(str::stream() << "Could not move chunk in '" << nss.ns() << "' to shard '"
-                                     << toString
-                                     << "' because that shard does not exist");
+            std::string msg(str::stream() << "Could not move chunk in '" << nss.ns()
+                                          << "' to shard '"
+                                          << toString
+                                          << "' because that shard does not exist");
             log() << msg;
             return appendCommandStatus(result, Status(ErrorCodes::ShardNotFound, msg));
         }
@@ -146,7 +143,7 @@ public:
             return false;
         }
 
-        shared_ptr<Chunk> chunk;
+        std::shared_ptr<Chunk> chunk;
 
         if (!find.isEmpty()) {
             // find
@@ -196,7 +193,8 @@ public:
                                                     to->getId(),
                                                     maxChunkSizeBytes,
                                                     secondaryThrottle,
-                                                    cmdObj["_waitForDelete"].trueValue()));
+                                                    cmdObj["_waitForDelete"].trueValue() ||
+                                                        cmdObj["waitForDelete"].trueValue()));
 
         Grid::get(opCtx)->catalogCache()->onStaleConfigError(std::move(routingInfo));
 

@@ -101,7 +101,7 @@ void NamespaceIndex::kill_ns(OperationContext* opCtx, StringData ns) {
     const Namespace n(ns);
     _ht->kill(opCtx, n);
 
-    if (ns.size() <= Namespace::MaxNsColletionLen) {
+    if (ns.size() <= Namespace::MaxNsCollectionLen) {
         // Larger namespace names don't have room for $extras so they can't exist. The code
         // below would cause an "$extra: ns too large" error and stacktrace to be printed to the
         // log even though everything is fine.
@@ -128,19 +128,14 @@ boost::filesystem::path NamespaceIndex::path() const {
     return ret;
 }
 
-static void namespaceGetNamespacesCallback(const Namespace& k,
-                                           NamespaceDetails& v,
-                                           list<string>* l) {
-    if (!k.hasDollarSign() || k == "local.oplog.$main") {
-        // we call out local.oplog.$main specifically as its the only "normal"
-        // collection that has a $, so we make sure it gets added
-        l->push_back(k.toString());
-    }
-}
-
 void NamespaceIndex::getCollectionNamespaces(list<string>* tofill) const {
-    _ht->iterAll(stdx::bind(
-        namespaceGetNamespacesCallback, stdx::placeholders::_1, stdx::placeholders::_2, tofill));
+    _ht->iterAll([tofill](const Namespace& k, NamespaceDetails& v) {
+        if (!k.hasDollarSign() || k == "local.oplog.$main") {
+            // we call out local.oplog.$main specifically as its the only "normal"
+            // collection that has a $, so we make sure it gets added
+            tofill->push_back(k.toString());
+        }
+    });
 }
 
 void NamespaceIndex::maybeMkdir() const {

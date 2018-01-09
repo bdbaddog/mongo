@@ -26,18 +26,38 @@
  *    it in the license file.
  */
 
+#include "mongo/platform/basic.h"
+
 #include "mongo/db/logical_time.h"
 
 #include "mongo/base/data_type_endian.h"
 #include "mongo/base/data_view.h"
-#include "mongo/platform/basic.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
 
 namespace mongo {
+namespace {
+
+constexpr auto kOperationTime = "operationTime"_sd;
+
+}  // namespace
 
 const LogicalTime LogicalTime::kUninitialized = LogicalTime();
 
 LogicalTime::LogicalTime(Timestamp ts) : _time(ts.asULL()) {}
+
+LogicalTime LogicalTime::fromOperationTime(const BSONObj& obj) {
+    const auto opTimeElem(obj[kOperationTime]);
+    uassert(ErrorCodes::FailedToParse, "No operationTime found", !opTimeElem.eoo());
+    uassert(ErrorCodes::BadValue,
+            "Operation time is of the wrong value",
+            opTimeElem.type() == bsonTimestamp);
+    return LogicalTime(opTimeElem.timestamp());
+}
+
+void LogicalTime::appendAsOperationTime(BSONObjBuilder* builder) const {
+    builder->append(kOperationTime, asTimestamp());
+}
 
 void LogicalTime::addTicks(uint64_t ticks) {
     _time += ticks;
@@ -48,15 +68,19 @@ LogicalTime LogicalTime::addTicks(uint64_t ticks) const {
 }
 
 std::string LogicalTime::toString() const {
-    StringBuilder buf;
-    buf << asTimestamp().toString();
-    return buf.str();
+    return toBSON().toString();
 }
 
 std::array<unsigned char, sizeof(uint64_t)> LogicalTime::toUnsignedArray() const {
     std::array<unsigned char, sizeof(uint64_t)> output;
     DataView(reinterpret_cast<char*>(output.data())).write(LittleEndian<uint64_t>{_time});
     return output;
+}
+
+BSONObj LogicalTime::toBSON() const {
+    BSONObjBuilder bldr;
+    bldr.append("ts", asTimestamp());
+    return bldr.obj();
 }
 
 }  // namespace mongo

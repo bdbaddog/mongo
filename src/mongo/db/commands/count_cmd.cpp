@@ -30,6 +30,7 @@
 
 #include "mongo/platform/basic.h"
 
+#include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/client.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/commands/run_aggregate.h"
@@ -54,9 +55,9 @@ using std::stringstream;
 /**
  * Implements the MongoD side of the count command.
  */
-class CmdCount : public Command {
+class CmdCount : public BasicCommand {
 public:
-    CmdCount() : Command("count") {}
+    CmdCount() : BasicCommand("count") {}
 
     virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
         return false;
@@ -79,7 +80,7 @@ public:
         return false;
     }
 
-    bool supportsReadConcern(const std::string& dbName, const BSONObj& cmdObj) const final {
+    bool supportsNonLocalReadConcern(const std::string& dbName, const BSONObj& cmdObj) const final {
         return true;
     }
 
@@ -91,12 +92,21 @@ public:
         help << "count objects in collection";
     }
 
-    virtual void addRequiredPrivileges(const std::string& dbname,
-                                       const BSONObj& cmdObj,
-                                       std::vector<Privilege>* out) {
-        ActionSet actions;
-        actions.addAction(ActionType::find);
-        out->push_back(Privilege(parseResourcePattern(dbname, cmdObj), actions));
+    Status checkAuthForOperation(OperationContext* opCtx,
+                                 const std::string& dbname,
+                                 const BSONObj& cmdObj) override {
+        AuthorizationSession* authSession = AuthorizationSession::get(opCtx->getClient());
+
+        if (!authSession->isAuthorizedToParseNamespaceElement(cmdObj.firstElement())) {
+            return Status(ErrorCodes::Unauthorized, "Unauthorized");
+        }
+
+        const NamespaceString nss(parseNsOrUUID(opCtx, dbname, cmdObj));
+        if (!authSession->isAuthorizedForActionsOnNamespace(nss, ActionType::find)) {
+            return Status(ErrorCodes::Unauthorized, "Unauthorized");
+        }
+
+        return Status::OK();
     }
 
     virtual Status explain(OperationContext* opCtx,
@@ -105,13 +115,16 @@ public:
                            ExplainOptions::Verbosity verbosity,
                            BSONObjBuilder* out) const {
         const bool isExplain = true;
-        auto request = CountRequest::parseFromBSON(dbname, cmdObj, isExplain);
+        Lock::DBLock dbLock(opCtx, dbname, MODE_IS);
+        auto nss = parseNsOrUUID(opCtx, dbname, cmdObj);
+        auto request = CountRequest::parseFromBSON(nss, cmdObj, isExplain);
         if (!request.isOK()) {
             return request.getStatus();
         }
 
         // Acquire the db read lock.
-        AutoGetCollectionOrViewForReadCommand ctx(opCtx, request.getValue().getNs());
+        AutoGetCollectionOrViewForReadCommand ctx(
+            opCtx, request.getValue().getNs(), std::move(dbLock));
         Collection* collection = ctx.getCollection();
 
         if (ctx.getView()) {
@@ -158,15 +171,17 @@ public:
     virtual bool run(OperationContext* opCtx,
                      const string& dbname,
                      const BSONObj& cmdObj,
-                     string& errmsg,
                      BSONObjBuilder& result) {
         const bool isExplain = false;
-        auto request = CountRequest::parseFromBSON(dbname, cmdObj, isExplain);
+        Lock::DBLock dbLock(opCtx, dbname, MODE_IS);
+        auto nss = parseNsOrUUID(opCtx, dbname, cmdObj);
+        auto request = CountRequest::parseFromBSON(nss, cmdObj, isExplain);
         if (!request.isOK()) {
             return appendCommandStatus(result, request.getStatus());
         }
 
-        AutoGetCollectionOrViewForReadCommand ctx(opCtx, request.getValue().getNs());
+        AutoGetCollectionOrViewForReadCommand ctx(
+            opCtx, request.getValue().getNs(), std::move(dbLock));
         Collection* collection = ctx.getCollection();
 
         if (ctx.getView()) {
@@ -177,16 +192,15 @@ public:
                 return appendCommandStatus(result, viewAggregation.getStatus());
             }
 
-            BSONObjBuilder aggResult;
-            (void)Command::findCommand("aggregate")
-                ->run(opCtx, dbname, viewAggregation.getValue(), errmsg, aggResult);
+            BSONObj aggResult = Command::runCommandDirectly(
+                opCtx, OpMsgRequest::fromDBAndBody(dbname, std::move(viewAggregation.getValue())));
 
-            if (ResolvedView::isResolvedViewErrorResponse(aggResult.asTempObj())) {
-                result.appendElements(aggResult.obj());
+            if (ResolvedView::isResolvedViewErrorResponse(aggResult)) {
+                result.appendElements(aggResult);
                 return false;
             }
 
-            ViewResponseFormatter formatter(aggResult.obj());
+            ViewResponseFormatter formatter(aggResult);
             Status formatStatus = formatter.appendAsCountResponse(&result);
             if (!formatStatus.isOK()) {
                 return appendCommandStatus(result, formatStatus);

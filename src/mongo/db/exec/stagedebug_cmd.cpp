@@ -35,6 +35,7 @@
 #include "mongo/db/auth/action_type.h"
 #include "mongo/db/auth/privilege.h"
 #include "mongo/db/catalog/database.h"
+#include "mongo/db/catalog/index_catalog.h"
 #include "mongo/db/client.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/db_raii.h"
@@ -115,9 +116,9 @@ BSONObj stripFieldNames(const BSONObj& obj) {
  * node -> {dedup: {filter: {filter}, args: {node: node, field: field}}}
  * node -> {unwind: {filter: filter}, args: {node: node, field: field}}
  */
-class StageDebugCmd : public Command {
+class StageDebugCmd : public BasicCommand {
 public:
-    StageDebugCmd() : Command("stageDebug") {}
+    StageDebugCmd() : BasicCommand("stageDebug") {}
 
     virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
         return false;
@@ -140,7 +141,6 @@ public:
     bool run(OperationContext* opCtx,
              const string& dbname,
              const BSONObj& cmdObj,
-             string& errmsg,
              BSONObjBuilder& result) {
         BSONElement argElt = cmdObj["stageDebug"];
         if (argElt.eoo() || !argElt.isABSONObj()) {
@@ -248,8 +248,13 @@ public:
             BSONObj argObj = e.Obj();
             if (filterTag == e.fieldName()) {
                 const CollatorInterface* collator = nullptr;
-                StatusWithMatchExpression statusWithMatcher = MatchExpressionParser::parse(
-                    argObj, ExtensionsCallbackReal(opCtx, &collection->ns()), collator);
+                const boost::intrusive_ptr<ExpressionContext> expCtx(
+                    new ExpressionContext(opCtx, collator));
+                auto statusWithMatcher =
+                    MatchExpressionParser::parse(argObj,
+                                                 expCtx,
+                                                 ExtensionsCallbackReal(opCtx, &collection->ns()),
+                                                 MatchExpressionParser::kAllowAllSpecialFeatures);
                 if (!statusWithMatcher.isOK()) {
                     return NULL;
                 }
@@ -479,7 +484,6 @@ public:
             // that can only be checked for equality.  We ignore this now.
             Status s = fam->getSpec().getIndexPrefix(BSONObj(), &params.indexPrefix);
             if (!s.isOK()) {
-                // errmsg = s.toString();
                 return NULL;
             }
 

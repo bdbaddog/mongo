@@ -55,9 +55,9 @@ using std::string;
 
 namespace {
 
-class RecvChunkStartCommand : public Command {
+class RecvChunkStartCommand : public ErrmsgCommandDeprecated {
 public:
-    RecvChunkStartCommand() : Command("_recvChunkStart") {}
+    RecvChunkStartCommand() : ErrmsgCommandDeprecated("_recvChunkStart") {}
 
     void help(std::stringstream& h) const {
         h << "internal";
@@ -84,11 +84,11 @@ public:
         out->push_back(Privilege(ResourcePattern::forClusterResource(), actions));
     }
 
-    bool run(OperationContext* opCtx,
-             const string&,
-             const BSONObj& cmdObj,
-             string& errmsg,
-             BSONObjBuilder& result) {
+    bool errmsgRun(OperationContext* opCtx,
+                   const string&,
+                   const BSONObj& cmdObj,
+                   string& errmsg,
+                   BSONObjBuilder& result) {
         auto shardingState = ShardingState::get(opCtx);
         uassertStatusOK(shardingState->canAcceptShardedCommands());
 
@@ -102,9 +102,8 @@ public:
         // Refresh our collection manager from the config server, we need a collection manager to
         // start registering pending chunks. We force the remote refresh here to make the behavior
         // consistent and predictable, generally we'd refresh anyway, and to be paranoid.
-        ChunkVersion currentVersion;
-
-        Status status = shardingState->refreshMetadataNow(opCtx, nss, &currentVersion);
+        ChunkVersion shardVersion;
+        Status status = shardingState->refreshMetadataNow(opCtx, nss, &shardVersion);
         if (!status.isOK()) {
             errmsg = str::stream() << "cannot start receiving chunk "
                                    << redact(chunkRange.toString()) << causedBy(redact(status));
@@ -147,7 +146,7 @@ public:
             chunkRange.getMin(),
             chunkRange.getMax(),
             shardKeyPattern,
-            currentVersion.epoch(),
+            shardVersion.epoch(),
             writeConcern));
 
         result.appendBool("started", true);
@@ -156,9 +155,9 @@ public:
 
 } recvChunkStartCmd;
 
-class RecvChunkStatusCommand : public Command {
+class RecvChunkStatusCommand : public BasicCommand {
 public:
-    RecvChunkStatusCommand() : Command("_recvChunkStatus") {}
+    RecvChunkStatusCommand() : BasicCommand("_recvChunkStatus") {}
 
     void help(std::stringstream& h) const {
         h << "internal";
@@ -187,7 +186,6 @@ public:
     bool run(OperationContext* opCtx,
              const string&,
              const BSONObj& cmdObj,
-             string& errmsg,
              BSONObjBuilder& result) {
         ShardingState::get(opCtx)->migrationDestinationManager()->report(result);
         return true;
@@ -195,9 +193,9 @@ public:
 
 } recvChunkStatusCommand;
 
-class RecvChunkCommitCommand : public Command {
+class RecvChunkCommitCommand : public BasicCommand {
 public:
-    RecvChunkCommitCommand() : Command("_recvChunkCommit") {}
+    RecvChunkCommitCommand() : BasicCommand("_recvChunkCommit") {}
 
     void help(std::stringstream& h) const {
         h << "internal";
@@ -227,7 +225,6 @@ public:
     bool run(OperationContext* opCtx,
              const string&,
              const BSONObj& cmdObj,
-             string& errmsg,
              BSONObjBuilder& result) {
         auto const sessionId = uassertStatusOK(MigrationSessionId::extractFromBSON(cmdObj));
         auto mdm = ShardingState::get(opCtx)->migrationDestinationManager();
@@ -242,9 +239,9 @@ public:
 
 } recvChunkCommitCommand;
 
-class RecvChunkAbortCommand : public Command {
+class RecvChunkAbortCommand : public BasicCommand {
 public:
-    RecvChunkAbortCommand() : Command("_recvChunkAbort") {}
+    RecvChunkAbortCommand() : BasicCommand("_recvChunkAbort") {}
 
     void help(std::stringstream& h) const {
         h << "internal";
@@ -274,7 +271,6 @@ public:
     bool run(OperationContext* opCtx,
              const string&,
              const BSONObj& cmdObj,
-             string& errmsg,
              BSONObjBuilder& result) {
         auto const mdm = ShardingState::get(opCtx)->migrationDestinationManager();
 

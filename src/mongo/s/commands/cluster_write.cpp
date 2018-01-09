@@ -32,6 +32,8 @@
 
 #include "mongo/s/commands/cluster_write.h"
 
+#include <algorithm>
+
 #include "mongo/base/status.h"
 #include "mongo/client/connpool.h"
 #include "mongo/db/lasterror.h"
@@ -51,9 +53,6 @@
 namespace mongo {
 namespace {
 
-// Test whether we should split once data * splitTestFactor > chunkSize (approximately)
-const uint64_t splitTestFactor = 5;
-
 const uint64_t kTooManySplitPoints = 4;
 
 void toBatchError(const Status& status, BatchedCommandResponse* response) {
@@ -62,28 +61,6 @@ void toBatchError(const Status& status, BatchedCommandResponse* response) {
     response->setErrMessage(status.reason());
     response->setOk(false);
     dassert(response->isValid(NULL));
-}
-
-/**
- * Given a maxChunkSize configuration and the number of chunks in a particular sharded collection,
- * returns an optimal chunk size to use in order to achieve a good ratio between number of chunks
- * and their size.
- */
-uint64_t calculateDesiredChunkSize(uint64_t maxChunkSizeBytes, uint64_t numChunks) {
-    // Splitting faster in early chunks helps spread out an initial load better
-    const uint64_t minChunkSize = 1 << 20;  // 1 MBytes
-
-    if (numChunks <= 1) {
-        return 1024;
-    } else if (numChunks < 3) {
-        return minChunkSize / 2;
-    } else if (numChunks < 10) {
-        return std::max(maxChunkSizeBytes / 4, minChunkSize);
-    } else if (numChunks < 20) {
-        return std::max(maxChunkSizeBytes / 2, minChunkSize);
-    } else {
-        return maxChunkSizeBytes;
-    }
 }
 
 /**
@@ -199,84 +176,67 @@ void splitIfNeeded(OperationContext* opCtx,
 
 }  // namespace
 
-ClusterWriter::ClusterWriter(bool autoSplit, int timeoutMillis)
-    : _autoSplit(autoSplit), _timeoutMillis(timeoutMillis) {}
-
 void ClusterWriter::write(OperationContext* opCtx,
-                          const BatchedCommandRequest& origRequest,
+                          const BatchedCommandRequest& request,
+                          BatchWriteExecStats* stats,
                           BatchedCommandResponse* response) {
-    // Add _ids to insert request if req'd
-    std::unique_ptr<BatchedCommandRequest> idRequest(
-        BatchedCommandRequest::cloneWithIds(origRequest));
+    const NamespaceString& nss = request.getNS();
 
-    const BatchedCommandRequest* request = idRequest ? idRequest.get() : &origRequest;
-
-    const NamespaceString& nss = request->getNS();
-    if (!nss.isValid()) {
-        toBatchError(Status(ErrorCodes::InvalidNamespace, nss.ns() + " is not a valid namespace"),
-                     response);
-        return;
-    }
-
-    if (!NamespaceString::validCollectionName(nss.coll())) {
-        toBatchError(
-            Status(ErrorCodes::BadValue, str::stream() << "invalid collection name " << nss.coll()),
-            response);
-        return;
-    }
-
-    if (request->sizeWriteOps() == 0u) {
-        toBatchError(Status(ErrorCodes::InvalidLength, "no write ops were included in the batch"),
-                     response);
-        return;
-    }
-
-    if (request->sizeWriteOps() > BatchedCommandRequest::kMaxWriteBatchSize) {
-        toBatchError(Status(ErrorCodes::InvalidLength,
-                            str::stream() << "exceeded maximum write batch size of "
-                                          << BatchedCommandRequest::kMaxWriteBatchSize),
-                     response);
-        return;
-    }
-
-    std::string errMsg;
-    if (request->isInsertIndexRequest() && !request->isValidIndexRequest(&errMsg)) {
-        toBatchError(Status(ErrorCodes::InvalidOptions, errMsg), response);
-        return;
-    }
+    LastError::Disabled disableLastError(&LastError::get(opCtx->getClient()));
 
     // Config writes and shard writes are done differently
-    if (nss.db() == NamespaceString::kConfigDb || nss.db() == NamespaceString::kAdminDb) {
-        Grid::get(opCtx)->catalogClient(opCtx)->writeConfigServerDirect(opCtx, *request, response);
+    if (nss.db() == NamespaceString::kAdminDb) {
+        Grid::get(opCtx)->catalogClient()->writeConfigServerDirect(opCtx, request, response);
     } else {
         TargeterStats targeterStats;
 
         {
-            ChunkManagerTargeter targeter(request->getTargetingNSS(), &targeterStats);
+            ChunkManagerTargeter targeter(request.getTargetingNS(), &targeterStats);
 
             Status targetInitStatus = targeter.init(opCtx);
             if (!targetInitStatus.isOK()) {
                 toBatchError({targetInitStatus.code(),
-                              str::stream() << "unable to target"
-                                            << (request->isInsertIndexRequest() ? " index" : "")
+                              str::stream() << "unable to initialize targeter for"
+                                            << (request.isInsertIndexRequest() ? " index" : "")
                                             << " write op for collection "
-                                            << request->getTargetingNSS().toString()
+                                            << request.getTargetingNS().ns()
                                             << causedBy(targetInitStatus)},
                              response);
                 return;
             }
 
-            BatchWriteExec::executeBatch(opCtx, targeter, *request, response, &_stats);
+            auto swEndpoints = targeter.targetCollection();
+            if (!swEndpoints.isOK()) {
+                toBatchError({swEndpoints.getStatus().code(),
+                              str::stream() << "unable to target"
+                                            << (request.isInsertIndexRequest() ? " index" : "")
+                                            << " write op for collection "
+                                            << request.getTargetingNS().ns()
+                                            << causedBy(swEndpoints.getStatus())},
+                             response);
+                return;
+            }
+
+            const auto& endpoints = swEndpoints.getValue();
+
+            // Handle sharded config server writes differently.
+            if (std::any_of(endpoints.begin(), endpoints.end(), [](const auto& it) {
+                    return it.shardName == ShardRegistry::kConfigServerShardId;
+                })) {
+                // There should be no namespaces that partially target config servers.
+                invariant(endpoints.size() == 1);
+
+                // For config servers, we do direct writes.
+                Grid::get(opCtx)->catalogClient()->writeConfigServerDirect(
+                    opCtx, request, response);
+                return;
+            }
+
+            BatchWriteExec::executeBatch(opCtx, targeter, request, response, stats);
         }
 
-        if (_autoSplit) {
-            splitIfNeeded(opCtx, request->getNS(), targeterStats);
-        }
+        splitIfNeeded(opCtx, request.getNS(), targeterStats);
     }
-}
-
-const BatchWriteExecStats& ClusterWriter::getStats() {
-    return _stats;
 }
 
 void updateChunkWriteStatsAndSplitIfNeeded(OperationContext* opCtx,
@@ -284,8 +244,8 @@ void updateChunkWriteStatsAndSplitIfNeeded(OperationContext* opCtx,
                                            Chunk* chunk,
                                            long dataWritten) {
     // Disable lastError tracking so that any errors, which occur during auto-split do not get
-    // bubbled up on the client connection doing a write.
-    LastError::Disabled d(&LastError::get(cc()));
+    // bubbled up on the client connection doing a write
+    LastError::Disabled disableLastError(&LastError::get(opCtx->getClient()));
 
     const auto balancerConfig = Grid::get(opCtx)->getBalancerConfiguration();
 
@@ -296,17 +256,9 @@ void updateChunkWriteStatsAndSplitIfNeeded(OperationContext* opCtx,
 
     const uint64_t chunkBytesWritten = chunk->addBytesWritten(dataWritten);
 
-    const uint64_t desiredChunkSize =
-        calculateDesiredChunkSize(balancerConfig->getMaxChunkSizeBytes(), manager->numChunks());
+    const uint64_t desiredChunkSize = balancerConfig->getMaxChunkSizeBytes();
 
-    // If this chunk is at either end of the range, trigger auto-split at 10% less data written in
-    // order to trigger the top-chunk optimization.
-    const uint64_t splitThreshold = (minIsInf || maxIsInf)
-        ? static_cast<uint64_t>((double)desiredChunkSize * 0.9)
-        : desiredChunkSize;
-
-    // Check if there are enough estimated bytes written to warrant a split
-    if (chunkBytesWritten < splitThreshold / splitTestFactor) {
+    if (!chunk->shouldSplit(desiredChunkSize, minIsInf, maxIsInf)) {
         return;
     }
 
@@ -330,7 +282,8 @@ void updateChunkWriteStatsAndSplitIfNeeded(OperationContext* opCtx,
         }
 
         LOG(1) << "about to initiate autosplit: " << redact(chunk->toString())
-               << " dataWritten: " << chunkBytesWritten << " splitThreshold: " << splitThreshold;
+               << " dataWritten: " << chunkBytesWritten
+               << " desiredChunkSize: " << desiredChunkSize;
 
         const uint64_t chunkSizeToUse = [&]() {
             const uint64_t estNumSplitPoints = chunkBytesWritten / desiredChunkSize * 2;
@@ -407,7 +360,7 @@ void updateChunkWriteStatsAndSplitIfNeeded(OperationContext* opCtx,
                 return false;
 
             auto collStatus =
-                Grid::get(opCtx)->catalogClient(opCtx)->getCollection(opCtx, manager->getns());
+                Grid::get(opCtx)->catalogClient()->getCollection(opCtx, manager->getns());
             if (!collStatus.isOK()) {
                 log() << "Auto-split for " << nss << " failed to load collection metadata"
                       << causedBy(redact(collStatus.getStatus()));
@@ -418,7 +371,7 @@ void updateChunkWriteStatsAndSplitIfNeeded(OperationContext* opCtx,
         }();
 
         log() << "autosplitted " << nss << " chunk: " << redact(chunk->toString()) << " into "
-              << (splitPoints.size() + 1) << " parts (splitThreshold " << splitThreshold << ")"
+              << (splitPoints.size() + 1) << " parts (desiredChunkSize " << desiredChunkSize << ")"
               << (suggestedMigrateChunk ? "" : (std::string) " (migrate suggested" +
                           (shouldBalance ? ")" : ", but no migrations allowed)"));
 
@@ -452,9 +405,13 @@ void updateChunkWriteStatsAndSplitIfNeeded(OperationContext* opCtx,
         // Ensure the collection gets reloaded because of the move
         Grid::get(opCtx)->catalogCache()->invalidateShardedCollection(nss);
     } catch (const DBException& ex) {
-        chunk->randomizeBytesWritten();
+        chunk->clearBytesWritten();
 
-        log() << "Unable to auto-split chunk " << redact(chunkRange.toString()) << causedBy(ex);
+        if (ErrorCodes::isStaleShardingError(ex.code())) {
+            log() << "Unable to auto-split chunk " << redact(chunkRange.toString()) << causedBy(ex)
+                  << ", going to invalidate routing table entry for " << nss;
+            Grid::get(opCtx)->catalogCache()->invalidateShardedCollection(nss);
+        }
     }
 }
 

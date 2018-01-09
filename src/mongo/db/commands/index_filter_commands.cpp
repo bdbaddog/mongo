@@ -113,12 +113,11 @@ using std::vector;
 using std::unique_ptr;
 
 IndexFilterCommand::IndexFilterCommand(const string& name, const string& helpText)
-    : Command(name), helpText(helpText) {}
+    : BasicCommand(name), helpText(helpText) {}
 
 bool IndexFilterCommand::run(OperationContext* opCtx,
                              const string& dbname,
                              const BSONObj& cmdObj,
-                             string& errmsg,
                              BSONObjBuilder& result) {
     const NamespaceString nss(parseNsCollectionRequired(dbname, cmdObj));
     Status status = runIndexFilterCommand(opCtx, nss.ns(), cmdObj, &result);
@@ -267,7 +266,7 @@ Status ClearFilters::clear(OperationContext* opCtx,
         querySettings->removeAllowedIndices(planCache->computeKey(*cq));
 
         // Remove entry from plan cache
-        planCache->remove(*cq);
+        planCache->remove(*cq).transitional_ignore();
 
         LOG(0) << "Removed index filter on " << ns << " " << redact(cq->toStringShort());
 
@@ -311,12 +310,18 @@ Status ClearFilters::clear(OperationContext* opCtx,
         qr->setSort(entry.sort);
         qr->setProj(entry.projection);
         qr->setCollation(entry.collation);
-        auto statusWithCQ = CanonicalQuery::canonicalize(opCtx, std::move(qr), extensionsCallback);
+        const boost::intrusive_ptr<ExpressionContext> expCtx;
+        auto statusWithCQ =
+            CanonicalQuery::canonicalize(opCtx,
+                                         std::move(qr),
+                                         expCtx,
+                                         extensionsCallback,
+                                         MatchExpressionParser::kAllowAllSpecialFeatures);
         invariantOK(statusWithCQ.getStatus());
         std::unique_ptr<CanonicalQuery> cq = std::move(statusWithCQ.getValue());
 
         // Remove plan cache entry.
-        planCache->remove(*cq);
+        planCache->remove(*cq).transitional_ignore();
     }
 
     LOG(0) << "Removed all index filters for collection: " << ns;
@@ -394,7 +399,7 @@ Status SetFilter::set(OperationContext* opCtx,
     querySettings->setAllowedIndices(*cq, planCache->computeKey(*cq), indexes, indexNames);
 
     // Remove entry from plan cache.
-    planCache->remove(*cq);
+    planCache->remove(*cq).transitional_ignore();
 
     LOG(0) << "Index filter set on " << ns << " " << redact(cq->toStringShort()) << " "
            << indexesElt;

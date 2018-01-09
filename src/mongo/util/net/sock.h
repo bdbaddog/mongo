@@ -68,12 +68,10 @@ struct SSLPeerInfo;
 extern const int portSendFlags;
 extern const int portRecvFlags;
 
-const int SOCK_FAMILY_UNKNOWN_ERROR = 13078;
-
+void setSocketKeepAliveParams(int sock,
+                              unsigned int maxKeepIdleSecs = 300,
+                              unsigned int maxKeepIntvlSecs = 300);
 void disableNagle(int sock);
-
-// Generate a string representation for getaddrinfo return codes
-std::string getAddrInfoStrError(int code);
 
 #if !defined(_WIN32)
 
@@ -102,6 +100,10 @@ std::string getHostName();
  * will be stale */
 std::string getHostNameCached();
 
+/** Returns getHostNameCached():<port>. */
+std::string getHostNameCachedAndPort();
+
+/** Returns getHostNameCached(), or getHostNameCached():<port> if running on a non-default port. */
 std::string prettyHostName();
 
 /**
@@ -248,7 +250,7 @@ private:
     /** raw recv, same semantics as ::recv */
     int _recv(char* buf, int max);
 
-    int _fd;
+    SOCKET _fd;
     uint64_t _fdCreationMicroSec;
     SockAddr _local;
     SockAddr _remote;

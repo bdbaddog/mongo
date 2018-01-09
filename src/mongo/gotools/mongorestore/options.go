@@ -1,3 +1,9 @@
+// Copyright (C) MongoDB, Inc. 2014-present.
+//
+// Licensed under the Apache License, Version 2.0 (the "License"); you may
+// not use this file except in compliance with the License. You may obtain
+// a copy of the License at http://www.apache.org/licenses/LICENSE-2.0
+
 package mongorestore
 
 // Usage describes basic usage of mongorestore
@@ -29,9 +35,12 @@ func (*InputOptions) Name() string {
 
 // OutputOptions defines the set of options for restoring dump data.
 type OutputOptions struct {
-	Drop                     bool   `long:"drop" description:"drop each collection before import"`
-	DryRun                   bool   `long:"dryRun" description:"view summary without importing anything. recommended with verbosity"`
-	WriteConcern             string `long:"writeConcern" value-name:"<write-concern>" default:"majority" default-mask:"-" description:"write concern options e.g. --writeConcern majority, --writeConcern '{w: 3, wtimeout: 500, fsync: true, j: true}' (defaults to 'majority')"`
+	Drop   bool `long:"drop" description:"drop each collection before import"`
+	DryRun bool `long:"dryRun" description:"view summary without importing anything. recommended with verbosity"`
+
+	// By default mongorestore uses a write concern of 'majority'.
+	// Cannot be used simultaneously with write concern options in a URI.
+	WriteConcern             string `long:"writeConcern" value-name:"<write-concern>" default-mask:"-" description:"write concern options e.g. --writeConcern majority, --writeConcern '{w: 3, wtimeout: 500, fsync: true, j: true}'"`
 	NoIndexRestore           bool   `long:"noIndexRestore" description:"don't restore indexes"`
 	NoOptionsRestore         bool   `long:"noOptionsRestore" description:"don't restore collection options"`
 	KeepIndexVersion         bool   `long:"keepIndexVersion" description:"don't update index version"`

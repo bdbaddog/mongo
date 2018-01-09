@@ -39,7 +39,6 @@
 #include "mongo/bson/mutable/algorithm.h"
 #include "mongo/bson/mutable/document.h"
 #include "mongo/bson/mutable/element.h"
-#include "mongo/bson/oid.h"
 #include "mongo/bson/util/bson_extract.h"
 #include "mongo/client/dbclientinterface.h"
 #include "mongo/config.h"
@@ -47,10 +46,12 @@
 #include "mongo/db/audit.h"
 #include "mongo/db/auth/action_set.h"
 #include "mongo/db/auth/action_type.h"
+#include "mongo/db/auth/address_restriction.h"
 #include "mongo/db/auth/authorization_manager.h"
 #include "mongo/db/auth/authorization_manager_global.h"
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/auth/privilege.h"
+#include "mongo/db/auth/privilege_parser.h"
 #include "mongo/db/auth/resource_pattern.h"
 #include "mongo/db/auth/sasl_options.h"
 #include "mongo/db/auth/user.h"
@@ -61,13 +62,11 @@
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/db/ops/write_ops.h"
 #include "mongo/db/service_context.h"
 #include "mongo/platform/unordered_set.h"
 #include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/s/write_ops/batched_command_response.h"
-#include "mongo/s/write_ops/batched_delete_request.h"
-#include "mongo/s/write_ops/batched_insert_request.h"
-#include "mongo/s/write_ops/batched_update_request.h"
 #include "mongo/stdx/functional.h"
 #include "mongo/stdx/mutex.h"
 #include "mongo/util/log.h"
@@ -77,8 +76,6 @@
 #include "mongo/util/time_support.h"
 
 namespace mongo {
-
-namespace str = mongoutils::str;
 
 using std::endl;
 using std::string;
@@ -142,7 +139,7 @@ Status getCurrentUserRoles(OperationContext* opCtx,
                            unordered_set<RoleName>* roles) {
     User* user;
     authzManager->invalidateUserByName(userName);  // Need to make sure cache entry is up to date
-    Status status = authzManager->acquireUserForInitialAuth(opCtx, userName, &user);
+    Status status = authzManager->acquireUser(opCtx, userName, &user);
     if (!status.isOK()) {
         return status;
     }
@@ -181,8 +178,7 @@ Status checkOkayToGrantRolesToRole(OperationContext* opCtx,
         }
 
         BSONObj roleToAddDoc;
-        Status status = authzManager->getRoleDescription(
-            opCtx, roleToAdd, PrivilegeFormat::kOmit, &roleToAddDoc);
+        Status status = authzManager->getRoleDescription(opCtx, roleToAdd, &roleToAddDoc);
         if (status == ErrorCodes::RoleNotFound) {
             return Status(ErrorCodes::RoleNotFound,
                           "Cannot grant nonexistent role " + roleToAdd.toString());
@@ -233,10 +229,6 @@ Status checkOkayToGrantPrivilegesToRole(const RoleName& role, const PrivilegeVec
     return Status::OK();
 }
 
-void appendBSONObjToBSONArrayBuilder(BSONArrayBuilder* array, const BSONObj& obj) {
-    array->append(obj);
-}
-
 /**
  * Finds all documents matching "query" in "collectionName".  For each document returned,
  * calls the function resultProcessor on it.
@@ -270,12 +262,14 @@ Status insertAuthzDocument(OperationContext* opCtx,
     try {
         DBDirectClient client(opCtx);
 
-        BatchedInsertRequest req;
-        req.setNS(collectionName);
-        req.addToDocuments(document);
-
         BSONObj res;
-        client.runCommand(collectionName.db().toString(), req.toBSON(), res);
+        client.runCommand(collectionName.db().toString(),
+                          [&] {
+                              write_ops::Insert insertOp(collectionName);
+                              insertOp.setDocuments({document});
+                              return insertOp.toBSON({});
+                          }(),
+                          res);
 
         BatchedCommandResponse response;
         std::string errmsg;
@@ -304,18 +298,21 @@ Status updateAuthzDocuments(OperationContext* opCtx,
     try {
         DBDirectClient client(opCtx);
 
-        auto doc = stdx::make_unique<BatchedUpdateDocument>();
-        doc->setQuery(query);
-        doc->setUpdateExpr(updatePattern);
-        doc->setMulti(multi);
-        doc->setUpsert(upsert);
-
-        BatchedUpdateRequest req;
-        req.setNS(collectionName);
-        req.addToUpdates(doc.release());
-
         BSONObj res;
-        client.runCommand(collectionName.db().toString(), req.toBSON(), res);
+        client.runCommand(collectionName.db().toString(),
+                          [&] {
+                              write_ops::Update updateOp(collectionName);
+                              updateOp.setUpdates({[&] {
+                                  write_ops::UpdateOpEntry entry;
+                                  entry.setQ(query);
+                                  entry.setU(updatePattern);
+                                  entry.setMulti(multi);
+                                  entry.setUpsert(upsert);
+                                  return entry;
+                              }()});
+                              return updateOp.toBSON({});
+                          }(),
+                          res);
 
         BatchedCommandResponse response;
         std::string errmsg;
@@ -374,16 +371,19 @@ Status removeAuthzDocuments(OperationContext* opCtx,
     try {
         DBDirectClient client(opCtx);
 
-        auto doc = stdx::make_unique<BatchedDeleteDocument>();
-        doc->setQuery(query);
-        doc->setLimit(0);
-
-        BatchedDeleteRequest req;
-        req.setNS(collectionName);
-        req.addToDeletes(doc.release());
-
         BSONObj res;
-        client.runCommand(collectionName.db().toString(), req.toBSON(), res);
+        client.runCommand(collectionName.db().toString(),
+                          [&] {
+                              write_ops::Delete deleteOp(collectionName);
+                              deleteOp.setDeletes({[&] {
+                                  write_ops::DeleteOpEntry entry;
+                                  entry.setQ(query);
+                                  entry.setMulti(true);
+                                  return entry;
+                              }()});
+                              return deleteOp.toBSON({});
+                          }(),
+                          res);
 
         BatchedCommandResponse response;
         std::string errmsg;
@@ -544,23 +544,23 @@ Status writeAuthSchemaVersionIfNeeded(OperationContext* opCtx,
 
 /**
  * Returns Status::OK() if the current Auth schema version is at least the auth schema version
- * for the MongoDB 2.6 and 3.0 MongoDB-CR/SCRAM mixed auth mode.
+ * for the MongoDB 3.0 SCRAM auth mode.
  * Returns an error otherwise.
  */
-Status requireAuthSchemaVersion26Final(OperationContext* opCtx,
-                                       AuthorizationManager* authzManager) {
+Status requireWritableAuthSchema28SCRAM(OperationContext* opCtx,
+                                        AuthorizationManager* authzManager) {
     int foundSchemaVersion;
     Status status = authzManager->getAuthorizationVersion(opCtx, &foundSchemaVersion);
     if (!status.isOK()) {
         return status;
     }
 
-    if (foundSchemaVersion < AuthorizationManager::schemaVersion26Final) {
+    if (foundSchemaVersion < AuthorizationManager::schemaVersion28SCRAM) {
         return Status(ErrorCodes::AuthSchemaIncompatible,
                       str::stream()
                           << "User and role management commands require auth data to have "
                           << "at least schema version "
-                          << AuthorizationManager::schemaVersion26Final
+                          << AuthorizationManager::schemaVersion28SCRAM
                           << " but found "
                           << foundSchemaVersion);
     }
@@ -571,9 +571,16 @@ Status requireAuthSchemaVersion26Final(OperationContext* opCtx,
  * Returns Status::OK() if the current Auth schema version is at least the auth schema version
  * for MongoDB 2.6 during the upgrade process.
  * Returns an error otherwise.
+ *
+ * This method should only be called by READ-ONLY commands (usersInfo & rolesInfo)
+ * because getAuthorizationVersion() will return the current max version without
+ * reifying the authSchema setting in the admin database.
+ *
+ * If records are added thinking we're at one schema level, then the default is changed,
+ * then the auth database would wind up in an inconsistent state.
  */
-Status requireAuthSchemaVersion26UpgradeOrFinal(OperationContext* opCtx,
-                                                AuthorizationManager* authzManager) {
+Status requireReadableAuthSchema26Upgrade(OperationContext* opCtx,
+                                          AuthorizationManager* authzManager) {
     int foundSchemaVersion;
     Status status = authzManager->getAuthorizationVersion(opCtx, &foundSchemaVersion);
     if (!status.isOK()) {
@@ -594,9 +601,9 @@ Status requireAuthSchemaVersion26UpgradeOrFinal(OperationContext* opCtx,
 }  // namespace
 
 
-class CmdCreateUser : public Command {
+class CmdCreateUser : public BasicCommand {
 public:
-    CmdCreateUser() : Command("createUser") {}
+    CmdCreateUser() : BasicCommand("createUser") {}
 
     virtual bool slaveOk() const {
         return false;
@@ -619,7 +626,6 @@ public:
     bool run(OperationContext* opCtx,
              const string& dbname,
              const BSONObj& cmdObj,
-             string& errmsg,
              BSONObjBuilder& result) {
         auth::CreateOrUpdateUserArgs args;
         Status status = auth::parseCreateOrUpdateUserCommands(cmdObj, "createUser", dbname, &args);
@@ -669,7 +675,6 @@ public:
         userObjBuilder.append(
             "_id", str::stream() << args.userName.getDB() << "." << args.userName.getUser());
         userObjBuilder.append(AuthorizationManager::USER_NAME_FIELD_NAME, args.userName.getUser());
-        userObjBuilder.append(AuthorizationManager::USER_ID_FIELD_NAME, OID::gen());
         userObjBuilder.append(AuthorizationManager::USER_DB_FIELD_NAME, args.userName.getDB());
 
         ServiceContext* serviceContext = opCtx->getClient()->getServiceContext();
@@ -685,20 +690,22 @@ public:
             // Must be an external user
             credentialsBuilder.append("external", true);
         } else {
-            // Add SCRAM credentials for appropriate authSchemaVersions.
-            if (authzVersion > AuthorizationManager::schemaVersion26Final) {
-                BSONObj scramCred = scram::generateCredentials(
-                    args.hashedPassword, saslGlobalParams.scramIterationCount.load());
-                credentialsBuilder.append("SCRAM-SHA-1", scramCred);
-            } else {  // Otherwise default to MONGODB-CR.
-                credentialsBuilder.append("MONGODB-CR", args.hashedPassword);
-            }
+            // Add SCRAM credentials.
+            BSONObj scramCred = scram::generateCredentials(
+                args.hashedPassword, saslGlobalParams.scramIterationCount.load());
+            credentialsBuilder.append("SCRAM-SHA-1", scramCred);
         }
         credentialsBuilder.done();
+
+        if (args.authenticationRestrictions && !args.authenticationRestrictions->isEmpty()) {
+            credentialsBuilder.append("authenticationRestrictions",
+                                      *args.authenticationRestrictions);
+        }
 
         if (args.hasCustomData) {
             userObjBuilder.append("customData", args.customData);
         }
+
         userObjBuilder.append("roles", rolesVectorToBSONArray(args.roles));
 
         BSONObj userObj = userObjBuilder.obj();
@@ -710,7 +717,7 @@ public:
 
         stdx::lock_guard<stdx::mutex> lk(getAuthzDataMutex(serviceContext));
 
-        status = requireAuthSchemaVersion26Final(opCtx, authzManager);
+        status = requireWritableAuthSchema28SCRAM(opCtx, authzManager);
         if (!status.isOK()) {
             return appendCommandStatus(result, status);
         }
@@ -718,8 +725,7 @@ public:
         // Role existence has to be checked after acquiring the update lock
         for (size_t i = 0; i < args.roles.size(); ++i) {
             BSONObj ignored;
-            status = authzManager->getRoleDescription(
-                opCtx, args.roles[i], PrivilegeFormat::kOmit, &ignored);
+            status = authzManager->getRoleDescription(opCtx, args.roles[i], &ignored);
             if (!status.isOK()) {
                 return appendCommandStatus(result, status);
             }
@@ -729,7 +735,8 @@ public:
                              args.userName,
                              args.hasHashedPassword,
                              args.hasCustomData ? &args.customData : NULL,
-                             args.roles);
+                             args.roles,
+                             args.authenticationRestrictions);
         status = insertPrivilegeDocument(opCtx, userObj);
         return appendCommandStatus(result, status);
     }
@@ -740,9 +747,9 @@ public:
 
 } cmdCreateUser;
 
-class CmdUpdateUser : public Command {
+class CmdUpdateUser : public BasicCommand {
 public:
-    CmdUpdateUser() : Command("updateUser") {}
+    CmdUpdateUser() : BasicCommand("updateUser") {}
 
     virtual bool slaveOk() const {
         return false;
@@ -765,7 +772,6 @@ public:
     bool run(OperationContext* opCtx,
              const string& dbname,
              const BSONObj& cmdObj,
-             string& errmsg,
              BSONObjBuilder& result) {
         auth::CreateOrUpdateUserArgs args;
         Status status = auth::parseCreateOrUpdateUserCommands(cmdObj, "updateUser", dbname, &args);
@@ -773,7 +779,8 @@ public:
             return appendCommandStatus(result, status);
         }
 
-        if (!args.hasHashedPassword && !args.hasCustomData && !args.hasRoles) {
+        if (!args.hasHashedPassword && !args.hasCustomData && !args.hasRoles &&
+            !args.authenticationRestrictions) {
             return appendCommandStatus(
                 result,
                 Status(ErrorCodes::BadValue,
@@ -789,49 +796,65 @@ public:
         }
 
         BSONObjBuilder updateSetBuilder;
+        BSONObjBuilder updateUnsetBuilder;
         if (args.hasHashedPassword) {
             BSONObjBuilder credentialsBuilder(updateSetBuilder.subobjStart("credentials"));
 
-            AuthorizationManager* authzManager = getGlobalAuthorizationManager();
-            int authzVersion;
-            Status status = authzManager->getAuthorizationVersion(opCtx, &authzVersion);
-            if (!status.isOK()) {
-                return appendCommandStatus(result, status);
-            }
+            // Add SCRAM credentials.
+            BSONObj scramCred = scram::generateCredentials(
+                args.hashedPassword, saslGlobalParams.scramIterationCount.load());
+            credentialsBuilder.append("SCRAM-SHA-1", scramCred);
 
-            // Add SCRAM credentials for appropriate authSchemaVersions
-            if (authzVersion > AuthorizationManager::schemaVersion26Final) {
-                BSONObj scramCred = scram::generateCredentials(
-                    args.hashedPassword, saslGlobalParams.scramIterationCount.load());
-                credentialsBuilder.append("SCRAM-SHA-1", scramCred);
-            } else {  // Otherwise default to MONGODB-CR
-                credentialsBuilder.append("MONGODB-CR", args.hashedPassword);
-            }
             credentialsBuilder.done();
         }
+
         if (args.hasCustomData) {
             updateSetBuilder.append("customData", args.customData);
         }
+
+        if (args.authenticationRestrictions) {
+            if (args.authenticationRestrictions->isEmpty()) {
+                updateUnsetBuilder.append("authenticationRestrictions", "");
+            } else {
+                auto swParsedRestrictions =
+                    parseAuthenticationRestriction(*args.authenticationRestrictions);
+                if (!swParsedRestrictions.isOK()) {
+                    return appendCommandStatus(result, swParsedRestrictions.getStatus());
+                }
+
+                updateSetBuilder.append("authenticationRestrictions",
+                                        *args.authenticationRestrictions);
+            }
+        }
+
         if (args.hasRoles) {
             updateSetBuilder.append("roles", rolesVectorToBSONArray(args.roles));
+        }
+
+        BSONObj updateSet = updateSetBuilder.done();
+        BSONObj updateUnset = updateUnsetBuilder.done();
+        BSONObjBuilder updateDocumentBuilder;
+        if (!updateSet.isEmpty()) {
+            updateDocumentBuilder << "$set" << updateSet;
+        }
+        if (!updateUnset.isEmpty()) {
+            updateDocumentBuilder << "$unset" << updateUnset;
         }
 
         ServiceContext* serviceContext = opCtx->getClient()->getServiceContext();
         stdx::lock_guard<stdx::mutex> lk(getAuthzDataMutex(serviceContext));
 
         AuthorizationManager* authzManager = AuthorizationManager::get(serviceContext);
-        status = requireAuthSchemaVersion26Final(opCtx, authzManager);
+        status = requireWritableAuthSchema28SCRAM(opCtx, authzManager);
         if (!status.isOK()) {
             return appendCommandStatus(result, status);
         }
-
 
         // Role existence has to be checked after acquiring the update lock
         if (args.hasRoles) {
             for (size_t i = 0; i < args.roles.size(); ++i) {
                 BSONObj ignored;
-                status = authzManager->getRoleDescription(
-                    opCtx, args.roles[i], PrivilegeFormat::kOmit, &ignored);
+                status = authzManager->getRoleDescription(opCtx, args.roles[i], &ignored);
                 if (!status.isOK()) {
                     return appendCommandStatus(result, status);
                 }
@@ -842,10 +865,10 @@ public:
                              args.userName,
                              args.hasHashedPassword,
                              args.hasCustomData ? &args.customData : NULL,
-                             args.hasRoles ? &args.roles : NULL);
+                             args.hasRoles ? &args.roles : NULL,
+                             args.authenticationRestrictions);
 
-        status =
-            updatePrivilegeDocument(opCtx, args.userName, BSON("$set" << updateSetBuilder.done()));
+        status = updatePrivilegeDocument(opCtx, args.userName, updateDocumentBuilder.done());
         // Must invalidate even on bad status - what if the write succeeded but the GLE failed?
         authzManager->invalidateUserByName(args.userName);
         return appendCommandStatus(result, status);
@@ -857,9 +880,9 @@ public:
 
 } cmdUpdateUser;
 
-class CmdDropUser : public Command {
+class CmdDropUser : public BasicCommand {
 public:
-    CmdDropUser() : Command("dropUser") {}
+    CmdDropUser() : BasicCommand("dropUser") {}
 
     virtual bool slaveOk() const {
         return false;
@@ -882,7 +905,6 @@ public:
     bool run(OperationContext* opCtx,
              const string& dbname,
              const BSONObj& cmdObj,
-             string& errmsg,
              BSONObjBuilder& result) {
         UserName userName;
         Status status = auth::parseAndValidateDropUserCommand(cmdObj, dbname, &userName);
@@ -893,7 +915,7 @@ public:
         ServiceContext* serviceContext = opCtx->getClient()->getServiceContext();
         stdx::lock_guard<stdx::mutex> lk(getAuthzDataMutex(serviceContext));
         AuthorizationManager* authzManager = AuthorizationManager::get(serviceContext);
-        status = requireAuthSchemaVersion26Final(opCtx, authzManager);
+        status = requireWritableAuthSchema28SCRAM(opCtx, authzManager);
         if (!status.isOK()) {
             return appendCommandStatus(result, status);
         }
@@ -925,9 +947,9 @@ public:
 
 } cmdDropUser;
 
-class CmdDropAllUsersFromDatabase : public Command {
+class CmdDropAllUsersFromDatabase : public BasicCommand {
 public:
-    CmdDropAllUsersFromDatabase() : Command("dropAllUsersFromDatabase") {}
+    CmdDropAllUsersFromDatabase() : BasicCommand("dropAllUsersFromDatabase") {}
 
     virtual bool slaveOk() const {
         return false;
@@ -950,7 +972,6 @@ public:
     bool run(OperationContext* opCtx,
              const string& dbname,
              const BSONObj& cmdObj,
-             string& errmsg,
              BSONObjBuilder& result) {
         Status status = auth::parseAndValidateDropAllUsersFromDatabaseCommand(cmdObj, dbname);
         if (!status.isOK()) {
@@ -960,7 +981,7 @@ public:
         stdx::lock_guard<stdx::mutex> lk(getAuthzDataMutex(serviceContext));
 
         AuthorizationManager* authzManager = AuthorizationManager::get(serviceContext);
-        status = requireAuthSchemaVersion26Final(opCtx, authzManager);
+        status = requireWritableAuthSchema28SCRAM(opCtx, authzManager);
         if (!status.isOK()) {
             return appendCommandStatus(result, status);
         }
@@ -982,9 +1003,9 @@ public:
 
 } cmdDropAllUsersFromDatabase;
 
-class CmdGrantRolesToUser : public Command {
+class CmdGrantRolesToUser : public BasicCommand {
 public:
-    CmdGrantRolesToUser() : Command("grantRolesToUser") {}
+    CmdGrantRolesToUser() : BasicCommand("grantRolesToUser") {}
 
     virtual bool slaveOk() const {
         return false;
@@ -1007,7 +1028,6 @@ public:
     bool run(OperationContext* opCtx,
              const string& dbname,
              const BSONObj& cmdObj,
-             string& errmsg,
              BSONObjBuilder& result) {
         std::string userNameString;
         std::vector<RoleName> roles;
@@ -1021,7 +1041,7 @@ public:
         stdx::lock_guard<stdx::mutex> lk(getAuthzDataMutex(serviceContext));
 
         AuthorizationManager* authzManager = AuthorizationManager::get(serviceContext);
-        status = requireAuthSchemaVersion26Final(opCtx, authzManager);
+        status = requireWritableAuthSchema28SCRAM(opCtx, authzManager);
         if (!status.isOK()) {
             return appendCommandStatus(result, status);
         }
@@ -1036,8 +1056,7 @@ public:
         for (vector<RoleName>::iterator it = roles.begin(); it != roles.end(); ++it) {
             RoleName& roleName = *it;
             BSONObj roleDoc;
-            status =
-                authzManager->getRoleDescription(opCtx, roleName, PrivilegeFormat::kOmit, &roleDoc);
+            status = authzManager->getRoleDescription(opCtx, roleName, &roleDoc);
             if (!status.isOK()) {
                 return appendCommandStatus(result, status);
             }
@@ -1056,9 +1075,9 @@ public:
 
 } cmdGrantRolesToUser;
 
-class CmdRevokeRolesFromUser : public Command {
+class CmdRevokeRolesFromUser : public BasicCommand {
 public:
-    CmdRevokeRolesFromUser() : Command("revokeRolesFromUser") {}
+    CmdRevokeRolesFromUser() : BasicCommand("revokeRolesFromUser") {}
 
     virtual bool slaveOk() const {
         return false;
@@ -1081,7 +1100,6 @@ public:
     bool run(OperationContext* opCtx,
              const string& dbname,
              const BSONObj& cmdObj,
-             string& errmsg,
              BSONObjBuilder& result) {
         std::string userNameString;
         std::vector<RoleName> roles;
@@ -1095,7 +1113,7 @@ public:
         stdx::lock_guard<stdx::mutex> lk(getAuthzDataMutex(serviceContext));
 
         AuthorizationManager* authzManager = AuthorizationManager::get(serviceContext);
-        status = requireAuthSchemaVersion26Final(opCtx, authzManager);
+        status = requireWritableAuthSchema28SCRAM(opCtx, authzManager);
         if (!status.isOK()) {
             return appendCommandStatus(result, status);
         }
@@ -1110,8 +1128,7 @@ public:
         for (vector<RoleName>::iterator it = roles.begin(); it != roles.end(); ++it) {
             RoleName& roleName = *it;
             BSONObj roleDoc;
-            status =
-                authzManager->getRoleDescription(opCtx, roleName, PrivilegeFormat::kOmit, &roleDoc);
+            status = authzManager->getRoleDescription(opCtx, roleName, &roleDoc);
             if (!status.isOK()) {
                 return appendCommandStatus(result, status);
             }
@@ -1130,7 +1147,7 @@ public:
 
 } cmdRevokeRolesFromUser;
 
-class CmdUsersInfo : public Command {
+class CmdUsersInfo : public BasicCommand {
 public:
     virtual bool slaveOk() const {
         return false;
@@ -1144,7 +1161,7 @@ public:
         return false;
     }
 
-    CmdUsersInfo() : Command("usersInfo") {}
+    CmdUsersInfo() : BasicCommand("usersInfo") {}
 
     virtual void help(stringstream& ss) const {
         ss << "Returns information about users." << endl;
@@ -1159,7 +1176,6 @@ public:
     bool run(OperationContext* opCtx,
              const string& dbname,
              const BSONObj& cmdObj,
-             string& errmsg,
              BSONObjBuilder& result) {
         auth::UsersInfoArgs args;
         Status status = auth::parseUsersInfoCommand(cmdObj, dbname, &args);
@@ -1167,22 +1183,26 @@ public:
             return appendCommandStatus(result, status);
         }
 
-        status = requireAuthSchemaVersion26UpgradeOrFinal(opCtx, getGlobalAuthorizationManager());
+        status = requireReadableAuthSchema26Upgrade(opCtx, getGlobalAuthorizationManager());
         if (!status.isOK()) {
             return appendCommandStatus(result, status);
         }
 
-        if (args.allForDB && args.showPrivileges) {
+        if (args.allForDB &&
+            (args.showPrivileges ||
+             args.authenticationRestrictionsFormat == AuthenticationRestrictionsFormat::kShow)) {
             return appendCommandStatus(
                 result,
                 Status(ErrorCodes::IllegalOperation,
-                       "Can only get privilege details on exact-match usersInfo "
+                       "Can only get privilege or restriction details on exact-match usersInfo "
                        "queries."));
         }
 
         BSONArrayBuilder usersArrayBuilder;
-        if (args.showPrivileges) {
-            // If you want privileges you need to call getUserDescription on each user.
+        if (args.showPrivileges ||
+            args.authenticationRestrictionsFormat == AuthenticationRestrictionsFormat::kShow) {
+            // If you want privileges or restrictions you need to call getUserDescription on each
+            // user.
             for (size_t i = 0; i < args.userNames.size(); ++i) {
                 BSONObj userDetails;
                 status = getGlobalAuthorizationManager()->getUserDescription(
@@ -1194,22 +1214,27 @@ public:
                     return appendCommandStatus(result, status);
                 }
 
-                if (!args.showCredentials) {
-                    // getUserDescription always includes credentials, need to strip it out
-                    BSONObjBuilder userWithoutCredentials(usersArrayBuilder.subobjStart());
-                    for (BSONObjIterator it(userDetails); it.more();) {
-                        BSONElement e = it.next();
-                        if (e.fieldNameStringData() != "credentials" &&
-                            e.fieldNameStringData() != AuthorizationManager::USER_ID_FIELD_NAME)
-                            userWithoutCredentials.append(e);
+                // getUserDescription always includes credentials and restrictions, which may need
+                // to be stripped out
+                BSONObjBuilder strippedUser(usersArrayBuilder.subobjStart());
+                for (const BSONElement& e : userDetails) {
+                    if (!args.showCredentials && e.fieldNameStringData() == "credentials") {
+                        continue;
                     }
-                    userWithoutCredentials.doneFast();
-                } else {
-                    usersArrayBuilder.append(userDetails);
+
+                    if (e.fieldNameStringData() == "authenticationRestrictions" &&
+                        args.authenticationRestrictionsFormat ==
+                            AuthenticationRestrictionsFormat::kOmit) {
+                        continue;
+                    }
+
+                    strippedUser.append(e);
                 }
+                strippedUser.doneFast();
             }
         } else {
-            // If you don't need privileges, you can just do a regular query on system.users
+            // If you don't need privileges, or authenticationRestrictions, you can just do a
+            // regular query on system.users
             BSONObjBuilder queryBuilder;
             if (args.allForDB) {
                 queryBuilder.append("query",
@@ -1228,17 +1253,19 @@ public:
             queryBuilder.append("orderby", BSON("user" << 1 << "db" << 1));
 
             BSONObjBuilder projection;
+            projection.append("authenticationRestrictions", 0);
             if (!args.showCredentials) {
-                projection.append(AuthorizationManager::USER_ID_FIELD_NAME, 0);
                 projection.append("credentials", 0);
             }
-            const stdx::function<void(const BSONObj&)> function = stdx::bind(
-                appendBSONObjToBSONArrayBuilder, &usersArrayBuilder, stdx::placeholders::_1);
-            queryAuthzDocument(opCtx,
-                               AuthorizationManager::usersCollectionNamespace,
-                               queryBuilder.done(),
-                               projection.done(),
-                               function);
+            Status status =
+                queryAuthzDocument(opCtx,
+                                   AuthorizationManager::usersCollectionNamespace,
+                                   queryBuilder.done(),
+                                   projection.done(),
+                                   [&](const BSONObj& obj) { usersArrayBuilder.append(obj); });
+            if (!status.isOK()) {
+                return appendCommandStatus(result, status);
+            }
         }
         result.append("users", usersArrayBuilder.arr());
         return true;
@@ -1246,9 +1273,9 @@ public:
 
 } cmdUsersInfo;
 
-class CmdCreateRole : public Command {
+class CmdCreateRole : public BasicCommand {
 public:
-    CmdCreateRole() : Command("createRole") {}
+    CmdCreateRole() : BasicCommand("createRole") {}
 
     virtual bool slaveOk() const {
         return false;
@@ -1271,7 +1298,6 @@ public:
     bool run(OperationContext* opCtx,
              const string& dbname,
              const BSONObj& cmdObj,
-             string& errmsg,
              BSONObjBuilder& result) {
         auth::CreateOrUpdateRoleArgs args;
         Status status = auth::parseCreateOrUpdateRoleCommands(cmdObj, "createRole", dbname, &args);
@@ -1331,11 +1357,16 @@ public:
 
         roleObjBuilder.append("roles", rolesVectorToBSONArray(args.roles));
 
+        if (args.authenticationRestrictions && !args.authenticationRestrictions->isEmpty()) {
+            roleObjBuilder.append("authenticationRestrictions",
+                                  args.authenticationRestrictions.get());
+        }
+
         ServiceContext* serviceContext = opCtx->getClient()->getServiceContext();
         stdx::lock_guard<stdx::mutex> lk(getAuthzDataMutex(serviceContext));
 
         AuthorizationManager* authzManager = AuthorizationManager::get(serviceContext);
-        status = requireAuthSchemaVersion26Final(opCtx, authzManager);
+        status = requireWritableAuthSchema28SCRAM(opCtx, authzManager);
         if (!status.isOK()) {
             return appendCommandStatus(result, status);
         }
@@ -1351,7 +1382,11 @@ public:
             return appendCommandStatus(result, status);
         }
 
-        audit::logCreateRole(Client::getCurrent(), args.roleName, args.roles, args.privileges);
+        audit::logCreateRole(Client::getCurrent(),
+                             args.roleName,
+                             args.roles,
+                             args.privileges,
+                             args.authenticationRestrictions);
 
         status = insertRoleDocument(opCtx, roleObjBuilder.done());
         return appendCommandStatus(result, status);
@@ -1359,9 +1394,9 @@ public:
 
 } cmdCreateRole;
 
-class CmdUpdateRole : public Command {
+class CmdUpdateRole : public BasicCommand {
 public:
-    CmdUpdateRole() : Command("updateRole") {}
+    CmdUpdateRole() : BasicCommand("updateRole") {}
 
     virtual bool slaveOk() const {
         return false;
@@ -1384,7 +1419,6 @@ public:
     bool run(OperationContext* opCtx,
              const string& dbname,
              const BSONObj& cmdObj,
-             string& errmsg,
              BSONObjBuilder& result) {
         auth::CreateOrUpdateRoleArgs args;
         Status status = auth::parseCreateOrUpdateRoleCommands(cmdObj, "updateRole", dbname, &args);
@@ -1392,7 +1426,7 @@ public:
             return appendCommandStatus(result, status);
         }
 
-        if (!args.hasPrivileges && !args.hasRoles) {
+        if (!args.hasPrivileges && !args.hasRoles && !args.authenticationRestrictions) {
             return appendCommandStatus(
                 result,
                 Status(ErrorCodes::BadValue,
@@ -1400,6 +1434,7 @@ public:
         }
 
         BSONObjBuilder updateSetBuilder;
+        BSONObjBuilder updateUnsetBuilder;
 
         if (args.hasPrivileges) {
             BSONArray privileges;
@@ -1414,19 +1449,27 @@ public:
             updateSetBuilder.append("roles", rolesVectorToBSONArray(args.roles));
         }
 
+        if (args.authenticationRestrictions) {
+            if (args.authenticationRestrictions->isEmpty()) {
+                updateUnsetBuilder.append("authenticationRestrictions", "");
+            } else {
+                updateSetBuilder.append("authenticationRestrictions",
+                                        args.authenticationRestrictions.get());
+            }
+        }
+
         ServiceContext* serviceContext = opCtx->getClient()->getServiceContext();
         stdx::lock_guard<stdx::mutex> lk(getAuthzDataMutex(serviceContext));
 
         AuthorizationManager* authzManager = AuthorizationManager::get(serviceContext);
-        status = requireAuthSchemaVersion26Final(opCtx, authzManager);
+        status = requireWritableAuthSchema28SCRAM(opCtx, authzManager);
         if (!status.isOK()) {
             return appendCommandStatus(result, status);
         }
 
         // Role existence has to be checked after acquiring the update lock
         BSONObj ignored;
-        status = authzManager->getRoleDescription(
-            opCtx, args.roleName, PrivilegeFormat::kOmit, &ignored);
+        status = authzManager->getRoleDescription(opCtx, args.roleName, &ignored);
         if (!status.isOK()) {
             return appendCommandStatus(result, status);
         }
@@ -1447,19 +1490,30 @@ public:
 
         audit::logUpdateRole(Client::getCurrent(),
                              args.roleName,
-                             args.hasRoles ? &args.roles : NULL,
-                             args.hasPrivileges ? &args.privileges : NULL);
+                             args.hasRoles ? &args.roles : nullptr,
+                             args.hasPrivileges ? &args.privileges : nullptr,
+                             args.authenticationRestrictions);
 
-        status = updateRoleDocument(opCtx, args.roleName, BSON("$set" << updateSetBuilder.done()));
+        const auto updateSet = updateSetBuilder.obj();
+        const auto updateUnset = updateUnsetBuilder.obj();
+        BSONObjBuilder updateDocumentBuilder;
+        if (!updateSet.isEmpty()) {
+            updateDocumentBuilder.append("$set", updateSet);
+        }
+        if (!updateUnset.isEmpty()) {
+            updateDocumentBuilder.append("$unset", updateUnset);
+        }
+
+        status = updateRoleDocument(opCtx, args.roleName, updateDocumentBuilder.obj());
         // Must invalidate even on bad status - what if the write succeeded but the GLE failed?
         authzManager->invalidateUserCache();
         return appendCommandStatus(result, status);
     }
 } cmdUpdateRole;
 
-class CmdGrantPrivilegesToRole : public Command {
+class CmdGrantPrivilegesToRole : public BasicCommand {
 public:
-    CmdGrantPrivilegesToRole() : Command("grantPrivilegesToRole") {}
+    CmdGrantPrivilegesToRole() : BasicCommand("grantPrivilegesToRole") {}
 
     virtual bool slaveOk() const {
         return false;
@@ -1482,7 +1536,6 @@ public:
     bool run(OperationContext* opCtx,
              const string& dbname,
              const BSONObj& cmdObj,
-             string& errmsg,
              BSONObjBuilder& result) {
 
         RoleName roleName;
@@ -1497,7 +1550,7 @@ public:
         stdx::lock_guard<stdx::mutex> lk(getAuthzDataMutex(serviceContext));
 
         AuthorizationManager* authzManager = AuthorizationManager::get(serviceContext);
-        status = requireAuthSchemaVersion26Final(opCtx, authzManager);
+        status = requireWritableAuthSchema28SCRAM(opCtx, authzManager);
         if (!status.isOK()) {
             return appendCommandStatus(result, status);
         }
@@ -1516,8 +1569,11 @@ public:
         }
 
         BSONObj roleDoc;
-        status = authzManager->getRoleDescription(
-            opCtx, roleName, PrivilegeFormat::kShowSeparate, &roleDoc);
+        status = authzManager->getRoleDescription(opCtx,
+                                                  roleName,
+                                                  PrivilegeFormat::kShowSeparate,
+                                                  AuthenticationRestrictionsFormat::kOmit,
+                                                  &roleDoc);
         if (!status.isOK()) {
             return appendCommandStatus(result, status);
         }
@@ -1565,9 +1621,9 @@ public:
 
 } cmdGrantPrivilegesToRole;
 
-class CmdRevokePrivilegesFromRole : public Command {
+class CmdRevokePrivilegesFromRole : public BasicCommand {
 public:
-    CmdRevokePrivilegesFromRole() : Command("revokePrivilegesFromRole") {}
+    CmdRevokePrivilegesFromRole() : BasicCommand("revokePrivilegesFromRole") {}
 
     virtual bool slaveOk() const {
         return false;
@@ -1590,7 +1646,6 @@ public:
     bool run(OperationContext* opCtx,
              const string& dbname,
              const BSONObj& cmdObj,
-             string& errmsg,
              BSONObjBuilder& result) {
         RoleName roleName;
         PrivilegeVector privilegesToRemove;
@@ -1604,7 +1659,7 @@ public:
         stdx::lock_guard<stdx::mutex> lk(getAuthzDataMutex(serviceContext));
 
         AuthorizationManager* authzManager = AuthorizationManager::get(serviceContext);
-        status = requireAuthSchemaVersion26Final(opCtx, authzManager);
+        status = requireWritableAuthSchema28SCRAM(opCtx, authzManager);
         if (!status.isOK()) {
             return appendCommandStatus(result, status);
         }
@@ -1618,8 +1673,11 @@ public:
         }
 
         BSONObj roleDoc;
-        status = authzManager->getRoleDescription(
-            opCtx, roleName, PrivilegeFormat::kShowSeparate, &roleDoc);
+        status = authzManager->getRoleDescription(opCtx,
+                                                  roleName,
+                                                  PrivilegeFormat::kShowSeparate,
+                                                  AuthenticationRestrictionsFormat::kOmit,
+                                                  &roleDoc);
         if (!status.isOK()) {
             return appendCommandStatus(result, status);
         }
@@ -1675,9 +1733,9 @@ public:
 
 } cmdRevokePrivilegesFromRole;
 
-class CmdGrantRolesToRole : public Command {
+class CmdGrantRolesToRole : public BasicCommand {
 public:
-    CmdGrantRolesToRole() : Command("grantRolesToRole") {}
+    CmdGrantRolesToRole() : BasicCommand("grantRolesToRole") {}
 
     virtual bool slaveOk() const {
         return false;
@@ -1700,7 +1758,6 @@ public:
     bool run(OperationContext* opCtx,
              const string& dbname,
              const BSONObj& cmdObj,
-             string& errmsg,
              BSONObjBuilder& result) {
         std::string roleNameString;
         std::vector<RoleName> rolesToAdd;
@@ -1723,15 +1780,14 @@ public:
         stdx::lock_guard<stdx::mutex> lk(getAuthzDataMutex(serviceContext));
 
         AuthorizationManager* authzManager = AuthorizationManager::get(serviceContext);
-        status = requireAuthSchemaVersion26Final(opCtx, authzManager);
+        status = requireWritableAuthSchema28SCRAM(opCtx, authzManager);
         if (!status.isOK()) {
             return appendCommandStatus(result, status);
         }
 
         // Role existence has to be checked after acquiring the update lock
         BSONObj roleDoc;
-        status =
-            authzManager->getRoleDescription(opCtx, roleName, PrivilegeFormat::kOmit, &roleDoc);
+        status = authzManager->getRoleDescription(opCtx, roleName, &roleDoc);
         if (!status.isOK()) {
             return appendCommandStatus(result, status);
         }
@@ -1766,9 +1822,9 @@ public:
 
 } cmdGrantRolesToRole;
 
-class CmdRevokeRolesFromRole : public Command {
+class CmdRevokeRolesFromRole : public BasicCommand {
 public:
-    CmdRevokeRolesFromRole() : Command("revokeRolesFromRole") {}
+    CmdRevokeRolesFromRole() : BasicCommand("revokeRolesFromRole") {}
 
     virtual bool slaveOk() const {
         return false;
@@ -1791,7 +1847,6 @@ public:
     bool run(OperationContext* opCtx,
              const string& dbname,
              const BSONObj& cmdObj,
-             string& errmsg,
              BSONObjBuilder& result) {
         std::string roleNameString;
         std::vector<RoleName> rolesToRemove;
@@ -1805,7 +1860,7 @@ public:
         stdx::lock_guard<stdx::mutex> lk(getAuthzDataMutex(serviceContext));
 
         AuthorizationManager* authzManager = AuthorizationManager::get(serviceContext);
-        status = requireAuthSchemaVersion26Final(opCtx, authzManager);
+        status = requireWritableAuthSchema28SCRAM(opCtx, authzManager);
         if (!status.isOK()) {
             return appendCommandStatus(result, status);
         }
@@ -1820,8 +1875,7 @@ public:
         }
 
         BSONObj roleDoc;
-        status =
-            authzManager->getRoleDescription(opCtx, roleName, PrivilegeFormat::kOmit, &roleDoc);
+        status = authzManager->getRoleDescription(opCtx, roleName, &roleDoc);
         if (!status.isOK()) {
             return appendCommandStatus(result, status);
         }
@@ -1852,9 +1906,9 @@ public:
 
 } cmdRevokeRolesFromRole;
 
-class CmdDropRole : public Command {
+class CmdDropRole : public BasicCommand {
 public:
-    CmdDropRole() : Command("dropRole") {}
+    CmdDropRole() : BasicCommand("dropRole") {}
 
     virtual bool slaveOk() const {
         return false;
@@ -1881,7 +1935,6 @@ public:
     bool run(OperationContext* opCtx,
              const string& dbname,
              const BSONObj& cmdObj,
-             string& errmsg,
              BSONObjBuilder& result) {
         RoleName roleName;
         Status status = auth::parseDropRoleCommand(cmdObj, dbname, &roleName);
@@ -1893,7 +1946,7 @@ public:
         stdx::lock_guard<stdx::mutex> lk(getAuthzDataMutex(serviceContext));
 
         AuthorizationManager* authzManager = AuthorizationManager::get(serviceContext);
-        status = requireAuthSchemaVersion26Final(opCtx, authzManager);
+        status = requireWritableAuthSchema28SCRAM(opCtx, authzManager);
         if (!status.isOK()) {
             return appendCommandStatus(result, status);
         }
@@ -1907,8 +1960,7 @@ public:
         }
 
         BSONObj roleDoc;
-        status =
-            authzManager->getRoleDescription(opCtx, roleName, PrivilegeFormat::kOmit, &roleDoc);
+        status = authzManager->getRoleDescription(opCtx, roleName, &roleDoc);
         if (!status.isOK()) {
             return appendCommandStatus(result, status);
         }
@@ -2005,9 +2057,9 @@ public:
 
 } cmdDropRole;
 
-class CmdDropAllRolesFromDatabase : public Command {
+class CmdDropAllRolesFromDatabase : public BasicCommand {
 public:
-    CmdDropAllRolesFromDatabase() : Command("dropAllRolesFromDatabase") {}
+    CmdDropAllRolesFromDatabase() : BasicCommand("dropAllRolesFromDatabase") {}
 
     virtual bool slaveOk() const {
         return false;
@@ -2035,7 +2087,6 @@ public:
     bool run(OperationContext* opCtx,
              const string& dbname,
              const BSONObj& cmdObj,
-             string& errmsg,
              BSONObjBuilder& result) {
         Status status = auth::parseDropAllRolesFromDatabaseCommand(cmdObj, dbname);
         if (!status.isOK()) {
@@ -2046,7 +2097,7 @@ public:
         stdx::lock_guard<stdx::mutex> lk(getAuthzDataMutex(serviceContext));
 
         AuthorizationManager* authzManager = AuthorizationManager::get(serviceContext);
-        status = requireAuthSchemaVersion26Final(opCtx, authzManager);
+        status = requireWritableAuthSchema28SCRAM(opCtx, authzManager);
         if (!status.isOK()) {
             return appendCommandStatus(result, status);
         }
@@ -2149,7 +2200,7 @@ public:
  *                    schema.
  */
 
-class CmdRolesInfo : public Command {
+class CmdRolesInfo : public BasicCommand {
 public:
     virtual bool slaveOk() const {
         return false;
@@ -2163,7 +2214,7 @@ public:
         return false;
     }
 
-    CmdRolesInfo() : Command("rolesInfo") {}
+    CmdRolesInfo() : BasicCommand("rolesInfo") {}
 
     virtual void help(stringstream& ss) const {
         ss << "Returns information about roles." << endl;
@@ -2178,7 +2229,6 @@ public:
     bool run(OperationContext* opCtx,
              const string& dbname,
              const BSONObj& cmdObj,
-             string& errmsg,
              BSONObjBuilder& result) {
         auth::RolesInfoArgs args;
         Status status = auth::parseRolesInfoCommand(cmdObj, dbname, &args);
@@ -2186,7 +2236,7 @@ public:
             return appendCommandStatus(result, status);
         }
 
-        status = requireAuthSchemaVersion26UpgradeOrFinal(opCtx, getGlobalAuthorizationManager());
+        status = requireReadableAuthSchema26Upgrade(opCtx, getGlobalAuthorizationManager());
         if (!status.isOK()) {
             return appendCommandStatus(result, status);
         }
@@ -2194,7 +2244,12 @@ public:
         if (args.allForDB) {
             std::vector<BSONObj> rolesDocs;
             status = getGlobalAuthorizationManager()->getRoleDescriptionsForDB(
-                opCtx, dbname, args.privilegeFormat, args.showBuiltinRoles, &rolesDocs);
+                opCtx,
+                dbname,
+                args.privilegeFormat,
+                args.authenticationRestrictionsFormat,
+                args.showBuiltinRoles,
+                &rolesDocs);
             if (!status.isOK()) {
                 return appendCommandStatus(result, status);
             }
@@ -2213,7 +2268,11 @@ public:
         } else {
             BSONObj roleDetails;
             status = getGlobalAuthorizationManager()->getRolesDescription(
-                opCtx, args.roleNames, args.privilegeFormat, &roleDetails);
+                opCtx,
+                args.roleNames,
+                args.privilegeFormat,
+                args.authenticationRestrictionsFormat,
+                &roleDetails);
             if (!status.isOK()) {
                 return appendCommandStatus(result, status);
             }
@@ -2230,7 +2289,7 @@ public:
 
 } cmdRolesInfo;
 
-class CmdInvalidateUserCache : public Command {
+class CmdInvalidateUserCache : public BasicCommand {
 public:
     virtual bool slaveOk() const {
         return true;
@@ -2244,7 +2303,7 @@ public:
         return false;
     }
 
-    CmdInvalidateUserCache() : Command("invalidateUserCache") {}
+    CmdInvalidateUserCache() : BasicCommand("invalidateUserCache") {}
 
     virtual void help(stringstream& ss) const {
         ss << "Invalidates the in-memory cache of user information" << endl;
@@ -2259,7 +2318,6 @@ public:
     bool run(OperationContext* opCtx,
              const string& dbname,
              const BSONObj& cmdObj,
-             string& errmsg,
              BSONObjBuilder& result) {
         AuthorizationManager* authzManager = getGlobalAuthorizationManager();
         authzManager->invalidateUserCache();
@@ -2268,7 +2326,7 @@ public:
 
 } cmdInvalidateUserCache;
 
-class CmdGetCacheGeneration : public Command {
+class CmdGetCacheGeneration : public BasicCommand {
 public:
     virtual bool slaveOk() const {
         return true;
@@ -2282,7 +2340,7 @@ public:
         return false;
     }
 
-    CmdGetCacheGeneration() : Command("_getUserCacheGeneration") {}
+    CmdGetCacheGeneration() : BasicCommand("_getUserCacheGeneration") {}
 
     virtual void help(stringstream& ss) const {
         ss << "internal" << endl;
@@ -2297,7 +2355,6 @@ public:
     bool run(OperationContext* opCtx,
              const string& dbname,
              const BSONObj& cmdObj,
-             string& errmsg,
              BSONObjBuilder& result) {
         AuthorizationManager* authzManager = getGlobalAuthorizationManager();
         result.append("cacheGeneration", authzManager->getCacheGeneration());
@@ -2316,9 +2373,9 @@ public:
  * It either adds the users/roles to the existing ones or replaces the existing ones, depending
  * on whether the "drop" argument is true or false.
  */
-class CmdMergeAuthzCollections : public Command {
+class CmdMergeAuthzCollections : public BasicCommand {
 public:
-    CmdMergeAuthzCollections() : Command("_mergeAuthzCollections") {}
+    CmdMergeAuthzCollections() : BasicCommand("_mergeAuthzCollections") {}
 
     virtual bool slaveOk() const {
         return false;
@@ -2353,18 +2410,6 @@ public:
         return UserName(name, db);
     }
 
-    /**
-     * Extracts the UserName from the user document and adds it to set of existing users.
-     * This function is written so it can used with stdx::bind over the result set of a query
-     * on admin.system.users to add the user names of all existing users to the "usersToDrop"
-     * set used in the command body.
-     */
-    static void extractAndInsertUserName(unordered_set<UserName>* existingUsers,
-                                         const BSONObj& userObj) {
-        UserName userName = extractUserNameFromBSON(userObj);
-        existingUsers->insert(userName);
-    }
-
     static RoleName extractRoleNameFromBSON(const BSONObj& roleObj) {
         std::string name;
         std::string db;
@@ -2374,18 +2419,6 @@ public:
         status = bsonExtractStringField(roleObj, AuthorizationManager::ROLE_DB_FIELD_NAME, &db);
         uassertStatusOK(status);
         return RoleName(name, db);
-    }
-
-    /**
-     * Extracts the RoleName from the role document and adds it to set of existing roles.
-     * This function is written so it can used with stdx::bind over the result set of a query
-     * on admin.system.roles to add the role names of all existing roles to the "rolesToDrop"
-     * set used in the command body.
-     */
-    static void extractAndInsertRoleName(unordered_set<RoleName>* existingRoles,
-                                         const BSONObj& roleObj) {
-        RoleName roleName = extractRoleNameFromBSON(roleObj);
-        existingRoles->insert(roleName);
     }
 
     /**
@@ -2401,18 +2434,28 @@ public:
             customData = userObj["customData"].Obj();
         }
 
+        boost::optional<BSONArray> authenticationRestrictions;
+        if (userObj.hasField("authenticationRestrictions")) {
+            auto r = getRawAuthenticationRestrictions(
+                BSONArray(userObj["authenticationRestrictions"].Obj()));
+            uassertStatusOK(r);
+            authenticationRestrictions = r.getValue();
+        }
+
         if (create) {
             audit::logCreateUser(Client::getCurrent(),
                                  userName,
-                                 userObj["credentials"].Obj().hasField("MONGODB-CR"),
+                                 userObj["credentials"].Obj().hasField("SCRAM-SHA-1"),
                                  userObj.hasField("customData") ? &customData : NULL,
-                                 roles);
+                                 roles,
+                                 authenticationRestrictions);
         } else {
             audit::logUpdateUser(Client::getCurrent(),
                                  userName,
-                                 userObj["credentials"].Obj().hasField("MONGODB-CR"),
+                                 userObj["credentials"].Obj().hasField("SCRAM-SHA-1"),
                                  userObj.hasField("customData") ? &customData : NULL,
-                                 &roles);
+                                 &roles,
+                                 authenticationRestrictions);
         }
     }
 
@@ -2427,15 +2470,26 @@ public:
             BSONArray(roleObj["roles"].Obj()), roleName.getDB(), &roles));
         uassertStatusOK(auth::parseAndValidatePrivilegeArray(BSONArray(roleObj["privileges"].Obj()),
                                                              &privileges));
+
+        boost::optional<BSONArray> authenticationRestrictions;
+        if (roleObj.hasField("authenticationRestrictions")) {
+            auto r = getRawAuthenticationRestrictions(
+                BSONArray(roleObj["authenticationRestrictions"].Obj()));
+            uassertStatusOK(r);
+            authenticationRestrictions = r.getValue();
+        }
+
         if (create) {
-            audit::logCreateRole(Client::getCurrent(), roleName, roles, privileges);
+            audit::logCreateRole(
+                Client::getCurrent(), roleName, roles, privileges, authenticationRestrictions);
         } else {
-            audit::logUpdateRole(Client::getCurrent(), roleName, &roles, &privileges);
+            audit::logUpdateRole(
+                Client::getCurrent(), roleName, &roles, &privileges, authenticationRestrictions);
         }
     }
 
     /**
-     * Designed to be used with stdx::bind to be called on every user object in the result
+     * Designed to be used as a callback to be called on every user object in the result
      * set of a query over the tempUsersCollection provided to the command.  For each user
      * in the temp collection that is defined on the given db, adds that user to the actual
      * admin.system.users collection.
@@ -2473,7 +2527,7 @@ public:
     }
 
     /**
-     * Designed to be used with stdx::bind to be called on every role object in the result
+     * Designed to be used as a callback to be called on every role object in the result
      * set of a query over the tempRolesCollection provided to the command.  For each role
      * in the temp collection that is defined on the given db, adds that role to the actual
      * admin.system.roles collection.
@@ -2544,9 +2598,9 @@ public:
                                    AuthorizationManager::usersCollectionNamespace,
                                    query,
                                    fields,
-                                   stdx::bind(&CmdMergeAuthzCollections::extractAndInsertUserName,
-                                              &usersToDrop,
-                                              stdx::placeholders::_1));
+                                   [&](const BSONObj& userObj) {
+                                       usersToDrop.insert(extractUserNameFromBSON(userObj));
+                                   });
             if (!status.isOK()) {
                 return status;
             }
@@ -2557,23 +2611,16 @@ public:
             NamespaceString(usersCollName),
             db.empty() ? BSONObj() : BSON(AuthorizationManager::USER_DB_FIELD_NAME << db),
             BSONObj(),
-            stdx::bind(&CmdMergeAuthzCollections::addUser,
-                       opCtx,
-                       authzManager,
-                       db,
-                       drop,
-                       &usersToDrop,
-                       stdx::placeholders::_1));
+            [&](const BSONObj& userObj) {
+                return addUser(opCtx, authzManager, db, drop, &usersToDrop, userObj);
+            });
         if (!status.isOK()) {
             return status;
         }
 
         if (drop) {
             long long numRemoved;
-            for (unordered_set<UserName>::iterator it = usersToDrop.begin();
-                 it != usersToDrop.end();
-                 ++it) {
-                const UserName& userName = *it;
+            for (const UserName& userName : usersToDrop) {
                 audit::logDropUser(Client::getCurrent(), userName);
                 status = removePrivilegeDocuments(opCtx,
                                                   BSON(AuthorizationManager::USER_NAME_FIELD_NAME
@@ -2624,9 +2671,9 @@ public:
                                    AuthorizationManager::rolesCollectionNamespace,
                                    query,
                                    fields,
-                                   stdx::bind(&CmdMergeAuthzCollections::extractAndInsertRoleName,
-                                              &rolesToDrop,
-                                              stdx::placeholders::_1));
+                                   [&](const BSONObj& roleObj) {
+                                       return rolesToDrop.insert(extractRoleNameFromBSON(roleObj));
+                                   });
             if (!status.isOK()) {
                 return status;
             }
@@ -2637,13 +2684,9 @@ public:
             NamespaceString(rolesCollName),
             db.empty() ? BSONObj() : BSON(AuthorizationManager::ROLE_DB_FIELD_NAME << db),
             BSONObj(),
-            stdx::bind(&CmdMergeAuthzCollections::addRole,
-                       opCtx,
-                       authzManager,
-                       db,
-                       drop,
-                       &rolesToDrop,
-                       stdx::placeholders::_1));
+            [&](const BSONObj& roleObj) {
+                return addRole(opCtx, authzManager, db, drop, &rolesToDrop, roleObj);
+            });
         if (!status.isOK()) {
             return status;
         }
@@ -2674,7 +2717,6 @@ public:
     bool run(OperationContext* opCtx,
              const string& dbname,
              const BSONObj& cmdObj,
-             string& errmsg,
              BSONObjBuilder& result) {
         auth::MergeAuthzCollectionsArgs args;
         Status status = auth::parseMergeAuthzCollectionsCommand(cmdObj, &args);
@@ -2694,7 +2736,7 @@ public:
         stdx::lock_guard<stdx::mutex> lk(getAuthzDataMutex(serviceContext));
 
         AuthorizationManager* authzManager = AuthorizationManager::get(serviceContext);
-        status = requireAuthSchemaVersion26Final(opCtx, authzManager);
+        status = requireWritableAuthSchema28SCRAM(opCtx, authzManager);
         if (!status.isOK()) {
             return appendCommandStatus(result, status);
         }
@@ -2720,219 +2762,4 @@ public:
 
 } cmdMergeAuthzCollections;
 
-/**
- * Logs that the auth schema upgrade failed because of "status" and returns "status".
- */
-Status logUpgradeFailed(const Status& status) {
-    log() << "Auth schema upgrade failed with " << redact(status);
-    return status;
-}
-
-/**
- * Updates a single user document from MONGODB-CR to SCRAM credentials.
- *
- * Throws a DBException on errors.
- */
-void updateUserCredentials(OperationContext* opCtx,
-                           const StringData& sourceDB,
-                           const BSONObj& userDoc) {
-    // Skip users in $external, SERVER-18475
-    if (userDoc["db"].String() == "$external") {
-        return;
-    }
-
-    BSONElement credentialsElement = userDoc["credentials"];
-    uassert(18806,
-            mongoutils::str::stream()
-                << "While preparing to upgrade user doc from "
-                   "2.6/3.0 user data schema to the 3.0+ SCRAM only schema, found a user doc "
-                   "with missing or incorrectly formatted credentials: "
-                << userDoc.toString(),
-            credentialsElement.type() == Object);
-
-    BSONObj credentialsObj = credentialsElement.Obj();
-    BSONElement mongoCRElement = credentialsObj["MONGODB-CR"];
-    BSONElement scramElement = credentialsObj["SCRAM-SHA-1"];
-
-    // Ignore any user documents that already have SCRAM credentials. This should only
-    // occur if a previous authSchemaUpgrade was interrupted halfway.
-    if (!scramElement.eoo()) {
-        return;
-    }
-
-    uassert(18744,
-            mongoutils::str::stream()
-                << "While preparing to upgrade user doc from "
-                   "2.6/3.0 user data schema to the 3.0+ SCRAM only schema, found a user doc "
-                   "missing MONGODB-CR credentials :"
-                << userDoc.toString(),
-            !mongoCRElement.eoo());
-
-    std::string hashedPassword = mongoCRElement.String();
-
-    BSONObj query = BSON("_id" << userDoc["_id"].String());
-    BSONObjBuilder updateBuilder;
-    {
-        BSONObjBuilder toSetBuilder(updateBuilder.subobjStart("$set"));
-        toSetBuilder << "credentials"
-                     << BSON("SCRAM-SHA-1" << scram::generateCredentials(
-                                 hashedPassword, saslGlobalParams.scramIterationCount.load()));
-    }
-
-    uassertStatusOK(updateOneAuthzDocument(
-        opCtx, NamespaceString("admin", "system.users"), query, updateBuilder.obj(), true));
-}
-
-/** Loop through all the user documents in the admin.system.users collection.
- *  For each user document:
- *   1. Compute SCRAM credentials based on the MONGODB-CR hash
- *   2. Remove the MONGODB-CR hash
- *   3. Add SCRAM credentials to the user document credentials section
- */
-Status updateCredentials(OperationContext* opCtx) {
-    // Loop through and update the user documents in admin.system.users.
-    Status status = queryAuthzDocument(
-        opCtx,
-        NamespaceString("admin", "system.users"),
-        BSONObj(),
-        BSONObj(),
-        stdx::bind(updateUserCredentials, opCtx, "admin", stdx::placeholders::_1));
-    if (!status.isOK())
-        return logUpgradeFailed(status);
-
-    // Update the schema version document.
-    status =
-        updateOneAuthzDocument(opCtx,
-                               AuthorizationManager::versionCollectionNamespace,
-                               AuthorizationManager::versionDocumentQuery,
-                               BSON("$set" << BSON(AuthorizationManager::schemaVersionFieldName
-                                                   << AuthorizationManager::schemaVersion28SCRAM)),
-                               true);
-    if (!status.isOK())
-        return logUpgradeFailed(status);
-
-    return Status::OK();
-}
-
-/**
- * Performs one step in the process of upgrading the stored authorization data to the
- * newest schema.
- *
- * On success, returns Status::OK(), and *isDone will indicate whether there are more
- * steps to perform.
- *
- * If the authorization data is already fully upgraded, returns Status::OK and sets *isDone
- * to true, so this is safe to call on a fully upgraded system.
- *
- * On failure, returns a status other than Status::OK().  In this case, is is typically safe
- * to try again.
- */
-Status upgradeAuthSchemaStep(OperationContext* opCtx,
-                             AuthorizationManager* authzManager,
-                             bool* isDone) {
-    int authzVersion;
-    Status status = authzManager->getAuthorizationVersion(opCtx, &authzVersion);
-    if (!status.isOK()) {
-        return status;
-    }
-
-    switch (authzVersion) {
-        case AuthorizationManager::schemaVersion26Final:
-        case AuthorizationManager::schemaVersion28SCRAM: {
-            Status status = updateCredentials(opCtx);
-            if (status.isOK())
-                *isDone = true;
-            return status;
-        }
-        default:
-            return Status(ErrorCodes::AuthSchemaIncompatible,
-                          mongoutils::str::stream()
-                              << "Do not know how to upgrade auth schema from version "
-                              << authzVersion);
-    }
-}
-
-/**
- * Performs up to maxSteps steps in the process of upgrading the stored authorization data
- * to the newest schema.  Behaves as if by repeatedly calling upgradeSchemaStep up to
- * maxSteps times until either it completes the upgrade or returns a non-OK status.
- *
- * Invalidates the user cache before the first step and after each attempted step.
- *
- * Returns Status::OK() to indicate that the upgrade process has completed successfully.
- * Returns ErrorCodes::OperationIncomplete to indicate that progress was made, but that more
- * steps must be taken to complete the process.  Other returns indicate a failure to make
- * progress performing the upgrade, and the specific code and message in the returned status
- * may provide additional information.
- */
-Status upgradeAuthSchema(OperationContext* opCtx,
-                         AuthorizationManager* authzManager,
-                         int maxSteps) {
-    if (maxSteps < 1) {
-        return Status(ErrorCodes::BadValue,
-                      "Minimum value for maxSteps parameter to upgradeAuthSchema is 1");
-    }
-    authzManager->invalidateUserCache();
-    for (int i = 0; i < maxSteps; ++i) {
-        bool isDone;
-        Status status = upgradeAuthSchemaStep(opCtx, authzManager, &isDone);
-        authzManager->invalidateUserCache();
-        if (!status.isOK() || isDone) {
-            return status;
-        }
-    }
-    return Status(ErrorCodes::OperationIncomplete,
-                  mongoutils::str::stream() << "Auth schema upgrade incomplete after " << maxSteps
-                                            << " successful steps.");
-}
-
-class CmdAuthSchemaUpgrade : public Command {
-public:
-    CmdAuthSchemaUpgrade() : Command("authSchemaUpgrade") {}
-
-    virtual bool slaveOk() const {
-        return false;
-    }
-
-    virtual bool adminOnly() const {
-        return true;
-    }
-
-    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
-        return true;
-    }
-
-    virtual void help(stringstream& ss) const {
-        ss << "Upgrades the auth data storage schema";
-    }
-
-    virtual Status checkAuthForCommand(Client* client,
-                                       const std::string& dbname,
-                                       const BSONObj& cmdObj) {
-        return auth::checkAuthForAuthSchemaUpgradeCommand(client);
-    }
-
-    virtual bool run(OperationContext* opCtx,
-                     const string& dbname,
-                     const BSONObj& cmdObj,
-                     string& errmsg,
-                     BSONObjBuilder& result) {
-        auth::AuthSchemaUpgradeArgs parsedArgs;
-        Status status = auth::parseAuthSchemaUpgradeCommand(cmdObj, dbname, &parsedArgs);
-        if (!status.isOK()) {
-            return appendCommandStatus(result, status);
-        }
-
-        ServiceContext* serviceContext = opCtx->getClient()->getServiceContext();
-        AuthorizationManager* authzManager = AuthorizationManager::get(serviceContext);
-
-        stdx::lock_guard<stdx::mutex> lk(getAuthzDataMutex(serviceContext));
-
-        status = upgradeAuthSchema(opCtx, authzManager, parsedArgs.maxSteps);
-        if (status.isOK())
-            result.append("done", true);
-        return appendCommandStatus(result, status);
-    }
-
-} cmdAuthSchemaUpgrade;
 }  // namespace mongo

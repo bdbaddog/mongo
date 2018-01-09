@@ -34,8 +34,10 @@
 #include <vector>
 
 #include "mongo/db/concurrency/d_concurrency.h"
+#include "mongo/db/concurrency/global_lock_acquisition_tracker.h"
 #include "mongo/db/concurrency/lock_manager_test_help.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
+#include "mongo/db/storage/recovery_unit_noop.h"
 #include "mongo/stdx/functional.h"
 #include "mongo/stdx/memory.h"
 #include "mongo/stdx/thread.h"
@@ -47,31 +49,11 @@
 #include "mongo/util/time_support.h"
 
 namespace mongo {
-
-extern bool _supportsDocLocking;
-
 namespace {
 
 const int kMaxPerfThreads = 16;    // max number of threads to use for lock perf
 const int kMaxStressThreads = 32;  // max number of threads to use for lock stress
 const int kMinPerfMillis = 30;     // min duration for reliable timing
-
-/**
- * Temporarily forces setting of the docLockingSupported global for testing purposes.
- */
-class ForceSupportsDocLocking {
-public:
-    explicit ForceSupportsDocLocking(bool supported) : _oldSupportsDocLocking(_supportsDocLocking) {
-        _supportsDocLocking = supported;
-    }
-
-    ~ForceSupportsDocLocking() {
-        _supportsDocLocking = _oldSupportsDocLocking;
-    }
-
-private:
-    bool _oldSupportsDocLocking;
-};
 
 /**
  * A RAII object that instantiates a TicketHolder that limits number of allowed global lock
@@ -182,7 +164,47 @@ private:
 
 
 TEST_F(DConcurrencyTestFixture, WriteConflictRetryInstantiatesOK) {
-    writeConflictRetry(nullptr, "", "", [] {});
+    auto opCtx = makeOpCtx();
+    opCtx->setLockState(stdx::make_unique<MMAPV1LockerImpl>());
+    writeConflictRetry(opCtx.get(), "", "", [] {});
+}
+
+TEST_F(DConcurrencyTestFixture, WriteConflictRetryRetriesFunctionOnWriteConflictException) {
+    auto opCtx = makeOpCtx();
+    opCtx->setLockState(stdx::make_unique<MMAPV1LockerImpl>());
+    auto&& opDebug = CurOp::get(opCtx.get())->debug();
+    ASSERT_EQUALS(0LL, opDebug.writeConflicts);
+    ASSERT_EQUALS(100, writeConflictRetry(opCtx.get(), "", "", [&opDebug] {
+                      if (opDebug.writeConflicts == 0LL) {
+                          throw WriteConflictException();
+                      }
+                      return 100;
+                  }));
+    ASSERT_EQUALS(1LL, opDebug.writeConflicts);
+}
+
+TEST_F(DConcurrencyTestFixture, WriteConflictRetryPropagatesNonWriteConflictException) {
+    auto opCtx = makeOpCtx();
+    opCtx->setLockState(stdx::make_unique<MMAPV1LockerImpl>());
+    ASSERT_THROWS_CODE(writeConflictRetry(opCtx.get(),
+                                          "",
+                                          "",
+                                          [] {
+                                              uassert(ErrorCodes::OperationFailed, "", false);
+                                              MONGO_UNREACHABLE;
+                                          }),
+                       AssertionException,
+                       ErrorCodes::OperationFailed);
+}
+
+TEST_F(DConcurrencyTestFixture,
+       WriteConflictRetryPropagatesWriteConflictExceptionIfAlreadyInAWriteUnitOfWork) {
+    auto opCtx = makeOpCtx();
+    opCtx->setLockState(stdx::make_unique<MMAPV1LockerImpl>());
+    Lock::GlobalWrite globalWrite(opCtx.get());
+    WriteUnitOfWork wuow(opCtx.get());
+    ASSERT_THROWS(writeConflictRetry(opCtx.get(), "", "", [] { throw WriteConflictException(); }),
+                  WriteConflictException);
 }
 
 TEST_F(DConcurrencyTestFixture, ResourceMutex) {
@@ -297,6 +319,152 @@ TEST_F(DConcurrencyTestFixture, GlobalWriteAndGlobalRead) {
     ASSERT(lockState->isW());
 }
 
+TEST_F(DConcurrencyTestFixture,
+       GlobalWriteRequiresExplicitDowngradeToIntentWriteModeIfDestroyedWhileHoldingDatabaseLock) {
+    auto opCtx = makeOpCtx();
+    opCtx->setLockState(stdx::make_unique<MMAPV1LockerImpl>());
+    auto lockState = opCtx->lockState();
+
+    const ResourceId globalId(RESOURCE_GLOBAL, ResourceId::SINGLETON_GLOBAL);
+    const ResourceId mmapId(RESOURCE_MMAPV1_FLUSH, ResourceId::SINGLETON_MMAPV1_FLUSH);
+
+    auto globalWrite = stdx::make_unique<Lock::GlobalWrite>(opCtx.get());
+    ASSERT(lockState->isW());
+    ASSERT(MODE_X == lockState->getLockMode(globalId))
+        << "unexpected global lock mode " << modeName(lockState->getLockMode(globalId));
+    ASSERT(MODE_IX == lockState->getLockMode(mmapId)) << "unexpected MMAPv1 flush lock mode "
+                                                      << modeName(lockState->getLockMode(mmapId));
+
+    {
+        Lock::DBLock dbWrite(opCtx.get(), "db", MODE_IX);
+        ASSERT(lockState->isW());
+        ASSERT(MODE_X == lockState->getLockMode(globalId))
+            << "unexpected global lock mode " << modeName(lockState->getLockMode(globalId));
+        ASSERT(MODE_IX == lockState->getLockMode(mmapId))
+            << "unexpected MMAPv1 flush lock mode " << modeName(lockState->getLockMode(mmapId));
+
+        // If we destroy the GlobalWrite out of order relative to the DBLock, we will leave the
+        // global lock resource locked in MODE_X. We have to explicitly downgrade this resource to
+        // MODE_IX to allow other write operations to make progress.
+        // This test case illustrates non-recommended usage of the RAII types. See SERVER-30948.
+        globalWrite = {};
+        ASSERT(lockState->isW());
+        lockState->downgrade(globalId, MODE_IX);
+        ASSERT_FALSE(lockState->isW());
+        ASSERT(lockState->isWriteLocked());
+        ASSERT(MODE_IX == lockState->getLockMode(globalId))
+            << "unexpected global lock mode " << modeName(lockState->getLockMode(globalId));
+        ASSERT(MODE_IX == lockState->getLockMode(mmapId))
+            << "unexpected MMAPv1 flush lock mode " << modeName(lockState->getLockMode(mmapId));
+    }
+
+
+    ASSERT_FALSE(lockState->isW());
+    ASSERT_FALSE(lockState->isWriteLocked());
+    ASSERT(MODE_NONE == lockState->getLockMode(globalId))
+        << "unexpected global lock mode " << modeName(lockState->getLockMode(globalId));
+    ASSERT(MODE_NONE == lockState->getLockMode(mmapId)) << "unexpected MMAPv1 flush lock mode "
+                                                        << modeName(lockState->getLockMode(mmapId));
+}
+
+TEST_F(DConcurrencyTestFixture,
+       GlobalWriteRequiresSupportsDowngradeToIntentWriteModeWhileHoldingDatabaseLock) {
+    auto opCtx = makeOpCtx();
+    opCtx->setLockState(stdx::make_unique<MMAPV1LockerImpl>());
+    auto lockState = opCtx->lockState();
+
+    const ResourceId globalId(RESOURCE_GLOBAL, ResourceId::SINGLETON_GLOBAL);
+    const ResourceId mmapId(RESOURCE_MMAPV1_FLUSH, ResourceId::SINGLETON_MMAPV1_FLUSH);
+
+    auto globalWrite = stdx::make_unique<Lock::GlobalWrite>(opCtx.get());
+    ASSERT(lockState->isW());
+    ASSERT(MODE_X == lockState->getLockMode(globalId))
+        << "unexpected global lock mode " << modeName(lockState->getLockMode(globalId));
+    ASSERT(MODE_IX == lockState->getLockMode(mmapId)) << "unexpected MMAPv1 flush lock mode "
+                                                      << modeName(lockState->getLockMode(mmapId));
+
+    {
+        Lock::DBLock dbWrite(opCtx.get(), "db", MODE_IX);
+        ASSERT(lockState->isW());
+        ASSERT(MODE_X == lockState->getLockMode(globalId))
+            << "unexpected global lock mode " << modeName(lockState->getLockMode(globalId));
+        ASSERT(MODE_IX == lockState->getLockMode(mmapId))
+            << "unexpected MMAPv1 flush lock mode " << modeName(lockState->getLockMode(mmapId));
+
+        // Downgrade global lock resource to MODE_IX to allow other write operations to make
+        // progress.
+        lockState->downgrade(globalId, MODE_IX);
+        ASSERT_FALSE(lockState->isW());
+        ASSERT(lockState->isWriteLocked());
+        ASSERT(MODE_IX == lockState->getLockMode(globalId))
+            << "unexpected global lock mode " << modeName(lockState->getLockMode(globalId));
+        ASSERT(MODE_IX == lockState->getLockMode(mmapId))
+            << "unexpected MMAPv1 flush lock mode " << modeName(lockState->getLockMode(mmapId));
+    }
+
+    ASSERT_FALSE(lockState->isW());
+    ASSERT(lockState->isWriteLocked());
+
+    globalWrite = {};
+    ASSERT_FALSE(lockState->isW());
+    ASSERT_FALSE(lockState->isWriteLocked());
+    ASSERT(MODE_NONE == lockState->getLockMode(globalId))
+        << "unexpected global lock mode " << modeName(lockState->getLockMode(globalId));
+    ASSERT(MODE_NONE == lockState->getLockMode(mmapId)) << "unexpected MMAPv1 flush lock mode "
+                                                        << modeName(lockState->getLockMode(mmapId));
+}
+
+TEST_F(DConcurrencyTestFixture,
+       NestedGlobalWriteSupportsDowngradeToIntentWriteModeWhileHoldingDatabaseLock) {
+    auto opCtx = makeOpCtx();
+    opCtx->setLockState(stdx::make_unique<MMAPV1LockerImpl>());
+    auto lockState = opCtx->lockState();
+
+    const ResourceId globalId(RESOURCE_GLOBAL, ResourceId::SINGLETON_GLOBAL);
+    const ResourceId mmapId(RESOURCE_MMAPV1_FLUSH, ResourceId::SINGLETON_MMAPV1_FLUSH);
+
+    auto outerGlobalWrite = stdx::make_unique<Lock::GlobalWrite>(opCtx.get());
+    auto innerGlobalWrite = stdx::make_unique<Lock::GlobalWrite>(opCtx.get());
+
+    {
+        Lock::DBLock dbWrite(opCtx.get(), "db", MODE_IX);
+        ASSERT(lockState->isW());
+        ASSERT(MODE_X == lockState->getLockMode(globalId))
+            << "unexpected global lock mode " << modeName(lockState->getLockMode(globalId));
+        ASSERT(MODE_IX == lockState->getLockMode(mmapId))
+            << "unexpected MMAPv1 flush lock mode " << modeName(lockState->getLockMode(mmapId));
+
+        // Downgrade global lock resource to MODE_IX to allow other write operations to make
+        // progress.
+        lockState->downgrade(globalId, MODE_IX);
+        ASSERT_FALSE(lockState->isW());
+        ASSERT(lockState->isWriteLocked());
+        ASSERT(MODE_IX == lockState->getLockMode(globalId))
+            << "unexpected global lock mode " << modeName(lockState->getLockMode(globalId));
+        ASSERT(MODE_IX == lockState->getLockMode(mmapId))
+            << "unexpected MMAPv1 flush lock mode " << modeName(lockState->getLockMode(mmapId));
+    }
+
+    ASSERT_FALSE(lockState->isW());
+    ASSERT(lockState->isWriteLocked());
+
+    innerGlobalWrite = {};
+    ASSERT_FALSE(lockState->isW());
+    ASSERT(lockState->isWriteLocked());
+    ASSERT(MODE_IX == lockState->getLockMode(globalId))
+        << "unexpected global lock mode " << modeName(lockState->getLockMode(globalId));
+    ASSERT(MODE_IX == lockState->getLockMode(mmapId)) << "unexpected MMAPv1 flush lock mode "
+                                                      << modeName(lockState->getLockMode(mmapId));
+
+    outerGlobalWrite = {};
+    ASSERT_FALSE(lockState->isW());
+    ASSERT_FALSE(lockState->isWriteLocked());
+    ASSERT(MODE_NONE == lockState->getLockMode(globalId))
+        << "unexpected global lock mode " << modeName(lockState->getLockMode(globalId));
+    ASSERT(MODE_NONE == lockState->getLockMode(mmapId)) << "unexpected MMAPv1 flush lock mode "
+                                                        << modeName(lockState->getLockMode(mmapId));
+}
+
 TEST_F(DConcurrencyTestFixture, GlobalLockS_Timeout) {
     auto clients = makeKClientsWithLockers<MMAPV1LockerImpl>(2);
 
@@ -314,6 +482,85 @@ TEST_F(DConcurrencyTestFixture, GlobalLockX_Timeout) {
 
     Lock::GlobalLock globalWriteTry(clients[1].second.get(), MODE_X, 1);
     ASSERT(!globalWriteTry.isLocked());
+}
+
+TEST_F(DConcurrencyTestFixture, GlobalLockXSetsGlobalLockTakenOnOperationContext) {
+    auto clients = makeKClientsWithLockers<MMAPV1LockerImpl>(1);
+    auto opCtx = clients[0].second.get();
+    ASSERT_FALSE(GlobalLockAcquisitionTracker::get(opCtx).getGlobalExclusiveLockTaken());
+
+    {
+        Lock::GlobalLock globalWrite(opCtx, MODE_X, 0);
+        ASSERT(globalWrite.isLocked());
+    }
+    ASSERT_TRUE(GlobalLockAcquisitionTracker::get(opCtx).getGlobalExclusiveLockTaken());
+}
+
+TEST_F(DConcurrencyTestFixture, GlobalLockIXSetsGlobalLockTakenOnOperationContext) {
+    auto clients = makeKClientsWithLockers<MMAPV1LockerImpl>(1);
+    auto opCtx = clients[0].second.get();
+    ASSERT_FALSE(GlobalLockAcquisitionTracker::get(opCtx).getGlobalExclusiveLockTaken());
+    {
+        Lock::GlobalLock globalWrite(opCtx, MODE_IX, 0);
+        ASSERT(globalWrite.isLocked());
+    }
+    ASSERT_TRUE(GlobalLockAcquisitionTracker::get(opCtx).getGlobalExclusiveLockTaken());
+}
+
+TEST_F(DConcurrencyTestFixture, GlobalLockSDoesNotSetGlobalLockTakenOnOperationContext) {
+    auto clients = makeKClientsWithLockers<MMAPV1LockerImpl>(1);
+    auto opCtx = clients[0].second.get();
+    ASSERT_FALSE(GlobalLockAcquisitionTracker::get(opCtx).getGlobalExclusiveLockTaken());
+    {
+        Lock::GlobalLock globalRead(opCtx, MODE_S, 0);
+        ASSERT(globalRead.isLocked());
+    }
+    ASSERT_FALSE(GlobalLockAcquisitionTracker::get(opCtx).getGlobalExclusiveLockTaken());
+}
+
+TEST_F(DConcurrencyTestFixture, GlobalLockISDoesNotSetGlobalLockTakenOnOperationContext) {
+    auto clients = makeKClientsWithLockers<MMAPV1LockerImpl>(1);
+    auto opCtx = clients[0].second.get();
+    ASSERT_FALSE(GlobalLockAcquisitionTracker::get(opCtx).getGlobalExclusiveLockTaken());
+    {
+        Lock::GlobalLock globalRead(opCtx, MODE_IS, 0);
+        ASSERT(globalRead.isLocked());
+    }
+    ASSERT_FALSE(GlobalLockAcquisitionTracker::get(opCtx).getGlobalExclusiveLockTaken());
+}
+
+TEST_F(DConcurrencyTestFixture, DBLockXSetsGlobalLockTakenOnOperationContext) {
+    auto clients = makeKClientsWithLockers<MMAPV1LockerImpl>(1);
+    auto opCtx = clients[0].second.get();
+    ASSERT_FALSE(GlobalLockAcquisitionTracker::get(opCtx).getGlobalExclusiveLockTaken());
+
+    { Lock::DBLock dbWrite(opCtx, "db", MODE_X); }
+    ASSERT_TRUE(GlobalLockAcquisitionTracker::get(opCtx).getGlobalExclusiveLockTaken());
+}
+
+TEST_F(DConcurrencyTestFixture, DBLockSDoesNotSetGlobalLockTakenOnOperationContext) {
+    auto clients = makeKClientsWithLockers<MMAPV1LockerImpl>(1);
+    auto opCtx = clients[0].second.get();
+    ASSERT_FALSE(GlobalLockAcquisitionTracker::get(opCtx).getGlobalExclusiveLockTaken());
+
+    { Lock::DBLock dbRead(opCtx, "db", MODE_S); }
+    ASSERT_FALSE(GlobalLockAcquisitionTracker::get(opCtx).getGlobalExclusiveLockTaken());
+}
+
+TEST_F(DConcurrencyTestFixture, GlobalLockXDoesNotSetGlobalLockTakenWhenLockAcquisitionTimesOut) {
+    auto clients = makeKClientsWithLockers<MMAPV1LockerImpl>(2);
+
+    // Take a global lock so that the next one times out.
+    Lock::GlobalLock globalWrite0(clients[0].second.get(), MODE_X, 0);
+    ASSERT(globalWrite0.isLocked());
+
+    auto opCtx = clients[1].second.get();
+    ASSERT_FALSE(GlobalLockAcquisitionTracker::get(opCtx).getGlobalExclusiveLockTaken());
+    {
+        Lock::GlobalLock globalWrite1(opCtx, MODE_X, 1);
+        ASSERT_FALSE(globalWrite1.isLocked());
+    }
+    ASSERT_FALSE(GlobalLockAcquisitionTracker::get(opCtx).getGlobalExclusiveLockTaken());
 }
 
 TEST_F(DConcurrencyTestFixture, GlobalLockS_NoTimeoutDueToGlobalLockS) {
@@ -755,6 +1002,208 @@ TEST_F(DConcurrencyTestFixture, Throttling) {
     ASSERT(!overlongWait);
 }
 
+TEST_F(DConcurrencyTestFixture, CompatibleFirstWithSXIS) {
+    auto clientOpctxPairs = makeKClientsWithLockers<DefaultLockerImpl>(3);
+    auto opctx1 = clientOpctxPairs[0].second.get();
+    auto opctx2 = clientOpctxPairs[1].second.get();
+    auto opctx3 = clientOpctxPairs[2].second.get();
+
+    // Build a queue of MODE_S <- MODE_X <- MODE_IS, with MODE_S granted.
+    Lock::GlobalRead lockS(opctx1);
+    ASSERT(lockS.isLocked());
+    Lock::GlobalLock lockX(opctx2, MODE_X, UINT_MAX, Lock::GlobalLock::EnqueueOnly());
+    ASSERT(!lockX.isLocked());
+
+    // A MODE_IS should be granted due to compatibleFirst policy.
+    Lock::GlobalLock lockIS(opctx3, MODE_IS, 0);
+    ASSERT(lockIS.isLocked());
+
+    lockX.waitForLock(0);
+    ASSERT(!lockX.isLocked());
+}
+
+
+TEST_F(DConcurrencyTestFixture, CompatibleFirstWithXSIXIS) {
+    auto clientOpctxPairs = makeKClientsWithLockers<DefaultLockerImpl>(4);
+    auto opctx1 = clientOpctxPairs[0].second.get();
+    auto opctx2 = clientOpctxPairs[1].second.get();
+    auto opctx3 = clientOpctxPairs[2].second.get();
+    auto opctx4 = clientOpctxPairs[3].second.get();
+
+    // Build a queue of MODE_X <- MODE_S <- MODE_IX <- MODE_IS, with MODE_X granted.
+    boost::optional<Lock::GlobalWrite> lockX;
+    lockX.emplace(opctx1);
+    ASSERT(lockX->isLocked());
+    boost::optional<Lock::GlobalLock> lockS;
+    lockS.emplace(opctx2, MODE_S, UINT_MAX, Lock::GlobalLock::EnqueueOnly());
+    ASSERT(!lockS->isLocked());
+    Lock::GlobalLock lockIX(opctx3, MODE_IX, UINT_MAX, Lock::GlobalLock::EnqueueOnly());
+    ASSERT(!lockIX.isLocked());
+    Lock::GlobalLock lockIS(opctx4, MODE_IS, UINT_MAX, Lock::GlobalLock::EnqueueOnly());
+    ASSERT(!lockIS.isLocked());
+
+
+    // Now release the MODE_X and ensure that MODE_S will switch policy to compatibleFirst
+    lockX.reset();
+    lockS->waitForLock(0);
+    ASSERT(lockS->isLocked());
+    ASSERT(!lockIX.isLocked());
+    lockIS.waitForLock(0);
+    ASSERT(lockIS.isLocked());
+
+    // Now release the MODE_S and ensure that MODE_IX gets locked.
+    lockS.reset();
+    lockIX.waitForLock(0);
+    ASSERT(lockIX.isLocked());
+}
+
+TEST_F(DConcurrencyTestFixture, CompatibleFirstWithXSXIXIS) {
+    auto clientOpctxPairs = makeKClientsWithLockers<DefaultLockerImpl>(5);
+    auto opctx1 = clientOpctxPairs[0].second.get();
+    auto opctx2 = clientOpctxPairs[1].second.get();
+    auto opctx3 = clientOpctxPairs[2].second.get();
+    auto opctx4 = clientOpctxPairs[3].second.get();
+    auto opctx5 = clientOpctxPairs[4].second.get();
+
+    // Build a queue of MODE_X <- MODE_S <- MODE_X <- MODE_IX <- MODE_IS, with the first MODE_X
+    // granted and check that releasing it will result in the MODE_IS being granted.
+    boost::optional<Lock::GlobalWrite> lockXgranted;
+    lockXgranted.emplace(opctx1);
+    ASSERT(lockXgranted->isLocked());
+
+    boost::optional<Lock::GlobalLock> lockX;
+    lockX.emplace(opctx3, MODE_X, UINT_MAX, Lock::GlobalLock::EnqueueOnly());
+    ASSERT(!lockX->isLocked());
+
+    // Now request MODE_S: it will be first in the pending list due to EnqueueAtFront policy.
+    boost::optional<Lock::GlobalLock> lockS;
+    lockS.emplace(opctx2, MODE_S, UINT_MAX, Lock::GlobalLock::EnqueueOnly());
+    ASSERT(!lockS->isLocked());
+
+    Lock::GlobalLock lockIX(opctx4, MODE_IX, UINT_MAX, Lock::GlobalLock::EnqueueOnly());
+    ASSERT(!lockIX.isLocked());
+    Lock::GlobalLock lockIS(opctx5, MODE_IS, UINT_MAX, Lock::GlobalLock::EnqueueOnly());
+    ASSERT(!lockIS.isLocked());
+
+
+    // Now release the granted MODE_X and ensure that MODE_S will switch policy to compatibleFirst,
+    // not locking the MODE_X or MODE_IX, but instead granting the final MODE_IS.
+    lockXgranted.reset();
+    lockS->waitForLock(0);
+    ASSERT(lockS->isLocked());
+
+    lockX->waitForLock(0);
+    ASSERT(!lockX->isLocked());
+    lockIX.waitForLock(0);
+    ASSERT(!lockIX.isLocked());
+
+    lockIS.waitForLock(0);
+    ASSERT(lockIS.isLocked());
+}
+
+TEST_F(DConcurrencyTestFixture, CompatibleFirstStress) {
+    int numThreads = 8;
+    int testMicros = 500'000;
+    AtomicUInt64 readOnlyInterval{0};
+    AtomicBool done{false};
+    std::vector<uint64_t> acquisitionCount(numThreads);
+    std::vector<uint64_t> timeoutCount(numThreads);
+    std::vector<uint64_t> busyWaitCount(numThreads);
+    auto clientOpctxPairs = makeKClientsWithLockers<DefaultLockerImpl>(numThreads);
+
+    // Do some busy waiting to trigger different timings. The atomic load prevents compilers
+    // from optimizing the loop away.
+    auto busyWait = [&done, &busyWaitCount](int threadId, long long iters) {
+        while (iters-- > 0) {
+            for (int i = 0; i < 100 && !done.load(); i++) {
+                busyWaitCount[threadId]++;
+            }
+        }
+    };
+
+    std::vector<stdx::thread> threads;
+
+    // Thread putting state in/out of read-only CompatibleFirst mode.
+    threads.emplace_back([&]() {
+        Timer t;
+        auto endTime = t.micros() + testMicros;
+        uint64_t readOnlyIntervalCount = 0;
+        OperationContext* opCtx = clientOpctxPairs[0].second.get();
+        for (int iters = 0; (t.micros() < endTime); iters++) {
+            busyWait(0, iters % 20);
+            Lock::GlobalRead readLock(opCtx, iters % 2);
+            if (!readLock.isLocked()) {
+                timeoutCount[0]++;
+                continue;
+            }
+            acquisitionCount[0]++;
+            readOnlyInterval.store(++readOnlyIntervalCount);
+            busyWait(0, iters % 200);
+            readOnlyInterval.store(0);
+        };
+        done.store(true);
+    });
+
+    for (int threadId = 1; threadId < numThreads; threadId++) {
+        threads.emplace_back([&, threadId]() {
+            Timer t;
+            for (int iters = 0; !done.load(); iters++) {
+                OperationContext* opCtx = clientOpctxPairs[threadId].second.get();
+                boost::optional<Lock::GlobalLock> lock;
+                switch (threadId) {
+                    case 1:
+                    case 2:
+                    case 3:
+                    case 4: {
+                        // Here, actually try to acquire a lock without waiting, and check whether
+                        // we should have gotten the lock or not. Use MODE_IS in 95% of the cases,
+                        // and MODE_S in only 5, as that stressing the partitioning scheme and
+                        // policy changes more as thread 0 acquires/releases its MODE_S lock.
+                        busyWait(threadId, iters % 100);
+                        auto interval = readOnlyInterval.load();
+                        lock.emplace(opCtx,
+                                     iters % 20 ? MODE_IS : MODE_S,
+                                     0,
+                                     Lock::GlobalLock::EnqueueOnly());
+                        // If thread 0 is holding the MODE_S lock while we tried to acquire a
+                        // MODE_IS or MODE_S lock, the CompatibleFirst policy guarantees success.
+                        auto newInterval = readOnlyInterval.load();
+                        invariant(!interval || interval != newInterval || lock->isLocked());
+                        lock->waitForLock(0);
+                        break;
+                    }
+                    case 5:
+                        busyWait(threadId, iters % 150);
+                        lock.emplace(opCtx, MODE_X, iters % 2);
+                        busyWait(threadId, iters % 10);
+                        break;
+                    case 6:
+                        lock.emplace(opCtx, iters % 25 ? MODE_IX : MODE_S, iters % 2);
+                        busyWait(threadId, iters % 100);
+                        break;
+                    case 7:
+                        busyWait(threadId, iters % 100);
+                        lock.emplace(opCtx, iters % 20 ? MODE_IS : MODE_X, 0);
+                        break;
+                    default:
+                        MONGO_UNREACHABLE;
+                }
+                if (lock->isLocked())
+                    acquisitionCount[threadId]++;
+                else
+                    timeoutCount[threadId]++;
+            };
+        });
+    }
+
+    for (auto& thread : threads)
+        thread.join();
+    for (int threadId = 0; threadId < numThreads; threadId++) {
+        log() << "thread " << threadId << " stats: " << acquisitionCount[threadId]
+              << " acquisitions, " << timeoutCount[threadId] << " timeouts, "
+              << busyWaitCount[threadId] / 1'000'000 << "M busy waits";
+    }
+}
 
 // These tests exercise single- and multi-threaded performance of uncontended lock acquisition. It
 // is neither practical nor useful to run them on debug builds.
@@ -823,6 +1272,42 @@ TEST_F(DConcurrencyTestFixture, PerformanceMMAPv1CollectionExclusive) {
             Lock::CollectionLock clk(clients[threadId].second->lockState(), "test.coll", MODE_X);
         },
         kMaxPerfThreads);
+}
+
+namespace {
+class RecoveryUnitMock : public RecoveryUnitNoop {
+public:
+    virtual void abandonSnapshot() {
+        activeTransaction = false;
+    }
+
+    bool activeTransaction = true;
+};
+}
+
+TEST_F(DConcurrencyTestFixture, TestGlobalLockAbandonSnapshot) {
+    auto clients = makeKClientsWithLockers<MMAPV1LockerImpl>(1);
+    auto opCtx = clients[0].second.get();
+    auto recovUnitOwned = stdx::make_unique<RecoveryUnitMock>();
+    auto recovUnitBorrowed = recovUnitOwned.get();
+    opCtx->setRecoveryUnit(recovUnitOwned.release(),
+                           OperationContext::RecoveryUnitState::kActiveUnitOfWork);
+
+    {
+        Lock::GlobalLock gw1(opCtx, MODE_IS, 0);
+        ASSERT(gw1.isLocked());
+        ASSERT(recovUnitBorrowed->activeTransaction);
+
+        {
+            Lock::GlobalLock gw2(opCtx, MODE_S, 0);
+            ASSERT(gw2.isLocked());
+            ASSERT(recovUnitBorrowed->activeTransaction);
+        }
+
+        ASSERT(recovUnitBorrowed->activeTransaction);
+        ASSERT(gw1.isLocked());
+    }
+    ASSERT_FALSE(recovUnitBorrowed->activeTransaction);
 }
 
 }  // namespace

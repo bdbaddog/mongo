@@ -15,6 +15,7 @@ Coverity
 Coverity's
 DB's
 DBTs
+DHANDLE
 DONTNEED
 Datastore
 DbCursor
@@ -43,6 +44,7 @@ Google's
 HyperDex
 HyperLevelDB
 IEC
+JDK
 JavaScript
 KMS
 LD
@@ -185,6 +187,8 @@ desc
 destructor
 destructors
 dev
+devdoc
+dhandle
 disjunction
 disjunctions
 distclean
@@ -208,6 +212,7 @@ endcond
 endian
 endif
 endinternal
+enduml
 english
 env
 eof
@@ -317,6 +322,7 @@ memalloc
 memfree
 memp
 metadata
+metatracking
 minkey
 mixin
 mixins
@@ -363,6 +369,7 @@ objectsin
 ol
 oltp
 oob
+optrack
 optype
 os
 outlier
@@ -375,7 +382,9 @@ perf
 petabyte
 pget
 php
+plantuml
 png
+pid
 posix
 pre
 prepends
@@ -440,6 +449,7 @@ sql
 src
 ssd
 startsync
+startuml
 statlog
 stderr
 str
@@ -455,6 +465,7 @@ substring
 superset
 sys
 sz
+tid
 tRuE
 tablename
 tcl

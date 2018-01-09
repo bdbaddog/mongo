@@ -10,7 +10,7 @@
     var rst = new ReplSetTest({
         name: "name",
         nodes: 2,
-        oplogSize: 100,
+        oplogSize: 500,
     });
 
     rst.startSet();
@@ -32,8 +32,8 @@
 
     // Start a w:2 write that will block until replication is resumed.
     var waitForReplStart = startParallelShell(function() {
-        printjson(assert.writeOK(
-            db.getCollection('side').insert({}, {writeConcern: {w: 2, wtimeout: 30 * 60 * 1000}})));
+        printjson(assert.writeOK(db.getCollection('side').insert(
+            {}, {writeConcern: {w: 2, wtimeout: ReplSetTest.kDefaultTimeoutMS}})));
     }, primary.host.split(':')[1]);
 
     // Insert a lot of data in increasing order to test.coll.
@@ -59,8 +59,8 @@
 
     // Following clean shutdown of a node, the oplog must exactly match the applied operations.
     // Additionally, the begin field must not be in the minValid document, the ts must match the
-    // top of the oplog (SERVER-25353), and the oplogDeleteFromPoint must be null (SERVER-7200 and
-    // SERVER-25071).
+    // top of the oplog (SERVER-25353), and the oplogTruncateAfterPoint must be null (SERVER-7200
+    // and SERVER-25071).
     var oplogDoc = conn.getCollection('local.oplog.rs')
                        .find({ns: 'test.coll'})
                        .sort({$natural: -1})
@@ -68,12 +68,19 @@
     var collDoc = conn.getCollection('test.coll').find().sort({_id: -1}).limit(1)[0];
     var minValidDoc =
         conn.getCollection('local.replset.minvalid').find().sort({$natural: -1}).limit(1)[0];
-    printjson({oplogDoc: oplogDoc, collDoc: collDoc, minValidDoc: minValidDoc});
+    var oplogTruncateAfterPointDoc =
+        conn.getCollection('local.replset.oplogTruncateAfterPoint').find().limit(1)[0];
+    printjson({
+        oplogDoc: oplogDoc,
+        collDoc: collDoc,
+        minValidDoc: minValidDoc,
+        oplogTruncateAfterPointDoc: oplogTruncateAfterPointDoc
+    });
     try {
         assert.eq(collDoc._id, oplogDoc.o._id);
         assert(!('begin' in minValidDoc), 'begin in minValidDoc');
-        assert.eq(minValidDoc.oplogDeleteFromPoint, Timestamp());
         assert.eq(minValidDoc.ts, oplogDoc.ts);
+        assert.eq(oplogTruncateAfterPointDoc.oplogTruncateAfterPoint, Timestamp());
     } catch (e) {
         // TODO remove once SERVER-25777 is resolved.
         jsTest.log(

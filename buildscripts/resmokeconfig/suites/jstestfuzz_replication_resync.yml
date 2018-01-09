@@ -12,6 +12,7 @@ executor:
         TestData:
           ignoreCommandsIncompatibleWithInitialSync: true
   hooks:
+  - class: CheckPrimary
   - class: BackgroundInitialSync
     use_resync: true
     n: 1
@@ -23,7 +24,6 @@ executor:
     class: ReplicaSetFixture
     mongod_options:
       oplogSize: 511
-      bind_ip_all: ''
       verbose: ''
       set_parameters:
         logComponentVerbosity:
@@ -31,5 +31,6 @@ executor:
         enableTestCommands: 1
         numInitialSyncAttempts: 1
         numInitialSyncConnectAttempts: 60
+        writePeriodicNoops: 1
     num_nodes: 2
     start_initial_sync_node: True

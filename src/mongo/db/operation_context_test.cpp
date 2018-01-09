@@ -31,8 +31,10 @@
 #include <boost/optional.hpp>
 
 #include "mongo/db/client.h"
+#include "mongo/db/json.h"
 #include "mongo/db/logical_session_id.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/db/operation_context_group.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/service_context_noop.h"
 #include "mongo/stdx/future.h"
@@ -45,8 +47,9 @@
 #include "mongo/util/time_support.h"
 
 namespace mongo {
-
 namespace {
+
+using unittest::assertGet;
 
 std::ostream& operator<<(std::ostream& os, stdx::cv_status cvStatus) {
     switch (cvStatus) {
@@ -72,37 +75,100 @@ std::ostream& operator<<(std::ostream& os, stdx::future_status futureStatus) {
     }
 }
 
-TEST(OperationContextTest, CanHaveLogicalSessionId) {
-    // Test that we can create opCtx's with or without a logical session id
+TEST(OperationContextTest, NoSessionIdNoTransactionNumber) {
     auto serviceCtx = stdx::make_unique<ServiceContextNoop>();
     auto client = serviceCtx->makeClient("OperationContextTest");
+    auto opCtx = client->makeOperationContext();
 
-    // No session id
+    ASSERT(!opCtx->getLogicalSessionId());
+    ASSERT(!opCtx->getTxnNumber());
+}
+
+TEST(OperationContextTest, SessionIdNoTransactionNumber) {
+    auto serviceCtx = stdx::make_unique<ServiceContextNoop>();
+    auto client = serviceCtx->makeClient("OperationContextTest");
+    auto opCtx = client->makeOperationContext();
+
+    const auto lsid = makeLogicalSessionIdForTest();
+    opCtx->setLogicalSessionId(lsid);
+
+    ASSERT(opCtx->getLogicalSessionId());
+    ASSERT_EQUALS(lsid, *opCtx->getLogicalSessionId());
+
+    ASSERT(!opCtx->getTxnNumber());
+}
+
+TEST(OperationContextTest, SessionIdAndTransactionNumber) {
+    auto serviceCtx = stdx::make_unique<ServiceContextNoop>();
+    auto client = serviceCtx->makeClient("OperationContextTest");
+    auto opCtx = client->makeOperationContext();
+
+    const auto lsid = makeLogicalSessionIdForTest();
+    opCtx->setLogicalSessionId(lsid);
+    opCtx->setTxnNumber(5);
+
+    ASSERT(opCtx->getTxnNumber());
+    ASSERT_EQUALS(5, *opCtx->getTxnNumber());
+}
+
+TEST(OperationContextTest, OpCtxGroup) {
+    OperationContextGroup group1;
+    ASSERT_TRUE(group1.isEmpty());
     {
-        auto opCtx = client->makeOperationContext();
-        ASSERT(!opCtx->getLogicalSessionId());
+        auto serviceCtx1 = stdx::make_unique<ServiceContextNoop>();
+        auto client1 = serviceCtx1->makeClient("OperationContextTest1");
+        auto opCtx1 = group1.makeOperationContext(*client1);
+        ASSERT_FALSE(group1.isEmpty());
+
+        auto serviceCtx2 = stdx::make_unique<ServiceContextNoop>();
+        auto client2 = serviceCtx2->makeClient("OperationContextTest2");
+        {
+            auto opCtx2 = group1.makeOperationContext(*client2);
+            opCtx1.discard();
+            ASSERT_FALSE(group1.isEmpty());
+        }
+        ASSERT_TRUE(group1.isEmpty());
+
+        auto opCtx3 = group1.makeOperationContext(*client1);
+        auto opCtx4 = group1.makeOperationContext(*client2);
+        ASSERT_TRUE(opCtx3->checkForInterruptNoAssert().isOK());    // use member op->
+        ASSERT_TRUE((*opCtx4).checkForInterruptNoAssert().isOK());  // use conversion to OC*
+        group1.interrupt(ErrorCodes::InternalError);
+        ASSERT_FALSE(opCtx3->checkForInterruptNoAssert().isOK());
+        ASSERT_FALSE((*opCtx4).checkForInterruptNoAssert().isOK());
+    }
+    ASSERT_TRUE(group1.isEmpty());
+
+    OperationContextGroup group2;
+    {
+        auto serviceCtx = stdx::make_unique<ServiceContextNoop>();
+        auto client = serviceCtx->makeClient("OperationContextTest1");
+        auto opCtx2 = group2.adopt(client->makeOperationContext());
+        ASSERT_FALSE(group2.isEmpty());
+        ASSERT_TRUE(opCtx2->checkForInterruptNoAssert().isOK());
+        group2.interrupt(ErrorCodes::InternalError);
+        ASSERT_FALSE(opCtx2->checkForInterruptNoAssert().isOK());
+        opCtx2.discard();
+        ASSERT(opCtx2.opCtx() == nullptr);
+        ASSERT_TRUE(group2.isEmpty());
     }
 
+    OperationContextGroup group3;
+    OperationContextGroup group4;
     {
-        auto opCtx = serviceCtx->makeOperationContext(client.get());
-        ASSERT(!opCtx->getLogicalSessionId());
-    }
-
-    // With a session id
-    auto res = LogicalSessionId::parse("00000000-abab-4000-8000-000000000000");
-    ASSERT(res.isOK());
-    auto lsid = res.getValue();
-
-    {
-        auto opCtx = client->makeOperationContext(lsid);
-        ASSERT(opCtx->getLogicalSessionId());
-        ASSERT_EQUALS(*(opCtx->getLogicalSessionId()), lsid);
-    }
-
-    {
-        auto opCtx = serviceCtx->makeOperationContext(client.get(), lsid);
-        ASSERT(opCtx->getLogicalSessionId());
-        ASSERT_EQUALS(*(opCtx->getLogicalSessionId()), lsid);
+        auto serviceCtx = stdx::make_unique<ServiceContextNoop>();
+        auto client3 = serviceCtx->makeClient("OperationContextTest3");
+        auto opCtx3 = group3.makeOperationContext(*client3);
+        auto p3 = opCtx3.opCtx();
+        auto opCtx4 = group4.take(std::move(opCtx3));
+        ASSERT_EQ(p3, opCtx4.opCtx());
+        ASSERT(opCtx3.opCtx() == nullptr);
+        ASSERT_TRUE(group3.isEmpty());
+        ASSERT_FALSE(group4.isEmpty());
+        group3.interrupt(ErrorCodes::InternalError);
+        ASSERT_TRUE(opCtx4->checkForInterruptNoAssert().isOK());
+        group4.interrupt(ErrorCodes::InternalError);
+        ASSERT_FALSE(opCtx4->checkForInterruptNoAssert().isOK());
     }
 }
 

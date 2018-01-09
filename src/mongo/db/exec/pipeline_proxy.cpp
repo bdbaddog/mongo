@@ -47,11 +47,11 @@ using stdx::make_unique;
 const char* PipelineProxyStage::kStageType = "PIPELINE_PROXY";
 
 PipelineProxyStage::PipelineProxyStage(OperationContext* opCtx,
-                                       std::unique_ptr<Pipeline, Pipeline::Deleter> pipeline,
+                                       std::unique_ptr<Pipeline, PipelineDeleter> pipeline,
                                        WorkingSet* ws)
     : PlanStage(kStageType, opCtx),
       _pipeline(std::move(pipeline)),
-      _includeMetaData(_pipeline->getContext()->inShard),  // send metadata to merger
+      _includeMetaData(_pipeline->getContext()->needsMerge),  // send metadata to merger
       _ws(ws) {
     // We take over responsibility for disposing of the Pipeline, since it is required that
     // doDispose() will be called before destruction of this PipelineProxyStage.
@@ -124,6 +124,10 @@ boost::optional<BSONObj> PipelineProxyStage::getNextBson() {
     }
 
     return boost::none;
+}
+
+Timestamp PipelineProxyStage::getLatestOplogTimestamp() const {
+    return PipelineD::getLatestOplogTimestamp(_pipeline.get());
 }
 
 std::string PipelineProxyStage::getPlanSummaryStr() const {

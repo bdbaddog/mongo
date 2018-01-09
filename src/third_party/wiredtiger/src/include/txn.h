@@ -1,5 +1,5 @@
 /*-
- * Copyright (c) 2014-2017 MongoDB, Inc.
+ * Copyright (c) 2014-2018 MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -9,6 +9,19 @@
 #define	WT_TXN_NONE	0		/* No txn running in a session. */
 #define	WT_TXN_FIRST	1		/* First transaction to run. */
 #define	WT_TXN_ABORTED	UINT64_MAX	/* Update rolled back, ignore. */
+
+/* AUTOMATIC FLAG VALUE GENERATION START */
+#define	WT_TXN_LOG_CKPT_CLEANUP	0x01u
+#define	WT_TXN_LOG_CKPT_PREPARE	0x02u
+#define	WT_TXN_LOG_CKPT_START	0x04u
+#define	WT_TXN_LOG_CKPT_STOP	0x08u
+#define	WT_TXN_LOG_CKPT_SYNC	0x10u
+/* AUTOMATIC FLAG VALUE GENERATION STOP */
+
+/* AUTOMATIC FLAG VALUE GENERATION START */
+#define	WT_TXN_OLDEST_STRICT	0x1u
+#define	WT_TXN_OLDEST_WAIT	0x2u
+/* AUTOMATIC FLAG VALUE GENERATION STOP */
 
 /*
  * Transaction ID comparison dealing with edge cases.
@@ -72,11 +85,11 @@ struct __wt_txn_state {
 	volatile uint64_t id;
 	volatile uint64_t pinned_id;
 	volatile uint64_t metadata_pinned;
+
 	WT_CACHE_LINE_PAD_END
 };
 
 struct __wt_txn_global {
-	WT_SPINLOCK id_lock;
 	volatile uint64_t current;	/* Current transaction ID. */
 
 	/* The oldest running transaction ID (may race). */
@@ -88,11 +101,34 @@ struct __wt_txn_global {
 	 */
 	volatile uint64_t oldest_id;
 
-	/*
-	 * Prevents the oldest ID moving forwards while threads are scanning
-	 * the global transaction state.
-	 */
-	WT_RWLOCK scan_rwlock;
+	WT_DECL_TIMESTAMP(commit_timestamp)
+	WT_DECL_TIMESTAMP(oldest_timestamp)
+	WT_DECL_TIMESTAMP(pinned_timestamp)
+	WT_DECL_TIMESTAMP(stable_timestamp)
+	bool has_commit_timestamp;
+	bool has_oldest_timestamp;
+	bool has_pinned_timestamp;
+	bool has_stable_timestamp;
+	bool oldest_is_pinned;
+	bool stable_is_pinned;
+
+	WT_SPINLOCK id_lock;
+
+	/* Protects the active transaction states. */
+	WT_RWLOCK rwlock;
+
+	/* Protects logging, checkpoints and transaction visibility. */
+	WT_RWLOCK visibility_rwlock;
+
+	/* List of transactions sorted by commit timestamp. */
+	WT_RWLOCK commit_timestamp_rwlock;
+	TAILQ_HEAD(__wt_txn_cts_qh, __wt_txn) commit_timestamph;
+	uint32_t commit_timestampq_len;
+
+	/* List of transactions sorted by read timestamp. */
+	WT_RWLOCK read_timestamp_rwlock;
+	TAILQ_HEAD(__wt_txn_rts_qh, __wt_txn) read_timestamph;
+	uint32_t read_timestampq_len;
 
 	/*
 	 * Track information about the running checkpoint. The transaction
@@ -107,8 +143,8 @@ struct __wt_txn_global {
 	 */
 	volatile bool	  checkpoint_running;	/* Checkpoint running */
 	volatile uint32_t checkpoint_id;	/* Checkpoint's session ID */
-	volatile uint64_t checkpoint_pinned;	/* Oldest ID for checkpoint */
-	volatile uint64_t checkpoint_txnid;	/* Checkpoint's txn ID */
+	WT_TXN_STATE	  checkpoint_state;	/* Checkpoint's txn state */
+	WT_TXN           *checkpoint_txn;	/* Checkpoint's txn structure */
 
 	volatile uint64_t metadata_pinned;	/* Oldest ID for metadata */
 
@@ -136,6 +172,7 @@ struct __wt_txn_op {
 	uint32_t fileid;
 	enum {
 		WT_TXN_OP_BASIC,
+		WT_TXN_OP_BASIC_TS,
 		WT_TXN_OP_INMEM,
 		WT_TXN_OP_REF,
 		WT_TXN_OP_TRUNCATE_COL,
@@ -185,6 +222,26 @@ struct __wt_txn {
 	uint32_t snapshot_count;
 	uint32_t txn_logsync;	/* Log sync configuration */
 
+	/*
+	 * Timestamp copied into updates created by this transaction.
+	 *
+	 * In some use cases, this can be updated while the transaction is
+	 * running.
+	 */
+	WT_DECL_TIMESTAMP(commit_timestamp)
+
+	/*
+	 * Set to the first commit timestamp used in the transaction and fixed
+	 * while the transaction is on the public list of committed timestamps.
+	 */
+	WT_DECL_TIMESTAMP(first_commit_timestamp)
+
+	/* Read updates committed as of this timestamp. */
+	WT_DECL_TIMESTAMP(read_timestamp)
+
+	TAILQ_ENTRY(__wt_txn) commit_timestampq;
+	TAILQ_ENTRY(__wt_txn) read_timestampq;
+
 	/* Array of modifications by this transaction. */
 	WT_TXN_OP      *mod;
 	size_t		mod_alloc;
@@ -202,13 +259,21 @@ struct __wt_txn {
 	WT_ITEM		*ckpt_snapshot;
 	bool		full_ckpt;
 
-#define	WT_TXN_AUTOCOMMIT	0x01
-#define	WT_TXN_ERROR		0x02
-#define	WT_TXN_HAS_ID		0x04
-#define	WT_TXN_HAS_SNAPSHOT	0x08
-#define	WT_TXN_NAMED_SNAPSHOT	0x10
-#define	WT_TXN_READONLY		0x20
-#define	WT_TXN_RUNNING		0x40
-#define	WT_TXN_SYNC_SET		0x80
+/* AUTOMATIC FLAG VALUE GENERATION START */
+#define	WT_TXN_AUTOCOMMIT	0x0001u
+#define	WT_TXN_ERROR		0x0002u
+#define	WT_TXN_HAS_ID		0x0004u
+#define	WT_TXN_HAS_SNAPSHOT	0x0008u
+#define	WT_TXN_HAS_TS_COMMIT	0x0010u
+#define	WT_TXN_HAS_TS_READ	0x0020u
+#define	WT_TXN_NAMED_SNAPSHOT	0x0040u
+#define	WT_TXN_PUBLIC_TS_COMMIT	0x0080u
+#define	WT_TXN_PUBLIC_TS_READ	0x0100u
+#define	WT_TXN_READONLY		0x0200u
+#define	WT_TXN_RUNNING		0x0400u
+#define	WT_TXN_SYNC_SET		0x0800u
+#define	WT_TXN_TS_COMMIT_ALWAYS	0x1000u
+#define	WT_TXN_TS_COMMIT_NEVER	0x2000u
+/* AUTOMATIC FLAG VALUE GENERATION STOP */
 	uint32_t flags;
 };

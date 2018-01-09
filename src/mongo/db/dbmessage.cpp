@@ -36,39 +36,6 @@
 
 namespace mongo {
 
-using std::string;
-using std::stringstream;
-
-string Message::toString() const {
-    stringstream ss;
-    ss << "op: " << networkOpToString(operation()) << " len: " << size();
-    if (operation() >= 2000 && operation() < 2100) {
-        DbMessage d(*this);
-        ss << " ns: " << d.getns();
-        switch (operation()) {
-            case dbUpdate: {
-                int flags = d.pullInt();
-                BSONObj q = d.nextJsObj();
-                BSONObj o = d.nextJsObj();
-                ss << " flags: " << flags << " query: " << q << " update: " << o;
-                break;
-            }
-            case dbInsert:
-                ss << d.nextJsObj();
-                break;
-            case dbDelete: {
-                int flags = d.pullInt();
-                BSONObj q = d.nextJsObj();
-                ss << " flags: " << flags << " query: " << q;
-                break;
-            }
-            default:
-                ss << " CANNOT HANDLE YET";
-        }
-    }
-    return ss.str();
-}
-
 DbMessage::DbMessage(const Message& msg) : _msg(msg), _nsStart(NULL), _mark(NULL), _nsLen(0) {
     // for received messages, Message has only one buffer
     _theEnd = _msg.singleData().data() + _msg.singleData().dataLen();
@@ -170,6 +137,77 @@ T DbMessage::readAndAdvance() {
     T t = read<T>();
     _nextjsobj += sizeof(T);
     return t;
+}
+
+namespace {
+template <typename Func>
+Message makeMessage(NetworkOp op, Func&& bodyBuilder) {
+    BufBuilder b;
+    b.skip(sizeof(MSGHEADER::Layout));
+
+    bodyBuilder(b);
+
+    const int size = b.len();
+    auto out = Message(b.release());
+    out.header().setOperation(op);
+    out.header().setLen(size);
+    return out;
+}
+}
+
+Message makeInsertMessage(StringData ns, const BSONObj* objs, size_t count, int flags) {
+    return makeMessage(dbInsert, [&](BufBuilder& b) {
+        int reservedFlags = 0;
+        if (flags & InsertOption_ContinueOnError)
+            reservedFlags |= InsertOption_ContinueOnError;
+
+        b.appendNum(reservedFlags);
+        b.appendStr(ns);
+
+        for (size_t i = 0; i < count; i++) {
+            objs[i].appendSelfToBufBuilder(b);
+        }
+    });
+}
+
+Message makeUpdateMessage(StringData ns, BSONObj query, BSONObj update, int flags) {
+    return makeMessage(dbUpdate, [&](BufBuilder& b) {
+        const int reservedFlags = 0;
+        b.appendNum(reservedFlags);
+        b.appendStr(ns);
+        b.appendNum(flags);
+
+        query.appendSelfToBufBuilder(b);
+        update.appendSelfToBufBuilder(b);
+    });
+}
+
+Message makeRemoveMessage(StringData ns, BSONObj query, int flags) {
+    return makeMessage(dbDelete, [&](BufBuilder& b) {
+        const int reservedFlags = 0;
+        b.appendNum(reservedFlags);
+        b.appendStr(ns);
+        b.appendNum(flags);
+
+        query.appendSelfToBufBuilder(b);
+    });
+}
+
+Message makeKillCursorsMessage(long long cursorId) {
+    return makeMessage(dbKillCursors, [&](BufBuilder& b) {
+        b.appendNum((int)0);  // reserved
+        b.appendNum((int)1);  // number
+        b.appendNum(cursorId);
+    });
+}
+
+Message makeGetMoreMessage(StringData ns, long long cursorId, int nToReturn, int flags) {
+    return makeMessage(dbGetMore, [&](BufBuilder& b) {
+        b.appendNum(flags);
+        b.appendStr(ns);
+        b.appendNum(nToReturn);
+        b.appendNum(cursorId);
+    });
 }
 
 OpQueryReplyBuilder::OpQueryReplyBuilder() : _buffer(32768) {

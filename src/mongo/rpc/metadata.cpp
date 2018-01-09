@@ -34,12 +34,14 @@
 #include "mongo/db/jsobj.h"
 #include "mongo/db/logical_clock.h"
 #include "mongo/db/logical_time_validator.h"
+#include "mongo/db/server_options.h"
 #include "mongo/rpc/metadata/audit_metadata.h"
 #include "mongo/rpc/metadata/client_metadata_ismaster.h"
 #include "mongo/rpc/metadata/config_server_metadata.h"
 #include "mongo/rpc/metadata/logical_time_metadata.h"
 #include "mongo/rpc/metadata/sharding_metadata.h"
 #include "mongo/rpc/metadata/tracking_metadata.h"
+#include "mongo/util/string_map.h"
 
 namespace mongo {
 namespace rpc {
@@ -94,34 +96,55 @@ void readRequestMetadata(OperationContext* opCtx, const BSONObj& metadataObj) {
             uassertStatusOK(rpc::LogicalTimeMetadata::readFromMetadata(logicalTimeElem));
 
         auto& signedTime = logicalTimeMetadata.getSignedTime();
-        // LogicalTimeMetadata is default constructed if no logical time metadata was sent, so a
+        // LogicalTimeMetadata is default constructed if no cluster time metadata was sent, so a
         // default constructed SignedLogicalTime should be ignored.
         if (signedTime.getTime() != LogicalTime::kUninitialized) {
-            auto logicalTimeValidator = LogicalTimeValidator::get(opCtx);
-            if (!LogicalTimeValidator::isAuthorizedToAdvanceClock(opCtx)) {
-                if (!logicalTimeValidator) {
-                    uasserted(ErrorCodes::CannotVerifyAndSignLogicalTime,
-                              "Cannot accept logicalTime: " + signedTime.getTime().toString() +
-                                  ". May not be a part of a sharded cluster");
-                } else {
-                    uassertStatusOK(logicalTimeValidator->validate(opCtx, signedTime));
+            // Cluster times are only sent by sharding aware mongod servers, so this point is only
+            // reached in sharded clusters.
+            if (serverGlobalParams.featureCompatibility.getVersion() ==
+                ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo36) {
+                auto logicalTimeValidator = LogicalTimeValidator::get(opCtx);
+                if (!LogicalTimeValidator::isAuthorizedToAdvanceClock(opCtx)) {
+                    if (!logicalTimeValidator) {
+                        uasserted(ErrorCodes::CannotVerifyAndSignLogicalTime,
+                                  "Cannot accept logicalTime: " + signedTime.getTime().toString() +
+                                      ". May not be a part of a sharded cluster");
+                    } else {
+                        uassertStatusOK(logicalTimeValidator->validate(opCtx, signedTime));
+                    }
                 }
-            }
 
-            uassertStatusOK(logicalClock->advanceClusterTime(signedTime.getTime()));
+                uassertStatusOK(logicalClock->advanceClusterTime(signedTime.getTime()));
+            }
         }
     }
 }
 
-CommandAndMetadata upconvertRequestMetadata(BSONObj legacyCmdObj, int queryFlags) {
-    // We can reuse the same metadata BOB for every upconvert call, but we need to keep
-    // making new command BOBs as each metadata bob will need to remove fields. We can not use
-    // mutablebson here because the ReadPreference upconvert routine performs
-    // manipulations (replacing a root with its child) that mutablebson doesn't
-    // support.
+namespace {
+const auto docSequenceFieldsForCommands = StringMap<std::string>{
+    {"insert", "documents"},  //
+    {"update", "updates"},
+    {"delete", "deletes"},
+};
+
+bool isArrayOfObjects(BSONElement array) {
+    if (array.type() != Array)
+        return false;
+
+    for (auto elem : array.Obj()) {
+        if (elem.type() != Object)
+            return false;
+    }
+
+    return true;
+}
+}
+
+OpMsgRequest upconvertRequest(StringData db, BSONObj cmdObj, int queryFlags) {
+    cmdObj = cmdObj.getOwned();  // Usually this is a no-op since it is already owned.
 
     auto readPrefContainer = BSONObj();
-    const StringData firstFieldName = legacyCmdObj.firstElementFieldName();
+    const StringData firstFieldName = cmdObj.firstElementFieldName();
     if (firstFieldName == "$query" || firstFieldName == "query") {
         // Commands sent over OP_QUERY specify read preference by putting it at the top level and
         // putting the command in a nested field called either query or $query.
@@ -130,83 +153,49 @@ CommandAndMetadata upconvertRequestMetadata(BSONObj legacyCmdObj, int queryFlags
         uassert(ErrorCodes::InvalidOptions,
                 "cannot use $maxTimeMS query option with commands; use maxTimeMS command option "
                 "instead",
-                !legacyCmdObj.hasField("$maxTimeMS"));
-        readPrefContainer = legacyCmdObj;
-        legacyCmdObj = legacyCmdObj.firstElement().Obj().getOwned();
-    } else if (auto queryOptions = legacyCmdObj["$queryOptions"]) {
+                !cmdObj.hasField("$maxTimeMS"));
+
+        if (auto readPref = cmdObj["$readPreference"])
+            readPrefContainer = readPref.wrap();
+
+        cmdObj = cmdObj.firstElement().Obj().shareOwnershipWith(cmdObj);
+    } else if (auto queryOptions = cmdObj["$queryOptions"]) {
         // Mongos rewrites commands with $readPreference to put it in a field nested inside of
         // $queryOptions. Its command implementations often forward commands in that format to
         // shards. This function is responsible for rewriting it to a format that the shards
         // understand.
-        readPrefContainer = queryOptions.Obj().getOwned();
-        legacyCmdObj = legacyCmdObj.removeField("$queryOptions");
+        readPrefContainer = queryOptions.Obj().shareOwnershipWith(cmdObj);
+        cmdObj = cmdObj.removeField("$queryOptions");
     }
 
-    BSONObjBuilder metadataBob;
-    if (auto readPref = readPrefContainer["$readPreference"]) {
-        metadataBob.append(readPref);
-    } else if (queryFlags & QueryOption_SlaveOk) {
-        ReadPreferenceSetting(ReadPreference::SecondaryPreferred).toContainingBSON(&metadataBob);
+    if (!readPrefContainer.isEmpty()) {
+        cmdObj = BSONObjBuilder(std::move(cmdObj)).appendElements(readPrefContainer).obj();
+    } else if (!cmdObj.hasField("$readPreference") && (queryFlags & QueryOption_SlaveOk)) {
+        BSONObjBuilder bodyBuilder(std::move(cmdObj));
+        ReadPreferenceSetting(ReadPreference::SecondaryPreferred).toContainingBSON(&bodyBuilder);
+        cmdObj = bodyBuilder.obj();
     }
 
-    // Ordering is important here - AuditMetadata::upconvert() expects the above up-conversion to
-    // already be done.
-    BSONObjBuilder auditCommandBob;
-    uassertStatusOK(
-        AuditMetadata::upconvert(legacyCmdObj, queryFlags, &auditCommandBob, &metadataBob));
+    uassert(40621, "$db is not allowed in OP_QUERY requests", !cmdObj.hasField("$db"));
 
-    BSONObjBuilder logicalTimeCommandBob;
-    for (auto elem : auditCommandBob.done()) {
-        if (elem.fieldNameStringData() == LogicalTimeMetadata::fieldName()) {
-            metadataBob.append(elem);
-        } else {
-            logicalTimeCommandBob.append(elem);
-        }
+    // Try to move supported array fields into document sequences.
+    auto docSequenceIt = docSequenceFieldsForCommands.find(cmdObj.firstElementFieldName());
+    auto docSequenceElem = docSequenceIt == docSequenceFieldsForCommands.end()
+        ? BSONElement()
+        : cmdObj[docSequenceIt->second];
+    if (!isArrayOfObjects(docSequenceElem))
+        return OpMsgRequest::fromDBAndBody(db, std::move(cmdObj));
+
+    auto docSequenceName = docSequenceElem.fieldNameStringData();
+
+    // Note: removing field before adding "$db" to avoid the need to copy the potentially large
+    // array.
+    auto out = OpMsgRequest::fromDBAndBody(db, cmdObj.removeField(docSequenceName));
+    out.sequences.push_back({docSequenceName.toString()});
+    for (auto elem : docSequenceElem.Obj()) {
+        out.sequences[0].objs.push_back(elem.Obj().shareOwnershipWith(cmdObj));
     }
-
-    return std::make_tuple(logicalTimeCommandBob.obj(), metadataBob.obj());
-}
-
-LegacyCommandAndFlags downconvertRequestMetadata(BSONObj cmdObj, BSONObj metadata) {
-    int legacyQueryFlags = 0;
-    BSONObjBuilder logicalTimeCommandBob;
-    logicalTimeCommandBob.appendElements(cmdObj);
-    if (auto logicalTime = metadata[LogicalTimeMetadata::fieldName()]) {
-        logicalTimeCommandBob.append(logicalTime);
-    }
-
-    // Ordering is important here - AuditingMetadata must be downconverted before ReadPreference.
-    BSONObjBuilder auditCommandBob;
-    uassertStatusOK(AuditMetadata::downconvert(
-        logicalTimeCommandBob.done(), metadata, &auditCommandBob, &legacyQueryFlags));
-
-    cmdObj = auditCommandBob.obj();
-
-    auto readPref = metadata["$readPreference"];
-    if (!readPref)
-        readPref = cmdObj["$readPreference"];
-
-    if (readPref) {
-        BSONObjBuilder bob;
-        bob.append("$query", cmdObj);
-        bob.append(readPref);
-        cmdObj = bob.obj();
-
-        auto parsed = ReadPreferenceSetting::fromInnerBSON(readPref);
-        if (parsed.isOK() && parsed.getValue().canRunOnSecondary()) {
-            legacyQueryFlags |= QueryOption_SlaveOk;
-        }
-    }
-
-    return std::make_tuple(cmdObj, std::move(legacyQueryFlags));
-}
-
-CommandReplyWithMetadata upconvertReplyMetadata(const BSONObj& legacyReply) {
-    BSONObjBuilder commandReplyBob;
-    BSONObjBuilder metadataBob;
-
-    uassertStatusOK(ShardingMetadata::upconvert(legacyReply, &commandReplyBob, &metadataBob));
-    return std::make_tuple(commandReplyBob.obj(), metadataBob.obj());
+    return out;
 }
 
 }  // namespace rpc

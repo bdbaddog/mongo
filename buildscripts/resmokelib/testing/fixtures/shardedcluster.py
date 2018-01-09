@@ -4,12 +4,11 @@ Sharded cluster fixture for executing JSTests against.
 
 from __future__ import absolute_import
 
-import copy
 import os.path
-import socket
 import time
 
 import pymongo
+import pymongo.errors
 
 from . import interface
 from . import standalone
@@ -43,7 +42,9 @@ class ShardedClusterFixture(interface.Fixture):
                  num_rs_nodes_per_shard=None,
                  separate_configsvr=True,
                  enable_sharding=None,
-                 auth_options=None):
+                 auth_options=None,
+                 configsvr_options=None,
+                 shard_options=None):
         """
         Initializes ShardedClusterFixture with the different options to
         the mongod and mongos processes.
@@ -64,12 +65,13 @@ class ShardedClusterFixture(interface.Fixture):
         self.separate_configsvr = separate_configsvr
         self.enable_sharding = utils.default_if_none(enable_sharding, [])
         self.auth_options = auth_options
+        self.configsvr_options = utils.default_if_none(configsvr_options, {})
+        self.shard_options = utils.default_if_none(shard_options, {})
 
         # Command line options override the YAML configuration.
         dbpath_prefix = utils.default_if_none(config.DBPATH_PREFIX, dbpath_prefix)
         dbpath_prefix = utils.default_if_none(dbpath_prefix, config.DEFAULT_DBPATH_PREFIX)
-        self._dbpath_prefix = os.path.join(dbpath_prefix,
-                                           "job%d" % (self.job_num),
+        self._dbpath_prefix = os.path.join(dbpath_prefix, "job{}".format(self.job_num),
                                            config.FIXTURE_SUBDIR)
 
         self.configsvr = None
@@ -115,9 +117,8 @@ class ShardedClusterFixture(interface.Fixture):
 
         # Wait for the mongos
         self.mongos.await_ready()
-        self.port = self.mongos.port
 
-        client = utils.new_mongo_client(port=self.port)
+        client = self.mongo_client()
         if self.auth_options is not None:
             auth_db = client[self.auth_options["authenticationDatabase"]]
             auth_db.authenticate(self.auth_options["username"],
@@ -132,6 +133,11 @@ class ShardedClusterFixture(interface.Fixture):
         for db_name in self.enable_sharding:
             self.logger.info("Enabling sharding for '%s' database...", db_name)
             client.admin.command({"enablesharding": db_name})
+
+        # Ensure that the sessions collection gets auto-sharded by the config server
+        if self.configsvr is not None:
+            primary = self.configsvr.get_primary().mongo_client()
+            primary.admin.command({ "refreshLogicalSessionCacheNow" : 1 })
 
     def _do_teardown(self):
         """
@@ -180,11 +186,14 @@ class ShardedClusterFixture(interface.Fixture):
                 all(shard.is_running() for shard in self.shards) and
                 self.mongos is not None and self.mongos.is_running())
 
-    def get_connection_string(self):
+    def get_internal_connection_string(self):
         if self.mongos is None:
-            raise ValueError("Must call setup() before calling get_connection_string()")
+            raise ValueError("Must call setup() before calling get_internal_connection_string()")
 
-        return "%s:%d" % (socket.gethostname(), self.mongos.port)
+        return self.mongos.get_internal_connection_string()
+
+    def get_driver_connection_url(self):
+        return "mongodb://" + self.get_internal_connection_string()
 
     def _new_configsvr(self):
         """
@@ -194,7 +203,18 @@ class ShardedClusterFixture(interface.Fixture):
 
         mongod_logger = self.logger.new_fixture_node_logger("configsvr")
 
-        mongod_options = copy.deepcopy(self.mongod_options)
+        configsvr_options = self.configsvr_options.copy()
+
+        auth_options = configsvr_options.pop("auth_options", self.auth_options)
+        mongod_executable = configsvr_options.pop("mongod_executable", self.mongod_executable)
+        preserve_dbpath = configsvr_options.pop("preserve_dbpath", self.preserve_dbpath)
+        num_nodes = configsvr_options.pop("num_nodes", 3)
+
+        replset_config_options = configsvr_options.pop("replset_config_options", {})
+        replset_config_options["configsvr"] = True
+
+        mongod_options = self.mongod_options.copy()
+        mongod_options.update(configsvr_options.pop("mongod_options", {}))
         mongod_options["configsvr"] = ""
         mongod_options["dbpath"] = os.path.join(self._dbpath_prefix, "config")
         mongod_options["replSet"] = ShardedClusterFixture._CONFIGSVR_REPLSET_NAME
@@ -202,12 +222,13 @@ class ShardedClusterFixture(interface.Fixture):
 
         return replicaset.ReplicaSetFixture(mongod_logger,
                                             self.job_num,
-                                            mongod_executable=self.mongod_executable,
+                                            mongod_executable=mongod_executable,
                                             mongod_options=mongod_options,
-                                            preserve_dbpath=self.preserve_dbpath,
-                                            num_nodes=3,
-                                            auth_options=self.auth_options,
-                                            replset_config_options={"configsvr": True})
+                                            preserve_dbpath=preserve_dbpath,
+                                            num_nodes=num_nodes,
+                                            auth_options=auth_options,
+                                            replset_config_options=replset_config_options,
+                                            **configsvr_options)
 
     def _new_rs_shard(self, index, num_rs_nodes_per_shard):
         """
@@ -215,21 +236,32 @@ class ShardedClusterFixture(interface.Fixture):
         shard in a sharded cluster.
         """
 
-        mongod_logger = self.logger.new_fixture_node_logger("shard%d" % index)
+        mongod_logger = self.logger.new_fixture_node_logger("shard{}".format(index))
 
-        mongod_options = copy.deepcopy(self.mongod_options)
+        shard_options = self.shard_options.copy()
+
+        auth_options = shard_options.pop("auth_options", self.auth_options)
+        mongod_executable = shard_options.pop("mongod_executable", self.mongod_executable)
+        preserve_dbpath = shard_options.pop("preserve_dbpath", self.preserve_dbpath)
+
+        replset_config_options = shard_options.pop("replset_config_options", {})
+        replset_config_options["configsvr"] = False
+
+        mongod_options = self.mongod_options.copy()
+        mongod_options.update(shard_options.pop("mongod_options", {}))
         mongod_options["shardsvr"] = ""
-        mongod_options["dbpath"] = os.path.join(self._dbpath_prefix, "shard%d" % (index))
+        mongod_options["dbpath"] = os.path.join(self._dbpath_prefix, "shard{}".format(index))
         mongod_options["replSet"] = ShardedClusterFixture._SHARD_REPLSET_NAME_PREFIX + str(index)
 
         return replicaset.ReplicaSetFixture(mongod_logger,
                                             self.job_num,
-                                            mongod_executable=self.mongod_executable,
+                                            mongod_executable=mongod_executable,
                                             mongod_options=mongod_options,
-                                            preserve_dbpath=self.preserve_dbpath,
+                                            preserve_dbpath=preserve_dbpath,
                                             num_nodes=num_rs_nodes_per_shard,
-                                            auth_options=self.auth_options,
-                                            replset_config_options={"configsvr": False})
+                                            auth_options=auth_options,
+                                            replset_config_options=replset_config_options,
+                                            **shard_options)
 
     def _new_standalone_shard(self, index):
         """
@@ -237,17 +269,24 @@ class ShardedClusterFixture(interface.Fixture):
         shard in a sharded cluster.
         """
 
-        mongod_logger = self.logger.new_fixture_node_logger("shard%d" % index)
+        mongod_logger = self.logger.new_fixture_node_logger("shard{}".format(index))
 
-        mongod_options = copy.deepcopy(self.mongod_options)
+        shard_options = self.shard_options.copy()
+
+        mongod_executable = shard_options.pop("mongod_executable", self.mongod_executable)
+        preserve_dbpath = shard_options.pop("preserve_dbpath", self.preserve_dbpath)
+
+        mongod_options = self.mongod_options.copy()
+        mongod_options.update(shard_options.pop("mongod_options", {}))
         mongod_options["shardsvr"] = ""
-        mongod_options["dbpath"] = os.path.join(self._dbpath_prefix, "shard%d" % (index))
+        mongod_options["dbpath"] = os.path.join(self._dbpath_prefix, "shard{}".format(index))
 
         return standalone.MongoDFixture(mongod_logger,
                                         self.job_num,
-                                        mongod_executable=self.mongod_executable,
+                                        mongod_executable=mongod_executable,
                                         mongod_options=mongod_options,
-                                        preserve_dbpath=self.preserve_dbpath)
+                                        preserve_dbpath=preserve_dbpath,
+                                        **shard_options)
 
     def _new_mongos(self):
         """
@@ -257,17 +296,12 @@ class ShardedClusterFixture(interface.Fixture):
 
         mongos_logger = self.logger.new_fixture_node_logger("mongos")
 
-        mongos_options = copy.deepcopy(self.mongos_options)
-        configdb_hostname = socket.gethostname()
+        mongos_options = self.mongos_options.copy()
 
         if self.separate_configsvr:
-            configdb_replset = ShardedClusterFixture._CONFIGSVR_REPLSET_NAME
-            configdb_port = self.configsvr.port
-            mongos_options["configdb"] = "%s/%s:%d" % (configdb_replset,
-                                                       configdb_hostname,
-                                                       configdb_port)
+            mongos_options["configdb"] = self.configsvr.get_internal_connection_string()
         else:
-            mongos_options["configdb"] = "%s:%d" % (configdb_hostname, self.shards[0].port)
+            mongos_options["configdb"] = "localhost:{}".format(self.shards[0].port)
 
         return _MongoSFixture(mongos_logger,
                               self.job_num,
@@ -283,9 +317,9 @@ class ShardedClusterFixture(interface.Fixture):
         for more details.
         """
 
-        connection_string = shard.get_connection_string()
-        self.logger.info("Adding %s as a shard..." % (connection_string))
-        client.admin.command({"addShard": "%s" % (connection_string)})
+        connection_string = shard.get_internal_connection_string()
+        self.logger.info("Adding %s as a shard...", connection_string)
+        client.admin.command({"addShard": connection_string})
 
 
 class _MongoSFixture(interface.Fixture):
@@ -309,6 +343,7 @@ class _MongoSFixture(interface.Fixture):
         self.mongos_options = utils.default_if_none(mongos_options, {}).copy()
 
         self.mongos = None
+        self.port = None
 
     def setup(self):
         if "port" not in self.mongos_options:
@@ -338,20 +373,21 @@ class _MongoSFixture(interface.Fixture):
             # Check whether the mongos exited for some reason.
             exit_code = self.mongos.poll()
             if exit_code is not None:
-                raise errors.ServerFailure("Could not connect to mongos on port %d, process ended"
-                                           " unexpectedly with code %d." % (self.port, exit_code))
+                raise errors.ServerFailure("Could not connect to mongos on port {}, process ended"
+                                           " unexpectedly with code {}.".format(self.port,
+                                                                                exit_code))
 
             try:
                 # Use a shorter connection timeout to more closely satisfy the requested deadline.
-                client = utils.new_mongo_client(self.port, timeout_millis=500)
+                client = self.mongo_client(timeout_millis=500)
                 client.admin.command("ping")
                 break
             except pymongo.errors.ConnectionFailure:
                 remaining = deadline - time.time()
                 if remaining <= 0.0:
                     raise errors.ServerFailure(
-                        "Failed to connect to mongos on port %d after %d seconds"
-                        % (self.port, standalone.MongoDFixture.AWAIT_READY_TIMEOUT_SECS))
+                        "Failed to connect to mongos on port {} after {} seconds".format(
+                            self.port, standalone.MongoDFixture.AWAIT_READY_TIMEOUT_SECS))
 
                 self.logger.info("Waiting to connect to mongos on port %d.", self.port)
                 time.sleep(0.1)  # Wait a little bit before trying again.
@@ -388,3 +424,12 @@ class _MongoSFixture(interface.Fixture):
 
     def is_running(self):
         return self.mongos is not None and self.mongos.poll() is None
+
+    def get_internal_connection_string(self):
+        if self.mongos is None:
+            raise ValueError("Must call setup() before calling get_internal_connection_string()")
+
+        return "localhost:%d" % self.port
+
+    def get_driver_connection_url(self):
+        return "mongodb://" + self.get_internal_connection_string()

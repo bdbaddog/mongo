@@ -48,14 +48,22 @@ public:
     GetNextResult getNext() final;
     const char* getSourceName() const final;
 
+    StageConstraints constraints(Pipeline::SplitState pipeState) const final {
+        return {StreamType::kBlocking,
+                PositionRequirement::kNone,
+                HostTypeRequirement::kNone,
+                DiskUseRequirement::kWritesTmpData,
+                FacetRequirement::kAllowed};
+    }
+
     /**
      * The $bucketAuto stage must be run on the merging shard.
      */
     boost::intrusive_ptr<DocumentSource> getShardSource() final {
         return nullptr;
     }
-    boost::intrusive_ptr<DocumentSource> getMergeSource() final {
-        return this;
+    std::list<boost::intrusive_ptr<DocumentSource>> getMergeSources() final {
+        return {this};
     }
 
     static const uint64_t kDefaultMaxMemoryUsageBytes = 100 * 1024 * 1024;

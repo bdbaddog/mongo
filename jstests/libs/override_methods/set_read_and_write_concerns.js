@@ -3,18 +3,23 @@
  */
 (function() {
     "use strict";
-    var defaultWriteConcern = {
-        w: "majority",
-        // Use a "signature" value that won't typically match a value assigned in normal use. This
-        // way the wtimeout set by this override is distinguishable in the server logs.
-        wtimeout: 5 * 60 * 1000 + 321,  // 300321ms
-    };
+
     if (typeof TestData === "undefined" || !TestData.hasOwnProperty("defaultReadConcernLevel")) {
         throw new Error(
             "The default read-concern level must be set as the 'defaultReadConcernLevel' " +
             "property on TestData");
     }
     var defaultReadConcern = {level: TestData.defaultReadConcernLevel};
+
+    var defaultWriteConcern = {
+        w: "majority",
+        // Use a "signature" value that won't typically match a value assigned in normal use.
+        // This way the wtimeout set by this override is distinguishable in the server logs.
+        wtimeout: 5 * 60 * 1000 + 321,  // 300321ms
+    };
+    if (TestData.hasOwnProperty("defaultWriteConcern")) {
+        defaultWriteConcern = TestData.defaultWriteConcern;
+    }
 
     var originalDBQuery = DBQuery;
 
@@ -47,6 +52,7 @@
         return originalStartParallelShell(newCode, port, noConnect);
     };
 
+    const originalRunCommand = DB.prototype._runCommandImpl;
     DB.prototype._runCommandImpl = function(dbName, obj, options) {
         var cmdName = "";
         for (var fieldName in obj) {
@@ -56,16 +62,29 @@
 
         // These commands directly support a writeConcern argument.
         var commandsToForceWriteConcern = [
+            "_configsvrAddShard",
+            "_configsvrAddShardToZone",
+            "_configsvrCommitChunkMerge",
+            "_configsvrCommitChunkMigration",
+            "_configsvrCommitChunkSplit",
+            "_configsvrCreateDatabase",
+            "_configsvrEnableSharding",
+            "_configsvrMoveChunk",
+            "_configsvrMovePrimary",
+            "_configsvrRemoveShard",
+            "_configsvrRemoveShardFromZone",
+            "_configsvrShardCollection",
+            "_configsvrUpdateZoneKeyRange",
             "_mergeAuthzCollections",
+            "_recvChunkStart",
             "appendOplogNote",
             "applyOps",
-            "authSchemaUpgrade",
             "captrunc",
             "cleanupOrphaned",
             "clone",
             "cloneCollection",
             "cloneCollectionAsCapped",
-            // "collMod", SERVER-25196 - not supported
+            "collMod",
             "convertToCapped",
             "copydb",
             "create",
@@ -73,8 +92,8 @@
             "createRole",
             "createUser",
             "delete",
+            "doTxn",
             "drop",
-            "dropDatabase",
             "dropAllRolesFromDatabase",
             "dropAllUsersFromDatabase",
             "dropDatabase",
@@ -89,16 +108,13 @@
             "grantRolesToRole",
             "grantRolesToUser",
             "insert",
-            "mapReduceFinish",
-            "mergeAuthzCollections",
+            "mapreduce.shardedfinish",
             "moveChunk",
-            "movePrimary",
-            "remove",
             "renameCollection",
-            "resvChunkStart",
-            "revokePriviligesFromRole",
+            "revokePrivilegesFromRole",
             "revokeRolesFromRole",
             "revokeRolesFromUser",
+            "setFeatureCompatibilityVersion",
             "update",
             "updateRole",
             "updateUser",
@@ -172,7 +188,7 @@
             }
         }
 
-        var res = this.getMongo().runCommand(dbName, obj, options);
+        var res = originalRunCommand.call(this, dbName, obj, options);
 
         return res;
     };

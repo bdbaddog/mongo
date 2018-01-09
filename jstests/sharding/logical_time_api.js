@@ -11,7 +11,7 @@
     "use strict";
 
     // Returns true if the given object contains a logicalTime BSON object in the following format:
-    // $logicalTime: {
+    // $clusterTime: {
     //     clusterTime: <Timestamp>
     //     signature: {
     //         hash: <BinData>
@@ -23,7 +23,7 @@
             return false;
         }
 
-        var logicalTime = obj.$logicalTime;
+        var logicalTime = obj.$clusterTime;
         return logicalTime && isType(logicalTime, "BSON") &&
             isType(logicalTime.clusterTime, "Timestamp") && isType(logicalTime.signature, "BSON") &&
             isType(logicalTime.signature.hash, "BinData") &&
@@ -39,7 +39,8 @@
 
     // A mongos that talks to a non-sharded collection on a sharded replica set returns a
     // logicalTime BSON object that matches the expected format.
-    var st = new ShardingTest({name: "logical_time_api", shards: {rs0: {nodes: 1}}});
+    var st = new ShardingTest(
+        {name: "logical_time_api", shards: {rs0: {nodes: 1}}, mongosWaitsForKeys: true});
 
     var testDB = st.s.getDB("test");
     var res =
@@ -58,8 +59,8 @@
            "Expected command body from a mongos talking to a sharded collection on a sharded " +
                "replica set to contain logicalTime, received: " + tojson(res));
 
-    // Verify mongos can accept requests with $logicalTime in the command body.
-    assert.commandWorked(testDB.runCommand({isMaster: 1, $logicalTime: res.$logicalTime}));
+    // Verify mongos can accept requests with $clusterTime in the command body.
+    assert.commandWorked(testDB.runCommand({isMaster: 1, $clusterTime: res.$clusterTime}));
 
     // A mongod in a sharded replica set returns a logicalTime bson that matches the expected
     // format.
@@ -69,8 +70,8 @@
            "Expected command body from a mongod in a sharded replica set to contain " +
                "logicalTime, received: " + tojson(res));
 
-    // Verify mongod can accept requests with $logicalTime in the command body.
-    res = assert.commandWorked(testDB.runCommand({isMaster: 1, $logicalTime: res.$logicalTime}));
+    // Verify mongod can accept requests with $clusterTime in the command body.
+    res = assert.commandWorked(testDB.runCommand({isMaster: 1, $clusterTime: res.$clusterTime}));
 
     st.stop();
 
@@ -81,8 +82,8 @@
 
     testDB = replTest.getPrimary().getDB("test");
     res = assert.commandWorked(testDB.runCommand("insert", {insert: "foo", documents: [{x: 4}]}));
-    assert(!containsValidLogicalTimeBson(res),
-           "Expected command body from a mongod in a non-sharded replica set to not " +
+    assert(containsValidLogicalTimeBson(res),
+           "Expected command body from a mongod in a non-sharded replica set to " +
                "contain logicalTime, received: " + tojson(res));
 
     replTest.stopSet();

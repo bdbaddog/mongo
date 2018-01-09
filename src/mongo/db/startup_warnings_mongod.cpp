@@ -38,6 +38,7 @@
 #include <sys/resource.h>
 #endif
 
+#include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/server_options.h"
 #include "mongo/db/startup_warnings_common.h"
 #include "mongo/db/storage/storage_options.h"
@@ -136,7 +137,8 @@ StatusWith<std::string> StartupWarningsMongod::readTransparentHugePagesParameter
 }
 
 void logMongodStartupWarnings(const StorageGlobalParams& storageParams,
-                              const ServerGlobalParams& serverParams) {
+                              const ServerGlobalParams& serverParams,
+                              ServiceContext* svcCtx) {
     logCommonStartupWarnings(serverParams);
 
     bool warned = false;
@@ -367,6 +369,23 @@ void logMongodStartupWarnings(const StorageGlobalParams& storageParams,
         warned = true;
     }
 
+    if (storageParams.engine == "wiredTiger") {
+        // If the filesystemMaxCacheSize / totalMemorySize > 0.4, we should raise this
+        // warning because it leads to terrible performance for WiredTiger
+        const double filesystemCachePercentageThreshold = 0.4;
+        if (p.getMaxSystemFileCachePercentage() > filesystemCachePercentageThreshold) {
+            log() << startupWarningsLog;
+            log()
+                << "** WARNING: The file system cache of this machine is configured to be greater "
+                << "than " << 100 * filesystemCachePercentageThreshold << "% of the total memory. "
+                << "This can lead to increased memory pressure and poor performance."
+                << startupWarningsLog;
+            log() << "See http://dochub.mongodb.org/core/wt-windows-system-file-cache"
+                  << startupWarningsLog;
+            warned = true;
+        }
+    }
+
 #endif  // #ifdef _WIN32
 
     if (storageParams.engine == "ephemeralForTest") {
@@ -374,6 +393,29 @@ void logMongodStartupWarnings(const StorageGlobalParams& storageParams,
         log() << "** NOTE: The ephemeralForTest storage engine is for testing only. "
               << startupWarningsLog;
         log() << "**       Do not use in production." << startupWarningsLog;
+        warned = true;
+    }
+
+    // Check if in master-slave mode
+    auto replCoord = repl::ReplicationCoordinator::get(svcCtx);
+    if (replCoord->getReplicationMode() == repl::ReplicationCoordinator::modeMasterSlave) {
+        log() << startupWarningsLog;
+        log() << "** WARNING: This node was started in master-slave replication mode."
+              << startupWarningsLog;
+        log() << "**          Master-slave replication is deprecated and subject to be removed "
+              << startupWarningsLog;
+        log() << "**          in a future version." << startupWarningsLog;
+        warned = true;
+    }
+
+    // Check if --nojournal
+    bool isReplSet = replCoord->getReplicationMode() == repl::ReplicationCoordinator::modeReplSet;
+    if (isReplSet && storageParams.engine == "wiredTiger" && !storageParams.dur) {
+        log() << startupWarningsLog;
+        log() << "** WARNING: Running wiredTiger with the --nojournal option in a replica set"
+              << startupWarningsLog;
+        log() << "**          is deprecated and subject to be removed in a future version."
+              << startupWarningsLog;
         warned = true;
     }
 

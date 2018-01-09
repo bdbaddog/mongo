@@ -68,6 +68,7 @@ public:
     virtual OldThreadPool* getDbWorkThreadPool() const override;
     virtual Status runRepairOnLocalDB(OperationContext* opCtx) override;
     virtual Status initializeReplSetStorage(OperationContext* opCtx, const BSONObj& config);
+    virtual void waitForAllEarlierOplogWritesToBeVisible(OperationContext* opCtx);
     void onDrainComplete(OperationContext* opCtx) override;
     OpTime onTransitionToPrimary(OperationContext* opCtx, bool isV1ElectionProtocol) override;
     virtual void forwardSlaveProgress();
@@ -80,7 +81,6 @@ public:
     virtual Status storeLocalLastVoteDocument(OperationContext* opCtx, const LastVote& lastVote);
     virtual void setGlobalTimestamp(ServiceContext* service, const Timestamp& newTime);
     virtual StatusWith<OpTime> loadLastOpTime(OperationContext* opCtx);
-    virtual void cleanUpLastApplyBatch(OperationContext* opCtx);
     virtual void closeConnections();
     virtual void killAllUserOperations(OperationContext* opCtx);
     virtual void shardingOnStepDownHook();
@@ -88,9 +88,7 @@ public:
     virtual void stopProducer();
     virtual void startProducerIfStopped();
     virtual void dropAllSnapshots();
-    virtual void updateCommittedSnapshot(SnapshotName newCommitPoint);
-    virtual void createSnapshot(OperationContext* opCtx, SnapshotName name);
-    virtual void forceSnapshotCreation();
+    virtual void updateCommittedSnapshot(const OpTime& newCommitPoint);
     virtual bool snapshotsEnabled() const;
     virtual void notifyOplogMetadataWaiters(const OpTime& committedOpTime);
     virtual double getElectionTimeoutOffsetLimitFraction() const;
@@ -152,6 +150,8 @@ public:
      */
     void setStoreLocalLastVoteDocumentToHang(bool hang);
 
+    void setFirstOpTimeOfMyTerm(const OpTime& opTime);
+
     /**
      * Returns true if startThreads() has been called.
      */
@@ -199,6 +199,7 @@ private:
     bool _threadsStarted;
     bool _isReadCommittedSupported = true;
     bool _areSnapshotsEnabled = true;
+    OpTime _firstOpTimeOfMyTerm;
 };
 
 }  // namespace repl

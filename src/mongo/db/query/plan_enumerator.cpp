@@ -281,7 +281,7 @@ std::string PlanEnumerator::dumpMemo() {
     mongoutils::str::stream ss;
 
     // Note that this needs to be kept in sync with allocateAssignment which assigns memo IDs.
-    for (size_t i = 1; i < _memo.size(); ++i) {
+    for (size_t i = 1; i <= _memo.size(); ++i) {
         ss << "[Node #" << i << "]: " << _memo[i]->toString() << "\n";
     }
     return ss;
@@ -305,6 +305,10 @@ string PlanEnumerator::NodeAssignment::toString() const {
 
                 for (size_t k = 0; k < oie.preds.size(); ++k) {
                     ss << "\t\t\tpos " << oie.positions[k] << " pred " << oie.preds[k]->toString();
+                }
+
+                for (auto&& pushdown : oie.orPushdowns) {
+                    ss << "\t\torPushdownPred: " << pushdown.first->toString();
                 }
             }
         }
@@ -340,21 +344,21 @@ PlanEnumerator::MemoID PlanEnumerator::memoIDForNode(MatchExpression* node) {
     return it->second;
 }
 
-bool PlanEnumerator::getNext(MatchExpression** tree) {
+unique_ptr<MatchExpression> PlanEnumerator::getNext() {
     if (_done) {
-        return false;
+        return nullptr;
     }
 
     // Tag with our first solution.
     tagMemo(memoIDForNode(_root));
 
-    *tree = _root->shallowClone().release();
-    tagForSort(*tree);
+    unique_ptr<MatchExpression> tree(_root->shallowClone());
+    tagForSort(tree.get());
 
     _root->resetTag();
     LOG(5) << "Enumerator: memo just before moving:" << endl << dumpMemo();
     _done = nextMemo(memoIDForNode(_root));
-    return true;
+    return tree;
 }
 
 //
@@ -575,6 +579,32 @@ bool PlanEnumerator::prepMemo(MatchExpression* node, PrepMemoContext context) {
     return false;
 }
 
+void PlanEnumerator::assignToNonMultikeyMandatoryIndex(
+    const IndexEntry& index,
+    const std::vector<MatchExpression*>& predsOverLeadingField,
+    const IndexToPredMap& idxToNotFirst,
+    OneIndexAssignment* indexAssign) {
+    // Text indexes are typically multikey because there is an index key for each token in the
+    // source text. However, the leading and trailing non-text fields of the index cannot be
+    // multikey. As a result, we should use non-multikey predicate assignment rules for such
+    // indexes.
+    invariant(!index.multikey || index.type == IndexType::INDEX_TEXT);
+
+    // Since the index is not multikey, all predicates over the leading field can be assigned.
+    indexAssign->preds = predsOverLeadingField;
+
+    // Since everything in assign.preds prefixes the index, they all go at position '0' in the
+    // index, the first position.
+    indexAssign->positions.resize(indexAssign->preds.size(), 0);
+
+    // And now we begin compound analysis. Find everything that could use assign.index but isn't a
+    // pred over the first field of that index.
+    auto compIt = idxToNotFirst.find(indexAssign->index);
+    if (compIt != idxToNotFirst.end()) {
+        compound(compIt->second, index, indexAssign);
+    }
+}
+
 bool PlanEnumerator::enumerateMandatoryIndex(const IndexToPredMap& idxToFirst,
                                              const IndexToPredMap& idxToNotFirst,
                                              MatchExpression* mandatoryPred,
@@ -609,7 +639,12 @@ bool PlanEnumerator::enumerateMandatoryIndex(const IndexToPredMap& idxToFirst,
 
         const vector<MatchExpression*>& predsOverLeadingField = it->second;
 
-        if (thisIndex.multikey && !thisIndex.multikeyPaths.empty()) {
+        // Text indexes should be treated like non-multikey indexes, since the non-text fields are
+        // prohibited from containing arrays.
+        if (thisIndex.type == IndexType::INDEX_TEXT) {
+            assignToNonMultikeyMandatoryIndex(
+                thisIndex, predsOverLeadingField, idxToNotFirst, &indexAssign);
+        } else if (thisIndex.multikey && !thisIndex.multikeyPaths.empty()) {
             // 2dsphere indexes are the only special index type that should ever have path-level
             // multikey information.
             invariant(INDEX_2DSPHERE == thisIndex.type);
@@ -721,22 +756,9 @@ bool PlanEnumerator::enumerateMandatoryIndex(const IndexToPredMap& idxToFirst,
                 }
             }
         } else {
-            // For non-multikey, we don't have to do anything too special.
-            // Just assign all "first" predicates and try to compound like usual.
-            indexAssign.preds = it->second;
-
-            // Since everything in assign.preds prefixes the index, they all go
-            // at position '0' in the index, the first position.
-            indexAssign.positions.resize(indexAssign.preds.size(), 0);
-
-            // And now we begin compound analysis.
-
-            // Find everything that could use assign.index but isn't a pred over
-            // the first field of that index.
-            IndexToPredMap::const_iterator compIt = idxToNotFirst.find(indexAssign.index);
-            if (compIt != idxToNotFirst.end()) {
-                compound(compIt->second, thisIndex, &indexAssign);
-            }
+            // The index is not multikey.
+            assignToNonMultikeyMandatoryIndex(
+                thisIndex, predsOverLeadingField, idxToNotFirst, &indexAssign);
         }
 
         // The mandatory predicate must be assigned.
@@ -966,21 +988,17 @@ void PlanEnumerator::enumerateAndIntersect(const IndexToPredMap& idxToFirst,
          ++firstIt) {
         const IndexEntry& oneIndex = (*_indices)[firstIt->first];
 
-        // 'oneAssign' is used to assign indices and subnodes or to
-        // make assignments for the first index when it's multikey.
-        // It is NOT used in the inner loop that considers pairs of
-        // indices.
-        OneIndexAssignment oneAssign;
-        oneAssign.index = firstIt->first;
-        oneAssign.preds = firstIt->second;
-        // Since everything in assign.preds prefixes the index, they all go
-        // at position '0' in the index, the first position.
-        oneAssign.positions.resize(oneAssign.preds.size(), 0);
-
         // We create a scan per predicate so if we have >1 predicate we'll already
         // have at least 2 scans (one predicate per scan as the planner can't
         // intersect bounds when the index is multikey), so we stop here.
-        if (oneIndex.multikey && oneAssign.preds.size() > 1) {
+        if (oneIndex.multikey && firstIt->second.size() > 1) {
+            OneIndexAssignment oneAssign;
+            oneAssign.index = firstIt->first;
+            oneAssign.preds = firstIt->second;
+            // Since everything in assign.preds prefixes the index, they all go at position '0' in
+            // the index, the first position.
+            oneAssign.positions.resize(oneAssign.preds.size(), 0);
+
             oneAssign.canCombineBounds = false;
             // One could imagine an enormous auto-generated $all query with too many clauses to
             // have an ixscan per clause.
@@ -998,6 +1016,13 @@ void PlanEnumerator::enumerateAndIntersect(const IndexToPredMap& idxToFirst,
 
         // Output (subnode, firstAssign) pairs.
         for (size_t i = 0; i < subnodes.size(); ++i) {
+            OneIndexAssignment oneAssign;
+            oneAssign.index = firstIt->first;
+            oneAssign.preds = firstIt->second;
+            // Since everything in assign.preds prefixes the index, they all go at position '0' in
+            // the index, the first position.
+            oneAssign.positions.resize(oneAssign.preds.size(), 0);
+
             AndEnumerableState indexAndSubnode;
             indexAndSubnode.assignments.push_back(std::move(oneAssign));
             indexAndSubnode.subnodesToIndex.push_back(subnodes[i]);
@@ -1168,22 +1193,6 @@ void PlanEnumerator::enumerateAndIntersect(const IndexToPredMap& idxToFirst,
             AndEnumerableState state;
             state.assignments.push_back(std::move(firstAssign));
             state.assignments.push_back(std::move(secondAssign));
-            andAssignment->choices.push_back(std::move(state));
-        }
-    }
-
-    // TODO: Do we just want one subnode at a time?  We can use far more than 2 indices at once
-    // doing this very easily.  If we want to restrict the # of indices the children use, when
-    // we memoize the subtree above we can restrict it to 1 index at a time.  This can get
-    // tricky if we want both an intersection and a 1-index memo entry, since our state change
-    // is simple and we don't traverse the memo in any targeted way.  Should also verify that
-    // having a one-to-many mapping of MatchExpression to MemoID doesn't break anything.  This
-    // approach errors on the side of "too much indexing."
-    for (size_t i = 0; i < subnodes.size(); ++i) {
-        for (size_t j = i + 1; j < subnodes.size(); ++j) {
-            AndEnumerableState state;
-            state.subnodesToIndex.push_back(subnodes[i]);
-            state.subnodesToIndex.push_back(subnodes[j]);
             andAssignment->choices.push_back(std::move(state));
         }
     }

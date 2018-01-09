@@ -35,6 +35,7 @@
 #include "mongo/db/auth/privilege.h"
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/database.h"
+#include "mongo/db/catalog/index_catalog.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/curop.h"
 #include "mongo/db/db_raii.h"
@@ -59,9 +60,9 @@ namespace mongo {
 using std::string;
 using std::vector;
 
-class GeoHaystackSearchCommand : public Command {
+class GeoHaystackSearchCommand : public ErrmsgCommandDeprecated {
 public:
-    GeoHaystackSearchCommand() : Command("geoSearch") {}
+    GeoHaystackSearchCommand() : ErrmsgCommandDeprecated("geoSearch") {}
 
     virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
         return false;
@@ -75,7 +76,7 @@ public:
         return true;
     }
 
-    bool supportsReadConcern(const std::string& dbName, const BSONObj& cmdObj) const final {
+    bool supportsNonLocalReadConcern(const std::string& dbName, const BSONObj& cmdObj) const final {
         return true;
     }
 
@@ -95,11 +96,11 @@ public:
         out->push_back(Privilege(parseResourcePattern(dbname, cmdObj), actions));
     }
 
-    bool run(OperationContext* opCtx,
-             const string& dbname,
-             const BSONObj& cmdObj,
-             string& errmsg,
-             BSONObjBuilder& result) {
+    bool errmsgRun(OperationContext* opCtx,
+                   const string& dbname,
+                   const BSONObj& cmdObj,
+                   string& errmsg,
+                   BSONObjBuilder& result) {
         const NamespaceString nss = parseNsCollectionRequired(dbname, cmdObj);
 
         AutoGetCollectionForReadCommand ctx(opCtx, nss);

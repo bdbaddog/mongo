@@ -31,6 +31,7 @@
 #include "mongo/client/dbclientcursor.h"
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/database.h"
+#include "mongo/db/catalog/index_catalog.h"
 #include "mongo/db/client.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/dbdirectclient.h"
@@ -38,7 +39,6 @@
 #include "mongo/db/exec/plan_stage.h"
 #include "mongo/db/json.h"
 #include "mongo/db/matcher/expression_parser.h"
-#include "mongo/db/matcher/extensions_callback_disallow_extensions.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/query/plan_executor.h"
 #include "mongo/dbtests/dbtests.h"
@@ -82,8 +82,10 @@ public:
         AutoGetCollectionForReadCommand ctx(&_opCtx, NamespaceString(ns()));
 
         const CollatorInterface* collator = nullptr;
-        StatusWithMatchExpression statusWithMatcher = MatchExpressionParser::parse(
-            filterObj, ExtensionsCallbackDisallowExtensions(), collator);
+        const boost::intrusive_ptr<ExpressionContext> expCtx(
+            new ExpressionContext(&_opCtx, collator));
+        StatusWithMatchExpression statusWithMatcher =
+            MatchExpressionParser::parse(filterObj, expCtx);
         verify(statusWithMatcher.isOK());
         unique_ptr<MatchExpression> filterExpr = std::move(statusWithMatcher.getValue());
 
@@ -227,7 +229,7 @@ public:
         params.bounds.boundInclusion = BoundInclusion::kIncludeBothStartAndEndKeys;
         params.direction = 1;
 
-        ASSERT_THROWS(countResults(params, BSON("baz" << 25)), MsgAssertionException);
+        ASSERT_THROWS(countResults(params, BSON("baz" << 25)), AssertionException);
     }
 };
 

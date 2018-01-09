@@ -63,11 +63,19 @@ public:
         size_t maxMemoryUsageBytes = kDefaultMaxMemoryUsageBytes);
 
     /**
-     * Parses 'elem' into a $group stage, or throws a UserException if 'elem' was an invalid
+     * Parses 'elem' into a $group stage, or throws a AssertionException if 'elem' was an invalid
      * specification.
      */
     static boost::intrusive_ptr<DocumentSource> createFromBson(
         BSONElement elem, const boost::intrusive_ptr<ExpressionContext>& pExpCtx);
+
+    StageConstraints constraints(Pipeline::SplitState pipeState) const final {
+        return {StreamType::kBlocking,
+                PositionRequirement::kNone,
+                HostTypeRequirement::kNone,
+                DiskUseRequirement::kWritesTmpData,
+                FacetRequirement::kAllowed};
+    }
 
     /**
      * Add an accumulator, which will become a field in each Document that results from grouping.
@@ -92,7 +100,7 @@ public:
 
     // Virtuals for SplittableDocumentSource.
     boost::intrusive_ptr<DocumentSource> getShardSource() final;
-    boost::intrusive_ptr<DocumentSource> getMergeSource() final;
+    std::list<boost::intrusive_ptr<DocumentSource>> getMergeSources() final;
 
 protected:
     void doDispose() final;
@@ -176,7 +184,7 @@ private:
 
     // Only used when '_spilled' is true.
     std::unique_ptr<Sorter<Value, Value>::Iterator> _sorterIterator;
-    const bool _extSortAllowed;
+    const bool _allowDiskUse;
 
     std::pair<Value, Value> _firstPartOfNextGroup;
     // Only used when '_sorted' is true.

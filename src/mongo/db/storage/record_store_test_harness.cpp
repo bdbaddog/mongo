@@ -60,7 +60,7 @@ TEST(RecordStoreTestHarness, Simple1) {
         {
             WriteUnitOfWork uow(opCtx.get());
             StatusWith<RecordId> res =
-                rs->insertRecord(opCtx.get(), s.c_str(), s.size() + 1, false);
+                rs->insertRecord(opCtx.get(), s.c_str(), s.size() + 1, Timestamp(), false);
             ASSERT_OK(res.getStatus());
             loc1 = res.getValue();
             uow.commit();
@@ -87,7 +87,7 @@ TEST(RecordStoreTestHarness, Simple1) {
         {
             WriteUnitOfWork uow(opCtx.get());
             StatusWith<RecordId> res =
-                rs->insertRecord(opCtx.get(), s.c_str(), s.size() + 1, false);
+                rs->insertRecord(opCtx.get(), s.c_str(), s.size() + 1, Timestamp(), false);
             ASSERT_OK(res.getStatus());
             uow.commit();
         }
@@ -131,7 +131,8 @@ TEST(RecordStoreTestHarness, Simple1InsertDocWroter) {
         {
             WriteUnitOfWork uow(opCtx.get());
             DummyDocWriter dw;
-            StatusWith<RecordId> res = rs->insertRecordWithDocWriter(opCtx.get(), &dw);
+            StatusWith<RecordId> res =
+                rs->insertRecordWithDocWriter(opCtx.get(), &dw, Timestamp(1));
             ASSERT_OK(res.getStatus());
             loc1 = res.getValue();
             uow.commit();
@@ -159,7 +160,7 @@ TEST(RecordStoreTestHarness, Delete1) {
         {
             WriteUnitOfWork uow(opCtx.get());
             StatusWith<RecordId> res =
-                rs->insertRecord(opCtx.get(), s.c_str(), s.size() + 1, false);
+                rs->insertRecord(opCtx.get(), s.c_str(), s.size() + 1, Timestamp(), false);
             ASSERT_OK(res.getStatus());
             loc = res.getValue();
             uow.commit();
@@ -204,9 +205,9 @@ TEST(RecordStoreTestHarness, Delete2) {
         {
             WriteUnitOfWork uow(opCtx.get());
             StatusWith<RecordId> res =
-                rs->insertRecord(opCtx.get(), s.c_str(), s.size() + 1, false);
+                rs->insertRecord(opCtx.get(), s.c_str(), s.size() + 1, Timestamp(), false);
             ASSERT_OK(res.getStatus());
-            res = rs->insertRecord(opCtx.get(), s.c_str(), s.size() + 1, false);
+            res = rs->insertRecord(opCtx.get(), s.c_str(), s.size() + 1, Timestamp(), false);
             ASSERT_OK(res.getStatus());
             loc = res.getValue();
             uow.commit();
@@ -247,7 +248,7 @@ TEST(RecordStoreTestHarness, Update1) {
         {
             WriteUnitOfWork uow(opCtx.get());
             StatusWith<RecordId> res =
-                rs->insertRecord(opCtx.get(), s1.c_str(), s1.size() + 1, false);
+                rs->insertRecord(opCtx.get(), s1.c_str(), s1.size() + 1, Timestamp(), false);
             ASSERT_OK(res.getStatus());
             loc = res.getValue();
             uow.commit();
@@ -272,7 +273,7 @@ TEST(RecordStoreTestHarness, Update1) {
                 // provides an equivalent check as only MMAPv1 will/should return false.
                 ASSERT_FALSE(harnessHelper->supportsDocLocking());
                 StatusWith<RecordId> newLocation =
-                    rs->insertRecord(opCtx.get(), s2.c_str(), s2.size() + 1, false);
+                    rs->insertRecord(opCtx.get(), s2.c_str(), s2.size() + 1, Timestamp(), false);
                 ASSERT_OK(newLocation.getStatus());
                 rs->deleteRecord(opCtx.get(), loc);
                 loc = newLocation.getValue();
@@ -308,7 +309,7 @@ TEST(RecordStoreTestHarness, UpdateInPlace1) {
         {
             WriteUnitOfWork uow(opCtx.get());
             StatusWith<RecordId> res =
-                rs->insertRecord(opCtx.get(), s1Rec.data(), s1Rec.size(), -1);
+                rs->insertRecord(opCtx.get(), s1Rec.data(), s1Rec.size(), Timestamp(), false);
             ASSERT_OK(res.getStatus());
             loc = res.getValue();
             uow.commit();
@@ -362,7 +363,7 @@ TEST(RecordStoreTestHarness, Truncate1) {
         {
             WriteUnitOfWork uow(opCtx.get());
             StatusWith<RecordId> res =
-                rs->insertRecord(opCtx.get(), s.c_str(), s.size() + 1, false);
+                rs->insertRecord(opCtx.get(), s.c_str(), s.size() + 1, Timestamp(), false);
             ASSERT_OK(res.getStatus());
             loc = res.getValue();
             uow.commit();
@@ -384,7 +385,7 @@ TEST(RecordStoreTestHarness, Truncate1) {
         ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
         {
             WriteUnitOfWork uow(opCtx.get());
-            rs->truncate(opCtx.get());
+            rs->truncate(opCtx.get()).transitional_ignore();
             uow.commit();
         }
     }
@@ -412,8 +413,8 @@ TEST(RecordStoreTestHarness, Cursor1) {
             WriteUnitOfWork uow(opCtx.get());
             for (int i = 0; i < N; i++) {
                 string s = str::stream() << "eliot" << i;
-                ASSERT_OK(
-                    rs->insertRecord(opCtx.get(), s.c_str(), s.size() + 1, false).getStatus());
+                ASSERT_OK(rs->insertRecord(opCtx.get(), s.c_str(), s.size() + 1, Timestamp(), false)
+                              .getStatus());
             }
             uow.commit();
         }

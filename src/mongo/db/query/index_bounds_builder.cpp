@@ -39,6 +39,7 @@
 #include "mongo/db/index/expression_params.h"
 #include "mongo/db/index/s2_common.h"
 #include "mongo/db/matcher/expression_geo.h"
+#include "mongo/db/matcher/expression_internal_expr_eq.h"
 #include "mongo/db/query/collation/collation_index_key.h"
 #include "mongo/db/query/collation/collator_interface.h"
 #include "mongo/db/query/expression_index.h"
@@ -61,6 +62,34 @@ IndexBoundsBuilder::BoundsTightness getInequalityPredicateTightness(const BSONEl
                                                           : IndexBoundsBuilder::INEXACT_FETCH;
 }
 
+/**
+ * Returns true if 'str' contains a non-escaped pipe character '|' on a best-effort basis. This
+ * function reports no false negatives, but will return false positives. For example, a pipe
+ * character inside of a character class or the \Q...\E escape sequence has no special meaning but
+ * may still be reported by this function as being non-escaped.
+ */
+bool stringMayHaveUnescapedPipe(StringData str) {
+    if (str.size() > 0 && str[0] == '|') {
+        return true;
+    }
+    if (str.size() > 1 && str[1] == '|' && str[0] != '\\') {
+        return true;
+    }
+
+    for (size_t i = 2U; i < str.size(); ++i) {
+        auto probe = str[i];
+        auto prev = str[i - 1];
+        auto tail = str[i - 2];
+
+        // We consider the pipe to have a special meaning if it is not preceded by a backslash, or
+        // preceded by a backslash that is itself escaped.
+        if (probe == '|' && (prev != '\\' || (prev == '\\' && tail == '\\'))) {
+            return true;
+        }
+    }
+    return false;
+}
+
 }  // namespace
 
 string IndexBoundsBuilder::simpleRegex(const char* regex,
@@ -77,7 +106,6 @@ string IndexBoundsBuilder::simpleRegex(const char* regex,
         return "";
     }
 
-    string r = "";
     *tightnessOut = IndexBoundsBuilder::INEXACT_COVERED;
 
     bool multilineOK;
@@ -88,41 +116,42 @@ string IndexBoundsBuilder::simpleRegex(const char* regex,
         multilineOK = false;
         regex += 1;
     } else {
-        return r;
+        return "";
     }
 
-    // A regex with the "|" character is never considered a simple regular expression.
-    if (StringData(regex).find('|') != std::string::npos) {
+    // A regex with an unescaped pipe character is not considered a simple regex.
+    if (stringMayHaveUnescapedPipe(StringData(regex))) {
         return "";
     }
 
     bool extended = false;
     while (*flags) {
         switch (*(flags++)) {
-            case 'm':  // multiline
+            case 'm':
+                // Multiline mode.
                 if (multilineOK)
                     continue;
                 else
-                    return r;
+                    return "";
             case 's':
                 // Single-line mode specified. This just changes the behavior of the '.'
                 // character to match every character instead of every character except '\n'.
                 continue;
-            case 'x':  // extended
+            case 'x':
+                // Extended free-spacing mode.
                 extended = true;
                 break;
             default:
-                return r;  // cant use index
+                // Cannot use the index.
+                return "";
         }
     }
 
     mongoutils::str::stream ss;
 
+    string r = "";
     while (*regex) {
         char c = *(regex++);
-
-        // We should have bailed out early above if '|' is in the regex.
-        invariant(c != '|');
 
         if (c == '*' || c == '?') {
             // These are the only two symbols that make the last char optional
@@ -249,6 +278,14 @@ bool typeMatch(const BSONObj& obj) {
     return first.canonicalType() == second.canonicalType();
 }
 
+bool IndexBoundsBuilder::canUseCoveredMatching(const MatchExpression* expr,
+                                               const IndexEntry& index) {
+    IndexBoundsBuilder::BoundsTightness tightness;
+    OrderedIntervalList oil;
+    translate(expr, BSONElement{}, index, &oil, &tightness);
+    return tightness >= IndexBoundsBuilder::INEXACT_COVERED;
+}
+
 // static
 void IndexBoundsBuilder::translate(const MatchExpression* expr,
                                    const BSONElement& elt,
@@ -266,8 +303,8 @@ void IndexBoundsBuilder::translate(const MatchExpression* expr,
     }
 
     if (isHashed) {
-        verify(MatchExpression::EQ == expr->matchType() ||
-               MatchExpression::MATCH_IN == expr->matchType());
+        invariant(MatchExpression::MATCH_IN == expr->matchType() ||
+                  ComparisonMatchExpressionBase::isEquality(expr->matchType()));
     }
 
     if (MatchExpression::ELEM_MATCH_VALUE == expr->matchType()) {
@@ -359,8 +396,8 @@ void IndexBoundsBuilder::translate(const MatchExpression* expr,
         } else {
             *tightnessOut = IndexBoundsBuilder::INEXACT_FETCH;
         }
-    } else if (MatchExpression::EQ == expr->matchType()) {
-        const EqualityMatchExpression* node = static_cast<const EqualityMatchExpression*>(expr);
+    } else if (ComparisonMatchExpressionBase::isEquality(expr->matchType())) {
+        const auto* node = static_cast<const ComparisonMatchExpressionBase*>(expr);
         translateEquality(node->getData(), index, isHashed, oilOut, tightnessOut);
     } else if (MatchExpression::LTE == expr->matchType()) {
         const LTEMatchExpression* node = static_cast<const LTEMatchExpression*>(expr);
@@ -520,7 +557,7 @@ void IndexBoundsBuilder::translate(const MatchExpression* expr,
     } else if (MatchExpression::TYPE_OPERATOR == expr->matchType()) {
         const TypeMatchExpression* tme = static_cast<const TypeMatchExpression*>(expr);
 
-        if (tme->getType() == BSONType::Array) {
+        if (tme->typeSet().hasType(BSONType::Array)) {
             // We have $type:"array". Since arrays are indexed by creating a key for each element,
             // we have to fetch all indexed documents and check whether the full document contains
             // an array.
@@ -531,17 +568,30 @@ void IndexBoundsBuilder::translate(const MatchExpression* expr,
 
         // If we are matching all numbers, we just use the bounds for NumberInt, as these bounds
         // also include all NumberDouble and NumberLong values.
-        BSONType type = tme->matchesAllNumbers() ? BSONType::NumberInt : tme->getType();
-        BSONObjBuilder bob;
-        bob.appendMinForType("", type);
-        bob.appendMaxForType("", type);
-        BSONObj dataObj = bob.obj();
-        verify(dataObj.isOwned());
-        oilOut->intervals.push_back(
-            makeRangeInterval(dataObj, BoundInclusion::kIncludeBothStartAndEndKeys));
+        if (tme->typeSet().allNumbers) {
+            BSONObjBuilder bob;
+            bob.appendMinForType("", BSONType::NumberInt);
+            bob.appendMaxForType("", BSONType::NumberInt);
+            oilOut->intervals.push_back(
+                makeRangeInterval(bob.obj(), BoundInclusion::kIncludeBothStartAndEndKeys));
+        }
 
-        *tightnessOut = tme->matchesAllNumbers() ? IndexBoundsBuilder::EXACT
-                                                 : IndexBoundsBuilder::INEXACT_FETCH;
+        for (auto type : tme->typeSet().bsonTypes) {
+            BSONObjBuilder bob;
+            bob.appendMinForType("", type);
+            bob.appendMaxForType("", type);
+            oilOut->intervals.push_back(
+                makeRangeInterval(bob.obj(), BoundInclusion::kIncludeBothStartAndEndKeys));
+        }
+
+        // If we're only matching the "number" type, then the bounds are exact. Otherwise, the
+        // bounds may be inexact.
+        *tightnessOut = (tme->typeSet().isSingleType() && tme->typeSet().allNumbers)
+            ? IndexBoundsBuilder::EXACT
+            : IndexBoundsBuilder::INEXACT_FETCH;
+
+        // Sort the intervals, and merge redundant ones.
+        unionize(oilOut);
     } else if (MatchExpression::MATCH_IN == expr->matchType()) {
         const InMatchExpression* ime = static_cast<const InMatchExpression*>(expr);
 

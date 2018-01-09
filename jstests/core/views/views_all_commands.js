@@ -1,3 +1,6 @@
+// @tags: [does_not_support_stepdowns, requires_getmore, requires_non_retryable_commands,
+// requires_non_retryable_writes]
+
 /*
  * Declaratively-defined tests for views for all database commands. This file contains a map of test
  * definitions as well as code to run them.
@@ -66,11 +69,19 @@
         _configsvrCommitChunkMerge: {skip: isAnInternalCommand},
         _configsvrCommitChunkMigration: {skip: isAnInternalCommand},
         _configsvrCommitChunkSplit: {skip: isAnInternalCommand},
+        _configsvrCreateDatabase: {skip: isAnInternalCommand},
+        _configsvrDropCollection: {skip: isAnInternalCommand},
+        _configsvrDropDatabase: {skip: isAnInternalCommand},
+        _configsvrEnableSharding: {skip: isAnInternalCommand},
         _configsvrMoveChunk: {skip: isAnInternalCommand},
         _configsvrMovePrimary: {skip: isAnInternalCommand},
+        _configsvrRemoveShard: {skip: isAnInternalCommand},
         _configsvrRemoveShardFromZone: {skip: isAnInternalCommand},
+        _configsvrShardCollection: {skip: isAnInternalCommand},
         _configsvrSetFeatureCompatibilityVersion: {skip: isAnInternalCommand},
         _configsvrUpdateZoneKeyRange: {skip: isAnInternalCommand},
+        _flushRoutingTableCacheUpdates: {skip: isUnrelated},
+        _getNextSessionMods: {skip: isAnInternalCommand},
         _getUserCacheGeneration: {skip: isAnInternalCommand},
         _hashBSONElement: {skip: isAnInternalCommand},
         _isSelf: {skip: isAnInternalCommand},
@@ -90,7 +101,6 @@
             expectFailure: true,
             skipSharded: true,
         },
-        authSchemaUpgrade: {skip: isUnrelated},
         authenticate: {skip: isUnrelated},
         availableQueryOptions: {skip: isAnInternalCommand},
         balancerStart: {skip: isUnrelated},
@@ -121,7 +131,6 @@
         connectionStatus: {skip: isUnrelated},
         convertToCapped: {command: {convertToCapped: "view", size: 12345}, expectFailure: true},
         copydb: {skip: "Tested in replsets/copydb.js"},
-        copydbgetnonce: {skip: isUnrelated},
         copydbsaslstart: {skip: isUnrelated},
         count: {command: {count: "view"}},
         cpuload: {skip: isAnInternalCommand},
@@ -153,6 +162,7 @@
             command: {dataSize: "test.view"},
             expectFailure: true,
         },
+        dbCheck: {command: {dbCheck: "view"}, expectFailure: true},
         dbHash: {
             command: function(conn) {
                 let getHash = function() {
@@ -167,15 +177,19 @@
                                      "could not create view 'view2' on 'view'");
                 let hash2 = getHash();
                 assert.neq(hash1, hash2, "expected hash to change after creating new view");
-                assert.commandWorked(conn.runCommand({drop: "view2"}, "problem dropping view2"));
+                assert.commandWorked(conn.runCommand({drop: "view2"}), "problem dropping view2");
                 let hash3 = getHash();
                 assert.eq(hash1, hash3, "hash should be the same again after removing 'view2'");
             }
         },
         dbStats: {skip: "TODO(SERVER-25948)"},
         delete: {command: {delete: "view", deletes: [{q: {x: 1}, limit: 1}]}, expectFailure: true},
-        diagLogging: {skip: isUnrelated},
         distinct: {command: {distinct: "view", key: "_id"}},
+        doTxn: {
+            command: {doTxn: [{op: "i", o: {_id: 1}, ns: "test.view"}]},
+            expectFailure: true,
+            skipSharded: true,
+        },
         driverOIDTest: {skip: isUnrelated},
         drop: {command: {drop: "view"}},
         dropAllRolesFromDatabase: {skip: isUnrelated},
@@ -198,6 +212,7 @@
             expectFailure: true,
         },
         enableSharding: {skip: "Tested as part of shardCollection"},
+        endSessions: {skip: isUnrelated},
         eval: {skip: isUnrelated},
         explain: {command: {explain: {count: "view"}}},
         features: {skip: isUnrelated},
@@ -316,11 +331,14 @@
                     ok: 1
                 };
                 delete res.operationTime;
-                delete res.$logicalTime;
+                delete res.$clusterTime;
                 assert.eq(expectedRes, res, "unexpected result for: " + tojson(killCursorsCmd));
             }
         },
         killOp: {skip: isUnrelated},
+        killSessions: {skip: isUnrelated},
+        killAllSessions: {skip: isUnrelated},
+        killAllSessionsByPattern: {skip: isUnrelated},
         listCollections: {skip: "tested in views/views_creation.js"},
         listCommands: {skip: isUnrelated},
         listDatabases: {skip: isUnrelated},
@@ -352,6 +370,7 @@
             expectedErrorCode: ErrorCodes.NamespaceNotSharded,
         },
         movePrimary: {skip: "Tested in sharding/movePrimary1.js"},
+        multicast: {skip: isUnrelated},
         netstat: {skip: isAnInternalCommand},
         parallelCollectionScan: {command: {parallelCollectionScan: "view"}, expectFailure: true},
         ping: {command: {ping: 1}},
@@ -363,6 +382,10 @@
             {command: {planCacheListQueryShapes: "view"}, expectFailure: true},
         planCacheSetFilter: {command: {planCacheSetFilter: "view"}, expectFailure: true},
         profile: {skip: isUnrelated},
+        refreshLogicalSessionCacheNow: {skip: isAnInternalCommand},
+        reapLogicalSessionCacheNow: {skip: isAnInternalCommand},
+        refreshSessions: {skip: isUnrelated},
+        refreshSessionsInternal: {skip: isAnInternalCommand},
         reIndex: {command: {reIndex: "view"}, expectFailure: true},
         removeShard: {skip: isUnrelated},
         removeShardFromZone: {skip: isUnrelated},
@@ -400,6 +423,7 @@
         replSetSyncFrom: {skip: isUnrelated},
         replSetTest: {skip: isUnrelated},
         replSetUpdatePosition: {skip: isUnrelated},
+        replSetResizeOplog: {skip: isUnrelated},
         resetError: {skip: isUnrelated},
         resync: {skip: isUnrelated},
         revokePrivilegesFromRole: {
@@ -453,7 +477,7 @@
                 max: {x: 0},
                 keyPattern: {x: 1},
                 splitKeys: [{x: -2}, {x: -1}],
-                shardVersion: [1, 2]
+                shardVersion: [ObjectId(), 2]
             },
             skipSharded: true,
             expectFailure: true,
@@ -469,6 +493,7 @@
             expectFailure: true,
         },
         stageDebug: {skip: isAnInternalCommand},
+        startSession: {skip: isAnInternalCommand},
         top: {skip: "tested in views/views_stats.js"},
         touch: {
             command: {touch: "view", data: true},

@@ -47,7 +47,7 @@ public:
     /**
      * Constructs a LiteParsedPipeline from the raw BSON stages given in 'request'.
      *
-     * May throw a UserException if there is an invalid stage specification, although full
+     * May throw a AssertionException if there is an invalid stage specification, although full
      * validation happens later, during Pipeline construction.
      */
     LiteParsedPipeline(const AggregationRequest& request) {
@@ -72,6 +72,19 @@ public:
     }
 
     /**
+     * Returns a list of the priviliges required for this pipeline.
+     */
+    PrivilegeVector requiredPrivileges(bool isMongos) const {
+        PrivilegeVector requiredPrivileges;
+        for (auto&& spec : _stageSpecs) {
+            Privilege::addPrivilegesToPrivilegeVector(&requiredPrivileges,
+                                                      spec->requiredPrivileges(isMongos));
+        }
+
+        return requiredPrivileges;
+    }
+
+    /**
      * Returns true if the pipeline begins with a $collStats stage.
      */
     bool startsWithCollStats() const {
@@ -79,10 +92,32 @@ public:
     }
 
     /**
-     * Returns true if the pipeline begins with a $changeNotification stage.
+     * Returns true if the pipeline has a $changeStream stage.
+     *
+     * TODO SERVER-29506 Require $changeStream to be the first stage.
      */
-    bool startsWithChangeNotification() const {
-        return !_stageSpecs.empty() && _stageSpecs.front()->isChangeNotification();
+    bool hasChangeStream() const {
+        return std::any_of(_stageSpecs.begin(), _stageSpecs.end(), [](auto&& spec) {
+            return spec->isChangeStream();
+        });
+    }
+
+    /**
+     * Returns false if the pipeline has any stage which must be run locally on mongos.
+     */
+    bool allowedToForwardFromMongos() const {
+        return std::all_of(_stageSpecs.cbegin(), _stageSpecs.cend(), [](const auto& spec) {
+            return spec->allowedToForwardFromMongos();
+        });
+    }
+
+    /**
+     * Returns false if the pipeline has any Documet Source which requires rewriting via serialize.
+     */
+    bool allowedToPassthroughFromMongos() const {
+        return std::all_of(_stageSpecs.cbegin(), _stageSpecs.cend(), [](const auto& spec) {
+            return spec->allowedToPassthroughFromMongos();
+        });
     }
 
 private:

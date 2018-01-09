@@ -45,6 +45,7 @@
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/client/version_manager.h"
 #include "mongo/s/grid.h"
+#include "mongo/s/request_types/create_database_gen.h"
 #include "mongo/s/shard_id.h"
 #include "mongo/s/stale_exception.h"
 #include "mongo/util/log.h"
@@ -68,8 +69,8 @@ void appendWriteConcernErrorToCmdResponse(const ShardId& shardId,
 
 namespace {
 
-std::vector<AsyncRequestsSender::Request> buildRequestsForAllShards(OperationContext* opCtx,
-                                                                    const BSONObj& cmdObj) {
+std::vector<AsyncRequestsSender::Request> buildUnversionedRequestsForAllShards(
+    OperationContext* opCtx, const BSONObj& cmdObj) {
     std::vector<AsyncRequestsSender::Request> requests;
     std::vector<ShardId> shardIds;
     Grid::get(opCtx)->shardRegistry()->getAllShardIds(&shardIds);
@@ -79,70 +80,50 @@ std::vector<AsyncRequestsSender::Request> buildRequestsForAllShards(OperationCon
     return requests;
 }
 
-std::vector<AsyncRequestsSender::Request> buildRequestsForShardsForNamespace(
+std::vector<AsyncRequestsSender::Request> buildVersionedRequestsForTargetedShards(
     OperationContext* opCtx,
     const CachedCollectionRoutingInfo& routingInfo,
     const BSONObj& cmdObj,
-    const boost::optional<BSONObj> query,
-    const boost::optional<BSONObj> collation,
-    bool appendVersion) {
+    const BSONObj& query,
+    const BSONObj& collation) {
     std::vector<AsyncRequestsSender::Request> requests;
     if (routingInfo.cm()) {
-        // The collection is sharded.
-        // Note(esha): The for-loop is duplicated because ChunkManager::getShardIdsForQuery() and
-        // ShardRegistry::getAllShardIds() return different types: std::set and std::vector,
-        // respectively.
-        if (query) {
-            // A query was specified. Target all shards that own chunks that match the query.
-            std::set<ShardId> shardIds;
-            routingInfo.cm()->getShardIdsForQuery(
-                opCtx, *query, (collation ? *collation : BSONObj()), &shardIds);
-            for (const ShardId& shardId : shardIds) {
-                requests.emplace_back(
-                    shardId,
-                    appendVersion
-                        ? appendShardVersion(cmdObj, routingInfo.cm()->getVersion(shardId))
-                        : cmdObj);
-            }
-        } else {
-            // No query was specified. Target all shards.
-            std::vector<ShardId> shardIds;
-            Grid::get(opCtx)->shardRegistry()->getAllShardIds(&shardIds);
-            for (const ShardId& shardId : shardIds) {
-                requests.emplace_back(
-                    shardId,
-                    appendVersion
-                        ? appendShardVersion(cmdObj, routingInfo.cm()->getVersion(shardId))
-                        : cmdObj);
-            }
+        // The collection is sharded. Target all shards that own chunks that match the query.
+        std::set<ShardId> shardIds;
+        routingInfo.cm()->getShardIdsForQuery(opCtx, query, collation, &shardIds);
+        for (const ShardId& shardId : shardIds) {
+            requests.emplace_back(
+                shardId, appendShardVersion(cmdObj, routingInfo.cm()->getVersion(shardId)));
         }
     } else {
         // The collection is unsharded. Target only the primary shard for the database.
         // Don't append shard version info when contacting the config servers.
         requests.emplace_back(routingInfo.primaryId(),
-                              appendVersion && !routingInfo.primary()->isConfig()
+                              !routingInfo.primary()->isConfig()
                                   ? appendShardVersion(cmdObj, ChunkVersion::UNSHARDED())
                                   : cmdObj);
     }
     return requests;
 }
 
+/**
+ * Throws StaleConfigException if any remote returns a stale shardVersion error.
+ */
 StatusWith<std::vector<AsyncRequestsSender::Response>> gatherResponses(
     OperationContext* opCtx,
     const std::string& dbName,
-    const BSONObj& cmdObj,
     const ReadPreferenceSetting& readPref,
+    Shard::RetryPolicy retryPolicy,
     const std::vector<AsyncRequestsSender::Request>& requests,
     BSONObj* viewDefinition) {
 
     // Send the requests.
-    LOG(2) << "Dispatching command " << redact(cmdObj) << " to " << requests.size()
-           << " targeted shards using readPreference " << readPref;
     AsyncRequestsSender ars(opCtx,
                             Grid::get(opCtx)->getExecutorPool()->getArbitraryExecutor(),
                             dbName,
                             requests,
-                            readPref);
+                            readPref,
+                            retryPolicy);
 
     // Get the responses.
 
@@ -156,128 +137,148 @@ StatusWith<std::vector<AsyncRequestsSender::Response>> gatherResponses(
             // We successfully received a response.
 
             // Check for special errors that require throwing out any accumulated results.
-
-            status = getStatusFromCommandResult(response.swResponse.getValue().data);
-            LOG(2) << "Received status " << status << " and responseObj "
-                   << response.swResponse.getValue() << " from shard " << response.shardId
-                   << " at host " << response.shardHostAndPort->toString();
+            auto& responseObj = response.swResponse.getValue().data;
+            status = getStatusFromCommandResult(responseObj);
 
             // Failing to establish a consistent shardVersion means no results should be examined.
             if (ErrorCodes::isStaleShardingError(status.code())) {
-                return status;
+                throw StaleConfigException(str::stream() << "got stale shardVersion response "
+                                                         << responseObj
+                                                         << " from shard "
+                                                         << response.shardId
+                                                         << " at host "
+                                                         << response.shardHostAndPort->toString(),
+                                           responseObj);
             }
 
-            // In the case a read is performed against a view, the shard primary can return an error
+            // In the case a read is performed against a view, the server can return an error
             // indicating that the underlying collection may be sharded. When this occurs the return
             // message will include an expanded view definition and collection namespace. We pass
             // the definition back to the caller by storing it in the 'viewDefinition' parameter.
             // This allows the caller to rewrite the request as an aggregation and retry it.
             if (ErrorCodes::CommandOnShardedViewNotSupportedOnMongod == status) {
-                auto& responseObj = response.swResponse.getValue().data;
                 if (!responseObj.hasField("resolvedView")) {
-                    status = Status(ErrorCodes::InternalError,
-                                    str::stream() << "Missing field 'resolvedView' in document: "
-                                                  << responseObj);
-                    return status;
+                    return {ErrorCodes::InternalError,
+                            str::stream() << "Missing field 'resolvedView' in document: "
+                                          << responseObj};
                 }
 
                 auto resolvedViewObj = responseObj.getObjectField("resolvedView");
                 if (resolvedViewObj.isEmpty()) {
-                    status = Status(ErrorCodes::InternalError,
-                                    str::stream() << "Field 'resolvedView' must be an object: "
-                                                  << responseObj);
-                    return status;
+                    return {ErrorCodes::InternalError,
+                            str::stream() << "Field 'resolvedView' must be an object: "
+                                          << responseObj};
                 }
+
                 if (viewDefinition) {
                     *viewDefinition = BSON("resolvedView" << resolvedViewObj.getOwned());
                 }
                 return status;
             }
-
-            if (status.isOK()) {
-                // The command status was OK.
-                responses.push_back(std::move(response));
-                continue;
-            }
         }
-
-        // Either we failed to get a response, or the command had a non-OK status that we can store
-        // as an individual shard response.
-        LOG(2) << "Received error " << response.swResponse.getStatus() << " from shard "
-               << response.shardId;
         responses.push_back(std::move(response));
     }
-
     return responses;
 }
 
 }  // namespace
 
-BSONObj appendShardVersion(const BSONObj& cmdObj, ChunkVersion version) {
-    BSONObjBuilder cmdWithVersionBob;
-    cmdWithVersionBob.appendElements(cmdObj);
+BSONObj appendShardVersion(BSONObj cmdObj, ChunkVersion version) {
+    BSONObjBuilder cmdWithVersionBob(std::move(cmdObj));
     version.appendForCommands(&cmdWithVersionBob);
     return cmdWithVersionBob.obj();
 }
 
-StatusWith<std::vector<AsyncRequestsSender::Response>> scatterGather(
+StatusWith<std::vector<AsyncRequestsSender::Response>> scatterGatherUnversionedTargetAllShards(
     OperationContext* opCtx,
     const std::string& dbName,
+    boost::optional<NamespaceString> nss,
     const BSONObj& cmdObj,
-    const ReadPreferenceSetting& readPref) {
-    auto requests = buildRequestsForAllShards(opCtx, cmdObj);
-    return gatherResponses(opCtx, dbName, cmdObj, readPref, requests, nullptr /* viewDefinition */);
+    const ReadPreferenceSetting& readPref,
+    Shard::RetryPolicy retryPolicy) {
+    // Some commands, such as $currentOp, operate on a collectionless namespace. If a full namespace
+    // is specified, its database must match the dbName.
+    invariant(!nss || (nss->db() == dbName));
+
+    auto requests = buildUnversionedRequestsForAllShards(opCtx, cmdObj);
+
+    return gatherResponses(
+        opCtx, dbName, readPref, retryPolicy, requests, nullptr /* viewDefinition */);
 }
 
-StatusWith<std::vector<AsyncRequestsSender::Response>> scatterGatherForNamespace(
+StatusWith<std::vector<AsyncRequestsSender::Response>> scatterGatherVersionedTargetByRoutingTable(
     OperationContext* opCtx,
+    const std::string& dbName,
     const NamespaceString& nss,
     const BSONObj& cmdObj,
     const ReadPreferenceSetting& readPref,
-    const boost::optional<BSONObj> query,
-    const boost::optional<BSONObj> collation,
-    const bool appendShardVersion,
+    Shard::RetryPolicy retryPolicy,
+    const BSONObj& query,
+    const BSONObj& collation,
     BSONObj* viewDefinition) {
-    int numAttempts = 0;
-    StatusWith<std::vector<AsyncRequestsSender::Response>> swResponses(
-        (std::vector<AsyncRequestsSender::Response>()));
-    do {
-        // Get the routing table cache.
-        auto swRoutingInfo = Grid::get(opCtx)->catalogCache()->getCollectionRoutingInfo(opCtx, nss);
-        if (!swRoutingInfo.isOK()) {
-            return swRoutingInfo.getStatus();
-        }
-        auto routingInfo = swRoutingInfo.getValue();
+    // The database in the full namespace must match the dbName.
+    invariant(nss.db() == dbName);
 
-        // Use the routing table cache to decide which shards to target, and build the requests to
-        // send to them.
-        auto requests = buildRequestsForShardsForNamespace(
-            opCtx, routingInfo, cmdObj, query, collation, appendShardVersion);
+    auto swRoutingInfo = Grid::get(opCtx)->catalogCache()->getCollectionRoutingInfo(opCtx, nss);
+    if (!swRoutingInfo.isOK()) {
+        return swRoutingInfo.getStatus();
+    }
+    auto routingInfo = swRoutingInfo.getValue();
 
-        // Retrieve the responses from the shards.
-        swResponses =
-            gatherResponses(opCtx, nss.db().toString(), cmdObj, readPref, requests, viewDefinition);
-        ++numAttempts;
+    auto requests =
+        buildVersionedRequestsForTargetedShards(opCtx, routingInfo, cmdObj, query, collation);
 
-        // If any shard returned a stale shardVersion error, invalidate the routing table cache.
-        // This will cause the cache to be refreshed the next time it is accessed.
-        if (ErrorCodes::isStaleShardingError(swResponses.getStatus().code())) {
-            Grid::get(opCtx)->catalogCache()->onStaleConfigError(std::move(routingInfo));
-            LOG(1) << "got stale shardVersion error " << swResponses.getStatus()
-                   << " while dispatching " << redact(cmdObj) << " after " << numAttempts
-                   << " dispatch attempts";
-        }
-    } while (numAttempts < kMaxNumStaleVersionRetries && !swResponses.getStatus().isOK());
-    return swResponses;
+    return gatherResponses(opCtx, dbName, readPref, retryPolicy, requests, viewDefinition);
+}
+
+StatusWith<std::vector<AsyncRequestsSender::Response>> scatterGatherOnlyVersionIfUnsharded(
+    OperationContext* opCtx,
+    const std::string& dbName,
+    const NamespaceString& nss,
+    const BSONObj& cmdObj,
+    const ReadPreferenceSetting& readPref,
+    Shard::RetryPolicy retryPolicy) {
+    // The database in the full namespace must match the dbName.
+    invariant(nss.db() == dbName);
+
+    auto swRoutingInfo = Grid::get(opCtx)->catalogCache()->getCollectionRoutingInfo(opCtx, nss);
+    if (!swRoutingInfo.isOK()) {
+        return swRoutingInfo.getStatus();
+    }
+    auto routingInfo = swRoutingInfo.getValue();
+
+    std::vector<AsyncRequestsSender::Request> requests;
+    if (routingInfo.cm()) {
+        // An unversioned request on a sharded collection can cause a shard that has not owned data
+        // for the collection yet to implicitly create the collection without all the collection
+        // options. So, we signal to shards that they should not implicitly create the collection.
+        BSONObjBuilder augmentedCmdBob;
+        augmentedCmdBob.appendElementsUnique(cmdObj);
+        augmentedCmdBob.append("allowImplicitCollectionCreation", false);
+        requests = buildUnversionedRequestsForAllShards(opCtx, augmentedCmdBob.obj());
+    } else {
+        requests = buildVersionedRequestsForTargetedShards(
+            opCtx, routingInfo, cmdObj, BSONObj(), BSONObj());
+    }
+
+    return gatherResponses(
+        opCtx, dbName, readPref, retryPolicy, requests, nullptr /* viewDefinition */);
 }
 
 bool appendRawResponses(OperationContext* opCtx,
                         std::string* errmsg,
                         BSONObjBuilder* output,
-                        std::vector<AsyncRequestsSender::Response> shardResponses) {
-    BSONObjBuilder subobj;    // Stores raw responses by ConnectionString
-    BSONObjBuilder errors;    // Stores errors by ConnectionString
-    int commonErrCode = -1;   // Stores the overall error code
+                        std::vector<AsyncRequestsSender::Response> shardResponses,
+                        std::set<ErrorCodes::Error> ignoredErrors) {
+    // Always include ShardNotFound as an ignored error, since this node may not have realized a
+    // shard has been removed.
+    ignoredErrors.insert(ErrorCodes::ShardNotFound);
+
+    BSONObjBuilder subobj;  // Stores raw responses by ConnectionString
+
+    // Stores all errors; we will remove ignoredErrors later if some shard returned success.
+    std::vector<std::pair<std::string, Status>> errors;  // Stores errors by ConnectionString
+
     BSONElement wcErrorElem;  // Stores the first writeConcern error we encounter
     ShardId wcErrorShardId;   // Stores the shardId for the first writeConcern error we encounter
     bool hasWCError = false;  // Whether we have encountered a writeConcern error yet
@@ -287,42 +288,43 @@ bool appendRawResponses(OperationContext* opCtx,
         const auto swShard =
             Grid::get(opCtx)->shardRegistry()->getShard(opCtx, shardResponse.shardId);
         if (ErrorCodes::ShardNotFound == swShard.getStatus().code()) {
-            // If a shard got removed, ignore its response.
+            // Store the error by ShardId, since we cannot know the shard connection string, and it
+            // is only used for reporting.
+            errors.push_back(std::make_pair(shardResponse.shardId.toString(), swShard.getStatus()));
             continue;
         }
         const auto shard = uassertStatusOK(swShard);
         const auto shardConnStr = shard->getConnString().toString();
 
-        auto status = shardResponse.swResponse.getStatus();
-        if (status.isOK()) {
-            status = getStatusFromCommandResult(shardResponse.swResponse.getValue().data);
+        Status sendStatus = shardResponse.swResponse.getStatus();
+        if (!sendStatus.isOK()) {
+            // Convert the error status back into the form of a command result and append it as the
+            // raw response.
+            BSONObjBuilder statusObjBob;
+            Command::appendCommandStatus(statusObjBob, sendStatus);
+            subobj.append(shardConnStr, statusObjBob.obj());
 
-            // Report the first writeConcern error we see.
-            if (!hasWCError) {
-                if ((wcErrorElem = shardResponse.swResponse.getValue().data["writeConcernError"])) {
-                    wcErrorShardId = shardResponse.shardId;
-                    hasWCError = true;
-                }
-            }
-
-            if (status.isOK()) {
-                subobj.append(shardConnStr, shardResponse.swResponse.getValue().data);
-                continue;
-            }
+            errors.push_back(std::make_pair(shardConnStr, sendStatus));
+            continue;
         }
 
-        errors.append(shardConnStr, status.reason());
+        // Got a response from the shard.
 
-        if (commonErrCode == -1) {
-            commonErrCode = status.code();
-        } else if (commonErrCode != status.code()) {
-            commonErrCode = 0;
+        auto& resObj = shardResponse.swResponse.getValue().data;
+
+        // Append the shard's raw response.
+        subobj.append(shardConnStr, Command::filterCommandReplyForPassthrough(resObj));
+
+        auto commandStatus = getStatusFromCommandResult(resObj);
+        if (!commandStatus.isOK()) {
+            errors.push_back(std::make_pair(shardConnStr, std::move(commandStatus)));
         }
 
-        // Convert the error status back into the format of a command result.
-        BSONObjBuilder statusObjBob;
-        Command::appendCommandStatus(statusObjBob, status);
-        subobj.append(shard->getConnString().toString(), statusObjBob.obj());
+        // Report the first writeConcern error we see.
+        if (!hasWCError && (wcErrorElem = resObj["writeConcernError"])) {
+            wcErrorShardId = shardResponse.shardId;
+            hasWCError = true;
+        }
     }
 
     output->append("raw", subobj.done());
@@ -331,7 +333,28 @@ bool appendRawResponses(OperationContext* opCtx,
         appendWriteConcernErrorToCmdResponse(wcErrorShardId, wcErrorElem, *output);
     }
 
-    BSONObj errobj = errors.done();
+    // If any shard returned success, filter out ignored errors
+    bool someShardReturnedOK = (errors.size() != shardResponses.size());
+
+    BSONObjBuilder errorBob;
+    int commonErrCode = -1;
+    auto it = errors.begin();
+    while (it != errors.end()) {
+        if (someShardReturnedOK && ignoredErrors.find(it->second.code()) != ignoredErrors.end()) {
+            // Ignore the error.
+            it = errors.erase(it);
+        } else {
+            errorBob.append(it->first, it->second.reason());
+            if (commonErrCode == -1) {
+                commonErrCode = it->second.code();
+            } else if (commonErrCode != it->second.code()) {
+                commonErrCode = 0;
+            }
+            ++it;
+        }
+    }
+    BSONObj errobj = errorBob.obj();
+
     if (!errobj.isEmpty()) {
         *errmsg = errobj.toString();
 
@@ -339,6 +362,7 @@ bool appendRawResponses(OperationContext* opCtx,
         // a top-level field "code" with this value to the output object.
         if (commonErrCode > 0) {
             output->append("code", commonErrCode);
+            output->append("codeName", ErrorCodes::errorString(ErrorCodes::Error(commonErrCode)));
         }
         return false;
     }
@@ -392,9 +416,8 @@ std::vector<NamespaceString> getAllShardedCollectionsForDb(OperationContext* opC
                                                            StringData dbName) {
     const auto dbNameStr = dbName.toString();
 
-    std::vector<CollectionType> collectionsOnConfig;
-    uassertStatusOK(Grid::get(opCtx)->catalogClient(opCtx)->getCollections(
-        opCtx, &dbNameStr, &collectionsOnConfig, nullptr));
+    const std::vector<CollectionType> collectionsOnConfig = uassertStatusOK(
+        Grid::get(opCtx)->catalogClient()->getCollections(opCtx, &dbNameStr, nullptr));
 
     std::vector<NamespaceString> collectionsToReturn;
     for (const auto& coll : collectionsOnConfig) {
@@ -421,8 +444,21 @@ CachedCollectionRoutingInfo getShardedCollection(OperationContext* opCtx,
 StatusWith<CachedDatabaseInfo> createShardDatabase(OperationContext* opCtx, StringData dbName) {
     auto dbStatus = Grid::get(opCtx)->catalogCache()->getDatabase(opCtx, dbName);
     if (dbStatus == ErrorCodes::NamespaceNotFound) {
+        ConfigsvrCreateDatabase configCreateDatabaseRequest;
+        configCreateDatabaseRequest.set_configsvrCreateDatabase(dbName);
+
+        auto configShard = Grid::get(opCtx)->shardRegistry()->getConfigShard();
+
         auto createDbStatus =
-            Grid::get(opCtx)->catalogClient(opCtx)->createDatabase(opCtx, dbName.toString());
+            uassertStatusOK(
+                configShard->runCommandWithFixedRetryAttempts(
+                    opCtx,
+                    ReadPreferenceSetting(ReadPreference::PrimaryOnly),
+                    "admin",
+                    Command::appendMajorityWriteConcern(configCreateDatabaseRequest.toBSON()),
+                    Shard::RetryPolicy::kIdempotent))
+                .commandStatus;
+
         if (createDbStatus.isOK() || createDbStatus == ErrorCodes::NamespaceExists) {
             dbStatus = Grid::get(opCtx)->catalogCache()->getDatabase(opCtx, dbName);
         } else {

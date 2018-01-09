@@ -1,5 +1,5 @@
 /*-
- * Copyright (c) 2014-2017 MongoDB, Inc.
+ * Copyright (c) 2014-2018 MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -21,8 +21,8 @@ hazard_grow(WT_SESSION_IMPL *session)
 {
 	WT_HAZARD *nhazard;
 	size_t size;
-	void *ohazard;
 	uint64_t hazard_gen;
+	void *ohazard;
 
 	/*
 	 * Allocate a new, larger hazard pointer array and copy the contents of

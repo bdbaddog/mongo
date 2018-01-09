@@ -1,5 +1,5 @@
 /*-
- * Copyright (c) 2014-2017 MongoDB, Inc.
+ * Copyright (c) 2014-2018 MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -33,14 +33,17 @@ int
 util_dump(WT_SESSION *session, int argc, char *argv[])
 {
 	WT_CURSOR *cursor;
+	WT_DECL_ITEM(tmp);
 	WT_DECL_RET;
-	size_t len;
+	WT_SESSION_IMPL *session_impl;
 	int ch, i;
+	char *checkpoint, *p, *simpleuri, *uri;
 	bool hex, json, reverse;
-	char *checkpoint, *config, *p, *simpleuri, *uri;
+
+	session_impl = (WT_SESSION_IMPL *)session;
 
 	hex = json = reverse = false;
-	checkpoint = config = simpleuri = uri = NULL;
+	checkpoint = simpleuri = uri = NULL;
 	cursor = NULL;
 	while ((ch = __wt_getopt(progname, argc, argv, "c:f:jrx")) != EOF)
 		switch (ch) {
@@ -85,6 +88,7 @@ util_dump(WT_SESSION *session, int argc, char *argv[])
 	    dump_prefix(session, hex, json) != 0))
 		goto err;
 
+	WT_RET(__wt_scr_alloc(session_impl, 0, &tmp));
 	for (i = 0; i < argc; i++) {
 		if (json && i > 0)
 			if (dump_json_separator(session) != 0)
@@ -96,24 +100,14 @@ util_dump(WT_SESSION *session, int argc, char *argv[])
 		if ((uri = util_uri(session, argv[i], "table")) == NULL)
 			goto err;
 
-		len =
-		    checkpoint == NULL ? 0 : strlen("checkpoint=") +
-		    strlen(checkpoint) + 1;
-		len += strlen(json ? "dump=json" :
-		    (hex ? "dump=hex" : "dump=print"));
-		if ((config = malloc(len + 10)) == NULL)
-			goto err;
-		if (checkpoint == NULL)
-			config[0] = '\0';
-		else {
-			(void)strcpy(config, "checkpoint=");
-			(void)strcat(config, checkpoint);
-			(void)strcat(config, ",");
-		}
-		(void)strcat(config, json ? "dump=json" :
-		    (hex ? "dump=hex" : "dump=print"));
+		WT_ERR(__wt_buf_set(session_impl, tmp, "", 0));
+		if (checkpoint != NULL)
+			WT_ERR(__wt_buf_catfmt(
+			    session_impl, tmp, "checkpoint=%s,", checkpoint));
+		WT_ERR(__wt_buf_catfmt(session_impl, tmp,
+		    "dump=%s", json ? "json" : (hex ? "hex" : "print")));
 		if ((ret = session->open_cursor(
-		    session, uri, NULL, config, &cursor)) != 0) {
+		    session, uri, NULL, (char *)tmp->data, &cursor)) != 0) {
 			fprintf(stderr, "%s: cursor open(%s) failed: %s\n",
 			    progname, uri, session->strerror(session, ret));
 			goto err;
@@ -147,7 +141,7 @@ util_dump(WT_SESSION *session, int argc, char *argv[])
 err:		ret = 1;
 	}
 
-	free(config);
+	__wt_scr_free(session_impl, &tmp);
 	free(uri);
 	free(simpleuri);
 	if (cursor != NULL && (ret = cursor->close(cursor)) != 0) {
@@ -269,7 +263,7 @@ dump_add_config(WT_SESSION *session, char **bufp, size_t *leftp,
 	if (ret != 0)
 		return (util_err(session, ret, NULL));
 	*bufp += n;
-	*leftp -= (size_t)n;
+	*leftp -= n;
 	return (0);
 }
 
@@ -281,14 +275,14 @@ static int
 dump_projection(WT_SESSION *session, const char *config, WT_CURSOR *cursor,
     char **newconfigp)
 {
-	WT_DECL_RET;
 	WT_CONFIG_ITEM key, value;
 	WT_CONFIG_PARSER *parser;
+	WT_DECL_RET;
 	WT_EXTENSION_API *wt_api;
 	size_t len, vallen;
 	int nkeys;
-	char *newconfig;
 	const char *keyformat, *p;
+	char *newconfig;
 
 	len = strlen(config) + strlen(cursor->value_format) +
 	    strlen(cursor->uri) + 20;
@@ -367,8 +361,8 @@ dump_table_config(
     const char *uri, bool json)
 {
 	WT_DECL_RET;
-	char *proj_config;
 	const char *name, *v;
+	char *proj_config;
 
 	proj_config = NULL;
 	/* Get the table name. */
@@ -412,12 +406,12 @@ dump_table_parts_config(WT_SESSION *session, WT_CURSOR *cursor,
     const char *name, const char *entry, bool json)
 {
 	WT_DECL_RET;
-	bool multiple;
-	const char *groupname, *key, *sep;
 	size_t len;
 	int exact;
-	const char *v;
+	const char *groupname, *key, *sep;
 	char *uriprefix;
+	const char *v;
+	bool multiple;
 
 	multiple = false;
 	sep = "";

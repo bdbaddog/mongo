@@ -28,8 +28,6 @@
 
 #pragma once
 
-#include <boost/optional.hpp>
-#include <memory>
 #include <vector>
 
 #include "mongo/base/disallow_copying.h"
@@ -37,8 +35,11 @@
 #include "mongo/db/storage/storage_engine.h"
 #include "mongo/platform/atomic_word.h"
 #include "mongo/platform/unordered_set.h"
+#include "mongo/stdx/condition_variable.h"
 #include "mongo/stdx/functional.h"
+#include "mongo/stdx/memory.h"
 #include "mongo/stdx/mutex.h"
+#include "mongo/transport/service_executor.h"
 #include "mongo/transport/session.h"
 #include "mongo/util/clock_source.h"
 #include "mongo/util/decorable.h"
@@ -55,7 +56,6 @@ class ServiceEntryPoint;
 
 namespace transport {
 class TransportLayer;
-class TransportLayerManager;
 }  // namespace transport
 
 /**
@@ -65,6 +65,8 @@ class TransportLayerManager;
  * including limitations on the lifetime of registered listeners.
  */
 class KillOpListenerInterface {
+    MONGO_DISALLOW_COPYING(KillOpListenerInterface);
+
 public:
     /**
      * Will be called *after* ops have been told they should die.
@@ -74,20 +76,23 @@ public:
     virtual void interruptAll() = 0;
 
 protected:
+    KillOpListenerInterface() = default;
+
     // Should not delete through a pointer of this type
-    virtual ~KillOpListenerInterface() {}
+    virtual ~KillOpListenerInterface() = default;
 };
 
 class StorageFactoriesIterator {
     MONGO_DISALLOW_COPYING(StorageFactoriesIterator);
 
 public:
-    virtual ~StorageFactoriesIterator() {}
+    virtual ~StorageFactoriesIterator() = default;
+
     virtual bool more() const = 0;
     virtual const StorageEngine::Factory* next() = 0;
 
 protected:
-    StorageFactoriesIterator() {}
+    StorageFactoriesIterator() = default;
 };
 
 /**
@@ -226,10 +231,8 @@ public:
      *
      * "client" must not have an active operation context.
      *
-     * If provided, the LogicalSessionId links this operation to a logical session.
      */
-    UniqueOperationContext makeOperationContext(
-        Client* client, boost::optional<LogicalSessionId> lsid = boost::none);
+    UniqueOperationContext makeOperationContext(Client* client);
 
     //
     // Storage
@@ -351,42 +354,60 @@ public:
     ServiceEntryPoint* getServiceEntryPoint() const;
 
     /**
-     * Add a new TransportLayer to this service context. The new TransportLayer will
-     * be added to the TransportLayerManager accessible via getTransportLayer().
+     * Get the service executor for the service context.
      *
-     * It additionally calls start() on the TransportLayer after adding it.
+     * See ServiceStateMachine for how this is used. Some configurations may not have a service
+     * executor registered and this will return a nullptr.
      */
-    Status addAndStartTransportLayer(std::unique_ptr<transport::TransportLayer> tl);
+    transport::ServiceExecutor* getServiceExecutor() const;
 
-    //
-    // Global OpObserver.
-    //
+    /**
+     * Waits for the ServiceContext to be fully initialized and for all TransportLayers to have been
+     * added/started.
+     *
+     * If startup is already complete this returns immediately.
+     */
+    void waitForStartupComplete();
+
+    /*
+     * Marks initialization as complete and all transport layers as started.
+     */
+    void notifyStartupComplete();
 
     /**
      * Set the OpObserver.
      */
-    virtual void setOpObserver(std::unique_ptr<OpObserver> opObserver) = 0;
+    void setOpObserver(std::unique_ptr<OpObserver> opObserver);
 
     /**
-     * Return the OpObserver instance we're using.
+     * Return the OpObserver instance we're using. This may be an OpObserverRegistry that in fact
+     * contains multiple observers.
      */
-    virtual OpObserver* getOpObserver() = 0;
+    OpObserver* getOpObserver() const {
+        return _opObserver.get();
+    }
 
     /**
      * Returns the tick/clock source set in this context.
      */
-    TickSource* getTickSource() const;
+    TickSource* getTickSource() const {
+        return _tickSource.get();
+    }
 
     /**
      * Get a ClockSource implementation that may be less precise than the _preciseClockSource but
      * may be cheaper to call.
      */
-    ClockSource* getFastClockSource() const;
+    ClockSource* getFastClockSource() const {
+        return _fastClockSource.get();
+    }
 
     /**
      * Get a ClockSource implementation that is very precise but may be expensive to call.
      */
-    ClockSource* getPreciseClockSource() const;
+    ClockSource* getPreciseClockSource() const {
+        return _preciseClockSource.get();
+    }
 
     /**
      * Replaces the current tick/clock source with a new one. In other words, the old source will be
@@ -411,6 +432,19 @@ public:
      */
     void setServiceEntryPoint(std::unique_ptr<ServiceEntryPoint> sep);
 
+    /**
+     * Binds the TransportLayer to the service context. The TransportLayer should have already
+     * had setup() called successfully, but not startup().
+     *
+     * This should be a TransportLayerManager created with the global server configuration.
+     */
+    void setTransportLayer(std::unique_ptr<transport::TransportLayer> tl);
+
+    /**
+     * Binds the service executor to the service context
+     */
+    void setServiceExecutor(std::unique_ptr<transport::ServiceExecutor> exec);
+
 protected:
     ServiceContext();
 
@@ -424,16 +458,7 @@ private:
     /**
      * Returns a new OperationContext. Private, for use by makeOperationContext.
      */
-    virtual std::unique_ptr<OperationContext> _newOpCtx(Client* client,
-                                                        unsigned opId,
-                                                        boost::optional<LogicalSessionId>) = 0;
-
-    /**
-     * Kills the given operation.
-     *
-     * Caller must own the service context's _mutex.
-     */
-    void _killOperation_inlock(OperationContext* opCtx, ErrorCodes::Error killCode);
+    virtual std::unique_ptr<OperationContext> _newOpCtx(Client* client, unsigned opId) = 0;
 
     /**
      * The periodic runner.
@@ -441,9 +466,9 @@ private:
     std::unique_ptr<PeriodicRunner> _runner;
 
     /**
-     * The TransportLayerManager.
+     * The TransportLayer.
      */
-    std::unique_ptr<transport::TransportLayerManager> _transportLayerManager;
+    std::unique_ptr<transport::TransportLayer> _transportLayer;
 
     /**
      * The service entry point
@@ -451,10 +476,20 @@ private:
     std::unique_ptr<ServiceEntryPoint> _serviceEntryPoint;
 
     /**
+     * The ServiceExecutor
+     */
+    std::unique_ptr<transport::ServiceExecutor> _serviceExecutor;
+
+    /**
      * Vector of registered observers.
      */
     std::vector<std::unique_ptr<ClientObserver>> _clientObservers;
     ClientSet _clients;
+
+    /**
+     * The registered OpObserver.
+     */
+    std::unique_ptr<OpObserver> _opObserver;
 
     std::unique_ptr<TickSource> _tickSource;
 
@@ -477,6 +512,9 @@ private:
 
     // Counter for assigning operation ids.
     AtomicUInt32 _nextOpId{1};
+
+    bool _startupComplete = false;
+    stdx::condition_variable _startupCompleteCondVar;
 };
 
 /**
@@ -492,6 +530,17 @@ bool hasGlobalServiceContext();
  * Caller does not own pointer.
  */
 ServiceContext* getGlobalServiceContext();
+
+/**
+ * Warning - This function is temporary. Do not introduce new uses of this API.
+ *
+ * Returns the singleton ServiceContext for this server process.
+ *
+ * Waits until there is a valid global ServiceContext.
+ *
+ * Caller does not own pointer.
+ */
+ServiceContext* waitAndGetGlobalServiceContext();
 
 /**
  * Sets the global ServiceContext.  If 'serviceContext' is NULL, un-sets and deletes

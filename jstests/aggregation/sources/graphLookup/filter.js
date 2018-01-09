@@ -75,4 +75,20 @@
               .toArray()[0];
 
     assert.eq(res.results.length, 1);
+
+    // $expr is allowed inside the 'restrictSearchWithMatch' match expression.
+    res = local
+              .aggregate({
+                  $graphLookup: {
+                      from: "foreign",
+                      startWith: "$starting",
+                      connectFromField: "to",
+                      connectToField: "from",
+                      as: "results",
+                      restrictSearchWithMatch: {$expr: {$eq: ["$shouldBeIncluded", true]}}
+                  }
+              })
+              .toArray()[0];
+
+    assert.eq(res.results.length, 1);
 })();

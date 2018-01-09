@@ -31,6 +31,7 @@
 #include "mongo/db/exec/idhack.h"
 
 #include "mongo/client/dbclientinterface.h"
+#include "mongo/db/catalog/index_catalog.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/exec/projection.h"
 #include "mongo/db/exec/scoped_timer.h"
@@ -160,7 +161,7 @@ PlanStage::StageState IDHackStage::doWork(WorkingSetID* out) {
         }
 
         return advance(id, member, out);
-    } catch (const WriteConflictException& wce) {
+    } catch (const WriteConflictException&) {
         // Restart at the beginning on retry.
         _recordCursor.reset();
         if (id != WorkingSet::INVALID_ID)

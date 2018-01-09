@@ -34,7 +34,6 @@
 
 #include "mongo/base/data_cursor.h"
 #include "mongo/base/init.h"
-#include "mongo/base/owned_pointer_vector.h"
 #include "mongo/base/status.h"
 #include "mongo/bson/util/bson_extract.h"
 #include "mongo/bson/util/builder.h"
@@ -42,17 +41,21 @@
 #include "mongo/db/auth/action_type.h"
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/commands.h"
+#include "mongo/db/initialize_operation_session_info.h"
 #include "mongo/db/lasterror.h"
 #include "mongo/db/logical_clock.h"
+#include "mongo/db/logical_session_id_helpers.h"
 #include "mongo/db/logical_time_validator.h"
 #include "mongo/db/matcher/extensions_callback_noop.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_time_tracker.h"
+#include "mongo/db/ops/write_ops.h"
 #include "mongo/db/query/find_common.h"
 #include "mongo/db/query/getmore_request.h"
 #include "mongo/db/query/query_request.h"
 #include "mongo/db/stats/counters.h"
 #include "mongo/db/views/resolved_view.h"
+#include "mongo/rpc/factory.h"
 #include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/rpc/metadata/logical_time_metadata.h"
 #include "mongo/rpc/metadata/tracking_metadata.h"
@@ -66,9 +69,6 @@
 #include "mongo/s/query/cluster_cursor_manager.h"
 #include "mongo/s/query/cluster_find.h"
 #include "mongo/s/stale_exception.h"
-#include "mongo/s/write_ops/batch_upconvert.h"
-#include "mongo/s/write_ops/batched_command_request.h"
-#include "mongo/s/write_ops/batched_command_response.h"
 #include "mongo/util/log.h"
 #include "mongo/util/mongoutils/str.h"
 #include "mongo/util/net/op_msg.h"
@@ -76,16 +76,9 @@
 #include "mongo/util/timer.h"
 
 namespace mongo {
-
-using std::unique_ptr;
-using std::shared_ptr;
-using std::set;
-using std::string;
-using std::stringstream;
-
 namespace {
 
-const std::string kOperationTime = "operationTime";
+const auto kOperationTime = "operationTime"_sd;
 
 /**
  * Extract and process metadata from the command request body.
@@ -102,7 +95,6 @@ Status processCommandMetadata(OperationContext* opCtx, const BSONObj& cmdObj) {
         return logicalTimeMetadata.getStatus();
     }
 
-    auto authSession = AuthorizationSession::get(opCtx->getClient());
     auto logicalTimeValidator = LogicalTimeValidator::get(opCtx);
     const auto& signedTime = logicalTimeMetadata.getValue().getSignedTime();
 
@@ -111,7 +103,7 @@ Status processCommandMetadata(OperationContext* opCtx, const BSONObj& cmdObj) {
         return Status::OK();
     }
 
-    if (authSession->getAuthorizationManager().isAuthEnabled()) {
+    if (!LogicalTimeValidator::isAuthorizedToAdvanceClock(opCtx)) {
         auto advanceClockStatus = logicalTimeValidator->validate(opCtx, signedTime);
 
         if (!advanceClockStatus.isOK()) {
@@ -126,20 +118,27 @@ Status processCommandMetadata(OperationContext* opCtx, const BSONObj& cmdObj) {
  * Append required fields to command response.
  */
 void appendRequiredFieldsToResponse(OperationContext* opCtx, BSONObjBuilder* responseBuilder) {
-    // Add $logicalTime.
     auto validator = LogicalTimeValidator::get(opCtx);
-    auto currentTime =
-        validator->signLogicalTime(opCtx, LogicalClock::get(opCtx)->getClusterTime());
-    rpc::LogicalTimeMetadata(currentTime).writeToMetadata(responseBuilder);
+    if (validator->shouldGossipLogicalTime()) {
+        // Add $clusterTime.
+        auto now = LogicalClock::get(opCtx)->getClusterTime();
+        if (LogicalTimeValidator::isAuthorizedToAdvanceClock(opCtx)) {
+            SignedLogicalTime dummySignedTime(now, TimeProofService::TimeProof(), 0);
+            rpc::LogicalTimeMetadata(dummySignedTime).writeToMetadata(responseBuilder);
+        } else {
+            auto currentTime = validator->signLogicalTime(opCtx, now);
+            rpc::LogicalTimeMetadata(currentTime).writeToMetadata(responseBuilder);
+        }
 
-    // Add operationTime.
-    if (auto tracker = OperationTimeTracker::get(opCtx)) {
+        // Add operationTime.
         auto operationTime = OperationTimeTracker::get(opCtx)->getMaxOperationTime();
-        responseBuilder->append(kOperationTime, operationTime.asTimestamp());
-    } else if (currentTime.getTime() != LogicalTime::kUninitialized) {
-        // If we don't know the actual operation time, use the cluster time instead. This is safe
-        // but not optimal because we can always return a later operation time than actual.
-        responseBuilder->append(kOperationTime, currentTime.getTime().asTimestamp());
+        if (operationTime != LogicalTime::kUninitialized) {
+            responseBuilder->append(kOperationTime, operationTime.asTimestamp());
+        } else if (now != LogicalTime::kUninitialized) {
+            // If we don't know the actual operation time, use the cluster time instead. This is
+            // safe but not optimal because we can always return a later operation time than actual.
+            responseBuilder->append(kOperationTime, now.asTimestamp());
+        }
     }
 }
 
@@ -175,7 +174,7 @@ void execCommandClient(OperationContext* opCtx,
                 topLevelFields[fieldName]++ == 0);
     }
 
-    Status status = Command::checkAuthorization(c, opCtx, dbname, request.body);
+    Status status = Command::checkAuthorization(c, opCtx, request);
     if (!status.isOK()) {
         Command::appendCommandStatus(result, status);
         return;
@@ -215,57 +214,26 @@ void execCommandClient(OperationContext* opCtx,
         return;
     }
 
-    std::string errmsg;
     bool ok = false;
-    try {
-        if (!supportsWriteConcern) {
-            ok = c->enhancedRun(opCtx, request, errmsg, result);
-        } else {
-            // Change the write concern while running the command.
-            const auto oldWC = opCtx->getWriteConcern();
-            ON_BLOCK_EXIT([&] { opCtx->setWriteConcern(oldWC); });
-            opCtx->setWriteConcern(wcResult.getValue());
+    if (!supportsWriteConcern) {
+        ok = c->publicRun(opCtx, request, result);
+    } else {
+        // Change the write concern while running the command.
+        const auto oldWC = opCtx->getWriteConcern();
+        ON_BLOCK_EXIT([&] { opCtx->setWriteConcern(oldWC); });
+        opCtx->setWriteConcern(wcResult.getValue());
 
-            ok = c->enhancedRun(opCtx, request, errmsg, result);
-        }
-    } catch (const DBException& e) {
-        result.resetToEmpty();
-        const int code = e.getCode();
-
-        // Codes for StaleConfigException
-        if (code == ErrorCodes::RecvStaleConfig || code == ErrorCodes::SendStaleConfig) {
-            throw;
-        }
-
-        errmsg = e.what();
-        result.append("code", code);
+        ok = c->publicRun(opCtx, request, result);
     }
-
     if (!ok) {
         c->incrementCommandsFailed();
     }
-
-    Command::appendCommandStatus(result, ok, errmsg);
-}
-
-void runAgainstRegistered(OperationContext* opCtx,
-                          const OpMsgRequest& request,
-                          BSONObjBuilder& anObjBuilder) {
-    const auto commandName = request.getCommandName();
-    Command* c = Command::findCommand(commandName);
-    if (!c) {
-        Command::appendCommandStatus(
-            anObjBuilder,
-            {ErrorCodes::CommandNotFound, str::stream() << "no such cmd: " << commandName});
-        Command::unknownCommands.increment();
-        return;
-    }
-
-    execCommandClient(opCtx, c, request, anObjBuilder);
+    Command::appendCommandStatus(result, ok);
 }
 
 void runCommand(OperationContext* opCtx, const OpMsgRequest& request, BSONObjBuilder&& builder) {
-    // Handle command option maxTimeMS.
+    // Handle command option maxTimeMS first thing while processing the command so that the
+    // subsequent code has the deadline available
     uassert(ErrorCodes::InvalidOptions,
             "no such command option $maxTimeMs; use maxTimeMS instead",
             request.body[QueryRequest::queryOptionMaxTimeMS].eoo());
@@ -276,12 +244,25 @@ void runCommand(OperationContext* opCtx, const OpMsgRequest& request, BSONObjBui
         opCtx->setDeadlineAfterNowBy(Milliseconds{maxTimeMS});
     }
 
+    auto const commandName = request.getCommandName();
+    auto const command = Command::findCommand(commandName);
+    if (!command) {
+        ON_BLOCK_EXIT([opCtx, &builder] { appendRequiredFieldsToResponse(opCtx, &builder); });
+        Command::appendCommandStatus(
+            builder,
+            {ErrorCodes::CommandNotFound, str::stream() << "no such cmd: " << commandName});
+        Command::unknownCommands.increment();
+        return;
+    }
+
+    initializeOperationSessionInfo(opCtx, request.body, command->requiresAuth(), true, true);
+
     int loops = 5;
 
     while (true) {
         builder.resetToEmpty();
         try {
-            runAgainstRegistered(opCtx, request, builder);
+            execCommandClient(opCtx, command, request, builder);
             return;
         } catch (const StaleConfigException& e) {
             if (e.getns().empty()) {
@@ -304,15 +285,21 @@ void runCommand(OperationContext* opCtx, const OpMsgRequest& request, BSONObjBui
                     Grid::get(opCtx)->catalogCache()->invalidateShardedCollection(staleNSS);
                 }
             }
+
             continue;
         } catch (const DBException& e) {
+            ON_BLOCK_EXIT([opCtx, &builder] { appendRequiredFieldsToResponse(opCtx, &builder); });
             builder.resetToEmpty();
+            command->incrementCommandsFailed();
             Command::appendCommandStatus(builder, e.toStatus());
+            LastError::get(opCtx->getClient()).setLastError(e.code(), e.reason());
             return;
         }
+
         MONGO_UNREACHABLE;
     }
 }
+
 }  // namespace
 
 DbResponse Strategy::queryOp(OperationContext* opCtx, const NamespaceString& nss, DbMessage* dbm) {
@@ -345,8 +332,13 @@ DbResponse Strategy::queryOp(OperationContext* opCtx, const NamespaceString& nss
     ReadPreferenceSetting::get(opCtx) =
         uassertStatusOK(ReadPreferenceSetting::fromContainingBSON(q.query, defaultReadPref));
 
-    auto canonicalQuery =
-        uassertStatusOK(CanonicalQuery::canonicalize(opCtx, q, ExtensionsCallbackNoop()));
+    const boost::intrusive_ptr<ExpressionContext> expCtx;
+    auto canonicalQuery = uassertStatusOK(
+        CanonicalQuery::canonicalize(opCtx,
+                                     q,
+                                     expCtx,
+                                     ExtensionsCallbackNoop(),
+                                     MatchExpressionParser::kAllowAllSpecialFeatures));
 
     // If the $explain flag was set, we must run the operation on the shards as an explain command
     // rather than a find command.
@@ -403,116 +395,56 @@ DbResponse Strategy::queryOp(OperationContext* opCtx, const NamespaceString& nss
                                          cursorId.getValue())};
 }
 
-DbResponse Strategy::clientOpQueryCommand(OperationContext* opCtx,
-                                          NamespaceString nss,
-                                          DbMessage* dbm) {
-    const QueryMessage q(*dbm);
+DbResponse Strategy::clientCommand(OperationContext* opCtx, const Message& m) {
+    auto reply = rpc::makeReplyBuilder(rpc::protocolForMessage(m));
 
-    LOG(3) << "command: " << nss << " " << redact(q.query) << " ntoreturn: " << q.ntoreturn
-           << " options: " << q.queryOptions;
+    [&] {
+        OpMsgRequest request;
+        std::string db;
+        try {  // Parse.
+            request = rpc::opMsgRequestFromAnyProtocol(m);
+            db = request.getDatabase().toString();
+        } catch (const DBException& ex) {
+            // If this error needs to fail the connection, propagate it out.
+            if (ErrorCodes::isConnectionFatalMessageParseError(ex.code()))
+                throw;
 
-    if (q.queryOptions & QueryOption_Exhaust) {
-        uasserted(18527,
-                  str::stream() << "The 'exhaust' query option is invalid for mongos commands: "
-                                << nss.ns()
-                                << " "
-                                << q.query.toString());
-    }
+            LOG(1) << "Exception thrown while parsing command " << causedBy(redact(ex));
+            reply->reset();
+            auto bob = reply->getInPlaceReplyBuilder(0);
+            Command::appendCommandStatus(bob, ex.toStatus());
+            appendRequiredFieldsToResponse(opCtx, &bob);
 
-    uassert(16978,
-            str::stream() << "Bad numberToReturn (" << q.ntoreturn
-                          << ") for $cmd type ns - can only be 1 or -1",
-            q.ntoreturn == 1 || q.ntoreturn == -1);
-
-    BSONObj cmdObj = q.query;
-
-    // Handle the $cmd.sys pseudo-commands
-    if (nss.isSpecialCommand()) {
-        const auto upgradeToRealCommand = [&](StringData commandName) {
-            BSONObjBuilder cmdBob;
-            cmdBob.append(commandName, 1);
-            cmdBob.appendElements(cmdObj);  // fields are validated by Commands
-            return cmdBob.obj();
-        };
-
-        if (nss.coll() == "$cmd.sys.inprog") {
-            cmdObj = upgradeToRealCommand("currentOp");
-        } else if (nss.coll() == "$cmd.sys.killop") {
-            cmdObj = upgradeToRealCommand("killOp");
-        } else if (nss.coll() == "$cmd.sys.unlock") {
-            uasserted(40442, "can't do unlock through mongos");
-        } else {
-            uasserted(40443, str::stream() << "unknown psuedo-command namespace " << nss.ns());
+            return;  // From lambda. Don't try executing if parsing failed.
         }
 
-        // These commands must be run against the admin db even though the psuedo commands
-        // ignored the db.
-        nss = NamespaceString("admin", "$cmd");
-    }
+        try {  // Execute.
+            LOG(3) << "Command begin db: " << db << " msg id: " << m.header().getId();
+            runCommand(opCtx, request, reply->getInPlaceReplyBuilder(0));
+            LOG(3) << "Command end db: " << db << " msg id: " << m.header().getId();
+        } catch (const DBException& ex) {
+            LOG(1) << "Exception thrown while processing command on " << db
+                   << " msg id: " << m.header().getId() << causedBy(redact(ex));
 
-    {
-        bool haveReadPref = false;
-        BSONElement e = cmdObj.firstElement();
-        if (e.type() == Object && (e.fieldName()[0] == '$' ? str::equals("query", e.fieldName() + 1)
-                                                           : str::equals("query", e.fieldName()))) {
-            // Extract the embedded query object.
-            if (auto readPrefElem = cmdObj[Query::ReadPrefField.name()]) {
-                // The command has a read preference setting. We don't want to lose this information
-                // so we copy it to a new field called $queryOptions.$readPreference
-                haveReadPref = true;
-                BSONObjBuilder finalCmdObjBuilder;
-                finalCmdObjBuilder.appendElements(e.embeddedObject());
-                finalCmdObjBuilder.append(readPrefElem);
-                cmdObj = finalCmdObjBuilder.obj();
-            } else {
-                cmdObj = e.embeddedObject();
-            }
+            reply->reset();
+            auto bob = reply->getInPlaceReplyBuilder(0);
+            Command::appendCommandStatus(bob, ex.toStatus());
+            appendRequiredFieldsToResponse(opCtx, &bob);
         }
+    }();
 
-        if (!haveReadPref && q.queryOptions & QueryOption_SlaveOk) {
-            // If the slaveOK bit is set, behave as-if read preference secondary-preferred was
-            // specified.
-            const auto readPref = ReadPreferenceSetting(ReadPreference::SecondaryPreferred);
-            BSONObjBuilder finalCmdObjBuilder;
-            finalCmdObjBuilder.appendElements(cmdObj);
-            readPref.toContainingBSON(&finalCmdObjBuilder);
-            cmdObj = finalCmdObjBuilder.obj();
-        }
+    if (OpMsg::isFlagSet(m, OpMsg::kMoreToCome)) {
+        return {};  // Don't reply.
     }
 
-    auto request = OpMsgRequest::fromDBAndBody(nss.db(), cmdObj);
-    OpQueryReplyBuilder reply;
-    runCommand(opCtx, request, BSONObjBuilder(reply.bufBuilderForResults()));
-    return DbResponse{reply.toCommandReply()};
-}
-
-DbResponse Strategy::clientOpMsgCommand(OperationContext* opCtx, const Message& m) {
-    // TODO SERVER-28964 If this parsing the request fails we reply to an invalid request which
-    // isn't always safe. Unfortunately tests currently rely on this. Figure out what to do
-    // (probably throw a special exception type like ConnectionFatalMessageParseError).
-    bool canReply = true;
-    boost::optional<OpMsgRequest> request;
-    OpMsgBuilder reply;
-    try {
-        request.emplace(OpMsgRequest::parse(m));  // Request is validated here.
-        canReply = !request->isFlagSet(OpMsg::kMoreToCome);
-        runCommand(opCtx, *request, reply.beginBody());
-    } catch (const DBException& ex) {
-        reply.reset();
-        auto bob = reply.beginBody();
-        Command::appendCommandStatus(bob, ex.toStatus());
-    }
-
-    if (!canReply)
-        return {};
-
-    return DbResponse{reply.finish()};
+    reply->setMetadata(BSONObj());  // mongos doesn't use metadata but the API requires this call.
+    return DbResponse{reply->done()};
 }
 
 void Strategy::commandOp(OperationContext* opCtx,
-                         const string& db,
+                         const std::string& db,
                          const BSONObj& command,
-                         const string& versionedNS,
+                         const std::string& versionedNS,
                          const BSONObj& targetingQuery,
                          const BSONObj& targetingCollation,
                          std::vector<CommandResult>* results) {
@@ -524,7 +456,7 @@ void Strategy::commandOp(OperationContext* opCtx,
     // Initialize the cursor
     cursor.init(opCtx);
 
-    set<ShardId> shardIds;
+    std::set<ShardId> shardIds;
     cursor.getQueryShardIds(shardIds);
 
     for (const ShardId& shardId : shardIds) {
@@ -615,16 +547,28 @@ void Strategy::killCursors(OperationContext* opCtx, DbMessage* dbm) {
             continue;
         }
 
-        Status authorizationStatus = authSession->checkAuthForKillCursors(*nss, cursorId);
-        audit::logKillCursorsAuthzCheck(client,
-                                        *nss,
-                                        cursorId,
-                                        authorizationStatus.isOK() ? ErrorCodes::OK
-                                                                   : ErrorCodes::Unauthorized);
-        if (!authorizationStatus.isOK()) {
-            LOG(3) << "Not authorized to kill cursor.  Namespace: '" << *nss
-                   << "', cursor id: " << cursorId << ".";
-            continue;
+        {
+            // Block scope ccPin so that it releases our checked out cursor
+            // prior to the killCursor invocation below.
+            auto ccPin = manager->checkOutCursor(*nss, cursorId, opCtx);
+            if (!ccPin.isOK()) {
+                LOG(3) << "Unable to check out cursor for killCursor.  Namespace: '" << *nss
+                       << "', cursor id: " << cursorId << ".";
+                continue;
+            }
+            auto cursorOwners = ccPin.getValue().getAuthenticatedUsers();
+            auto authorizationStatus = authSession->checkAuthForKillCursors(*nss, cursorOwners);
+
+            audit::logKillCursorsAuthzCheck(client,
+                                            *nss,
+                                            cursorId,
+                                            authorizationStatus.isOK() ? ErrorCodes::OK
+                                                                       : ErrorCodes::Unauthorized);
+            if (!authorizationStatus.isOK()) {
+                LOG(3) << "Not authorized to kill cursor.  Namespace: '" << *nss
+                       << "', cursor id: " << cursorId << ".";
+                continue;
+            }
         }
 
         Status killCursorStatus = manager->killCursor(*nss, cursorId);
@@ -639,51 +583,25 @@ void Strategy::killCursors(OperationContext* opCtx, DbMessage* dbm) {
 }
 
 void Strategy::writeOp(OperationContext* opCtx, DbMessage* dbm) {
-    std::vector<std::unique_ptr<BatchedCommandRequest>> commandRequests;
+    runCommand(opCtx,
+               [&]() {
+                   const auto& msg = dbm->msg();
 
-    msgToBatchRequests(dbm->msg(), &commandRequests);
-
-    auto& clientLastError = LastError::get(opCtx->getClient());
-
-    for (auto it = commandRequests.begin(); it != commandRequests.end(); ++it) {
-        // Multiple commands registered to last error as multiple requests
-        if (it != commandRequests.begin()) {
-            clientLastError.startRequest();
-        }
-
-        BatchedCommandRequest* const commandRequest = it->get();
-
-        BatchedCommandResponse commandResponse;
-
-        {
-            // Disable the last error object for the duration of the write cmd
-            LastError::Disabled disableLastError(&clientLastError);
-
-            // Adjust namespace for command
-            const NamespaceString& fullNS(commandRequest->getNS());
-
-            BSONObj commandBSON = commandRequest->toBSON();
-
-            BSONObjBuilder builder;
-            runAgainstRegistered(
-                opCtx, OpMsgRequest::fromDBAndBody(fullNS.db(), commandBSON), builder);
-
-            bool parsed = commandResponse.parseBSON(builder.done(), nullptr);
-            (void)parsed;  // for compile
-            dassert(parsed && commandResponse.isValid(nullptr));
-        }
-
-        // Populate the lastError object based on the write response
-        clientLastError.reset();
-
-        const bool hadError =
-            batchErrorToLastError(*commandRequest, commandResponse, &clientLastError);
-
-        // Check if this is an ordered batch and we had an error which should stop processing
-        if (commandRequest->getOrdered() && hadError) {
-            break;
-        }
-    }
+                   switch (msg.operation()) {
+                       case dbInsert: {
+                           return InsertOp::parseLegacy(msg).serialize({});
+                       }
+                       case dbUpdate: {
+                           return UpdateOp::parseLegacy(msg).serialize({});
+                       }
+                       case dbDelete: {
+                           return DeleteOp::parseLegacy(msg).serialize({});
+                       }
+                       default:
+                           MONGO_UNREACHABLE;
+                   }
+               }(),
+               BSONObjBuilder());
 }
 
 Status Strategy::explainFind(OperationContext* opCtx,
@@ -698,14 +616,16 @@ Status Strategy::explainFind(OperationContext* opCtx,
     Timer timer;
 
     BSONObj viewDefinition;
-    auto swShardResponses = scatterGatherForNamespace(opCtx,
-                                                      qr.nss(),
-                                                      explainCmd,
-                                                      readPref,
-                                                      qr.getFilter(),
-                                                      qr.getCollation(),
-                                                      true,  // do shard versioning
-                                                      &viewDefinition);
+    auto swShardResponses =
+        scatterGatherVersionedTargetByRoutingTable(opCtx,
+                                                   qr.nss().db().toString(),
+                                                   qr.nss(),
+                                                   explainCmd,
+                                                   readPref,
+                                                   Shard::RetryPolicy::kIdempotent,
+                                                   qr.getFilter(),
+                                                   qr.getCollation(),
+                                                   &viewDefinition);
 
     long long millisElapsed = timer.millis();
 

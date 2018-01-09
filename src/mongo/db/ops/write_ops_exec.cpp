@@ -53,6 +53,8 @@
 #include "mongo/db/ops/update_lifecycle_impl.h"
 #include "mongo/db/ops/update_request.h"
 #include "mongo/db/ops/write_ops_exec.h"
+#include "mongo/db/ops/write_ops_gen.h"
+#include "mongo/db/ops/write_ops_retryability.h"
 #include "mongo/db/query/get_executor.h"
 #include "mongo/db/query/plan_summary_stats.h"
 #include "mongo/db/query/query_knobs.h"
@@ -60,6 +62,7 @@
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/s/collection_sharding_state.h"
 #include "mongo/db/s/sharding_state.h"
+#include "mongo/db/session_catalog.h"
 #include "mongo/db/stats/counters.h"
 #include "mongo/db/stats/top.h"
 #include "mongo/db/write_concern.h"
@@ -96,7 +99,7 @@ void finishCurOp(OperationContext* opCtx, CurOp* curOp) {
                     curOp->isCommand(),
                     curOp->getReadWriteType());
 
-        if (!curOp->debug().exceptionInfo.empty()) {
+        if (!curOp->debug().exceptionInfo.isOK()) {
             LOG(3) << "Caught Assertion in " << redact(logicalOpToString(curOp->getLogicalOp()))
                    << ": " << curOp->debug().exceptionInfo.toString();
         }
@@ -175,7 +178,7 @@ void assertCanWrite_inlock(OperationContext* opCtx, const NamespaceString& ns) {
 }
 
 void makeCollection(OperationContext* opCtx, const NamespaceString& ns) {
-    MONGO_WRITE_CONFLICT_RETRY_LOOP_BEGIN {
+    writeConflictRetry(opCtx, "implicit collection creation", ns.ns(), [&opCtx, &ns] {
         AutoGetOrCreateDb db(opCtx, ns.db(), MODE_X);
         assertCanWrite_inlock(opCtx, ns);
         if (!db.getDb()->getCollection(opCtx, ns)) {  // someone else may have beat us to it.
@@ -183,8 +186,7 @@ void makeCollection(OperationContext* opCtx, const NamespaceString& ns) {
             uassertStatusOK(userCreateNS(opCtx, db.getDb(), ns.ns(), BSONObj()));
             wuow.commit();
         }
-    }
-    MONGO_WRITE_CONFLICT_RETRY_LOOP_END(opCtx, "implicit collection creation", ns.ns());
+    });
 }
 
 /**
@@ -192,49 +194,49 @@ void makeCollection(OperationContext* opCtx, const NamespaceString& ns) {
  */
 bool handleError(OperationContext* opCtx,
                  const DBException& ex,
-                 const ParsedWriteOp& wholeOp,
+                 const NamespaceString& nss,
+                 const write_ops::WriteCommandBase& wholeOp,
                  WriteResult* out) {
-    LastError::get(opCtx->getClient()).setLastError(ex.getCode(), ex.getInfo().msg);
+    LastError::get(opCtx->getClient()).setLastError(ex.code(), ex.reason());
     auto& curOp = *CurOp::get(opCtx);
-    curOp.debug().exceptionInfo = ex.getInfo();
+    curOp.debug().exceptionInfo = ex.toStatus();
 
-    if (ErrorCodes::isInterruption(ErrorCodes::Error(ex.getCode()))) {
+    if (ErrorCodes::isInterruption(ex.code())) {
         throw;  // These have always failed the whole batch.
     }
 
-    if (ErrorCodes::isStaleShardingError(ErrorCodes::Error(ex.getCode()))) {
-        auto staleConfigException = dynamic_cast<const SendStaleConfigException*>(&ex);
+    if (ErrorCodes::isStaleShardingError(ex.code())) {
+        auto staleConfigException = dynamic_cast<const StaleConfigException*>(&ex);
         if (!staleConfigException) {
             // We need to get extra info off of the SCE, but some common patterns can result in the
-            // exception being converted to a Status then rethrown as a UserException, losing the
-            // info we need. It would be a bug if this happens so we want to detect it in testing,
-            // but it isn't severe enough that we should bring down the server if it happens in
-            // production.
+            // exception being converted to a Status then rethrown as a AssertionException, losing
+            // the info we need. It would be a bug if this happens so we want to detect it in
+            // testing, but it isn't severe enough that we should bring down the server if it
+            // happens in production.
             dassert(staleConfigException);
-            msgassertedNoTrace(35475,
-                               str::stream()
-                                   << "Got a StaleConfig error but exception was the wrong type: "
-                                   << demangleName(typeid(ex)));
+            msgasserted(35475,
+                        str::stream()
+                            << "Got a StaleConfig error but exception was the wrong type: "
+                            << demangleName(typeid(ex)));
         }
 
         if (!opCtx->getClient()->isInDirectClient()) {
-            ShardingState::get(opCtx)->onStaleShardVersion(
-                opCtx, wholeOp.ns, staleConfigException->getVersionReceived());
+            ShardingState::get(opCtx)
+                ->onStaleShardVersion(opCtx, nss, staleConfigException->getVersionReceived())
+                .transitional_ignore();
         }
-        out->staleConfigException =
-            stdx::make_unique<SendStaleConfigException>(*staleConfigException);
+        out->staleConfigException = stdx::make_unique<StaleConfigException>(*staleConfigException);
         return false;
     }
 
     out->results.emplace_back(ex.toStatus());
-    return wholeOp.continueOnError;
+
+    return !wholeOp.getOrdered();
 }
 
-}  // namespace
-
-static WriteResult::SingleResult createIndex(OperationContext* opCtx,
-                                             const NamespaceString& systemIndexes,
-                                             const BSONObj& spec) {
+SingleWriteResult createIndex(OperationContext* opCtx,
+                              const NamespaceString& systemIndexes,
+                              const BSONObj& spec) {
     BSONElement nsElement = spec["ns"];
     uassert(ErrorCodes::NoSuchKey, "Missing \"ns\" field in index description", !nsElement.eoo());
     uassert(ErrorCodes::TypeMismatch,
@@ -252,14 +254,9 @@ static WriteResult::SingleResult createIndex(OperationContext* opCtx,
     BSONObjBuilder cmdBuilder;
     cmdBuilder << "createIndexes" << ns.coll();
     cmdBuilder << "indexes" << BSON_ARRAY(spec);
-    auto cmd = cmdBuilder.obj();
 
-    BSONObjBuilder cmdReplyBuilder;
-    std::string errMsg;
-    bool ok = Command::findCommand("createIndexes")
-                  ->run(opCtx, systemIndexes.db().toString(), cmd, errMsg, cmdReplyBuilder);
-    Command::appendCommandStatus(cmdReplyBuilder, ok, errMsg);
-    auto cmdResult = cmdReplyBuilder.obj();
+    auto cmdResult = Command::runCommandDirectly(
+        opCtx, OpMsgRequest::fromDBAndBody(systemIndexes.db(), cmdBuilder.obj()));
     uassertStatusOK(getStatusFromCommandResult(cmdResult));
 
     // Unlike normal inserts, it is not an error to "insert" a duplicate index.
@@ -267,10 +264,12 @@ static WriteResult::SingleResult createIndex(OperationContext* opCtx,
         cmdResult["numIndexesAfter"].numberInt() - cmdResult["numIndexesBefore"].numberInt();
     CurOp::get(opCtx)->debug().ninserted += n;
 
-    return {n};
+    SingleWriteResult result;
+    result.setN(n);
+    return result;
 }
 
-static WriteResult performCreateIndexes(OperationContext* opCtx, const InsertOp& wholeOp) {
+WriteResult performCreateIndexes(OperationContext* opCtx, const write_ops::Insert& wholeOp) {
     // Currently this creates each index independently. We could pass multiple indexes to
     // createIndexes, but there is a lot of complexity involved in doing it correctly. For one
     // thing, createIndexes only takes indexes to a single collection, but this batch could include
@@ -279,15 +278,16 @@ static WriteResult performCreateIndexes(OperationContext* opCtx, const InsertOp&
     // errors or stops at the first one. These could theoretically be worked around, but it doesn't
     // seem worth it since users that want faster index builds should just use the createIndexes
     // command rather than a legacy emulation.
-    LastOpFixer lastOpFixer(opCtx, wholeOp.ns);
+    LastOpFixer lastOpFixer(opCtx, wholeOp.getNamespace());
     WriteResult out;
-    for (auto&& spec : wholeOp.documents) {
+    for (auto&& spec : wholeOp.getDocuments()) {
         try {
             lastOpFixer.startingOp();
-            out.results.emplace_back(createIndex(opCtx, wholeOp.ns, spec));
+            out.results.emplace_back(createIndex(opCtx, wholeOp.getNamespace(), spec));
             lastOpFixer.finishedOpSuccessfully();
         } catch (const DBException& ex) {
-            const bool canContinue = handleError(opCtx, ex, wholeOp, &out);
+            const bool canContinue =
+                handleError(opCtx, ex, wholeOp.getNamespace(), wholeOp.getWriteCommandBase(), &out);
             if (!canContinue)
                 break;
         }
@@ -295,13 +295,33 @@ static WriteResult performCreateIndexes(OperationContext* opCtx, const InsertOp&
     return out;
 }
 
-static void insertDocuments(OperationContext* opCtx,
-                            Collection* collection,
-                            std::vector<BSONObj>::const_iterator begin,
-                            std::vector<BSONObj>::const_iterator end) {
-    // Intentionally not using a WRITE_CONFLICT_RETRY_LOOP. That is handled by the caller so it can
-    // react to oversized batches.
+void insertDocuments(OperationContext* opCtx,
+                     Collection* collection,
+                     std::vector<InsertStatement>::iterator begin,
+                     std::vector<InsertStatement>::iterator end) {
+    // Intentionally not using writeConflictRetry. That is handled by the caller so it can react to
+    // oversized batches.
     WriteUnitOfWork wuow(opCtx);
+
+    // Acquire optimes and fill them in for each item in the batch.
+    // This must only be done for doc-locking storage engines, which are allowed to insert oplog
+    // documents out-of-timestamp-order.  For other storage engines, the oplog entries must be
+    // physically written in timestamp order, so we defer optime assignment until the oplog is about
+    // to be written.
+    auto batchSize = std::distance(begin, end);
+    if (supportsDocLocking()) {
+        auto replCoord = repl::ReplicationCoordinator::get(opCtx);
+        if (!replCoord->isOplogDisabledFor(opCtx, collection->ns())) {
+            // Populate 'slots' with new optimes for each insert.
+            // This also notifies the storage engine of each new timestamp.
+            auto oplogSlots = repl::getNextOpTimes(opCtx, batchSize);
+            auto slot = oplogSlots.begin();
+            for (auto it = begin; it != end; it++) {
+                it->oplogSlot = *slot++;
+            }
+        }
+    }
+
     uassertStatusOK(collection->insertDocuments(
         opCtx, begin, end, &CurOp::get(opCtx)->debug(), /*enforceQuota*/ true));
     wuow.commit();
@@ -310,11 +330,11 @@ static void insertDocuments(OperationContext* opCtx,
 /**
  * Returns true if caller should try to insert more documents. Does nothing else if batch is empty.
  */
-static bool insertBatchAndHandleErrors(OperationContext* opCtx,
-                                       const InsertOp& wholeOp,
-                                       const std::vector<BSONObj>& batch,
-                                       LastOpFixer* lastOpFixer,
-                                       WriteResult* out) {
+bool insertBatchAndHandleErrors(OperationContext* opCtx,
+                                const write_ops::Insert& wholeOp,
+                                std::vector<InsertStatement>& batch,
+                                LastOpFixer* lastOpFixer,
+                                WriteResult* out) {
     if (batch.empty())
         return true;
 
@@ -329,16 +349,16 @@ static bool insertBatchAndHandleErrors(OperationContext* opCtx,
                 uasserted(ErrorCodes::InternalError, "failAllInserts failpoint active!");
             }
 
-            collection.emplace(opCtx, wholeOp.ns, MODE_IX);
+            collection.emplace(opCtx, wholeOp.getNamespace(), MODE_IX);
             if (collection->getCollection())
                 break;
 
             collection.reset();  // unlock.
-            makeCollection(opCtx, wholeOp.ns);
+            makeCollection(opCtx, wholeOp.getNamespace());
         }
 
         curOp.raiseDbProfileLevel(collection->getDb()->getProfilingLevel());
-        assertCanWrite_inlock(opCtx, wholeOp.ns);
+        assertCanWrite_inlock(opCtx, wholeOp.getNamespace());
     };
 
     try {
@@ -350,13 +370,16 @@ static bool insertBatchAndHandleErrors(OperationContext* opCtx,
             insertDocuments(opCtx, collection->getCollection(), batch.begin(), batch.end());
             lastOpFixer->finishedOpSuccessfully();
             globalOpCounters.gotInserts(batch.size());
-            std::fill_n(
-                std::back_inserter(out->results), batch.size(), WriteResult::SingleResult{1});
+            SingleWriteResult result;
+            result.setN(1);
+
+            std::fill_n(std::back_inserter(out->results), batch.size(), std::move(result));
             curOp.debug().ninserted += batch.size();
             return true;
         }
-    } catch (const DBException& ex) {
+    } catch (const DBException&) {
         collection.reset();
+
         // Ignore this failure and behave as-if we never tried to do the combined batch insert.
         // The loop below will handle reporting any non-transient errors.
     }
@@ -366,14 +389,16 @@ static bool insertBatchAndHandleErrors(OperationContext* opCtx,
     for (auto it = batch.begin(); it != batch.end(); ++it) {
         globalOpCounters.gotInsert();
         try {
-            MONGO_WRITE_CONFLICT_RETRY_LOOP_BEGIN {
+            writeConflictRetry(opCtx, "insert", wholeOp.getNamespace().ns(), [&] {
                 try {
                     if (!collection)
                         acquireCollection();
                     lastOpFixer->startingOp();
                     insertDocuments(opCtx, collection->getCollection(), it, it + 1);
                     lastOpFixer->finishedOpSuccessfully();
-                    out->results.emplace_back(WriteResult::SingleResult{1});
+                    SingleWriteResult result;
+                    result.setN(1);
+                    out->results.emplace_back(std::move(result));
                     curOp.debug().ninserted++;
                 } catch (...) {
                     // Release the lock following any error. Among other things, this ensures that
@@ -381,10 +406,10 @@ static bool insertBatchAndHandleErrors(OperationContext* opCtx,
                     collection.reset();
                     throw;
                 }
-            }
-            MONGO_WRITE_CONFLICT_RETRY_LOOP_END(opCtx, "insert", wholeOp.ns.ns());
+            });
         } catch (const DBException& ex) {
-            bool canContinue = handleError(opCtx, ex, wholeOp, out);
+            bool canContinue =
+                handleError(opCtx, ex, wholeOp.getNamespace(), wholeOp.getWriteCommandBase(), out);
             if (!canContinue)
                 return false;
         }
@@ -393,7 +418,22 @@ static bool insertBatchAndHandleErrors(OperationContext* opCtx,
     return true;
 }
 
-WriteResult performInserts(OperationContext* opCtx, const InsertOp& wholeOp) {
+template <typename T>
+StmtId getStmtIdForWriteOp(OperationContext* opCtx, const T& wholeOp, size_t opIndex) {
+    return opCtx->getTxnNumber() ? write_ops::getStmtIdForWriteAt(wholeOp, opIndex)
+                                 : kUninitializedStmtId;
+}
+
+SingleWriteResult makeWriteResultForInsertOrDeleteRetry() {
+    SingleWriteResult res;
+    res.setN(1);
+    res.setNModified(0);
+    return res;
+}
+
+}  // namespace
+
+WriteResult performInserts(OperationContext* opCtx, const write_ops::Insert& wholeOp) {
     invariant(!opCtx->lockState()->inAWriteUnitOfWork());  // Does own retries.
     auto& curOp = *CurOp::get(opCtx);
     ON_BLOCK_EXIT([&] {
@@ -402,7 +442,7 @@ WriteResult performInserts(OperationContext* opCtx, const InsertOp& wholeOp) {
         curOp.done();
         Top::get(opCtx->getServiceContext())
             .record(opCtx,
-                    wholeOp.ns.ns(),
+                    wholeOp.getNamespace().ns(),
                     LogicalOp::opInsert,
                     Top::LockType::WriteLocked,
                     durationCount<Microseconds>(curOp.elapsedTimeExcludingPauses()),
@@ -413,39 +453,52 @@ WriteResult performInserts(OperationContext* opCtx, const InsertOp& wholeOp) {
 
     {
         stdx::lock_guard<Client> lk(*opCtx->getClient());
-        curOp.setNS_inlock(wholeOp.ns.ns());
+        curOp.setNS_inlock(wholeOp.getNamespace().ns());
         curOp.setLogicalOp_inlock(LogicalOp::opInsert);
         curOp.ensureStarted();
         curOp.debug().ninserted = 0;
     }
 
-    uassertStatusOK(userAllowedWriteNS(wholeOp.ns));
+    uassertStatusOK(userAllowedWriteNS(wholeOp.getNamespace()));
 
-    if (wholeOp.ns.isSystemDotIndexes()) {
+    if (wholeOp.getNamespace().isSystemDotIndexes()) {
         return performCreateIndexes(opCtx, wholeOp);
     }
 
-    DisableDocumentValidationIfTrue docValidationDisabler(opCtx, wholeOp.bypassDocumentValidation);
-    LastOpFixer lastOpFixer(opCtx, wholeOp.ns);
+    DisableDocumentValidationIfTrue docValidationDisabler(
+        opCtx, wholeOp.getWriteCommandBase().getBypassDocumentValidation());
+    LastOpFixer lastOpFixer(opCtx, wholeOp.getNamespace());
 
     WriteResult out;
-    out.results.reserve(wholeOp.documents.size());
+    out.results.reserve(wholeOp.getDocuments().size());
 
+    size_t stmtIdIndex = 0;
     size_t bytesInBatch = 0;
-    std::vector<BSONObj> batch;
+    std::vector<InsertStatement> batch;
     const size_t maxBatchSize = internalInsertMaxBatchSize.load();
-    batch.reserve(std::min(wholeOp.documents.size(), maxBatchSize));
+    batch.reserve(std::min(wholeOp.getDocuments().size(), maxBatchSize));
 
-    for (auto&& doc : wholeOp.documents) {
-        const bool isLastDoc = (&doc == &wholeOp.documents.back());
+    for (auto&& doc : wholeOp.getDocuments()) {
+        const bool isLastDoc = (&doc == &wholeOp.getDocuments().back());
         auto fixedDoc = fixDocumentForInsert(opCtx->getServiceContext(), doc);
         if (!fixedDoc.isOK()) {
             // Handled after we insert anything in the batch to be sure we report errors in the
             // correct order. In an ordered insert, if one of the docs ahead of us fails, we should
             // behave as-if we never got to this document.
         } else {
-            batch.push_back(fixedDoc.getValue().isEmpty() ? doc : std::move(fixedDoc.getValue()));
-            bytesInBatch += batch.back().objsize();
+            const auto stmtId = getStmtIdForWriteOp(opCtx, wholeOp, stmtIdIndex++);
+            if (opCtx->getTxnNumber()) {
+                auto session = OperationContextSession::get(opCtx);
+                if (session->checkStatementExecutedNoOplogEntryFetch(*opCtx->getTxnNumber(),
+                                                                     stmtId)) {
+                    out.results.emplace_back(makeWriteResultForInsertOrDeleteRetry());
+                    continue;
+                }
+            }
+
+            BSONObj toInsert = fixedDoc.getValue().isEmpty() ? doc : std::move(fixedDoc.getValue());
+            batch.emplace_back(stmtId, toInsert);
+            bytesInBatch += batch.back().doc.objsize();
             if (!isLastDoc && batch.size() < maxBatchSize && bytesInBatch < insertVectorMaxBytes)
                 continue;  // Add more to batch before inserting.
         }
@@ -456,11 +509,13 @@ WriteResult performInserts(OperationContext* opCtx, const InsertOp& wholeOp) {
 
         if (canContinue && !fixedDoc.isOK()) {
             globalOpCounters.gotInsert();
-            canContinue = handleError(
-                opCtx,
-                UserException(fixedDoc.getStatus().code(), fixedDoc.getStatus().reason()),
-                wholeOp,
-                &out);
+            try {
+                uassertStatusOK(fixedDoc.getStatus());
+                MONGO_UNREACHABLE;
+            } catch (const DBException& ex) {
+                canContinue = handleError(
+                    opCtx, ex, wholeOp.getNamespace(), wholeOp.getWriteCommandBase(), &out);
+            }
         }
 
         if (!canContinue)
@@ -470,9 +525,14 @@ WriteResult performInserts(OperationContext* opCtx, const InsertOp& wholeOp) {
     return out;
 }
 
-static WriteResult::SingleResult performSingleUpdateOp(OperationContext* opCtx,
-                                                       const NamespaceString& ns,
-                                                       const UpdateOp::SingleUpdate& op) {
+static SingleWriteResult performSingleUpdateOp(OperationContext* opCtx,
+                                               const NamespaceString& ns,
+                                               StmtId stmtId,
+                                               const write_ops::UpdateOpEntry& op) {
+    uassert(ErrorCodes::InvalidOptions,
+            "Cannot use (or request) retryable writes with multi=true",
+            !(opCtx->getTxnNumber() && op.getMulti()));
+
     globalOpCounters.gotUpdate();
     auto& curOp = *CurOp::get(opCtx);
     {
@@ -487,12 +547,13 @@ static WriteResult::SingleResult performSingleUpdateOp(OperationContext* opCtx,
     UpdateLifecycleImpl updateLifecycle(ns);
     UpdateRequest request(ns);
     request.setLifecycle(&updateLifecycle);
-    request.setQuery(op.query);
-    request.setCollation(op.collation);
-    request.setUpdates(op.update);
-    request.setArrayFilters(op.arrayFilters);
-    request.setMulti(op.multi);
-    request.setUpsert(op.upsert);
+    request.setQuery(op.getQ());
+    request.setUpdates(op.getU());
+    request.setCollation(write_ops::collationOf(op));
+    request.setStmtId(stmtId);
+    request.setArrayFilters(write_ops::arrayFiltersOf(op));
+    request.setMulti(op.getMulti());
+    request.setUpsert(op.getUpsert());
     request.setYieldPolicy(PlanExecutor::YIELD_AUTO);  // ParsedUpdate overrides this for $isolated.
 
     ParsedUpdate parsedUpdate(opCtx, &request);
@@ -509,7 +570,7 @@ static WriteResult::SingleResult performSingleUpdateOp(OperationContext* opCtx,
                            ns,
                            MODE_IX,  // DB is always IX, even if collection is X.
                            parsedUpdate.isIsolated() ? MODE_X : MODE_IX);
-        if (collection->getCollection() || !op.upsert)
+        if (collection->getCollection() || !op.getUpsert())
             break;
 
         collection.reset();  // unlock.
@@ -553,19 +614,37 @@ static WriteResult::SingleResult performSingleUpdateOp(OperationContext* opCtx,
     const long long nMatchedOrInserted = didInsert ? 1 : res.numMatched;
     LastError::get(opCtx->getClient()).recordUpdate(res.existing, nMatchedOrInserted, res.upserted);
 
-    return {nMatchedOrInserted, res.numDocsModified, res.upserted};
+    SingleWriteResult result;
+    result.setN(nMatchedOrInserted);
+    result.setNModified(res.numDocsModified);
+    result.setUpsertedId(res.upserted);
+
+    return result;
 }
 
-WriteResult performUpdates(OperationContext* opCtx, const UpdateOp& wholeOp) {
+WriteResult performUpdates(OperationContext* opCtx, const write_ops::Update& wholeOp) {
     invariant(!opCtx->lockState()->inAWriteUnitOfWork());  // Does own retries.
-    uassertStatusOK(userAllowedWriteNS(wholeOp.ns));
+    uassertStatusOK(userAllowedWriteNS(wholeOp.getNamespace()));
 
-    DisableDocumentValidationIfTrue docValidationDisabler(opCtx, wholeOp.bypassDocumentValidation);
-    LastOpFixer lastOpFixer(opCtx, wholeOp.ns);
+    DisableDocumentValidationIfTrue docValidationDisabler(
+        opCtx, wholeOp.getWriteCommandBase().getBypassDocumentValidation());
+    LastOpFixer lastOpFixer(opCtx, wholeOp.getNamespace());
 
+    size_t stmtIdIndex = 0;
     WriteResult out;
-    out.results.reserve(wholeOp.updates.size());
-    for (auto&& singleOp : wholeOp.updates) {
+    out.results.reserve(wholeOp.getUpdates().size());
+
+    for (auto&& singleOp : wholeOp.getUpdates()) {
+        const auto stmtId = getStmtIdForWriteOp(opCtx, wholeOp, stmtIdIndex++);
+        if (opCtx->getTxnNumber()) {
+            auto session = OperationContextSession::get(opCtx);
+            if (auto entry =
+                    session->checkStatementExecuted(opCtx, *opCtx->getTxnNumber(), stmtId)) {
+                out.results.emplace_back(parseOplogEntryForUpdate(*entry));
+                continue;
+            }
+        }
+
         // TODO: don't create nested CurOp for legacy writes.
         // Add Command pointer to the nested CurOp.
         auto& parentCurOp = *CurOp::get(opCtx);
@@ -578,10 +657,12 @@ WriteResult performUpdates(OperationContext* opCtx, const UpdateOp& wholeOp) {
         ON_BLOCK_EXIT([&] { finishCurOp(opCtx, &curOp); });
         try {
             lastOpFixer.startingOp();
-            out.results.emplace_back(performSingleUpdateOp(opCtx, wholeOp.ns, singleOp));
+            out.results.emplace_back(
+                performSingleUpdateOp(opCtx, wholeOp.getNamespace(), stmtId, singleOp));
             lastOpFixer.finishedOpSuccessfully();
         } catch (const DBException& ex) {
-            const bool canContinue = handleError(opCtx, ex, wholeOp, &out);
+            const bool canContinue =
+                handleError(opCtx, ex, wholeOp.getNamespace(), wholeOp.getWriteCommandBase(), &out);
             if (!canContinue)
                 break;
         }
@@ -590,9 +671,14 @@ WriteResult performUpdates(OperationContext* opCtx, const UpdateOp& wholeOp) {
     return out;
 }
 
-static WriteResult::SingleResult performSingleDeleteOp(OperationContext* opCtx,
-                                                       const NamespaceString& ns,
-                                                       const DeleteOp::SingleDelete& op) {
+static SingleWriteResult performSingleDeleteOp(OperationContext* opCtx,
+                                               const NamespaceString& ns,
+                                               StmtId stmtId,
+                                               const write_ops::DeleteOpEntry& op) {
+    uassert(ErrorCodes::InvalidOptions,
+            "Cannot use (or request) retryable writes with limit=0",
+            !(opCtx->getTxnNumber() && op.getMulti()));
+
     globalOpCounters.gotDelete();
     auto& curOp = *CurOp::get(opCtx);
     {
@@ -607,10 +693,11 @@ static WriteResult::SingleResult performSingleDeleteOp(OperationContext* opCtx,
     curOp.debug().ndeleted = 0;
 
     DeleteRequest request(ns);
-    request.setQuery(op.query);
-    request.setCollation(op.collation);
-    request.setMulti(op.multi);
+    request.setQuery(op.getQ());
+    request.setCollation(write_ops::collationOf(op));
+    request.setMulti(op.getMulti());
     request.setYieldPolicy(PlanExecutor::YIELD_AUTO);  // ParsedDelete overrides this for $isolated.
+    request.setStmtId(stmtId);
 
     ParsedDelete parsedDelete(opCtx, &request);
     uassertStatusOK(parsedDelete.parseRequest());
@@ -658,19 +745,33 @@ static WriteResult::SingleResult performSingleDeleteOp(OperationContext* opCtx,
 
     LastError::get(opCtx->getClient()).recordDelete(n);
 
-    return {n};
+    SingleWriteResult result;
+    result.setN(n);
+    return result;
 }
 
-WriteResult performDeletes(OperationContext* opCtx, const DeleteOp& wholeOp) {
+WriteResult performDeletes(OperationContext* opCtx, const write_ops::Delete& wholeOp) {
     invariant(!opCtx->lockState()->inAWriteUnitOfWork());  // Does own retries.
-    uassertStatusOK(userAllowedWriteNS(wholeOp.ns));
+    uassertStatusOK(userAllowedWriteNS(wholeOp.getNamespace()));
 
-    DisableDocumentValidationIfTrue docValidationDisabler(opCtx, wholeOp.bypassDocumentValidation);
-    LastOpFixer lastOpFixer(opCtx, wholeOp.ns);
+    DisableDocumentValidationIfTrue docValidationDisabler(
+        opCtx, wholeOp.getWriteCommandBase().getBypassDocumentValidation());
+    LastOpFixer lastOpFixer(opCtx, wholeOp.getNamespace());
 
+    size_t stmtIdIndex = 0;
     WriteResult out;
-    out.results.reserve(wholeOp.deletes.size());
-    for (auto&& singleOp : wholeOp.deletes) {
+    out.results.reserve(wholeOp.getDeletes().size());
+
+    for (auto&& singleOp : wholeOp.getDeletes()) {
+        const auto stmtId = getStmtIdForWriteOp(opCtx, wholeOp, stmtIdIndex++);
+        if (opCtx->getTxnNumber()) {
+            auto session = OperationContextSession::get(opCtx);
+            if (session->checkStatementExecutedNoOplogEntryFetch(*opCtx->getTxnNumber(), stmtId)) {
+                out.results.emplace_back(makeWriteResultForInsertOrDeleteRetry());
+                continue;
+            }
+        }
+
         // TODO: don't create nested CurOp for legacy writes.
         // Add Command pointer to the nested CurOp.
         auto& parentCurOp = *CurOp::get(opCtx);
@@ -683,10 +784,12 @@ WriteResult performDeletes(OperationContext* opCtx, const DeleteOp& wholeOp) {
         ON_BLOCK_EXIT([&] { finishCurOp(opCtx, &curOp); });
         try {
             lastOpFixer.startingOp();
-            out.results.emplace_back(performSingleDeleteOp(opCtx, wholeOp.ns, singleOp));
+            out.results.emplace_back(
+                performSingleDeleteOp(opCtx, wholeOp.getNamespace(), stmtId, singleOp));
             lastOpFixer.finishedOpSuccessfully();
         } catch (const DBException& ex) {
-            const bool canContinue = handleError(opCtx, ex, wholeOp, &out);
+            const bool canContinue =
+                handleError(opCtx, ex, wholeOp.getNamespace(), wholeOp.getWriteCommandBase(), &out);
             if (!canContinue)
                 break;
         }

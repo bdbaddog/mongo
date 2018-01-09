@@ -14,8 +14,8 @@ from . import report as _report
 from . import testcases
 from .. import config as _config
 from .. import errors
-from .. import logging
 from .. import utils
+from ..core import network
 from ..utils import queue as _queue
 
 
@@ -40,14 +40,31 @@ class TestSuiteExecutor(object):
         """
         self.logger = exec_logger
 
-        self.fixture_config = fixture
+        if _config.SHELL_CONN_STRING is not None:
+            # Specifying the shellConnString command line option should override the fixture
+            # specified in the YAML configuration to be the no-op fixture.
+            self.fixture_config = {"class": fixtures.NOOP_FIXTURE_CLASS}
+        else:
+            self.fixture_config = fixture
+
         self.hooks_config = utils.default_if_none(hooks, [])
         self.test_config = utils.default_if_none(config, {})
 
         self._suite = suite
 
+        # Only start as many jobs as we need. Note this means that the number of jobs we run may not
+        # actually be _config.JOBS or self._suite.options.num_jobs.
+        jobs_to_start = self._suite.options.num_jobs
+        num_tests = len(suite.tests)
+
+        if num_tests < jobs_to_start:
+            self.logger.info(
+                "Reducing the number of jobs from %d to %d since there are only %d test(s) to run.",
+                self._suite.options.num_jobs, num_tests, num_tests)
+            jobs_to_start = num_tests
+
         # Must be done after getting buildlogger configuration.
-        self._jobs = [self._make_job(job_num) for job_num in xrange(_config.JOBS)]
+        self._jobs = [self._make_job(job_num) for job_num in xrange(jobs_to_start)]
 
     def run(self):
         """
@@ -66,7 +83,7 @@ class TestSuiteExecutor(object):
                 return_code = 2
                 return
 
-            num_repeats = _config.REPEAT
+            num_repeats = self._suite.options.num_repeats
             while num_repeats > 0:
                 test_queue = self._make_test_queue()
 
@@ -95,7 +112,7 @@ class TestSuiteExecutor(object):
 
                 if not report.wasSuccessful():
                     return_code = 1
-                    if _config.FAIL_FAST:
+                    if self._suite.options.fail_fast:
                         break
 
                 # Clear the report so it can be reused for the next execution.
@@ -112,6 +129,12 @@ class TestSuiteExecutor(object):
         """
         Sets up a fixture for each job.
         """
+
+        # We reset the internal state of the PortAllocator before calling job.fixture.setup() so
+        # that ports used by the fixture during a test suite run earlier can be reused during this
+        # current test suite.
+        network.PortAllocator.reset()
+
         for job in self._jobs:
             try:
                 job.fixture.setup()
@@ -225,7 +248,7 @@ class TestSuiteExecutor(object):
             behavior_config = behavior_config.copy()
             behavior_class = behavior_config.pop("class")
 
-            hook_logger = self.logger.new_hook_logger(behavior_class, job_num)
+            hook_logger = self.logger.new_hook_logger(behavior_class, job_num, fixture.logger)
             behavior = _hooks.make_custom_behavior(behavior_class,
                                                    hook_logger,
                                                    fixture,
@@ -244,9 +267,9 @@ class TestSuiteExecutor(object):
         fixture = self._make_fixture(job_num, job_logger)
         hooks = self._make_hooks(job_num, fixture)
 
-        report = _report.TestReport(job_logger)
+        report = _report.TestReport(job_logger, self._suite.options)
 
-        return _job.Job(job_logger, fixture, hooks, report)
+        return _job.Job(job_logger, fixture, hooks, report, self._suite.options)
 
     def _make_test_queue(self):
         """
@@ -267,7 +290,7 @@ class TestSuiteExecutor(object):
             queue.put(test_case)
 
         # Add sentinel value for each job to indicate when there are no more items to process.
-        for _ in xrange(_config.JOBS):
+        for _ in xrange(len(self._jobs)):
             queue.put(None)
 
         return queue

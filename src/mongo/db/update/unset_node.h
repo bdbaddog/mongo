@@ -28,7 +28,7 @@
 
 #pragma once
 
-#include "mongo/db/update/update_leaf_node.h"
+#include "mongo/db/update/modifier_node.h"
 #include "mongo/stdx/memory.h"
 
 namespace mongo {
@@ -36,9 +36,9 @@ namespace mongo {
 /**
  * Represents the application of a $unset to the value at the end of a path.
  */
-class UnsetNode : public UpdateLeafNode {
+class UnsetNode : public ModifierNode {
 public:
-    Status init(BSONElement modExpr, const CollatorInterface* collator) final;
+    Status init(BSONElement modExpr, const boost::intrusive_ptr<ExpressionContext>& expCtx) final;
 
     std::unique_ptr<UpdateNode> clone() const final {
         return stdx::make_unique<UnsetNode>(*this);
@@ -46,15 +46,23 @@ public:
 
     void setCollator(const CollatorInterface* collator) final {}
 
-    void apply(mutablebson::Element element,
-               FieldRef* pathToCreate,
-               FieldRef* pathTaken,
-               StringData matchedField,
-               bool fromReplication,
-               const UpdateIndexData* indexData,
-               LogBuilder* logBuilder,
-               bool* indexesAffected,
-               bool* noop) const final;
+    ModifyResult updateExistingElement(mutablebson::Element* element,
+                                       std::shared_ptr<FieldRef> elementPath) const final;
+
+    void validateUpdate(mutablebson::ConstElement updatedElement,
+                        mutablebson::ConstElement leftSibling,
+                        mutablebson::ConstElement rightSibling,
+                        std::uint32_t recursionLevel,
+                        ModifyResult modifyResult) const final;
+
+    void logUpdate(LogBuilder* logBuilder,
+                   StringData pathTaken,
+                   mutablebson::Element element,
+                   ModifyResult modifyResult) const final;
+
+    bool allowNonViablePath() const final {
+        return true;
+    }
 };
 
 }  // namespace mongo

@@ -34,7 +34,7 @@
 #include "mongo/db/repl/elect_cmd_runner.h"
 #include "mongo/db/repl/freshness_checker.h"
 #include "mongo/db/repl/replication_coordinator_impl.h"
-#include "mongo/db/repl/topology_coordinator_impl.h"
+#include "mongo/db/repl/topology_coordinator.h"
 #include "mongo/stdx/mutex.h"
 #include "mongo/util/log.h"
 #include "mongo/util/scopeguard.h"
@@ -142,9 +142,12 @@ void ReplicationCoordinatorImpl::_startElectSelf_inlock() {
         return;
     }
     fassert(18681, nextPhaseEvh.getStatus());
-    _replExecutor->onEvent(
-        nextPhaseEvh.getValue(),
-        stdx::bind(&ReplicationCoordinatorImpl::_onFreshnessCheckComplete, this));
+    _replExecutor
+        ->onEvent(nextPhaseEvh.getValue(),
+                  [this](const mongo::executor::TaskExecutor::CallbackArgs&) {
+                      _onFreshnessCheckComplete();
+                  })
+        .status_with_transitional_ignore();
     lossGuard.dismiss();
 }
 
@@ -179,9 +182,9 @@ void ReplicationCoordinatorImpl::_onFreshnessCheckComplete() {
                       << dateToISOStringLocal(nextCandidateTime);
                 _topCoord->setElectionSleepUntil(nextCandidateTime);
                 _scheduleWorkAt(nextCandidateTime,
-                                stdx::bind(&ReplicationCoordinatorImpl::_recoverFromElectionTie,
-                                           this,
-                                           stdx::placeholders::_1));
+                                [=](const executor::TaskExecutor::CallbackArgs& cbData) {
+                                    _recoverFromElectionTie(cbData);
+                                });
                 _sleptLastElection = true;
                 return;
             }
@@ -217,9 +220,10 @@ void ReplicationCoordinatorImpl::_onFreshnessCheckComplete() {
     }
     fassert(18685, nextPhaseEvh.getStatus());
 
-    _replExecutor->onEvent(
-        nextPhaseEvh.getValue(),
-        stdx::bind(&ReplicationCoordinatorImpl::_onElectCmdRunnerComplete, this));
+    _replExecutor
+        ->onEvent(nextPhaseEvh.getValue(),
+                  [=](const executor::TaskExecutor::CallbackArgs&) { _onElectCmdRunnerComplete(); })
+        .status_with_transitional_ignore();
     lossGuard.dismiss();
 }
 
@@ -250,10 +254,9 @@ void ReplicationCoordinatorImpl::_onElectCmdRunnerComplete() {
         const Date_t nextCandidateTime = now + ms;
         log() << "waiting until " << nextCandidateTime << " before standing for election again";
         _topCoord->setElectionSleepUntil(nextCandidateTime);
-        _scheduleWorkAt(nextCandidateTime,
-                        stdx::bind(&ReplicationCoordinatorImpl::_recoverFromElectionTie,
-                                   this,
-                                   stdx::placeholders::_1));
+        _scheduleWorkAt(nextCandidateTime, [=](const executor::TaskExecutor::CallbackArgs& cbData) {
+            _recoverFromElectionTie(cbData);
+        });
         return;
     }
 
@@ -282,7 +285,9 @@ void ReplicationCoordinatorImpl::_recoverFromElectionTie(
     if (!status.isOK()) {
         LOG(2) << "ReplicationCoordinatorImpl::_recoverFromElectionTie -- " << status.reason();
     } else {
-        fassertStatusOK(28817, _topCoord->becomeCandidateIfElectable(now, false));
+        fassertStatusOK(28817,
+                        _topCoord->becomeCandidateIfElectable(
+                            now, TopologyCoordinator::StartElectionReason::kElectionTimeout));
         _startElectSelf_inlock();
     }
 }

@@ -84,11 +84,12 @@
         db.runCommand({aggregate: "view", pipeline: [{$match: {a: {$lte: 8}}}], explain: true});
     verifyExplainResult(result, "queryPlanner");
 
-    result = db.runCommand({explain: {aggregate: "view", pipeline: [{$match: {a: {$lte: 8}}}]}});
+    result = db.runCommand(
+        {explain: {aggregate: "view", pipeline: [{$match: {a: {$lte: 8}}}], cursor: {}}});
     verifyExplainResult(result, "allPlansExecution");
     for (let verbosity of explainVerbosities) {
         result = db.runCommand({
-            explain: {aggregate: "view", pipeline: [{$match: {a: {$lte: 8}}}]},
+            explain: {aggregate: "view", pipeline: [{$match: {a: {$lte: 8}}}], cursor: {}},
             verbosity: verbosity
         });
         verifyExplainResult(result, verbosity);
@@ -145,10 +146,14 @@
 
     assert.eq(5, view.find({a: {$lte: 8}}).comment("agg_comment").itcount());
 
-    profilerHasSingleMatchingEntryOrThrow(sdb, {
-        "command.aggregate": coll.getName(),
-        "command.fromRouter": true,
-        "command.comment": "agg_comment"
+    profilerHasSingleMatchingEntryOrThrow({
+        profileDB: sdb,
+        filter: {
+            "command.aggregate": coll.getName(),
+            "command.comment": "agg_comment",
+            "command.needsMerge": true,
+            "command.pipeline.$mergeCursors": {$exists: false}
+        }
     });
 
     st.stop();

@@ -40,6 +40,7 @@
 #include "mongo/db/catalog/collection_catalog_entry.h"
 #include "mongo/db/catalog/database.h"
 #include "mongo/db/catalog/database_catalog_entry.h"
+#include "mongo/db/catalog/index_catalog.h"
 #include "mongo/db/clientcursor.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/commands/list_collections_filter.h"
@@ -48,7 +49,6 @@
 #include "mongo/db/exec/queued_data_stage.h"
 #include "mongo/db/exec/working_set.h"
 #include "mongo/db/index/index_descriptor.h"
-#include "mongo/db/matcher/extensions_callback_disallow_extensions.h"
 #include "mongo/db/query/cursor_request.h"
 #include "mongo/db/query/cursor_response.h"
 #include "mongo/db/query/find_common.h"
@@ -195,7 +195,7 @@ BSONObj buildCollectionBson(OperationContext* opCtx,
     return b.obj();
 }
 
-class CmdListCollections : public Command {
+class CmdListCollections : public BasicCommand {
 public:
     virtual bool slaveOk() const {
         return false;
@@ -227,12 +227,11 @@ public:
                       str::stream() << "Not authorized to list collections on db: " << dbname);
     }
 
-    CmdListCollections() : Command("listCollections") {}
+    CmdListCollections() : BasicCommand("listCollections") {}
 
     bool run(OperationContext* opCtx,
              const string& dbname,
              const BSONObj& jsobj,
-             string& errmsg,
              BSONObjBuilder& result) {
         unique_ptr<MatchExpression> matcher;
 
@@ -245,8 +244,9 @@ public:
             }
             // The collator is null because collection objects are compared using binary comparison.
             const CollatorInterface* collator = nullptr;
-            StatusWithMatchExpression statusWithMatcher = MatchExpressionParser::parse(
-                filterElt.Obj(), ExtensionsCallbackDisallowExtensions(), collator);
+            boost::intrusive_ptr<ExpressionContext> expCtx(new ExpressionContext(opCtx, collator));
+            StatusWithMatchExpression statusWithMatcher =
+                MatchExpressionParser::parse(filterElt.Obj(), std::move(expCtx));
             if (!statusWithMatcher.isOK()) {
                 return appendCommandStatus(result, statusWithMatcher.getStatus());
             }

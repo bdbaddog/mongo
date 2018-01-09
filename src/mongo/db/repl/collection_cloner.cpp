@@ -43,6 +43,7 @@
 #include "mongo/db/repl/storage_interface_mock.h"
 #include "mongo/db/server_parameters.h"
 #include "mongo/rpc/get_status_from_command_result.h"
+#include "mongo/s/query/cluster_client_cursor_params.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/destructor_guard.h"
 #include "mongo/util/fail_point_service.h"
@@ -55,6 +56,7 @@ namespace {
 
 using LockGuard = stdx::lock_guard<stdx::mutex>;
 using UniqueLock = stdx::unique_lock<stdx::mutex>;
+using executor::RemoteCommandRequest;
 
 constexpr auto kCountResponseDocumentCountFieldName = "n"_sd;
 
@@ -69,13 +71,32 @@ MONGO_EXPORT_SERVER_PARAMETER(numInitialSyncListIndexesAttempts, int, 3);
 MONGO_EXPORT_SERVER_PARAMETER(numInitialSyncCollectionFindAttempts, int, 3);
 }  // namespace
 
+// Failpoint which causes initial sync to hang before establishing its cursor to clone the
+// 'namespace' collection.
+MONGO_FP_DECLARE(initialSyncHangBeforeCollectionClone);
+
 // Failpoint which causes initial sync to hang when it has cloned 'numDocsToClone' documents to
 // collection 'namespace'.
 MONGO_FP_DECLARE(initialSyncHangDuringCollectionClone);
 
-// Failpoint which causes initial sync to hang after the initial 'find' command of collection
-// cloning, for a specific collection.
-MONGO_FP_DECLARE(initialSyncHangCollectionClonerAfterInitialFind);
+// Failpoint which causes initial sync to hang after handling the next batch of results from the
+// 'AsyncResultsMerger', optionally limited to a specific collection.
+MONGO_FP_DECLARE(initialSyncHangCollectionClonerAfterHandlingBatchResponse);
+
+// Failpoint which causes initial sync to hang before establishing the cursors (but after
+// listIndexes), optionally limited to a specific collection.
+MONGO_FP_DECLARE(initialSyncHangCollectionClonerBeforeEstablishingCursor);
+
+BSONObj makeCommandWithUUIDorCollectionName(StringData command,
+                                            OptionalCollectionUUID uuid,
+                                            const NamespaceString& nss) {
+    BSONObjBuilder builder;
+    if (uuid)
+        uuid->appendToBuilder(&builder, command);
+    else
+        builder.append(command, nss.coll());
+    return builder.obj();
+}
 
 CollectionCloner::CollectionCloner(executor::TaskExecutor* executor,
                                    OldThreadPool* dbWorkThreadPool,
@@ -84,7 +105,8 @@ CollectionCloner::CollectionCloner(executor::TaskExecutor* executor,
                                    const CollectionOptions& options,
                                    const CallbackFn& onCompletion,
                                    StorageInterface* storageInterface,
-                                   const int batchSize)
+                                   const int batchSize,
+                                   const int maxNumClonerCursors)
     : _executor(executor),
       _dbWorkThreadPool(dbWorkThreadPool),
       _source(source),
@@ -94,39 +116,48 @@ CollectionCloner::CollectionCloner(executor::TaskExecutor* executor,
       _onCompletion(onCompletion),
       _storageInterface(storageInterface),
       _countScheduler(_executor,
-                      RemoteCommandRequest(_source,
-                                           _sourceNss.db().toString(),
-                                           BSON("count" << _sourceNss.coll()),
-                                           ReadPreferenceSetting::secondaryPreferredMetadata(),
-                                           nullptr,
-                                           RemoteCommandRequest::kNoTimeout),
-                      stdx::bind(&CollectionCloner::_countCallback, this, stdx::placeholders::_1),
+                      RemoteCommandRequest(
+                          _source,
+                          _sourceNss.db().toString(),
+                          makeCommandWithUUIDorCollectionName("count", _options.uuid, sourceNss),
+                          ReadPreferenceSetting::secondaryPreferredMetadata(),
+                          nullptr,
+                          RemoteCommandRequest::kNoTimeout),
+                      [this](const executor::TaskExecutor::RemoteCommandCallbackArgs& args) {
+                          return _countCallback(args);
+                      },
                       RemoteCommandRetryScheduler::makeRetryPolicy(
                           numInitialSyncCollectionCountAttempts.load(),
                           executor::RemoteCommandRequest::kNoTimeout,
                           RemoteCommandRetryScheduler::kAllRetriableErrors)),
-      _listIndexesFetcher(_executor,
-                          _source,
-                          _sourceNss.db().toString(),
-                          BSON("listIndexes" << _sourceNss.coll()),
-                          stdx::bind(&CollectionCloner::_listIndexesCallback,
-                                     this,
-                                     stdx::placeholders::_1,
-                                     stdx::placeholders::_2,
-                                     stdx::placeholders::_3),
-                          ReadPreferenceSetting::secondaryPreferredMetadata(),
-                          RemoteCommandRequest::kNoTimeout,
-                          RemoteCommandRetryScheduler::makeRetryPolicy(
-                              numInitialSyncListIndexesAttempts.load(),
-                              executor::RemoteCommandRequest::kNoTimeout,
-                              RemoteCommandRetryScheduler::kAllRetriableErrors)),
+      _listIndexesFetcher(
+          _executor,
+          _source,
+          _sourceNss.db().toString(),
+          makeCommandWithUUIDorCollectionName("listIndexes", _options.uuid, sourceNss),
+          [this](const Fetcher::QueryResponseStatus& fetchResult,
+                 Fetcher::NextAction * nextAction,
+                 BSONObjBuilder * getMoreBob) {
+              _listIndexesCallback(fetchResult, nextAction, getMoreBob);
+          },
+          ReadPreferenceSetting::secondaryPreferredMetadata(),
+          RemoteCommandRequest::kNoTimeout /* find network timeout */,
+          RemoteCommandRequest::kNoTimeout /* getMore network timeout */,
+          RemoteCommandRetryScheduler::makeRetryPolicy(
+              numInitialSyncListIndexesAttempts.load(),
+              executor::RemoteCommandRequest::kNoTimeout,
+              RemoteCommandRetryScheduler::kAllRetriableErrors)),
       _indexSpecs(),
-      _documents(),
+      _documentsToInsert(),
       _dbWorkTaskRunner(_dbWorkThreadPool),
       _scheduleDbWorkFn([this](const executor::TaskExecutor::CallbackFn& work) {
-          auto task = [work](OperationContext* opCtx,
-                             const Status& status) -> TaskRunner::NextAction {
-              work(executor::TaskExecutor::CallbackArgs(nullptr, {}, status, opCtx));
+          auto task = [ this, work ](OperationContext * opCtx,
+                                     const Status& status) noexcept->TaskRunner::NextAction {
+              try {
+                  work(executor::TaskExecutor::CallbackArgs(nullptr, {}, status, opCtx));
+              } catch (...) {
+                  _finishCallback(exceptionToStatus());
+              }
               return TaskRunner::NextAction::kDisposeOperationContext;
           };
           _dbWorkTaskRunner.schedule(task);
@@ -137,7 +168,8 @@ CollectionCloner::CollectionCloner(executor::TaskExecutor* executor,
                      kProgressMeterCheckInterval,
                      "documents copied",
                      str::stream() << _sourceNss.toString() << " collection clone progress"),
-      _batchSize(batchSize) {
+      _collectionCloningBatchSize(batchSize),
+      _maxNumClonerCursors(maxNumClonerCursors) {
     // Fetcher throws an exception on null executor.
     invariant(executor);
     uassert(ErrorCodes::BadValue,
@@ -212,15 +244,22 @@ void CollectionCloner::shutdown() {
             // Nothing to do if we are already in ShuttingDown or Complete state.
             return;
     }
-
     _cancelRemainingWork_inlock();
 }
 
 void CollectionCloner::_cancelRemainingWork_inlock() {
+    if (_arm) {
+        Client::initThreadIfNotAlready();
+        _killArmHandle = _arm->kill(cc().getOperationContext());
+    }
     _countScheduler.shutdown();
     _listIndexesFetcher.shutdown();
-    if (_findFetcher) {
-        _findFetcher->shutdown();
+    if (_establishCollectionCursorsScheduler) {
+        _establishCollectionCursorsScheduler->shutdown();
+    }
+    if (_verifyCollectionDroppedScheduler) {
+        _verifyCollectionDroppedScheduler->shutdown();
+        _verifyCollectionDroppedScheduler.reset();
     }
     _dbWorkTaskRunner.cancel();
 }
@@ -232,6 +271,9 @@ CollectionCloner::Stats CollectionCloner::getStats() const {
 
 void CollectionCloner::join() {
     stdx::unique_lock<stdx::mutex> lk(_mutex);
+    if (_killArmHandle) {
+        _executor->waitForEvent(_killArmHandle);
+    }
     _condition.wait(lk, [this]() { return !_isActive_inlock(); });
 }
 
@@ -245,6 +287,11 @@ void CollectionCloner::waitForDbWorker() {
 void CollectionCloner::setScheduleDbWorkFn_forTest(const ScheduleDbWorkFn& scheduleDbWorkFn) {
     LockGuard lk(_mutex);
     _scheduleDbWorkFn = scheduleDbWorkFn;
+}
+
+std::vector<BSONObj> CollectionCloner::getDocumentsToInsert_forTest() {
+    LockGuard lk(_mutex);
+    return _documentsToInsert;
 }
 
 void CollectionCloner::_countCallback(
@@ -267,8 +314,12 @@ void CollectionCloner::_countCallback(
         return;
     }
 
+    long long count = 0;
     Status commandStatus = getStatusFromCommandResult(args.response.data);
-    if (!commandStatus.isOK()) {
+    if (commandStatus == ErrorCodes::NamespaceNotFound && _options.uuid) {
+        // Querying by a non-existing collection by UUID returns an error. Treat same as
+        // behavior of find by namespace and use count == 0.
+    } else if (!commandStatus.isOK()) {
         _finishCallback({commandStatus.code(),
                          str::stream() << "During count call on collection '" << _sourceNss.ns()
                                        << "' from "
@@ -277,21 +328,21 @@ void CollectionCloner::_countCallback(
                                        << commandStatus.reason()
                                        << "'"});
         return;
-    }
-
-    long long count = 0;
-    auto countStatus =
-        bsonExtractIntegerField(args.response.data, kCountResponseDocumentCountFieldName, &count);
-    if (!countStatus.isOK()) {
-        _finishCallback({countStatus.code(),
-                         str::stream() << "There was an error parsing document count from count "
-                                          "command result on collection "
-                                       << _sourceNss.ns()
-                                       << " from "
-                                       << _source.toString()
-                                       << ": "
-                                       << countStatus.reason()});
-        return;
+    } else {
+        auto countStatus = bsonExtractIntegerField(
+            args.response.data, kCountResponseDocumentCountFieldName, &count);
+        if (!countStatus.isOK()) {
+            _finishCallback({countStatus.code(),
+                             str::stream()
+                                 << "There was an error parsing document count from count "
+                                    "command result on collection "
+                                 << _sourceNss.ns()
+                                 << " from "
+                                 << _source.toString()
+                                 << ": "
+                                 << countStatus.reason()});
+            return;
+        }
     }
 
     if (count < 0) {
@@ -360,14 +411,22 @@ void CollectionCloner::_listIndexesCallback(const Fetcher::QueryResponseStatus& 
     }
 
     UniqueLock lk(_mutex);
+    // When listing indexes by UUID, the sync source may use a different name for the collection
+    // as result of renaming or two-phase drop. As the index spec also includes a 'ns' field, this
+    // must be rewritten.
+    BSONObjBuilder nsFieldReplacementBuilder;
+    nsFieldReplacementBuilder.append("ns", _sourceNss.ns());
+    BSONElement nsFieldReplacementElem = nsFieldReplacementBuilder.done().firstElement();
+
     // We may be called with multiple batches leading to a need to grow _indexSpecs.
     _indexSpecs.reserve(_indexSpecs.size() + documents.size());
     for (auto&& doc : documents) {
+        // The addField replaces the 'ns' field with the correct name, see above.
         if (StringData("_id_") == doc["name"].str()) {
-            _idIndexSpec = doc;
+            _idIndexSpec = doc.addField(nsFieldReplacementElem);
             continue;
         }
-        _indexSpecs.push_back(doc);
+        _indexSpecs.push_back(doc.addField(nsFieldReplacementElem));
     }
     lk.unlock();
 
@@ -381,79 +440,10 @@ void CollectionCloner::_listIndexesCallback(const Fetcher::QueryResponseStatus& 
 
     // We have all of the indexes now, so we can start cloning the collection data.
     auto&& scheduleResult = _scheduleDbWorkFn(
-        stdx::bind(&CollectionCloner::_beginCollectionCallback, this, stdx::placeholders::_1));
+        [=](const executor::TaskExecutor::CallbackArgs& cbd) { _beginCollectionCallback(cbd); });
     if (!scheduleResult.isOK()) {
         _finishCallback(scheduleResult.getStatus());
         return;
-    }
-}
-
-void CollectionCloner::_findCallback(const StatusWith<Fetcher::QueryResponse>& fetchResult,
-                                     Fetcher::NextAction* nextAction,
-                                     BSONObjBuilder* getMoreBob,
-                                     std::shared_ptr<OnCompletionGuard> onCompletionGuard) {
-    if (!fetchResult.isOK()) {
-        // Wait for active inserts to complete.
-        waitForDbWorker();
-
-        Status newStatus{fetchResult.getStatus().code(),
-                         str::stream() << "While querying collection '" << _sourceNss.ns()
-                                       << "' there was an error '"
-                                       << fetchResult.getStatus().reason()
-                                       << "'"};
-
-        stdx::lock_guard<stdx::mutex> lock(_mutex);
-        onCompletionGuard->setResultAndCancelRemainingWork_inlock(lock, newStatus);
-        return;
-    }
-
-    auto batchData(fetchResult.getValue());
-    bool lastBatch = *nextAction == Fetcher::NextAction::kNoAction;
-    if (batchData.documents.size() > 0) {
-        LockGuard lk(_mutex);
-        _documents.insert(_documents.end(), batchData.documents.begin(), batchData.documents.end());
-    } else if (!batchData.first) {
-        warning() << "No documents returned in batch; ns: " << _sourceNss
-                  << ", cursorId:" << batchData.cursorId << ", isLastBatch:" << lastBatch;
-    }
-
-    auto&& scheduleResult =
-        _scheduleDbWorkFn(stdx::bind(&CollectionCloner::_insertDocumentsCallback,
-                                     this,
-                                     stdx::placeholders::_1,
-                                     lastBatch,
-                                     onCompletionGuard));
-    if (!scheduleResult.isOK()) {
-        Status newStatus{scheduleResult.getStatus().code(),
-                         str::stream() << "While cloning collection '" << _sourceNss.ns()
-                                       << "' there was an error '"
-                                       << scheduleResult.getStatus().reason()
-                                       << "'"};
-
-        stdx::lock_guard<stdx::mutex> lock(_mutex);
-        onCompletionGuard->setResultAndCancelRemainingWork_inlock(lock, newStatus);
-        return;
-    }
-
-    MONGO_FAIL_POINT_BLOCK(initialSyncHangCollectionClonerAfterInitialFind, nssData) {
-        const BSONObj& data = nssData.getData();
-        auto nss = data["nss"].str();
-        // Only hang when cloning the specified collection.
-        if (_destNss.toString() == nss) {
-            while (MONGO_FAIL_POINT(initialSyncHangCollectionClonerAfterInitialFind) &&
-                   !_isShuttingDown()) {
-                log() << "initialSyncHangCollectionClonerAfterInitialFind fail point enabled for "
-                      << nss << ". Blocking until fail point is disabled.";
-                mongo::sleepsecs(1);
-            }
-        }
-    }
-
-    if (!lastBatch) {
-        invariant(getMoreBob);
-        getMoreBob->append("getMore", batchData.cursorId);
-        getMoreBob->append("collection", batchData.nss.coll());
-        getMoreBob->append("batchSize", _batchSize);
     }
 }
 
@@ -462,6 +452,210 @@ void CollectionCloner::_beginCollectionCallback(const executor::TaskExecutor::Ca
         _finishCallback(cbd.status);
         return;
     }
+    MONGO_FAIL_POINT_BLOCK(initialSyncHangCollectionClonerBeforeEstablishingCursor, nssData) {
+        const BSONObj& data = nssData.getData();
+        auto nss = data["nss"].str();
+        // Only hang when cloning the specified collection, or if no collection was specified.
+        if (nss.empty() || _destNss.toString() == nss) {
+            while (MONGO_FAIL_POINT(initialSyncHangCollectionClonerBeforeEstablishingCursor) &&
+                   !_isShuttingDown()) {
+                log() << "initialSyncHangCollectionClonerBeforeEstablishingCursor fail point "
+                         "enabled for "
+                      << _destNss.toString() << ". Blocking until fail point is disabled.";
+                mongo::sleepsecs(1);
+            }
+        }
+    }
+    if (!_idIndexSpec.isEmpty() && _options.autoIndexId == CollectionOptions::NO) {
+        warning()
+            << "Found the _id_ index spec but the collection specified autoIndexId of false on ns:"
+            << this->_sourceNss;
+    }
+
+    auto collectionBulkLoader = _storageInterface->createCollectionForBulkLoading(
+        _destNss, _options, _idIndexSpec, _indexSpecs);
+
+    if (!collectionBulkLoader.isOK()) {
+        _finishCallback(collectionBulkLoader.getStatus());
+        return;
+    }
+
+    _stats.indexes = _indexSpecs.size();
+    if (!_idIndexSpec.isEmpty()) {
+        ++_stats.indexes;
+    }
+
+    _collLoader = std::move(collectionBulkLoader.getValue());
+
+    BSONObjBuilder cmdObj;
+    EstablishCursorsCommand cursorCommand;
+    // The 'find' command is used when the number of cloning cursors is 1 to ensure
+    // the correctness of the collection cloning process until 'parallelCollectionScan'
+    // can be tested more extensively in context of initial sync.
+    if (_maxNumClonerCursors == 1) {
+        cmdObj.appendElements(
+            makeCommandWithUUIDorCollectionName("find", _options.uuid, _sourceNss));
+        cmdObj.append("noCursorTimeout", true);
+        // Set batchSize to be 0 to establish the cursor without fetching any documents,
+        // similar to the response format of 'parallelCollectionScan'.
+        cmdObj.append("batchSize", 0);
+        cursorCommand = Find;
+    } else {
+        cmdObj.appendElements(makeCommandWithUUIDorCollectionName(
+            "parallelCollectionScan", _options.uuid, _sourceNss));
+        cmdObj.append("numCursors", _maxNumClonerCursors);
+        cursorCommand = ParallelCollScan;
+    }
+
+    Client::initThreadIfNotAlready();
+    auto opCtx = cc().getOperationContext();
+
+    MONGO_FAIL_POINT_BLOCK(initialSyncHangBeforeCollectionClone, options) {
+        const BSONObj& data = options.getData();
+        if (data["namespace"].String() == _destNss.ns()) {
+            log() << "initial sync - initialSyncHangBeforeCollectionClone fail point "
+                     "enabled. Blocking until fail point is disabled.";
+            while (MONGO_FAIL_POINT(initialSyncHangBeforeCollectionClone) && !_isShuttingDown()) {
+                mongo::sleepsecs(1);
+            }
+        }
+    }
+
+    _establishCollectionCursorsScheduler = stdx::make_unique<RemoteCommandRetryScheduler>(
+        _executor,
+        RemoteCommandRequest(_source,
+                             _sourceNss.db().toString(),
+                             cmdObj.obj(),
+                             ReadPreferenceSetting::secondaryPreferredMetadata(),
+                             opCtx,
+                             RemoteCommandRequest::kNoTimeout),
+        [=](const RemoteCommandCallbackArgs& rcbd) {
+            _establishCollectionCursorsCallback(rcbd, cursorCommand);
+        },
+        RemoteCommandRetryScheduler::makeRetryPolicy(
+            numInitialSyncCollectionFindAttempts.load(),
+            executor::RemoteCommandRequest::kNoTimeout,
+            RemoteCommandRetryScheduler::kAllRetriableErrors));
+    auto scheduleStatus = _establishCollectionCursorsScheduler->startup();
+    LOG(1) << "Attempting to establish cursors with maxNumClonerCursors: " << _maxNumClonerCursors;
+
+    if (!scheduleStatus.isOK()) {
+        _establishCollectionCursorsScheduler.reset();
+        _finishCallback(scheduleStatus);
+        return;
+    }
+}
+
+Status CollectionCloner::_parseCursorResponse(BSONObj response,
+                                              std::vector<CursorResponse>* cursors,
+                                              EstablishCursorsCommand cursorCommand) {
+    switch (cursorCommand) {
+        case Find: {
+            StatusWith<CursorResponse> findResponse = CursorResponse::parseFromBSON(response);
+            if (!findResponse.isOK()) {
+                Status errorStatus{findResponse.getStatus().code(),
+                                   str::stream()
+                                       << "While parsing the 'find' query against collection '"
+                                       << _sourceNss.ns()
+                                       << "' there was an error '"
+                                       << findResponse.getStatus().reason()
+                                       << "'"};
+                return errorStatus;
+            }
+            cursors->push_back(std::move(findResponse.getValue()));
+            break;
+        }
+        case ParallelCollScan: {
+            auto cursorElements = _parseParallelCollectionScanResponse(response);
+            if (!cursorElements.isOK()) {
+                return cursorElements.getStatus();
+            }
+            std::vector<BSONElement> cursorsArray;
+            cursorsArray = cursorElements.getValue();
+            // Parse each BSONElement into a 'CursorResponse' object.
+            for (BSONElement cursor : cursorsArray) {
+                if (!cursor.isABSONObj()) {
+                    Status errorStatus(
+                        ErrorCodes::FailedToParse,
+                        "The 'cursor' field in the list of cursor responses is not a "
+                        "valid BSON Object");
+                    return errorStatus;
+                }
+                const BSONObj cursorObj = cursor.Obj().getOwned();
+                StatusWith<CursorResponse> parallelCollScanResponse =
+                    CursorResponse::parseFromBSON(cursorObj);
+                if (!parallelCollScanResponse.isOK()) {
+                    return parallelCollScanResponse.getStatus();
+                }
+                cursors->push_back(std::move(parallelCollScanResponse.getValue()));
+            }
+            break;
+        }
+        default: {
+            Status errorStatus(
+                ErrorCodes::FailedToParse,
+                "The command used to establish the collection cloner cursors is not valid.");
+            return errorStatus;
+        }
+    }
+    return Status::OK();
+}
+
+void CollectionCloner::_establishCollectionCursorsCallback(const RemoteCommandCallbackArgs& rcbd,
+                                                           EstablishCursorsCommand cursorCommand) {
+    if (_state == State::kShuttingDown) {
+        Status shuttingDownStatus{ErrorCodes::CallbackCanceled, "Cloner shutting down."};
+        _finishCallback(shuttingDownStatus);
+        return;
+    }
+    auto response = rcbd.response;
+    if (!response.isOK()) {
+        _finishCallback(response.status);
+        return;
+    }
+    Status commandStatus = getStatusFromCommandResult(response.data);
+    if (commandStatus == ErrorCodes::NamespaceNotFound) {
+        _finishCallback(Status::OK());
+        return;
+    }
+    if (!commandStatus.isOK()) {
+        Status newStatus{commandStatus.code(),
+                         str::stream() << "While querying collection '" << _sourceNss.ns()
+                                       << "' there was an error '"
+                                       << commandStatus.reason()
+                                       << "'"};
+        _finishCallback(commandStatus);
+        return;
+    }
+
+    std::vector<CursorResponse> cursorResponses;
+    Status parseResponseStatus =
+        _parseCursorResponse(response.data, &cursorResponses, cursorCommand);
+    if (!parseResponseStatus.isOK()) {
+        _finishCallback(parseResponseStatus);
+        return;
+    }
+    LOG(1) << "Collection cloner running with " << cursorResponses.size()
+           << " cursors established.";
+
+    // Initialize the 'AsyncResultsMerger'(ARM).
+    std::vector<ClusterClientCursorParams::RemoteCursor> remoteCursors;
+    for (auto&& cursorResponse : cursorResponses) {
+        // A placeholder 'ShardId' is used until the ARM is made less sharding specific.
+        remoteCursors.emplace_back(
+            ShardId("CollectionClonerSyncSource"), _source, std::move(cursorResponse));
+    }
+
+    // An empty list of authenticated users is passed into the cluster parameters
+    // as user information is not used in the ARM in context of collection cloning.
+    _clusterClientCursorParams =
+        stdx::make_unique<ClusterClientCursorParams>(_sourceNss, UserNameIterator());
+    _clusterClientCursorParams->remotes = std::move(remoteCursors);
+    if (_collectionCloningBatchSize > 0)
+        _clusterClientCursorParams->batchSize = _collectionCloningBatchSize;
+    Client::initThreadIfNotAlready();
+    _arm = stdx::make_unique<AsyncResultsMerger>(
+        cc().getOperationContext(), _executor, _clusterClientCursorParams.get());
 
     // This completion guard invokes _finishCallback on destruction.
     auto cancelRemainingWorkInLock = [this]() { _cancelRemainingWork_inlock(); };
@@ -473,50 +667,220 @@ void CollectionCloner::_beginCollectionCallback(const executor::TaskExecutor::Ca
     // that will cause the destructor of the completion guard to run, the destructor must be run
     // outside the mutex. This is a necessary condition to invoke _finishCallback.
     stdx::lock_guard<stdx::mutex> lock(_mutex);
-    if (!_idIndexSpec.isEmpty() && _options.autoIndexId == CollectionOptions::NO) {
-        warning()
-            << "Found the _id_ index spec but the collection specified autoIndexId of false on ns:"
-            << this->_sourceNss;
-    }
-
-    auto status = _storageInterface->createCollectionForBulkLoading(
-        _destNss, _options, _idIndexSpec, _indexSpecs);
-
-    if (!status.isOK()) {
-        onCompletionGuard->setResultAndCancelRemainingWork_inlock(lock, status.getStatus());
-        return;
-    }
-
-    _stats.indexes = _indexSpecs.size();
-    if (!_idIndexSpec.isEmpty()) {
-        ++_stats.indexes;
-    }
-
-    _collLoader = std::move(status.getValue());
-
-    _findFetcher = stdx::make_unique<Fetcher>(
-        _executor,
-        _source,
-        _sourceNss.db().toString(),
-        BSON("find" << _sourceNss.coll() << "noCursorTimeout" << true << "batchSize" << _batchSize),
-        stdx::bind(&CollectionCloner::_findCallback,
-                   this,
-                   stdx::placeholders::_1,
-                   stdx::placeholders::_2,
-                   stdx::placeholders::_3,
-                   onCompletionGuard),
-        ReadPreferenceSetting::secondaryPreferredMetadata(),
-        RemoteCommandRequest::kNoTimeout,
-        RemoteCommandRetryScheduler::makeRetryPolicy(
-            numInitialSyncCollectionFindAttempts.load(),
-            executor::RemoteCommandRequest::kNoTimeout,
-            RemoteCommandRetryScheduler::kAllRetriableErrors));
-
-    Status scheduleStatus = _findFetcher->schedule();
+    Status scheduleStatus = _scheduleNextARMResultsCallback(onCompletionGuard);
+    _arm->detachFromOperationContext();
     if (!scheduleStatus.isOK()) {
-        _findFetcher.reset();
         onCompletionGuard->setResultAndCancelRemainingWork_inlock(lock, scheduleStatus);
         return;
+    }
+}
+
+StatusWith<std::vector<BSONElement>> CollectionCloner::_parseParallelCollectionScanResponse(
+    BSONObj resp) {
+    if (!resp.hasField("cursors")) {
+        return Status(ErrorCodes::CursorNotFound,
+                      "The 'parallelCollectionScan' response does not contain a 'cursors' field.");
+    }
+    BSONElement response = resp["cursors"];
+    if (response.type() == BSONType::Array) {
+        return response.Array();
+    } else {
+        return Status(
+            ErrorCodes::FailedToParse,
+            "The 'parallelCollectionScan' response is unable to be transformed into an array.");
+    }
+}
+
+Status CollectionCloner::_bufferNextBatchFromArm(WithLock lock) {
+    Client::initThreadIfNotAlready();
+    auto opCtx = cc().getOperationContext();
+    _arm->reattachToOperationContext(opCtx);
+    while (_arm->ready()) {
+        auto armResultStatus = _arm->nextReady();
+        if (!armResultStatus.getStatus().isOK()) {
+            return armResultStatus.getStatus();
+        }
+        if (armResultStatus.getValue().isEOF()) {
+            // We have reached the end of the batch.
+            break;
+        } else {
+            auto queryResult = armResultStatus.getValue().getResult();
+            _documentsToInsert.push_back(std::move(*queryResult));
+        }
+    }
+    _arm->detachFromOperationContext();
+
+    return Status::OK();
+}
+
+Status CollectionCloner::_scheduleNextARMResultsCallback(
+    std::shared_ptr<OnCompletionGuard> onCompletionGuard) {
+    Client::initThreadIfNotAlready();
+    _arm->reattachToOperationContext(cc().getOperationContext());
+    auto nextEvent = _arm->nextEvent();
+    _arm->detachFromOperationContext();
+    if (!nextEvent.isOK()) {
+        return nextEvent.getStatus();
+    }
+    auto event = nextEvent.getValue();
+    auto handleARMResultsOnNextEvent =
+        _executor->onEvent(event, [=](const executor::TaskExecutor::CallbackArgs& cbd) {
+            _handleARMResultsCallback(cbd, onCompletionGuard);
+        });
+    return handleARMResultsOnNextEvent.getStatus();
+}
+
+void CollectionCloner::_handleARMResultsCallback(
+    const executor::TaskExecutor::CallbackArgs& cbd,
+    std::shared_ptr<OnCompletionGuard> onCompletionGuard) {
+    auto setResultAndCancelRemainingWork = [this](std::shared_ptr<OnCompletionGuard> guard,
+                                                  Status status) {
+        stdx::lock_guard<stdx::mutex> lock(_mutex);
+        guard->setResultAndCancelRemainingWork_inlock(lock, status);
+        return;
+    };
+
+    if (!cbd.status.isOK()) {
+        // Wait for active inserts to complete.
+        waitForDbWorker();
+        Status newStatus{cbd.status.code(),
+                         str::stream() << "While querying collection '" << _sourceNss.ns()
+                                       << "' there was an error '"
+                                       << cbd.status.reason()
+                                       << "'"};
+        setResultAndCancelRemainingWork(onCompletionGuard, cbd.status);
+        return;
+    }
+
+    // Pull the documents from the ARM into a buffer until the entire batch has been processed.
+    bool lastBatch;
+    {
+        UniqueLock lk(_mutex);
+        auto nextBatchStatus = _bufferNextBatchFromArm(lk);
+        if (!nextBatchStatus.isOK()) {
+            if (_options.uuid && (nextBatchStatus.code() == ErrorCodes::OperationFailed ||
+                                  nextBatchStatus.code() == ErrorCodes::CursorNotFound)) {
+                // With these errors, it's possible the collection was dropped while we were
+                // cloning.  If so, we'll execute the drop during oplog application, so it's OK to
+                // just stop cloning.  This is only safe if cloning by UUID; if we are cloning by
+                // name, we have no way to detect if the collection was dropped and another
+                // collection with the same name created in the interim.
+                _verifyCollectionWasDropped(lk, nextBatchStatus, onCompletionGuard, cbd.opCtx);
+            } else {
+                onCompletionGuard->setResultAndCancelRemainingWork_inlock(lk, nextBatchStatus);
+            }
+            return;
+        }
+
+        // Check if this is the last batch of documents to clone.
+        lastBatch = _arm->remotesExhausted();
+    }
+
+    // Schedule the next document batch insertion.
+    auto&& scheduleResult = _scheduleDbWorkFn([=](const executor::TaskExecutor::CallbackArgs& cbd) {
+        _insertDocumentsCallback(cbd, lastBatch, onCompletionGuard);
+    });
+    if (!scheduleResult.isOK()) {
+        Status newStatus{scheduleResult.getStatus().code(),
+                         str::stream() << "While cloning collection '" << _sourceNss.ns()
+                                       << "' there was an error '"
+                                       << scheduleResult.getStatus().reason()
+                                       << "'"};
+        setResultAndCancelRemainingWork(onCompletionGuard, scheduleResult.getStatus());
+        return;
+    }
+
+    MONGO_FAIL_POINT_BLOCK(initialSyncHangCollectionClonerAfterHandlingBatchResponse, nssData) {
+        const BSONObj& data = nssData.getData();
+        auto nss = data["nss"].str();
+        // Only hang when cloning the specified collection, or if no collection was specified.
+        if (nss.empty() || _destNss.toString() == nss) {
+            while (MONGO_FAIL_POINT(initialSyncHangCollectionClonerAfterHandlingBatchResponse) &&
+                   !_isShuttingDown()) {
+                log() << "initialSyncHangCollectionClonerAfterHandlingBatchResponse fail point "
+                         "enabled for "
+                      << _destNss.toString() << ". Blocking until fail point is disabled.";
+                mongo::sleepsecs(1);
+            }
+        }
+    }
+
+    // If the remote cursors are not exhausted, schedule this callback again to handle
+    // the impending cursor response.
+    if (!lastBatch) {
+        Status scheduleStatus = _scheduleNextARMResultsCallback(onCompletionGuard);
+        if (!scheduleStatus.isOK()) {
+            setResultAndCancelRemainingWork(onCompletionGuard, scheduleStatus);
+            return;
+        }
+    }
+}
+
+void CollectionCloner::_verifyCollectionWasDropped(
+    const stdx::unique_lock<stdx::mutex>& lk,
+    Status batchStatus,
+    std::shared_ptr<OnCompletionGuard> onCompletionGuard,
+    OperationContext* opCtx) {
+    // If we already have a _verifyCollectionDroppedScheduler, just return; the existing
+    // scheduler will take care of cleaning up.
+    if (_verifyCollectionDroppedScheduler) {
+        return;
+    }
+    BSONObjBuilder cmdObj;
+    _options.uuid->appendToBuilder(&cmdObj, "find");
+    cmdObj.append("batchSize", 0);
+    _verifyCollectionDroppedScheduler = stdx::make_unique<RemoteCommandRetryScheduler>(
+        _executor,
+        RemoteCommandRequest(_source,
+                             _sourceNss.db().toString(),
+                             cmdObj.obj(),
+                             ReadPreferenceSetting::secondaryPreferredMetadata(),
+                             opCtx,
+                             RemoteCommandRequest::kNoTimeout),
+        [this, batchStatus, onCompletionGuard](const RemoteCommandCallbackArgs& args) {
+            // If the attempt to determine if the collection was dropped fails for any reason other
+            // than NamespaceNotFound, return the original error code.
+            //
+            // Otherwise, if the collection was dropped, either the error will be NamespaceNotFound,
+            // or it will be a drop-pending collection and the find will succeed and give us a
+            // collection with a drop-pending name.
+            UniqueLock lk(_mutex);
+            Status finalStatus(batchStatus);
+            if (args.response.isOK()) {
+                auto response = CursorResponse::parseFromBSON(args.response.data);
+                if (response.getStatus().code() == ErrorCodes::NamespaceNotFound ||
+                    (response.isOK() && response.getValue().getNSS().isDropPendingNamespace())) {
+                    log() << "CollectionCloner ns: '" << _sourceNss.ns() << "' uuid: UUID(\""
+                          << *_options.uuid << "\") stopped because collection was dropped.";
+                    finalStatus = Status::OK();
+                } else if (!response.isOK()) {
+                    log() << "CollectionCloner received an unexpected error when verifying drop of "
+                             "ns: '"
+                          << _sourceNss.ns() << "' uuid: UUID(\"" << *_options.uuid
+                          << "\"), status " << response.getStatus();
+                }
+            } else {
+                log() << "CollectionCloner is unable to verify drop of ns: '" << _sourceNss.ns()
+                      << "' uuid: UUID(\"" << *_options.uuid << "\"), status "
+                      << args.response.status;
+            }
+            // Because setResultAndCancelRemainingWork destroys the RemoteCommandRetryScheduler, it
+            // must be done outside this callback.
+            auto result = _executor->scheduleWork([this, finalStatus, onCompletionGuard](
+                const executor::TaskExecutor::CallbackArgs& args) {
+                UniqueLock lk(_mutex);
+                onCompletionGuard->setResultAndCancelRemainingWork_inlock(lk, finalStatus);
+            });
+            invariant(result.isOK() || result.getStatus().code() == ErrorCodes::ShutdownInProgress);
+        },
+        RemoteCommandRetryScheduler::makeNoRetryPolicy());
+
+    auto status = _verifyCollectionDroppedScheduler->startup();
+    if (!status.isOK()) {
+        log() << "CollectionCloner is unable to start verification of ns: '" << _sourceNss.ns()
+              << "' uuid: UUID(\"" << *_options.uuid << "\"), status " << status;
+        // If we can't run the command, assume this wasn't a drop and just use the original error.
+        onCompletionGuard->setResultAndCancelRemainingWork_inlock(lk, batchStatus);
     }
 }
 
@@ -530,24 +894,21 @@ void CollectionCloner::_insertDocumentsCallback(
         return;
     }
 
-    std::vector<BSONObj> docs;
     UniqueLock lk(_mutex);
-    if (_documents.size() == 0) {
+    std::vector<BSONObj> docs;
+    if (_documentsToInsert.size() == 0) {
         warning() << "_insertDocumentsCallback, but no documents to insert for ns:" << _destNss;
-
         if (lastBatch) {
             onCompletionGuard->setResultAndCancelRemainingWork_inlock(lk, Status::OK());
         }
         return;
     }
-
-    _documents.swap(docs);
+    _documentsToInsert.swap(docs);
     _stats.documentsCopied += docs.size();
     ++_stats.fetchBatches;
     _progressMeter.hit(int(docs.size()));
     invariant(_collLoader);
     const auto status = _collLoader->insertDocuments(docs.cbegin(), docs.cend());
-
     if (!status.isOK()) {
         onCompletionGuard->setResultAndCancelRemainingWork_inlock(lk, status);
         return;
@@ -567,12 +928,10 @@ void CollectionCloner::_insertDocumentsCallback(
         }
     }
 
-    if (!lastBatch) {
-        return;
+    if (lastBatch) {
+        // Clean up resources once the last batch has been copied over and set the status to OK.
+        onCompletionGuard->setResultAndCancelRemainingWork_inlock(lk, Status::OK());
     }
-
-    // Done with last batch and time to set result in completion guard to Status::OK().
-    onCompletionGuard->setResultAndCancelRemainingWork_inlock(lk, Status::OK());
 }
 
 void CollectionCloner::_finishCallback(const Status& status) {
@@ -581,7 +940,6 @@ void CollectionCloner::_finishCallback(const Status& status) {
     // Copy the status so we can change it below if needed.
     auto finalStatus = status;
     bool callCollectionLoader = false;
-
     decltype(_onCompletion) onCompletion;
     {
         LockGuard lk(_mutex);
@@ -592,7 +950,6 @@ void CollectionCloner::_finishCallback(const Status& status) {
         invariant(_onCompletion);
         std::swap(_onCompletion, onCompletion);
     }
-
     if (callCollectionLoader) {
         if (finalStatus.isOK()) {
             const auto loaderStatus = _collLoader->commit();
@@ -606,7 +963,6 @@ void CollectionCloner::_finishCallback(const Status& status) {
         // This will release the resources held by the loader.
         _collLoader.reset();
     }
-
     onCompletion(finalStatus);
 
     // This will release the resources held by the callback function object. '_onCompletion' is

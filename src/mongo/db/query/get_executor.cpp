@@ -39,6 +39,7 @@
 #include "mongo/base/error_codes.h"
 #include "mongo/base/parse_number.h"
 #include "mongo/client/dbclientinterface.h"
+#include "mongo/db/catalog/index_catalog.h"
 #include "mongo/db/exec/cached_plan.h"
 #include "mongo/db/exec/count.h"
 #include "mongo/db/exec/delete.h"
@@ -54,7 +55,6 @@
 #include "mongo/db/exec/update.h"
 #include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/index_names.h"
-#include "mongo/db/matcher/extensions_callback_disallow_extensions.h"
 #include "mongo/db/matcher/extensions_callback_noop.h"
 #include "mongo/db/matcher/extensions_callback_real.h"
 #include "mongo/db/ops/update_lifecycle.h"
@@ -72,6 +72,7 @@
 #include "mongo/db/query/query_planner_common.h"
 #include "mongo/db/query/query_settings.h"
 #include "mongo/db/query/stage_builder.h"
+#include "mongo/db/repl/optime.h"
 #include "mongo/db/repl/replication_coordinator_global.h"
 #include "mongo/db/s/collection_metadata.h"
 #include "mongo/db/s/collection_sharding_state.h"
@@ -119,6 +120,7 @@ void filterAllowedIndexEntries(const AllowedIndicesFilter& allowedIndicesFilter,
 namespace {
 // The body is below in the "count hack" section but getExecutor calls it.
 bool turnIxscanIntoCount(QuerySolution* soln);
+
 }  // namespace
 
 
@@ -187,6 +189,10 @@ void fillOutPlannerParams(OperationContext* opCtx,
 
     if (internalQueryPlannerEnableIndexIntersection.load()) {
         plannerParams->options |= QueryPlannerParams::INDEX_INTERSECTION;
+    }
+
+    if (internalQueryPlannerGenerateCoveredWholeIndexScans.load()) {
+        plannerParams->options |= QueryPlannerParams::GENERATE_COVERED_IXSCANS;
     }
 
     plannerParams->options |= QueryPlannerParams::SPLIT_LIMITED_SORT;
@@ -290,19 +296,18 @@ StatusWith<PrepareExecutionResult> prepareExecution(OperationContext* opCtx,
         // document, so we don't support covered projections. However, we might use the
         // simple inclusion fast path.
         if (NULL != canonicalQuery->getProj()) {
-            ProjectionStageParams params(ExtensionsCallbackReal(opCtx, &collection->ns()));
+            ProjectionStageParams params;
             params.projObj = canonicalQuery->getProj()->getProjObj();
             params.collator = canonicalQuery->getCollator();
 
             // Add a SortKeyGeneratorStage if there is a $meta sortKey projection.
             if (canonicalQuery->getProj()->wantSortKey()) {
-                root = make_unique<SortKeyGeneratorStage>(
-                    opCtx,
-                    root.release(),
-                    ws,
-                    canonicalQuery->getQueryRequest().getSort(),
-                    canonicalQuery->getQueryRequest().getFilter(),
-                    canonicalQuery->getCollator());
+                root =
+                    make_unique<SortKeyGeneratorStage>(opCtx,
+                                                       root.release(),
+                                                       ws,
+                                                       canonicalQuery->getQueryRequest().getSort(),
+                                                       canonicalQuery->getCollator());
             }
 
             // Stuff the right data into the params depending on what proj impl we use.
@@ -492,24 +497,73 @@ namespace {
 
 /**
  * Returns true if 'me' is a GTE or GE predicate over the "ts" field.
- * Such predicates can be used for the oplog start hack.
  */
-bool isOplogTsPred(const mongo::MatchExpression* me) {
+bool isOplogTsLowerBoundPred(const mongo::MatchExpression* me) {
     if (mongo::MatchExpression::GT != me->matchType() &&
         mongo::MatchExpression::GTE != me->matchType()) {
         return false;
     }
 
-    return mongoutils::str::equals(me->path().rawData(), "ts");
+    return me->path() == repl::OpTime::kTimestampFieldName;
 }
 
-mongo::BSONElement extractOplogTsOptime(const mongo::MatchExpression* me) {
-    invariant(isOplogTsPred(me));
-    return static_cast<const mongo::ComparisonMatchExpression*>(me)->getData();
+/**
+ * Extracts the lower and upper bounds on the "ts" field from 'me'. This only examines comparisons
+ * of "ts" against a Timestamp at the top level or inside a top-level $and.
+ */
+std::pair<boost::optional<Timestamp>, boost::optional<Timestamp>> extractTsRange(
+    const MatchExpression* me, bool topLevel = true) {
+    boost::optional<Timestamp> min;
+    boost::optional<Timestamp> max;
+
+    if (me->matchType() == MatchExpression::AND && topLevel) {
+        for (size_t i = 0; i < me->numChildren(); ++i) {
+            boost::optional<Timestamp> childMin;
+            boost::optional<Timestamp> childMax;
+            std::tie(childMin, childMax) = extractTsRange(me->getChild(i), false);
+            if (childMin && (!min || childMin.get() > min.get())) {
+                min = childMin;
+            }
+            if (childMax && (!max || childMax.get() < max.get())) {
+                max = childMax;
+            }
+        }
+        return {min, max};
+    }
+
+    if (!ComparisonMatchExpression::isComparisonMatchExpression(me) ||
+        me->path() != repl::OpTime::kTimestampFieldName) {
+        return {min, max};
+    }
+
+    auto rawElem = static_cast<const ComparisonMatchExpression*>(me)->getData();
+    if (rawElem.type() != BSONType::bsonTimestamp) {
+        return {min, max};
+    }
+
+    switch (me->matchType()) {
+        case MatchExpression::EQ:
+            min = rawElem.timestamp();
+            max = rawElem.timestamp();
+            return {min, max};
+        case MatchExpression::GT:
+        case MatchExpression::GTE:
+            min = rawElem.timestamp();
+            return {min, max};
+        case MatchExpression::LT:
+        case MatchExpression::LTE:
+            max = rawElem.timestamp();
+            return {min, max};
+        default:
+            MONGO_UNREACHABLE;
+    }
 }
 
 StatusWith<unique_ptr<PlanExecutor, PlanExecutor::Deleter>> getOplogStartHack(
-    OperationContext* opCtx, Collection* collection, unique_ptr<CanonicalQuery> cq) {
+    OperationContext* opCtx,
+    Collection* collection,
+    unique_ptr<CanonicalQuery> cq,
+    size_t plannerOptions) {
     invariant(collection);
     invariant(cq.get());
 
@@ -524,40 +578,21 @@ StatusWith<unique_ptr<PlanExecutor, PlanExecutor::Deleter>> getOplogStartHack(
         cq->setCollator(collection->getDefaultCollator()->clone());
     }
 
-    // A query can only do oplog start finding if it has a top-level $gt or $gte predicate over
-    // the "ts" field (the operation's timestamp). Find that predicate and pass it to
-    // the OplogStart stage.
-    MatchExpression* tsExpr = NULL;
-    if (MatchExpression::AND == cq->root()->matchType()) {
-        // The query has an AND at the top-level. See if any of the children
-        // of the AND are $gt or $gte predicates over 'ts'.
-        for (size_t i = 0; i < cq->root()->numChildren(); ++i) {
-            MatchExpression* me = cq->root()->getChild(i);
-            if (isOplogTsPred(me)) {
-                tsExpr = me;
-                break;
-            }
-        }
-    } else if (isOplogTsPred(cq->root())) {
-        // The root of the tree is a $gt or $gte predicate over 'ts'.
-        tsExpr = cq->root();
-    }
+    boost::optional<Timestamp> minTs, maxTs;
+    std::tie(minTs, maxTs) = extractTsRange(cq->root());
 
-    if (NULL == tsExpr) {
+    if (!minTs) {
         return Status(ErrorCodes::OplogOperationUnsupported,
                       "OplogReplay query does not contain top-level "
-                      "$gt or $gte over the 'ts' field.");
+                      "$eq, $gt, or $gte over the 'ts' field.");
     }
 
     boost::optional<RecordId> startLoc = boost::none;
 
     // See if the RecordStore supports the oplogStartHack
-    const BSONElement tsElem = extractOplogTsOptime(tsExpr);
-    if (tsElem.type() == bsonTimestamp) {
-        StatusWith<RecordId> goal = oploghack::keyForOptime(tsElem.timestamp());
-        if (goal.isOK()) {
-            startLoc = collection->getRecordStore()->oplogStartHack(opCtx, goal.getValue());
-        }
+    StatusWith<RecordId> goal = oploghack::keyForOptime(*minTs);
+    if (goal.isOK()) {
+        startLoc = collection->getRecordStore()->oplogStartHack(opCtx, goal.getValue());
     }
 
     if (startLoc) {
@@ -568,7 +603,7 @@ StatusWith<unique_ptr<PlanExecutor, PlanExecutor::Deleter>> getOplogStartHack(
         // Fallback to trying the OplogStart stage.
         unique_ptr<WorkingSet> oplogws = make_unique<WorkingSet>();
         unique_ptr<OplogStart> stage =
-            make_unique<OplogStart>(opCtx, collection, tsExpr, oplogws.get());
+            make_unique<OplogStart>(opCtx, collection, *minTs, oplogws.get());
         // Takes ownership of oplogws and stage.
         auto statusWithPlanExecutor = PlanExecutor::make(
             opCtx, std::move(oplogws), std::move(stage), collection, PlanExecutor::YIELD_AUTO);
@@ -580,13 +615,13 @@ StatusWith<unique_ptr<PlanExecutor, PlanExecutor::Deleter>> getOplogStartHack(
         startLoc = RecordId();
         PlanExecutor::ExecState state = exec->getNext(NULL, startLoc.get_ptr());
 
-        // This is normal.  The start of the oplog is the beginning of the collection.
         if (PlanExecutor::IS_EOF == state) {
-            return getExecutor(opCtx, collection, std::move(cq), PlanExecutor::YIELD_AUTO);
-        }
-
-        // This is not normal.  An error was encountered.
-        if (PlanExecutor::ADVANCED != state) {
+            // EOF from the OplogStart stage means that the starting point is prior to the very
+            // first document in the oplog. In this case, we should start from the beginning of the
+            // collection.
+            startLoc = boost::none;
+        } else if (PlanExecutor::ADVANCED != state) {
+            // This is not normal.  An error was encountered.
             return Status(ErrorCodes::InternalError, "quick oplog start location had error...?");
         }
     }
@@ -594,15 +629,20 @@ StatusWith<unique_ptr<PlanExecutor, PlanExecutor::Deleter>> getOplogStartHack(
     // Build our collection scan...
     CollectionScanParams params;
     params.collection = collection;
-    params.start = *startLoc;
+    if (startLoc) {
+        params.start = *startLoc;
+    }
+    params.maxTs = maxTs;
     params.direction = CollectionScanParams::FORWARD;
     params.tailable = cq->getQueryRequest().isTailable();
+    params.shouldTrackLatestOplogTimestamp =
+        plannerOptions & QueryPlannerParams::TRACK_LATEST_OPLOG_TS;
 
-    // If the query is just tsExpr, we know that every document in the collection after the first
-    // matching one must also match. To avoid wasting time running the match expression on every
-    // document to be returned, we tell the CollectionScan stage to stop applying the filter once it
-    // finds the first match.
-    if (cq->root() == tsExpr) {
+    // If the query is just a lower bound on "ts", we know that every document in the collection
+    // after the first matching one must also match. To avoid wasting time running the match
+    // expression on every document to be returned, we tell the CollectionScan stage to stop
+    // applying the filter once it finds the first match.
+    if (isOplogTsLowerBoundPred(cq->root())) {
         params.stopApplyingFilterAfterFirstMatch = true;
     }
 
@@ -621,17 +661,17 @@ StatusWith<unique_ptr<PlanExecutor, PlanExecutor::Deleter>> getExecutorFind(
     Collection* collection,
     const NamespaceString& nss,
     unique_ptr<CanonicalQuery> canonicalQuery,
-    PlanExecutor::YieldPolicy yieldPolicy) {
+    PlanExecutor::YieldPolicy yieldPolicy,
+    size_t plannerOptions) {
     if (NULL != collection && canonicalQuery->getQueryRequest().isOplogReplay()) {
-        return getOplogStartHack(opCtx, collection, std::move(canonicalQuery));
+        return getOplogStartHack(opCtx, collection, std::move(canonicalQuery), plannerOptions);
     }
 
-    size_t options = QueryPlannerParams::DEFAULT;
     if (ShardingState::get(opCtx)->needCollectionMetadata(opCtx, nss.ns())) {
-        options |= QueryPlannerParams::INCLUDE_SHARD_FILTER;
+        plannerOptions |= QueryPlannerParams::INCLUDE_SHARD_FILTER;
     }
     return getExecutor(
-        opCtx, collection, std::move(canonicalQuery), PlanExecutor::YIELD_AUTO, options);
+        opCtx, collection, std::move(canonicalQuery), PlanExecutor::YIELD_AUTO, plannerOptions);
 }
 
 namespace {
@@ -653,8 +693,7 @@ StatusWith<unique_ptr<PlanStage>> applyProjection(OperationContext* opCtx,
     invariant(!proj.isEmpty());
 
     ParsedProjection* rawParsedProj;
-    Status ppStatus = ParsedProjection::make(
-        proj.getOwned(), cq->root(), &rawParsedProj, ExtensionsCallbackDisallowExtensions());
+    Status ppStatus = ParsedProjection::make(opCtx, proj.getOwned(), cq->root(), &rawParsedProj);
     if (!ppStatus.isOK()) {
         return ppStatus;
     }
@@ -674,7 +713,7 @@ StatusWith<unique_ptr<PlanStage>> applyProjection(OperationContext* opCtx,
                 "Cannot use a $meta sortKey projection in findAndModify commands."};
     }
 
-    ProjectionStageParams params(ExtensionsCallbackReal(opCtx, &nsString));
+    ProjectionStageParams params;
     params.projObj = proj;
     params.collator = cq->getCollator();
     params.fullExpression = cq->root();
@@ -693,8 +732,8 @@ StatusWith<unique_ptr<PlanExecutor, PlanExecutor::Deleter>> getExecutorDelete(
 
     const NamespaceString& nss(request->getNamespaceString());
     if (!request->isGod()) {
-        if (nss.isSystem()) {
-            uassert(12050, "cannot delete from system namespace", legalClientSystemNS(nss.ns()));
+        if (nss.isSystem() && opCtx->lockState()->shouldConflictWithSecondaryBatchApplication()) {
+            uassert(12050, "cannot delete from system namespace", nss.isLegalClientSystemNS());
         }
         if (nss.isVirtualized()) {
             log() << "cannot delete from a virtual collection: " << nss;
@@ -722,6 +761,7 @@ StatusWith<unique_ptr<PlanExecutor, PlanExecutor::Deleter>> getExecutorDelete(
     deleteStageParams.returnDeleted = request->shouldReturnDeleted();
     deleteStageParams.sort = request->getSort();
     deleteStageParams.opDebug = opDebug;
+    deleteStageParams.stmtId = request->getStmtId();
 
     unique_ptr<WorkingSet> ws = make_unique<WorkingSet>();
     const PlanExecutor::YieldPolicy policy = parsedDelete->yieldPolicy();
@@ -821,33 +861,23 @@ StatusWith<unique_ptr<PlanExecutor, PlanExecutor::Deleter>> getExecutorDelete(
 // Update
 //
 
-namespace {
-
-// TODO: Make this a function on NamespaceString, or make it cleaner.
-inline void validateUpdate(const char* ns, const BSONObj& updateobj, const BSONObj& patternOrig) {
-    uassert(10155, "cannot update reserved $ collection", strchr(ns, '$') == 0);
-    if (strstr(ns, ".system.")) {
-        /* dm: it's very important that system.indexes is never updated as IndexDetails
-           has pointers into it */
-        uassert(10156,
-                str::stream() << "cannot update system collection: " << ns << " q: " << patternOrig
-                              << " u: "
-                              << updateobj,
-                legalClientSystemNS(ns));
-    }
-}
-
-}  // namespace
-
 StatusWith<unique_ptr<PlanExecutor, PlanExecutor::Deleter>> getExecutorUpdate(
     OperationContext* opCtx, OpDebug* opDebug, Collection* collection, ParsedUpdate* parsedUpdate) {
     const UpdateRequest* request = parsedUpdate->getRequest();
     UpdateDriver* driver = parsedUpdate->getDriver();
 
-    const NamespaceString& nsString = request->getNamespaceString();
+    const NamespaceString& nss = request->getNamespaceString();
     UpdateLifecycle* lifecycle = request->getLifecycle();
 
-    validateUpdate(nsString.ns().c_str(), request->getUpdates(), request->getQuery());
+    if (nss.isSystem() && opCtx->lockState()->shouldConflictWithSecondaryBatchApplication()) {
+        uassert(10156,
+                str::stream() << "cannot update a system namespace: " << nss.ns(),
+                nss.isLegalClientSystemNS());
+    }
+    if (nss.isVirtualized()) {
+        log() << "cannot update a virtual collection: " << nss;
+        uasserted(10155, "cannot update a virtual collection");
+    }
 
     // If there is no collection and this is an upsert, callers are supposed to create
     // the collection prior to calling this method. Explain, however, will never do
@@ -867,11 +897,11 @@ StatusWith<unique_ptr<PlanExecutor, PlanExecutor::Deleter>> getExecutorUpdate(
     // writes on a secondary. If this is an update to a secondary from the replication system,
     // however, then we make an exception and let the write proceed.
     bool userInitiatedWritesAndNotPrimary = opCtx->writesAreReplicated() &&
-        !repl::getGlobalReplicationCoordinator()->canAcceptWritesFor(opCtx, nsString);
+        !repl::getGlobalReplicationCoordinator()->canAcceptWritesFor(opCtx, nss);
 
     if (userInitiatedWritesAndNotPrimary) {
         return Status(ErrorCodes::PrimarySteppedDown,
-                      str::stream() << "Not primary while performing update on " << nsString.ns());
+                      str::stream() << "Not primary while performing update on " << nss.ns());
     }
 
     if (lifecycle) {
@@ -893,12 +923,11 @@ StatusWith<unique_ptr<PlanExecutor, PlanExecutor::Deleter>> getExecutorUpdate(
             // Treat collections that do not exist as empty collections. Note that the explain
             // reporting machinery always assumes that the root stage for an update operation is
             // an UpdateStage, so in this case we put an UpdateStage on top of an EOFStage.
-            LOG(2) << "Collection " << nsString.ns() << " does not exist."
+            LOG(2) << "Collection " << nss.ns() << " does not exist."
                    << " Using EOF stage: " << redact(unparsedQuery);
             auto updateStage = make_unique<UpdateStage>(
                 opCtx, updateStageParams, ws.get(), collection, new EOFStage(opCtx));
-            return PlanExecutor::make(
-                opCtx, std::move(ws), std::move(updateStage), nsString, policy);
+            return PlanExecutor::make(opCtx, std::move(ws), std::move(updateStage), nss, policy);
         }
 
         const IndexDescriptor* descriptor = collection->getIndexCatalog()->findIdIndex(opCtx);
@@ -954,13 +983,8 @@ StatusWith<unique_ptr<PlanExecutor, PlanExecutor::Deleter>> getExecutorUpdate(
         // is invalid to use a positional projection because the query expression need not
         // match the array element after the update has been applied.
         const bool allowPositional = request->shouldReturnOldDocs();
-        StatusWith<unique_ptr<PlanStage>> projStatus = applyProjection(opCtx,
-                                                                       nsString,
-                                                                       cq.get(),
-                                                                       request->getProj(),
-                                                                       allowPositional,
-                                                                       ws.get(),
-                                                                       std::move(root));
+        StatusWith<unique_ptr<PlanStage>> projStatus = applyProjection(
+            opCtx, nss, cq.get(), request->getProj(), allowPositional, ws.get(), std::move(root));
         if (!projStatus.isOK()) {
             return projStatus.getStatus();
         }
@@ -1011,7 +1035,13 @@ StatusWith<unique_ptr<PlanExecutor, PlanExecutor::Deleter>> getExecutorGroup(
 
     const ExtensionsCallbackReal extensionsCallback(opCtx, &nss);
 
-    auto statusWithCQ = CanonicalQuery::canonicalize(opCtx, std::move(qr), extensionsCallback);
+    const boost::intrusive_ptr<ExpressionContext> expCtx;
+    auto statusWithCQ =
+        CanonicalQuery::canonicalize(opCtx,
+                                     std::move(qr),
+                                     expCtx,
+                                     extensionsCallback,
+                                     MatchExpressionParser::kAllowAllSpecialFeatures);
     if (!statusWithCQ.isOK()) {
         return statusWithCQ.getStatus();
     }
@@ -1241,12 +1271,16 @@ StatusWith<unique_ptr<PlanExecutor, PlanExecutor::Deleter>> getExecutorCount(
     qr->setHint(request.getHint());
     qr->setExplain(explain);
 
+    const boost::intrusive_ptr<ExpressionContext> expCtx;
     auto statusWithCQ = CanonicalQuery::canonicalize(
         opCtx,
         std::move(qr),
+        expCtx,
         collection ? static_cast<const ExtensionsCallback&>(
                          ExtensionsCallbackReal(opCtx, &collection->ns()))
-                   : static_cast<const ExtensionsCallback&>(ExtensionsCallbackNoop()));
+                   : static_cast<const ExtensionsCallback&>(ExtensionsCallbackNoop()),
+        MatchExpressionParser::kAllowAllSpecialFeatures &
+            ~MatchExpressionParser::AllowedFeatures::kIsolated);
 
     if (!statusWithCQ.isOK()) {
         return statusWithCQ.getStatus();
@@ -1497,7 +1531,14 @@ StatusWith<unique_ptr<PlanExecutor, PlanExecutor::Deleter>> getExecutorDistinct(
     auto qr = stdx::make_unique<QueryRequest>(parsedDistinct->getQuery()->getQueryRequest());
     qr->setProj(projection);
 
-    auto statusWithCQ = CanonicalQuery::canonicalize(opCtx, std::move(qr), extensionsCallback);
+    const boost::intrusive_ptr<ExpressionContext> expCtx;
+    auto statusWithCQ =
+        CanonicalQuery::canonicalize(opCtx,
+                                     std::move(qr),
+                                     expCtx,
+                                     extensionsCallback,
+                                     MatchExpressionParser::kAllowAllSpecialFeatures &
+                                         ~MatchExpressionParser::AllowedFeatures::kIsolated);
     if (!statusWithCQ.isOK()) {
         return statusWithCQ.getStatus();
     }

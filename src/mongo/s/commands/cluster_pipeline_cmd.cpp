@@ -38,9 +38,9 @@
 namespace mongo {
 namespace {
 
-class ClusterPipelineCommand : public Command {
+class ClusterPipelineCommand : public BasicCommand {
 public:
-    ClusterPipelineCommand() : Command("aggregate") {}
+    ClusterPipelineCommand() : BasicCommand("aggregate") {}
 
     void help(std::stringstream& help) const {
         help << "Runs the sharded aggregation command. See "
@@ -62,14 +62,13 @@ public:
     Status checkAuthForCommand(Client* client,
                                const std::string& dbname,
                                const BSONObj& cmdObj) override {
-        const NamespaceString nss(parseNsCollectionRequired(dbname, cmdObj));
-        return AuthorizationSession::get(client)->checkAuthForAggregate(nss, cmdObj);
+        const NamespaceString nss(AggregationRequest::parseNs(dbname, cmdObj));
+        return AuthorizationSession::get(client)->checkAuthForAggregate(nss, cmdObj, true);
     }
 
     bool run(OperationContext* opCtx,
              const std::string& dbname,
              const BSONObj& cmdObj,
-             std::string& errmsg,
              BSONObjBuilder& result) override {
         return appendCommandStatus(result,
                                    _runAggCommand(opCtx, dbname, cmdObj, boost::none, &result));
@@ -89,16 +88,13 @@ private:
                                  const BSONObj& cmdObj,
                                  boost::optional<ExplainOptions::Verbosity> verbosity,
                                  BSONObjBuilder* result) {
-        NamespaceString nss(parseNsCollectionRequired(dbname, cmdObj));
-
         const auto aggregationRequest =
-            uassertStatusOK(AggregationRequest::parseFromBSON(nss, cmdObj, verbosity));
+            uassertStatusOK(AggregationRequest::parseFromBSON(dbname, cmdObj, verbosity));
 
-        return ClusterAggregate::runAggregate(opCtx,
-                                              ClusterAggregate::Namespaces{nss, std::move(nss)},
-                                              aggregationRequest,
-                                              cmdObj,
-                                              result);
+        const auto& nss = aggregationRequest.getNamespaceString();
+
+        return ClusterAggregate::runAggregate(
+            opCtx, ClusterAggregate::Namespaces{nss, nss}, aggregationRequest, cmdObj, result);
     }
 
 } clusterPipelineCmd;

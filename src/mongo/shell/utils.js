@@ -39,7 +39,8 @@ function _getErrorWithCode(codeOrObj, message) {
 
 // Checks if a javascript exception is a network error.
 function isNetworkError(error) {
-    return error.message.indexOf("error doing query") >= 0 ||
+    return error.message.indexOf("network error") >= 0 ||
+        error.message.indexOf("error doing query") >= 0 ||
         error.message.indexOf("socket exception") >= 0;
 }
 
@@ -158,6 +159,18 @@ print.captureAllOutput = function(fn, args) {
     return res;
 };
 
+var indentStr = function(indent, s) {
+    if (typeof(s) === "undefined") {
+        s = indent;
+        indent = 0;
+    }
+    if (indent > 0) {
+        indent = (new Array(indent + 1)).join(" ");
+        s = indent + s.replace(/\n/g, "\n" + indent);
+    }
+    return s;
+};
+
 if (typeof TestData == "undefined") {
     TestData = undefined;
 }
@@ -198,10 +211,12 @@ var _jsTestOptions = {enableTestCommands: true};  // Test commands should be ena
 jsTestOptions = function() {
     if (TestData) {
         return Object.merge(_jsTestOptions, {
+            serviceExecutor: TestData.serviceExecutor,
             setParameters: TestData.setParameters,
             setParametersMongos: TestData.setParametersMongos,
             storageEngine: TestData.storageEngine,
             storageEngineCacheSizeGB: TestData.storageEngineCacheSizeGB,
+            transportLayer: TestData.transportLayer,
             wiredTigerEngineConfigString: TestData.wiredTigerEngineConfigString,
             wiredTigerCollectionConfigString: TestData.wiredTigerCollectionConfigString,
             wiredTigerIndexConfigString: TestData.wiredTigerIndexConfigString,
@@ -228,9 +243,28 @@ jsTestOptions = function() {
             mongosBinVersion: TestData.mongosBinVersion || "",
             shardMixedBinVersions: TestData.shardMixedBinVersions || false,
             networkMessageCompressors: TestData.networkMessageCompressors,
+            replSetFeatureCompatibilityVersion: TestData.replSetFeatureCompatibilityVersion,
+            skipRetryOnNetworkError: TestData.skipRetryOnNetworkError,
             skipValidationOnInvalidViewDefinitions: TestData.skipValidationOnInvalidViewDefinitions,
             skipCollectionAndIndexValidation: TestData.skipCollectionAndIndexValidation,
-            skipValidationOnNamespaceNotFound: TestData.skipValidationOnNamespaceNotFound
+            // We default skipValidationOnNamespaceNotFound to true because mongod can end up
+            // dropping a collection after calling listCollections (e.g. if a secondary applies an
+            // oplog entry).
+            skipValidationOnNamespaceNotFound:
+                TestData.hasOwnProperty("skipValidationOnNamespaceNotFound")
+                ? TestData.skipValidationOnNamespaceNotFound
+                : true,
+            skipValidationNamespaces: TestData.skipValidationNamespaces || [],
+            skipCheckingUUIDsConsistentAcrossCluster:
+                TestData.skipCheckingUUIDsConsistentAcrossCluster || false,
+            jsonSchemaTestFile: TestData.jsonSchemaTestFile,
+            excludedDBsFromDBHash: TestData.excludedDBsFromDBHash,
+            alwaysInjectTransactionNumber: TestData.alwaysInjectTransactionNumber,
+            skipGossipingClusterTime: TestData.skipGossipingClusterTime || false,
+            disableEnableSessions: TestData.disableEnableSessions,
+            overrideRetryAttempts: TestData.overrideRetryAttempts || 0,
+            logRetryAttempts: TestData.logRetryAttempts || false,
+            connectionString: TestData.connectionString || "",
         });
     }
     return _jsTestOptions;
@@ -266,7 +300,7 @@ jsTest.authenticate = function(conn) {
             // back into authenticate.
             conn.authenticated = true;
             print("Authenticating as user " + jsTestOptions().authUser + " with mechanism " +
-                  DB.prototype._defaultAuthenticationMechanism + " on connection: " + conn);
+                  DB.prototype._getDefaultAuthenticationMechanism() + " on connection: " + conn);
             conn.authenticated = conn.getDB(jsTestOptions().authenticationDatabase).auth({
                 user: jsTestOptions().authUser,
                 pwd: jsTestOptions().authPassword,
@@ -442,24 +476,35 @@ isMasterStatePrompt = function(isMasterResponse) {
     return state + '> ';
 };
 
-if (typeof(_useWriteCommandsDefault) == 'undefined') {
-    // This is for cases when the v8 engine is used other than the mongo shell, like map reduce.
-    _useWriteCommandsDefault = function() {
+if (typeof _useWriteCommandsDefault === "undefined") {
+    // We ensure the _useWriteCommandsDefault() function is always defined, in case the JavaScript
+    // engine is being used from someplace other than the mongo shell (e.g. map-reduce).
+    _useWriteCommandsDefault = function _useWriteCommandsDefault() {
         return false;
     };
 }
 
-if (typeof(_writeMode) == 'undefined') {
-    // This is for cases when the v8 engine is used other than the mongo shell, like map reduce.
-    _writeMode = function() {
+if (typeof _writeMode === "undefined") {
+    // We ensure the _writeMode() function is always defined, in case the JavaScript engine is being
+    // used from someplace other than the mongo shell (e.g. map-reduce).
+    _writeMode = function _writeMode() {
         return "commands";
     };
 }
 
-if (typeof(_readMode) == 'undefined') {
-    // This is for cases when the v8 engine is used other than the mongo shell, like map reduce.
-    _readMode = function() {
+if (typeof _readMode === "undefined") {
+    // We ensure the _readMode() function is always defined, in case the JavaScript engine is being
+    // used from someplace other than the mongo shell (e.g. map-reduce).
+    _readMode = function _readMode() {
         return "legacy";
+    };
+}
+
+if (typeof _shouldRetryWrites === 'undefined') {
+    // We ensure the _shouldRetryWrites() function is always defined, in case the JavaScript engine
+    // is being used from someplace other than the mongo shell (e.g. map-reduce).
+    _shouldRetryWrites = function _shouldRetryWrites() {
+        return false;
     };
 }
 
@@ -669,7 +714,7 @@ shellHelper.use = function(dbname) {
         print("bad use parameter");
         return;
     }
-    db = db.getMongo().getDB(dbname);
+    db = db.getSiblingDB(dbname);
     print("switched to db " + db.getName());
 };
 
@@ -766,7 +811,7 @@ shellHelper.show = function(what) {
     }
 
     if (what == "dbs" || what == "databases") {
-        var dbs = db.getMongo().getDBs();
+        var dbs = db.getMongo().getDBs(db.getSession());
         var dbinfo = [];
         var maxNameLength = 0;
         var maxGbDigits = 0;

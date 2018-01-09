@@ -48,7 +48,7 @@ constexpr StringData kWaitFieldName = "wait"_sd;
 }  // namespace
 
 // operator requested resynchronization of replication (on a slave or secondary). {resync: 1}
-class CmdResync : public Command {
+class CmdResync : public ErrmsgCommandDeprecated {
 public:
     virtual bool slaveOk() const {
         return true;
@@ -71,12 +71,12 @@ public:
         h << "resync (from scratch) a stale slave or replica set secondary node.\n";
     }
 
-    CmdResync() : Command(kResyncFieldName) {}
-    virtual bool run(OperationContext* opCtx,
-                     const string& dbname,
-                     const BSONObj& cmdObj,
-                     string& errmsg,
-                     BSONObjBuilder& result) {
+    CmdResync() : ErrmsgCommandDeprecated(kResyncFieldName) {}
+    virtual bool errmsgRun(OperationContext* opCtx,
+                           const string& dbname,
+                           const BSONObj& cmdObj,
+                           string& errmsg,
+                           BSONObjBuilder& result) {
         bool waitForResync = !cmdObj.hasField(kWaitFieldName) || cmdObj[kWaitFieldName].trueValue();
 
         // Replica set resync.
@@ -90,14 +90,28 @@ public:
                            "Replica sets do not support the resync command"));
             }
 
-            const MemberState memberState = replCoord->getMemberState();
-            if (memberState.startup()) {
-                return appendCommandStatus(
-                    result, Status(ErrorCodes::NotYetInitialized, "no replication yet active"));
-            }
-            if (memberState.primary() || !replCoord->setFollowerMode(MemberState::RS_STARTUP2)) {
-                return appendCommandStatus(
-                    result, Status(ErrorCodes::NotSecondary, "primaries cannot resync"));
+            {
+                // Need global write lock to transition out of SECONDARY
+                Lock::GlobalWrite globalWriteLock(opCtx);
+
+                const MemberState memberState = replCoord->getMemberState();
+                if (memberState.startup()) {
+                    return appendCommandStatus(
+                        result, Status(ErrorCodes::NotYetInitialized, "no replication yet active"));
+                }
+                if (memberState.primary()) {
+                    return appendCommandStatus(
+                        result, Status(ErrorCodes::NotSecondary, "primaries cannot resync"));
+                }
+                auto status = replCoord->setFollowerMode(MemberState::RS_STARTUP2);
+                if (!status.isOK()) {
+                    return appendCommandStatus(
+                        result,
+                        Status(status.code(),
+                               str::stream()
+                                   << "Failed to transition to STARTUP2 state to perform resync: "
+                                   << status.reason()));
+                }
             }
             uassertStatusOKWithLocation(replCoord->resyncData(opCtx, waitForResync), "resync", 0);
             return true;

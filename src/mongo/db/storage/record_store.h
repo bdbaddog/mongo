@@ -374,14 +374,20 @@ public:
     virtual StatusWith<RecordId> insertRecord(OperationContext* opCtx,
                                               const char* data,
                                               int len,
+                                              Timestamp timestamp,
                                               bool enforceQuota) = 0;
 
     virtual Status insertRecords(OperationContext* opCtx,
                                  std::vector<Record>* records,
+                                 std::vector<Timestamp>* timestamps,
                                  bool enforceQuota) {
+        int index = 0;
         for (auto& record : *records) {
-            StatusWith<RecordId> res =
-                insertRecord(opCtx, record.data.data(), record.data.size(), enforceQuota);
+            StatusWith<RecordId> res = insertRecord(opCtx,
+                                                    record.data.data(),
+                                                    record.data.size(),
+                                                    (*timestamps)[index++],
+                                                    enforceQuota);
             if (!res.isOK())
                 return res.getStatus();
 
@@ -401,15 +407,18 @@ public:
      */
     virtual Status insertRecordsWithDocWriter(OperationContext* opCtx,
                                               const DocWriter* const* docs,
+                                              const Timestamp* timestamps,
                                               size_t nDocs,
                                               RecordId* idsOut = nullptr) = 0;
 
     /**
      * A thin wrapper around insertRecordsWithDocWriter() to simplify handling of single DocWriters.
      */
-    StatusWith<RecordId> insertRecordWithDocWriter(OperationContext* opCtx, const DocWriter* doc) {
+    StatusWith<RecordId> insertRecordWithDocWriter(OperationContext* opCtx,
+                                                   const DocWriter* doc,
+                                                   Timestamp timestamp) {
         RecordId out;
-        Status status = insertRecordsWithDocWriter(opCtx, &doc, 1, &out);
+        Status status = insertRecordsWithDocWriter(opCtx, &doc, &timestamp, 1, &out);
         if (!status.isOK())
             return status;
         return out;
@@ -551,6 +560,19 @@ public:
     }
 
     /**
+     * Does the RecordStore cursor retrieve its document in RecordId Order?
+     *
+     * If a subclass overrides the default value to true, the RecordStore cursor must retrieve
+     * its documents in RecordId order.
+     *
+     * This enables your storage engine to run collection validation in the
+     * background.
+     */
+    virtual bool isInRecordIdOrder() const {
+        return false;
+    }
+
+    /**
      * @return OK if the validate run successfully
      *         OK will be returned even if corruption is found
      *         deatils will be in result
@@ -622,6 +644,14 @@ public:
     virtual void updateStatsAfterRepair(OperationContext* opCtx,
                                         long long numRecords,
                                         long long dataSize) = 0;
+
+    /**
+     * used to support online change oplog size.
+     */
+    virtual Status updateCappedSize(OperationContext* opCtx, long long cappedSize) {
+        return Status(ErrorCodes::CommandNotSupported,
+                      "this storage engine does not support updateCappedSize");
+    }
 
 protected:
     std::string _ns;

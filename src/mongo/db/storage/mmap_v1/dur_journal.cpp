@@ -162,7 +162,7 @@ bool JSectFooter::checkHash(const void* begin, int len) const {
 }
 
 namespace {
-SecureRandom* mySecureRandom = NULL;
+std::unique_ptr<SecureRandom> mySecureRandom;
 stdx::mutex mySecureRandomMutex;
 int64_t getMySecureRandomNumber() {
     stdx::lock_guard<stdx::mutex> lk(mySecureRandomMutex);
@@ -417,7 +417,7 @@ void checkFreeSpace() {
         log() << "Please make at least " << spaceNeeded / (1024 * 1024) << "MB available in "
               << getJournalDir().string() << " or use --smallfiles" << endl;
         log() << endl;
-        throw UserException(15926, "Insufficient free space for journals");
+        uasserted(15926, "Insufficient free space for journals");
     }
 }
 

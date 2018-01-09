@@ -31,52 +31,82 @@
 #include "mongo/db/pipeline/document_source_current_op.h"
 
 #include "mongo/db/pipeline/lite_parsed_document_source.h"
-#include "mongo/db/server_options.h"
-#include "mongo/util/net/sock.h"
 
 namespace mongo {
 
 namespace {
 const StringData kAllUsersFieldName = "allUsers"_sd;
 const StringData kIdleConnectionsFieldName = "idleConnections"_sd;
+const StringData kTruncateOpsFieldName = "truncateOps"_sd;
 
 const StringData kOpIdFieldName = "opid"_sd;
 const StringData kClientFieldName = "client"_sd;
 const StringData kMongosClientFieldName = "client_s"_sd;
+const StringData kShardFieldName = "shard"_sd;
 }  // namespace
 
 using boost::intrusive_ptr;
 
 REGISTER_DOCUMENT_SOURCE(currentOp,
-                         LiteParsedDocumentSourceDefault::parse,
+                         DocumentSourceCurrentOp::LiteParsed::parse,
                          DocumentSourceCurrentOp::createFromBson);
+
+std::unique_ptr<DocumentSourceCurrentOp::LiteParsed> DocumentSourceCurrentOp::LiteParsed::parse(
+    const AggregationRequest& request, const BSONElement& spec) {
+    // Need to check the value of allUsers; if true then inprog privilege is required.
+    if (spec.type() != BSONType::Object) {
+        uasserted(ErrorCodes::TypeMismatch,
+                  str::stream() << "$currentOp options must be specified in an object, but found: "
+                                << typeName(spec.type()));
+    }
+
+    bool allUsers = false;
+
+    // Check the spec for all fields named 'allUsers'. If any of them are 'true', we require
+    // the 'inprog' privilege. This avoids the possibility that a spec with multiple
+    // allUsers fields might allow an unauthorized user to view all operations.
+    for (auto&& elem : spec.embeddedObject()) {
+        if (elem.fieldNameStringData() == "allUsers"_sd) {
+            if (elem.type() != BSONType::Bool) {
+                uasserted(ErrorCodes::TypeMismatch,
+                          str::stream() << "The 'allUsers' parameter of the $currentOp stage "
+                                           "must be a boolean value, but found: "
+                                        << typeName(elem.type()));
+            }
+
+            allUsers = allUsers || elem.boolean();
+        }
+    }
+
+    return stdx::make_unique<DocumentSourceCurrentOp::LiteParsed>(allUsers);
+}
+
 
 const char* DocumentSourceCurrentOp::getSourceName() const {
     return "$currentOp";
 }
 
-DocumentSource::InitialSourceType DocumentSourceCurrentOp::getInitialSourceType() const {
-    return InitialSourceType::kCollectionlessInitialSource;
-}
-
 DocumentSource::GetNextResult DocumentSourceCurrentOp::getNext() {
+    pExpCtx->checkForInterrupt();
+
     if (_ops.empty()) {
-        _ops = _mongod->getCurrentOps(_includeIdleConnections, _includeOpsFromAllUsers);
+        _ops = pExpCtx->mongoProcessInterface->getCurrentOps(
+            pExpCtx->opCtx, _includeIdleConnections, _includeOpsFromAllUsers, _truncateOps);
 
         _opsIter = _ops.begin();
 
-        if (pExpCtx->inShard) {
-            _shardName = _mongod->getShardName(pExpCtx->opCtx);
+        if (pExpCtx->fromMongos) {
+            _shardName = pExpCtx->mongoProcessInterface->getShardName(pExpCtx->opCtx);
 
             uassert(40465,
-                    "Aggregation request specified 'fromRouter' but unable to retrieve shard name "
+                    "Aggregation request specified 'fromMongos' but unable to retrieve shard name "
                     "for $currentOp pipeline stage.",
                     !_shardName.empty());
         }
     }
 
     if (_opsIter != _ops.end()) {
-        if (!pExpCtx->inShard) {
+        if (!pExpCtx->fromMongos) {
             return Document(*_opsIter++);
         }
 
@@ -85,6 +115,9 @@ DocumentSource::GetNextResult DocumentSourceCurrentOp::getNext() {
 
         const BSONObj& op = *_opsIter++;
         MutableDocument doc;
+
+        // Add the shard name to the output document.
+        doc.addField(kShardFieldName, Value(_shardName));
 
         // For operations on a shard, we change the opid from the raw numeric form to
         // 'shardname:opid'. We also change the fieldname 'client' to 'client_s' to indicate
@@ -130,6 +163,7 @@ intrusive_ptr<DocumentSource> DocumentSourceCurrentOp::createFromBson(
 
     ConnMode includeIdleConnections = ConnMode::kExcludeIdle;
     UserMode includeOpsFromAllUsers = UserMode::kExcludeOthers;
+    TruncationMode truncateOps = TruncationMode::kNoTruncation;
 
     for (auto&& elem : spec.embeddedObject()) {
         const auto fieldName = elem.fieldNameStringData();
@@ -150,6 +184,14 @@ intrusive_ptr<DocumentSource> DocumentSourceCurrentOp::createFromBson(
                     elem.type() == BSONType::Bool);
             includeOpsFromAllUsers =
                 (elem.Bool() ? UserMode::kIncludeAll : UserMode::kExcludeOthers);
+        } else if (fieldName == kTruncateOpsFieldName) {
+            uassert(ErrorCodes::FailedToParse,
+                    str::stream() << "The 'truncateOps' parameter of the $currentOp stage must be "
+                                     "a boolean value, but found: "
+                                  << typeName(elem.type()),
+                    elem.type() == BSONType::Bool);
+            truncateOps =
+                (elem.Bool() ? TruncationMode::kTruncateOps : TruncationMode::kNoTruncation);
         } else {
             uasserted(ErrorCodes::FailedToParse,
                       str::stream() << "Unrecognized option '" << fieldName
@@ -157,22 +199,24 @@ intrusive_ptr<DocumentSource> DocumentSourceCurrentOp::createFromBson(
         }
     }
 
-    return intrusive_ptr<DocumentSourceCurrentOp>(
-        new DocumentSourceCurrentOp(pExpCtx, includeIdleConnections, includeOpsFromAllUsers));
+    return intrusive_ptr<DocumentSourceCurrentOp>(new DocumentSourceCurrentOp(
+        pExpCtx, includeIdleConnections, includeOpsFromAllUsers, truncateOps));
 }
 
 intrusive_ptr<DocumentSourceCurrentOp> DocumentSourceCurrentOp::create(
     const boost::intrusive_ptr<ExpressionContext>& pExpCtx,
     ConnMode includeIdleConnections,
-    UserMode includeOpsFromAllUsers) {
-    return intrusive_ptr<DocumentSourceCurrentOp>(
-        new DocumentSourceCurrentOp(pExpCtx, includeIdleConnections, includeOpsFromAllUsers));
+    UserMode includeOpsFromAllUsers,
+    TruncationMode truncateOps) {
+    return intrusive_ptr<DocumentSourceCurrentOp>(new DocumentSourceCurrentOp(
+        pExpCtx, includeIdleConnections, includeOpsFromAllUsers, truncateOps));
 }
 
 Value DocumentSourceCurrentOp::serialize(boost::optional<ExplainOptions::Verbosity> explain) const {
     return Value(Document{
         {getSourceName(),
          Document{{kIdleConnectionsFieldName, (_includeIdleConnections == ConnMode::kIncludeIdle)},
-                  {kAllUsersFieldName, (_includeOpsFromAllUsers == UserMode::kIncludeAll)}}}});
+                  {kAllUsersFieldName, (_includeOpsFromAllUsers == UserMode::kIncludeAll)},
+                  {kTruncateOpsFieldName, (_truncateOps == TruncationMode::kTruncateOps)}}}});
 }
 }  // namespace mongo

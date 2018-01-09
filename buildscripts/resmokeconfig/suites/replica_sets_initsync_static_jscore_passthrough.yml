@@ -19,6 +19,7 @@ executor:
       eval: "testingReplication = true;"
       readMode: commands
   hooks:
+  - class: CheckPrimary
   - class: IntermediateInitialSync
     n: *run_hook_interval
   - class: CleanEveryN
@@ -26,7 +27,6 @@ executor:
   fixture:
     class: ReplicaSetFixture
     mongod_options:
-      bind_ip_all: ''
       oplogSize: 511
       set_parameters:
         enableTestCommands: 1

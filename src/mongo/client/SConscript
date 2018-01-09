@@ -4,6 +4,16 @@ Import('env')
 
 env = env.Clone()
 
+
+env.SConscript(
+    dirs=[
+        'embedded',
+    ],
+    exports=[
+        'env',
+    ],
+)
+	
 # Contains only the core ConnectionString functionality, *not* the ability to call connect()
 # and return a DBClientBase* back. For that you need to link against the 'clientdriver' library.
 env.Library(
@@ -13,7 +23,10 @@ env.Library(
         'mongo_uri.cpp',
     ],
     LIBDEPS=[
-        '$BUILD_DIR/mongo/util/net/hostandport',
+        '$BUILD_DIR/mongo/util/net/network',
+    ],
+    LIBDEPS_PRIVATE=[
+        '$BUILD_DIR/mongo/util/dns_query',
     ]
 )
 
@@ -21,6 +34,15 @@ env.CppUnitTest(
     target='connection_string_test',
     source=[
         'connection_string_test.cpp',
+    ],
+    LIBDEPS=[
+        'clientdriver',
+    ]
+)
+
+env.CppUnitTest(
+    target='mongo_uri_test',
+    source=[
         'mongo_uri_test.cpp',
     ],
     LIBDEPS=[
@@ -116,7 +138,7 @@ env.CppUnitTest(
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/rpc/command_status',
-        '$BUILD_DIR/mongo/util/net/hostandport',
+        '$BUILD_DIR/mongo/util/net/network',
         '$BUILD_DIR/mongo/util/md5',
         'authentication',
     ]
@@ -162,6 +184,7 @@ clientDriverEnv.Library(
         '$BUILD_DIR/mongo/executor/thread_pool_task_executor',
         '$BUILD_DIR/mongo/rpc/command_status',
         '$BUILD_DIR/mongo/rpc/rpc',
+        '$BUILD_DIR/mongo/util/background_job',
         '$BUILD_DIR/mongo/util/md5',
         '$BUILD_DIR/mongo/util/net/network',
         'authentication',
@@ -201,7 +224,7 @@ env.Library(
         'remote_command_targeter_factory_mock.cpp',
     ],
     LIBDEPS=[
-        '$BUILD_DIR/mongo/util/net/hostandport',
+        '$BUILD_DIR/mongo/util/net/network',
         '$BUILD_DIR/mongo/s/coreshard',
     ]
 )
@@ -246,7 +269,7 @@ env.CppUnitTest(
         'clientdriver',
         '$BUILD_DIR/mongo/db/auth/authorization_manager_mock_init',
         '$BUILD_DIR/mongo/db/service_context_noop_init',
-        '$BUILD_DIR/mongo/transport/transport_layer_legacy',
+        '$BUILD_DIR/mongo/transport/transport_layer',
         '$BUILD_DIR/mongo/util/net/network',
         '$BUILD_DIR/mongo/util/version_impl',
     ],

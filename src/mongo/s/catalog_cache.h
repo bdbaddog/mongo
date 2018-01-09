@@ -32,12 +32,11 @@
 #include "mongo/base/string_data.h"
 #include "mongo/s/catalog_cache_loader.h"
 #include "mongo/s/chunk_manager.h"
-#include "mongo/s/chunk_version.h"
 #include "mongo/s/client/shard.h"
-#include "mongo/s/config_server_catalog_cache_loader.h"
 #include "mongo/stdx/memory.h"
 #include "mongo/stdx/mutex.h"
 #include "mongo/util/concurrency/notification.h"
+#include "mongo/util/concurrency/with_lock.h"
 #include "mongo/util/string_map.h"
 
 namespace mongo {
@@ -57,35 +56,8 @@ class CatalogCache {
     MONGO_DISALLOW_COPYING(CatalogCache);
 
 public:
-    /**
-     * Defaults to instantiating a ConfigServerCatalogCacheLoader.
-     */
-    CatalogCache();
-
-    CatalogCache(std::unique_ptr<CatalogCacheLoader> cacheLoader);
-
+    CatalogCache(CatalogCacheLoader& cacheLoader);
     ~CatalogCache();
-
-    /**
-     * Intializes the catalog cache loader state for primary or secondary depending on 'isPrimary'.
-     *
-     * This can only be called on a shard, and only once during sharding state intiailization!
-     */
-    void initializeReplicaSetRole(bool isPrimary);
-
-    /**
-     * Tells the catalog cache loader that it should be in secondary mode.
-     *
-     * This can only be called on a shard!
-     */
-    void onStepDown();
-
-    /**
-     * Tells the catalog cache loader that it should be in primary mode.
-     *
-     * This can only be called on a shard!
-     */
-    void onStepUp();
 
     /**
      * Retrieves the cached metadata for the specified database. The returned value is still owned
@@ -106,17 +78,19 @@ public:
      */
     StatusWith<CachedCollectionRoutingInfo> getCollectionRoutingInfo(OperationContext* opCtx,
                                                                      const NamespaceString& nss);
-    StatusWith<CachedCollectionRoutingInfo> getCollectionRoutingInfo(OperationContext* opCtx,
-                                                                     StringData ns);
 
     /**
-     * Same as getCollectionRoutingInfo above, but in addition causes the namespace to be refreshed
-     * and returns a NamespaceNotSharded error if the collection is not sharded.
+     * Same as getCollectionRoutingInfo above, but in addition causes the namespace to be refreshed.
+     */
+    StatusWith<CachedCollectionRoutingInfo> getCollectionRoutingInfoWithRefresh(
+        OperationContext* opCtx, const NamespaceString& nss);
+
+    /**
+     * Same as getCollectionRoutingInfoWithRefresh above, but in addition returns a
+     * NamespaceNotSharded error if the collection is not sharded.
      */
     StatusWith<CachedCollectionRoutingInfo> getShardedCollectionRoutingInfoWithRefresh(
         OperationContext* opCtx, const NamespaceString& nss);
-    StatusWith<CachedCollectionRoutingInfo> getShardedCollectionRoutingInfoWithRefresh(
-        OperationContext* opCtx, StringData ns);
 
     /**
      * Non-blocking method to be called whenever using the specified routing table has encountered a
@@ -131,16 +105,16 @@ public:
      * namespace to be refreshed the next time getCollectionRoutingInfo is called.
      */
     void invalidateShardedCollection(const NamespaceString& nss);
-    void invalidateShardedCollection(StringData ns);
 
     /**
-     * Blocking method, which removes the entire specified database (including its collections) from
-     * the cache.
+     * Non-blocking method, which removes the entire specified database (including its collections)
+     * from the cache.
      */
     void purgeDatabase(StringData dbName);
 
     /**
-     * Blocking method, which removes all databases (including their collections) from the cache.
+     * Non-blocking method, which removes all databases (including their collections) from the
+     * cache.
      */
     void purgeAllDatabases();
 
@@ -188,13 +162,14 @@ private:
      * Non-blocking call which schedules an asynchronous refresh for the specified namespace. The
      * namespace must be in the 'needRefresh' state.
      */
-    void _scheduleCollectionRefresh_inlock(std::shared_ptr<DatabaseInfoEntry> dbEntry,
-                                           std::shared_ptr<ChunkManager> existingRoutingInfo,
-                                           const NamespaceString& nss,
-                                           int refreshAttempt);
+    void _scheduleCollectionRefresh(WithLock,
+                                    std::shared_ptr<DatabaseInfoEntry> dbEntry,
+                                    std::shared_ptr<ChunkManager> existingRoutingInfo,
+                                    NamespaceString const& nss,
+                                    int refreshAttempt);
 
     // Interface from which chunks will be retrieved
-    const std::unique_ptr<CatalogCacheLoader> _cacheLoader;
+    CatalogCacheLoader& _cacheLoader;
 
     // Mutex to serialize access to the structures below
     stdx::mutex _mutex;

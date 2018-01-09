@@ -57,21 +57,22 @@
 #include "mongo/util/fail_point_service.h"
 #include "mongo/util/log.h"
 #include "mongo/util/md5.hpp"
+#include "mongo/util/net/sock.h"
 #include "mongo/util/ntservice.h"
 #include "mongo/util/processinfo.h"
 #include "mongo/util/ramlog.h"
 #include "mongo/util/version.h"
 
 namespace mongo {
+namespace {
 
-using std::endl;
 using std::string;
 using std::stringstream;
 using std::vector;
 
-class CmdBuildInfo : public Command {
+class CmdBuildInfo : public BasicCommand {
 public:
-    CmdBuildInfo() : Command("buildInfo", "buildinfo") {}
+    CmdBuildInfo() : BasicCommand("buildInfo", "buildinfo") {}
     virtual bool slaveOk() const {
         return true;
     }
@@ -92,7 +93,6 @@ public:
     bool run(OperationContext* opCtx,
              const std::string& dbname,
              const BSONObj& jsobj,
-             std::string& errmsg,
              BSONObjBuilder& result) {
         VersionInfoInterface::instance().appendBuildInfo(&result);
         appendStorageEngineList(&result);
@@ -101,10 +101,9 @@ public:
 
 } cmdBuildInfo;
 
-
-class PingCommand : public Command {
+class PingCommand : public BasicCommand {
 public:
-    PingCommand() : Command("ping") {}
+    PingCommand() : BasicCommand("ping") {}
     virtual bool slaveOk() const {
         return true;
     }
@@ -115,22 +114,27 @@ public:
     virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
         return false;
     }
+    virtual bool allowsAfterClusterTime(const BSONObj& cmdObj) const override {
+        return false;
+    }
     virtual void addRequiredPrivileges(const std::string& dbname,
                                        const BSONObj& cmdObj,
                                        std::vector<Privilege>* out) {}  // No auth required
+    virtual bool requiresAuth() const override {
+        return false;
+    }
     virtual bool run(OperationContext* opCtx,
                      const string& badns,
                      const BSONObj& cmdObj,
-                     string& errmsg,
                      BSONObjBuilder& result) {
         // IMPORTANT: Don't put anything in here that might lock db - including authentication
         return true;
     }
 } pingCmd;
 
-class FeaturesCmd : public Command {
+class FeaturesCmd : public BasicCommand {
 public:
-    FeaturesCmd() : Command("features") {}
+    FeaturesCmd() : BasicCommand("features") {}
     void help(stringstream& h) const {
         h << "return build level feature settings";
     }
@@ -146,7 +150,6 @@ public:
     virtual bool run(OperationContext* opCtx,
                      const string& ns,
                      const BSONObj& cmdObj,
-                     string& errmsg,
                      BSONObjBuilder& result) {
         if (getGlobalScriptEngine()) {
             BSONObjBuilder bb(result.subobjStart("js"));
@@ -163,9 +166,9 @@ public:
 
 } featuresCmd;
 
-class HostInfoCmd : public Command {
+class HostInfoCmd : public BasicCommand {
 public:
-    HostInfoCmd() : Command("hostInfo") {}
+    HostInfoCmd() : BasicCommand("hostInfo") {}
     virtual bool slaveOk() const {
         return true;
     }
@@ -188,7 +191,6 @@ public:
     bool run(OperationContext* opCtx,
              const string& dbname,
              const BSONObj& cmdObj,
-             string& errmsg,
              BSONObjBuilder& result) {
         ProcessInfo p;
         BSONObjBuilder bSys, bOs;
@@ -213,9 +215,9 @@ public:
 
 } hostInfoCmd;
 
-class LogRotateCmd : public Command {
+class LogRotateCmd : public BasicCommand {
 public:
-    LogRotateCmd() : Command("logRotate") {}
+    LogRotateCmd() : BasicCommand("logRotate") {}
     virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
         return false;
     }
@@ -235,7 +237,6 @@ public:
     virtual bool run(OperationContext* opCtx,
                      const string& ns,
                      const BSONObj& cmdObj,
-                     string& errmsg,
                      BSONObjBuilder& result) {
         bool didRotate = rotateLogs(serverGlobalParams.logRenameOnRotate);
         if (didRotate)
@@ -245,12 +246,12 @@ public:
 
 } logRotateCmd;
 
-class ListCommandsCmd : public Command {
+class ListCommandsCmd : public BasicCommand {
 public:
     virtual void help(stringstream& help) const {
         help << "get a list of all db commands";
     }
-    ListCommandsCmd() : Command("listCommands") {}
+    ListCommandsCmd() : BasicCommand("listCommands") {}
     virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
         return false;
     }
@@ -266,14 +267,13 @@ public:
     virtual bool run(OperationContext* opCtx,
                      const string& ns,
                      const BSONObj& cmdObj,
-                     string& errmsg,
                      BSONObjBuilder& result) {
         // sort the commands before building the result BSON
         std::vector<Command*> commands;
-        for (CommandMap::const_iterator it = _commands->begin(); it != _commands->end(); ++it) {
+        for (const auto command : allCommands()) {
             // don't show oldnames
-            if (it->first == it->second->getName())
-                commands.push_back(it->second);
+            if (command.first == command.second->getName())
+                commands.push_back(command.second);
         }
         std::sort(commands.begin(), commands.end(), [](Command* lhs, Command* rhs) {
             return (lhs->getName()) < (rhs->getName());
@@ -302,51 +302,8 @@ public:
 
 } listCommandsCmd;
 
-namespace {
-MONGO_FP_DECLARE(crashOnShutdown);
-
-int* volatile illegalAddress;  // NOLINT - used for fail point only
-}  // namespace
-
-void CmdShutdown::addRequiredPrivileges(const std::string& dbname,
-                                        const BSONObj& cmdObj,
-                                        std::vector<Privilege>* out) {
-    ActionSet actions;
-    actions.addAction(ActionType::shutdown);
-    out->push_back(Privilege(ResourcePattern::forClusterResource(), actions));
-}
-
-void CmdShutdown::shutdownHelper() {
-    MONGO_FAIL_POINT_BLOCK(crashOnShutdown, crashBlock) {
-        const std::string crashHow = crashBlock.getData()["how"].str();
-        if (crashHow == "fault") {
-            ++*illegalAddress;
-        }
-        ::abort();
-    }
-
-    log() << "terminating, shutdown command received";
-
-#if defined(_WIN32)
-    // Signal the ServiceMain thread to shutdown.
-    if (ntservice::shouldStartService()) {
-        shutdownNoTerminate();
-
-        // Client expects us to abruptly close the socket as part of exiting
-        // so this function is not allowed to return.
-        // The ServiceMain thread will quit for us so just sleep until it does.
-        while (true)
-            sleepsecs(60);  // Loop forever
-    } else
-#endif
-    {
-        exitCleanly(EXIT_CLEAN);  // this never returns
-        invariant(false);
-    }
-}
-
 /* for testing purposes only */
-class CmdForceError : public Command {
+class CmdForceError : public BasicCommand {
 public:
     virtual void help(stringstream& help) const {
         help << "for testing purposes only.  forces a user assertion exception";
@@ -360,20 +317,19 @@ public:
     virtual void addRequiredPrivileges(const std::string& dbname,
                                        const BSONObj& cmdObj,
                                        std::vector<Privilege>* out) {}  // No auth required
-    CmdForceError() : Command("forceerror") {}
+    CmdForceError() : BasicCommand("forceerror") {}
     bool run(OperationContext* opCtx,
              const string& dbnamne,
              const BSONObj& cmdObj,
-             string& errmsg,
              BSONObjBuilder& result) {
         LastError::get(cc()).setLastError(10038, "forced error");
         return false;
     }
 } cmdForceError;
 
-class GetLogCmd : public Command {
+class GetLogCmd : public ErrmsgCommandDeprecated {
 public:
-    GetLogCmd() : Command("getLog") {}
+    GetLogCmd() : ErrmsgCommandDeprecated("getLog") {}
 
     virtual bool slaveOk() const {
         return true;
@@ -395,11 +351,11 @@ public:
         help << "{ getLog : '*' }  OR { getLog : 'global' }";
     }
 
-    virtual bool run(OperationContext* opCtx,
-                     const string& dbname,
-                     const BSONObj& cmdObj,
-                     string& errmsg,
-                     BSONObjBuilder& result) {
+    virtual bool errmsgRun(OperationContext* opCtx,
+                           const string& dbname,
+                           const BSONObj& cmdObj,
+                           string& errmsg,
+                           BSONObjBuilder& result) {
         BSONElement val = cmdObj.firstElement();
         if (val.type() != String) {
             return appendCommandStatus(
@@ -442,9 +398,9 @@ public:
 
 } getLogCmd;
 
-class ClearLogCmd : public Command {
+class ClearLogCmd : public BasicCommand {
 public:
-    ClearLogCmd() : Command("clearLog") {}
+    ClearLogCmd() : BasicCommand("clearLog") {}
 
     virtual bool slaveOk() const {
         return true;
@@ -469,7 +425,6 @@ public:
     virtual bool run(OperationContext* opCtx,
                      const string& dbname,
                      const BSONObj& cmdObj,
-                     string& errmsg,
                      BSONObjBuilder& result) {
         std::string logName;
         Status status = bsonExtractStringField(cmdObj, "clearLog", &logName);
@@ -496,9 +451,9 @@ MONGO_INITIALIZER(RegisterClearLogCmd)(InitializerContext* context) {
     return Status::OK();
 }
 
-class CmdGetCmdLineOpts : Command {
+class CmdGetCmdLineOpts : public BasicCommand {
 public:
-    CmdGetCmdLineOpts() : Command("getCmdLineOpts") {}
+    CmdGetCmdLineOpts() : BasicCommand("getCmdLineOpts") {}
     void help(stringstream& h) const {
         h << "get argv";
     }
@@ -521,7 +476,6 @@ public:
     virtual bool run(OperationContext* opCtx,
                      const string&,
                      const BSONObj& cmdObj,
-                     string& errmsg,
                      BSONObjBuilder& result) {
         result.append("argv", serverGlobalParams.argvArray);
         result.append("parsed", serverGlobalParams.parsedOpts);
@@ -529,4 +483,47 @@ public:
     }
 
 } cmdGetCmdLineOpts;
+
+MONGO_FP_DECLARE(crashOnShutdown);
+int* volatile illegalAddress;  // NOLINT - used for fail point only
+
+}  // namespace
+
+void CmdShutdown::addRequiredPrivileges(const std::string& dbname,
+                                        const BSONObj& cmdObj,
+                                        std::vector<Privilege>* out) {
+    ActionSet actions;
+    actions.addAction(ActionType::shutdown);
+    out->push_back(Privilege(ResourcePattern::forClusterResource(), actions));
 }
+
+void CmdShutdown::shutdownHelper() {
+    MONGO_FAIL_POINT_BLOCK(crashOnShutdown, crashBlock) {
+        const std::string crashHow = crashBlock.getData()["how"].str();
+        if (crashHow == "fault") {
+            ++*illegalAddress;
+        }
+        ::abort();
+    }
+
+    log() << "terminating, shutdown command received";
+
+#if defined(_WIN32)
+    // Signal the ServiceMain thread to shutdown.
+    if (ntservice::shouldStartService()) {
+        shutdownNoTerminate();
+
+        // Client expects us to abruptly close the socket as part of exiting
+        // so this function is not allowed to return.
+        // The ServiceMain thread will quit for us so just sleep until it does.
+        while (true)
+            sleepsecs(60);  // Loop forever
+    } else
+#endif
+    {
+        exitCleanly(EXIT_CLEAN);  // this never returns
+        invariant(false);
+    }
+}
+
+}  // namespace mongo

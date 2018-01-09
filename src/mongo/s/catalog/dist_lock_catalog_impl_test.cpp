@@ -54,7 +54,7 @@
 #include "mongo/s/client/shard_remote.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/sharding_mongod_test_fixture.h"
-#include "mongo/s/write_ops/batched_update_request.h"
+#include "mongo/s/write_ops/batched_command_request.h"
 #include "mongo/stdx/future.h"
 #include "mongo/stdx/memory.h"
 #include "mongo/stdx/thread.h"
@@ -95,9 +95,8 @@ protected:
         configTargeter()->setFindHostReturnValue(dummyHost);
     }
 
-    std::unique_ptr<DistLockCatalog> makeDistLockCatalog(ShardRegistry* shardRegistry) override {
-        invariant(shardRegistry);
-        return stdx::make_unique<DistLockCatalogImpl>(shardRegistry);
+    std::unique_ptr<DistLockCatalog> makeDistLockCatalog() override {
+        return stdx::make_unique<DistLockCatalogImpl>();
     }
 
     std::unique_ptr<DistLockManager> makeDistLockManager(
@@ -1121,19 +1120,23 @@ TEST_F(DistLockCatalogFixture, BasicUnlockAll) {
         ASSERT_EQUALS(dummyHost, request.target);
         ASSERT_EQUALS("config", request.dbname);
 
-        std::string errmsg;
-        BatchedUpdateRequest batchRequest;
-        ASSERT(batchRequest.parseBSON("config", request.cmdObj, &errmsg));
-        ASSERT_EQUALS(LocksType::ConfigNS, batchRequest.getNS().toString());
-        ASSERT_BSONOBJ_EQ(BSON("w" << 1 << "wtimeout" << 0), batchRequest.getWriteConcern());
-        auto updates = batchRequest.getUpdates();
+        const auto opMsgRequest(OpMsgRequest::fromDBAndBody(request.dbname, request.cmdObj));
+        const auto commandRequest(BatchedCommandRequest::parseUpdate(opMsgRequest));
+
+        ASSERT_BSONOBJ_EQ(BSON("w" << 1 << "wtimeout" << 0), commandRequest.getWriteConcern());
+
+        const auto& updateOp = commandRequest.getUpdateRequest();
+        ASSERT_EQUALS(LocksType::ConfigNS, updateOp.getNamespace().ns());
+
+        const auto& updates = updateOp.getUpdates();
         ASSERT_EQUALS(1U, updates.size());
-        auto update = updates.front();
-        ASSERT_FALSE(update->getUpsert());
-        ASSERT_TRUE(update->getMulti());
-        ASSERT_BSONOBJ_EQ(BSON(LocksType::process("processID")), update->getQuery());
+
+        const auto& update = updates.front();
+        ASSERT(!update.getUpsert());
+        ASSERT(update.getMulti());
+        ASSERT_BSONOBJ_EQ(BSON(LocksType::process("processID")), update.getQ());
         ASSERT_BSONOBJ_EQ(BSON("$set" << BSON(LocksType::state(LocksType::UNLOCKED))),
-                          update->getUpdateExpr());
+                          update.getU());
 
         return BSON("ok" << 1);
     });

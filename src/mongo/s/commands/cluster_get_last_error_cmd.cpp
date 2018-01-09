@@ -118,7 +118,8 @@ Status enforceLegacyWriteConcern(OperationContext* opCtx,
                             Grid::get(opCtx)->getExecutorPool()->getArbitraryExecutor(),
                             dbName.toString(),
                             requests,
-                            readPref);
+                            readPref,
+                            Shard::RetryPolicy::kIdempotent);
 
     // Receive the responses.
 
@@ -184,9 +185,9 @@ Status enforceLegacyWriteConcern(OperationContext* opCtx,
 }
 
 
-class GetLastErrorCmd : public Command {
+class GetLastErrorCmd : public BasicCommand {
 public:
-    GetLastErrorCmd() : Command("getLastError", "getlasterror") {}
+    GetLastErrorCmd() : BasicCommand("getLastError", "getlasterror") {}
 
     virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
         return false;
@@ -206,10 +207,13 @@ public:
         // No auth required for getlasterror
     }
 
+    bool requiresAuth() const override {
+        return false;
+    }
+
     virtual bool run(OperationContext* opCtx,
                      const std::string& dbname,
                      const BSONObj& cmdObj,
-                     std::string& errmsg,
                      BSONObjBuilder& result) {
         // Mongos GLE - finicky.
         //

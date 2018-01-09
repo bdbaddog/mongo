@@ -46,9 +46,7 @@
 #include "mongo/util/concurrency/idle_thread_block.h"
 #include "mongo/util/exit.h"
 #include "mongo/util/log.h"
-#include "mongo/util/net/asio_message_port.h"
 #include "mongo/util/net/message_port.h"
-#include "mongo/util/net/message_port_startup_param.h"
 #include "mongo/util/net/ssl_manager.h"
 #include "mongo/util/net/ssl_options.h"
 #include "mongo/util/scopeguard.h"
@@ -96,13 +94,13 @@ using std::vector;
 vector<SockAddr> ipToAddrs(const char* ips, int port, bool useUnixSockets) {
     vector<SockAddr> out;
     if (*ips == '\0') {
-        out.push_back(SockAddr("127.0.0.1", port));  // IPv4 localhost
+        out.push_back(SockAddr("127.0.0.1", port, AF_INET));  // IPv4 localhost
 
         if (IPv6Enabled())
-            out.push_back(SockAddr("::1", port));  // IPv6 localhost
+            out.push_back(SockAddr("::1", port, AF_INET6));  // IPv6 localhost
 #ifndef _WIN32
         if (useUnixSockets)
-            out.push_back(SockAddr(makeUnixSockPath(port), port));  // Unix socket
+            out.push_back(SockAddr(makeUnixSockPath(port), port, AF_UNIX));  // Unix socket
 #endif
         return out;
     }
@@ -118,13 +116,13 @@ vector<SockAddr> ipToAddrs(const char* ips, int port, bool useUnixSockets) {
             ips = "";
         }
 
-        SockAddr sa(ip.c_str(), port);
+        SockAddr sa(ip.c_str(), port, IPv6Enabled() ? AF_UNSPEC : AF_INET);
         out.push_back(sa);
 
 #ifndef _WIN32
         if (sa.isValid() && useUnixSockets &&
             (sa.getAddr() == "127.0.0.1" || sa.getAddr() == "0.0.0.0"))  // only IPv4
-            out.push_back(SockAddr(makeUnixSockPath(port), port));
+            out.push_back(SockAddr(makeUnixSockPath(port), port, AF_INET));
 #endif
     }
     return out;
@@ -166,7 +164,9 @@ Listener::~Listener() {
 }
 
 bool Listener::setupSockets() {
-    checkTicketNumbers();
+    if (!_setAsServiceCtxDecoration) {
+        checkTicketNumbers();
+    }
 
 #if !defined(_WIN32)
     _mine = ipToAddrs(_ip.c_str(), _port, (!serverGlobalParams.noUnixSocket && useUnixSockets()));
@@ -251,7 +251,7 @@ void Listener::initAndListen() {
 
     SOCKET maxfd = 0;  // needed for select()
     for (unsigned i = 0; i < _socks.size(); i++) {
-        if (::listen(_socks[i], SOMAXCONN) != 0) {
+        if (::listen(_socks[i], serverGlobalParams.listenBacklog) != 0) {
             error() << "listen(): listen() failed " << errnoWithDescription();
             return;
         }
@@ -347,7 +347,7 @@ void Listener::initAndListen() {
 
             long long myConnectionNumber = globalConnectionNumber.addAndFetch(1);
 
-            if (_logConnect && !serverGlobalParams.quiet.load()) {
+            if (_logConnect && !_setAsServiceCtxDecoration && !serverGlobalParams.quiet.load()) {
                 int conns = globalTicketHolder.used() + 1;
                 const char* word = (conns == 1 ? " connection" : " connections");
                 log() << "connection accepted from " << from.toString() << " #"
@@ -430,7 +430,7 @@ void Listener::initAndListen() {
     }
 
     for (unsigned i = 0; i < _socks.size(); i++) {
-        if (::listen(_socks[i], SOMAXCONN) != 0) {
+        if (::listen(_socks[i], serverGlobalParams.listenBacklog) != 0) {
             error() << "listen(): listen() failed " << errnoWithDescription();
             return;
         }
@@ -565,7 +565,7 @@ void Listener::initAndListen() {
 
         long long myConnectionNumber = globalConnectionNumber.addAndFetch(1);
 
-        if (_logConnect && !serverGlobalParams.quiet.load()) {
+        if (_logConnect && !_setAsServiceCtxDecoration && !serverGlobalParams.quiet.load()) {
             int conns = globalTicketHolder.used() + 1;
             const char* word = (conns == 1 ? " connection" : " connections");
             log() << "connection accepted from " << from.toString() << " #" << myConnectionNumber
@@ -600,11 +600,7 @@ void Listener::waitUntilListening() const {
 
 void Listener::_accepted(const std::shared_ptr<Socket>& psocket, long long connectionId) {
     std::unique_ptr<AbstractMessagingPort> port;
-    if (isMessagePortImplASIO()) {
-        port = stdx::make_unique<ASIOMessagingPort>(psocket->stealSD(), psocket->remoteAddr());
-    } else {
-        port = stdx::make_unique<MessagingPort>(psocket);
-    }
+    port = stdx::make_unique<MessagingPort>(psocket);
     port->setConnectionId(connectionId);
     accepted(std::move(port));
 }
@@ -649,7 +645,7 @@ void Listener::checkTicketNumbers() {
             log() << " --maxConns too high, can only handle " << want;
         }
     }
-    globalTicketHolder.resize(want);
+    globalTicketHolder.resize(want).transitional_ignore();
 }
 
 void Listener::shutdown() {

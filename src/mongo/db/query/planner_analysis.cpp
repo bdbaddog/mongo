@@ -373,6 +373,12 @@ bool QueryPlannerAnalysis::explodeForSort(const CanonicalQuery& query,
             return false;
         }
 
+        if (isn->index.multikey && isn->index.multikeyPaths.empty()) {
+            // The index is multikey but has no path-level multikeyness metadata. In this case, the
+            // index can never provide a sort.
+            return false;
+        }
+
         // How many scans will we create if we blow up this ixscan?
         size_t numScans = 1;
 
@@ -405,7 +411,13 @@ bool QueryPlannerAnalysis::explodeForSort(const CanonicalQuery& query,
         // the bounds.
         BSONObjBuilder resultingSortBob;
         while (kpIt.more()) {
-            resultingSortBob.append(kpIt.next());
+            auto elem = kpIt.next();
+            if (isn->multikeyFields.find(elem.fieldNameStringData()) != isn->multikeyFields.end()) {
+                // One of the indexed fields providing the sort is multikey. It is not correct for a
+                // field with multikey components to provide a sort, so bail out.
+                return false;
+            }
+            resultingSortBob.append(elem);
         }
 
         // See if it's the order we're looking for.
@@ -525,7 +537,6 @@ QuerySolutionNode* QueryPlannerAnalysis::analyzeSort(const CanonicalQuery& query
     // And build the full sort stage. The sort stage has to have a sort key generating stage
     // as its child, supplying it with the appropriate sort keys.
     SortKeyGeneratorNode* keyGenNode = new SortKeyGeneratorNode();
-    keyGenNode->queryObj = qr.getFilter();
     keyGenNode->sortSpec = sortObj;
     keyGenNode->children.push_back(solnRoot);
     solnRoot = keyGenNode;
@@ -796,7 +807,6 @@ QuerySolution* QueryPlannerAnalysis::analyzeDataAccess(
         // generate the sort key computed data.
         if (!hasSortStage && query.getProj()->wantSortKey()) {
             SortKeyGeneratorNode* keyGenNode = new SortKeyGeneratorNode();
-            keyGenNode->queryObj = qr.getFilter();
             keyGenNode->sortSpec = qr.getSort();
             keyGenNode->children.push_back(solnRoot.release());
             solnRoot.reset(keyGenNode);

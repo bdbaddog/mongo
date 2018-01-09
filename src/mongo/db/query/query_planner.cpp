@@ -87,27 +87,58 @@ static bool is2DIndex(const BSONObj& pattern) {
 string optionString(size_t options) {
     mongoutils::str::stream ss;
 
-    // These options are all currently mutually exclusive.
     if (QueryPlannerParams::DEFAULT == options) {
         ss << "DEFAULT ";
     }
-    if (options & QueryPlannerParams::NO_TABLE_SCAN) {
-        ss << "NO_TABLE_SCAN ";
-    }
-    if (options & QueryPlannerParams::INCLUDE_COLLSCAN) {
-        ss << "INCLUDE_COLLSCAN ";
-    }
-    if (options & QueryPlannerParams::INCLUDE_SHARD_FILTER) {
-        ss << "INCLUDE_SHARD_FILTER ";
-    }
-    if (options & QueryPlannerParams::NO_BLOCKING_SORT) {
-        ss << "NO_BLOCKING_SORT ";
-    }
-    if (options & QueryPlannerParams::INDEX_INTERSECTION) {
-        ss << "INDEX_INTERSECTION ";
-    }
-    if (options & QueryPlannerParams::KEEP_MUTATIONS) {
-        ss << "KEEP_MUTATIONS";
+    while (options) {
+        // The expression (x & (x - 1)) yields x with the lowest bit cleared.  Then the exclusive-or
+        // of the result with the original yields the lowest bit by itself.
+        size_t new_options = options & (options - 1);
+        QueryPlannerParams::Options opt = QueryPlannerParams::Options(new_options ^ options);
+        options = new_options;
+        switch (opt) {
+            case QueryPlannerParams::NO_TABLE_SCAN:
+                ss << "NO_TABLE_SCAN ";
+                break;
+            case QueryPlannerParams::INCLUDE_COLLSCAN:
+                ss << "INCLUDE_COLLSCAN ";
+                break;
+            case QueryPlannerParams::INCLUDE_SHARD_FILTER:
+                ss << "INCLUDE_SHARD_FILTER ";
+                break;
+            case QueryPlannerParams::NO_BLOCKING_SORT:
+                ss << "NO_BLOCKING_SORT ";
+                break;
+            case QueryPlannerParams::INDEX_INTERSECTION:
+                ss << "INDEX_INTERSECTION ";
+                break;
+            case QueryPlannerParams::KEEP_MUTATIONS:
+                ss << "KEEP_MUTATIONS ";
+                break;
+            case QueryPlannerParams::IS_COUNT:
+                ss << "IS_COUNT ";
+                break;
+            case QueryPlannerParams::SPLIT_LIMITED_SORT:
+                ss << "SPLIT_LIMITED_SORT ";
+                break;
+            case QueryPlannerParams::CANNOT_TRIM_IXISECT:
+                ss << "CANNOT_TRIM_IXISECT ";
+                break;
+            case QueryPlannerParams::SNAPSHOT_USE_ID:
+                ss << "SNAPSHOT_USE_ID ";
+                break;
+            case QueryPlannerParams::NO_UNCOVERED_PROJECTIONS:
+                ss << "NO_UNCOVERED_PROJECTIONS ";
+                break;
+            case QueryPlannerParams::GENERATE_COVERED_IXSCANS:
+                ss << "GENERATE_COVERED_IXSCANS ";
+                break;
+            case QueryPlannerParams::TRACK_LATEST_OPLOG_TS:
+                ss << "TRACK_LATEST_OPLOG_TS ";
+            case QueryPlannerParams::DEFAULT:
+                MONGO_UNREACHABLE;
+                break;
+        }
     }
 
     return ss;
@@ -585,23 +616,29 @@ Status QueryPlanner::plan(const CanonicalQuery& query,
     //
     // Don't do this if the query is a geonear or text as as text search queries must be answered
     // using full text indices and geoNear queries must be answered using geospatial indices.
-    if (query.getQueryRequest().isSnapshot() &&
-        !QueryPlannerCommon::hasNode(query.root(), MatchExpression::GEO_NEAR) &&
-        !QueryPlannerCommon::hasNode(query.root(), MatchExpression::TEXT)) {
-        const bool useIXScan = params.options & QueryPlannerParams::SNAPSHOT_USE_ID;
+    if (query.getQueryRequest().isSnapshot()) {
+        RARELY {
+            warning() << "The snapshot option is deprecated. See "
+                         "http://dochub.mongodb.org/core/snapshot-deprecation";
+        }
 
-        if (!useIXScan) {
-            QuerySolution* soln = buildCollscanSoln(query, isTailable, params);
-            if (soln) {
-                out->push_back(soln);
-            }
-            return Status::OK();
-        } else {
-            // Find the ID index in indexKeyPatterns. It's our hint.
-            for (size_t i = 0; i < params.indices.size(); ++i) {
-                if (isIdIndex(params.indices[i].keyPattern)) {
-                    hintIndex = params.indices[i].keyPattern;
-                    break;
+        if (!QueryPlannerCommon::hasNode(query.root(), MatchExpression::GEO_NEAR) &&
+            !QueryPlannerCommon::hasNode(query.root(), MatchExpression::TEXT)) {
+            const bool useIXScan = params.options & QueryPlannerParams::SNAPSHOT_USE_ID;
+
+            if (!useIXScan) {
+                QuerySolution* soln = buildCollscanSoln(query, isTailable, params);
+                if (soln) {
+                    out->push_back(soln);
+                }
+                return Status::OK();
+            } else {
+                // Find the ID index in indexKeyPatterns. It's our hint.
+                for (size_t i = 0; i < params.indices.size(); ++i) {
+                    if (isIdIndex(params.indices[i].keyPattern)) {
+                        hintIndex = params.indices[i].keyPattern;
+                        break;
+                    }
                 }
             }
         }
@@ -832,17 +869,17 @@ Status QueryPlanner::plan(const CanonicalQuery& query,
         enumParams.indices = &relevantIndices;
 
         PlanEnumerator isp(enumParams);
-        isp.init();
+        isp.init().transitional_ignore();
 
-        MatchExpression* rawTree;
-        while (isp.getNext(&rawTree) && (out->size() < params.maxIndexedSolutions)) {
+        unique_ptr<MatchExpression> rawTree;
+        while ((rawTree = isp.getNext()) && (out->size() < params.maxIndexedSolutions)) {
             LOG(5) << "About to build solntree from tagged tree:" << endl
-                   << redact(rawTree->toString());
+                   << redact(rawTree.get()->toString());
 
             // Store the plan cache index tree before calling prepareForAccessingPlanning(), so that
             // the PlanCacheIndexTree has the same sort as the MatchExpression used to generate the
             // plan cache key.
-            std::unique_ptr<MatchExpression> clone(rawTree->shallowClone());
+            std::unique_ptr<MatchExpression> clone(rawTree.get()->shallowClone());
             PlanCacheIndexTree* cacheData;
             Status indexTreeStatus =
                 cacheDataFromTaggedTree(clone.get(), relevantIndices, &cacheData);
@@ -853,11 +890,11 @@ Status QueryPlanner::plan(const CanonicalQuery& query,
 
             // We have already cached the tree in canonical order, so now we can order the nodes for
             // access planning.
-            prepareForAccessPlanning(rawTree);
+            prepareForAccessPlanning(rawTree.get());
 
             // This can fail if enumeration makes a mistake.
             std::unique_ptr<QuerySolutionNode> solnRoot(QueryPlannerAccess::buildIndexedDataAccess(
-                query, rawTree, false, relevantIndices, params));
+                query, rawTree.release(), false, relevantIndices, params));
 
             if (!solnRoot) {
                 continue;
@@ -1005,8 +1042,8 @@ Status QueryPlanner::plan(const CanonicalQuery& query,
     // If a projection exists, there may be an index that allows for a covered plan, even if none
     // were considered earlier.
     const auto projection = query.getProj();
-    if (out->size() == 0 && query.getQueryObj().isEmpty() && projection &&
-        !projection->requiresDocument()) {
+    if (params.options & QueryPlannerParams::GENERATE_COVERED_IXSCANS && out->size() == 0 &&
+        query.getQueryObj().isEmpty() && projection && !projection->requiresDocument()) {
 
         const auto* indicesToConsider = hintIndex.isEmpty() ? &params.indices : &relevantIndices;
         for (auto&& index : *indicesToConsider) {

@@ -28,8 +28,14 @@
 
 #include "mongo/platform/basic.h"
 
+#include <pcrecpp.h>
+
+#include "mongo/bson/util/builder.h"
+#include "mongo/db/catalog/collection_catalog_entry.h"
 #include "mongo/db/catalog/index_create.h"
+#include "mongo/db/catalog/uuid_catalog.h"
 #include "mongo/db/client.h"
+#include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/jsobj.h"
@@ -87,7 +93,7 @@ void DatabaseTest::setUp() {
 
     // Ensure that we are primary.
     auto replCoord = repl::ReplicationCoordinator::get(_opCtx.get());
-    ASSERT_TRUE(replCoord->setFollowerMode(repl::MemberState::RS_PRIMARY));
+    ASSERT_OK(replCoord->setFollowerMode(repl::MemberState::RS_PRIMARY));
 
     // Set up OpObserver so that Database will append actual oplog entries to the oplog using
     // repl::logOp(). repl::logOp() will also store the oplog entry's optime in ReplClientInfo.
@@ -107,10 +113,65 @@ void DatabaseTest::tearDown() {
     ServiceContextMongoDTest::tearDown();
 }
 
+TEST_F(DatabaseTest, SetDropPendingThrowsExceptionIfDatabaseIsAlreadyInADropPendingState) {
+    writeConflictRetry(_opCtx.get(), "testSetDropPending", _nss.ns(), [this] {
+        AutoGetOrCreateDb autoDb(_opCtx.get(), _nss.db(), MODE_X);
+        auto db = autoDb.getDb();
+        ASSERT_TRUE(db);
+
+        ASSERT_FALSE(db->isDropPending(_opCtx.get()));
+        db->setDropPending(_opCtx.get(), true);
+        ASSERT_TRUE(db->isDropPending(_opCtx.get()));
+
+        ASSERT_THROWS_CODE_AND_WHAT(
+            db->setDropPending(_opCtx.get(), true),
+            AssertionException,
+            ErrorCodes::DatabaseDropPending,
+            (StringBuilder() << "Unable to drop database " << _nss.db()
+                             << " because it is already in the process of being dropped.")
+                .stringData());
+
+        db->setDropPending(_opCtx.get(), false);
+        ASSERT_FALSE(db->isDropPending(_opCtx.get()));
+
+        // It's fine to reset 'dropPending' multiple times.
+        db->setDropPending(_opCtx.get(), false);
+        ASSERT_FALSE(db->isDropPending(_opCtx.get()));
+    });
+}
+
+TEST_F(DatabaseTest, CreateCollectionThrowsExceptionWhenDatabaseIsInADropPendingState) {
+    writeConflictRetry(
+        _opCtx.get(), "testÇreateCollectionWhenDatabaseIsInADropPendingState", _nss.ns(), [this] {
+            AutoGetOrCreateDb autoDb(_opCtx.get(), _nss.db(), MODE_X);
+            auto db = autoDb.getDb();
+            ASSERT_TRUE(db);
+
+            db->setDropPending(_opCtx.get(), true);
+
+            WriteUnitOfWork wuow(_opCtx.get());
+
+            // If createCollection() unexpectedly succeeds, we need to commit the collection
+            // creation to
+            // avoid leaving the ephemeralForTest storage engine in a bad state for subsequent
+            // tests.
+            ON_BLOCK_EXIT([&wuow] { wuow.commit(); });
+
+            ASSERT_THROWS_CODE_AND_WHAT(
+                db->createCollection(_opCtx.get(), _nss.ns()),
+                AssertionException,
+                ErrorCodes::DatabaseDropPending,
+                (StringBuilder() << "Cannot create collection " << _nss.ns()
+                                 << " - database is in the process of being dropped.")
+                    .stringData());
+        });
+}
+
 void _testDropCollection(OperationContext* opCtx,
                          const NamespaceString& nss,
                          bool createCollectionBeforeDrop,
-                         const repl::OpTime& dropOpTime = {}) {
+                         const repl::OpTime& dropOpTime = {},
+                         const CollectionOptions& collOpts = {}) {
     writeConflictRetry(opCtx, "testDropCollection", nss.ns(), [=] {
         AutoGetOrCreateDb autoDb(opCtx, nss.db(), MODE_X);
         auto db = autoDb.getDb();
@@ -118,7 +179,7 @@ void _testDropCollection(OperationContext* opCtx,
 
         WriteUnitOfWork wuow(opCtx);
         if (createCollectionBeforeDrop) {
-            ASSERT_TRUE(db->createCollection(opCtx, nss.ns()));
+            ASSERT_TRUE(db->createCollection(opCtx, nss.ns(), collOpts));
         } else {
             ASSERT_FALSE(db->getCollection(opCtx, nss));
         }
@@ -282,6 +343,14 @@ TEST_F(
     ASSERT_FALSE(reaperEarliestDropOpTime);
 }
 
+TEST_F(DatabaseTest, DropPendingCollectionIsAllowedToHaveDocumentValidators) {
+    CollectionOptions opts;
+    opts.validator = BSON("x" << BSON("$type"
+                                      << "string"));
+    opts.validationAction = "error";
+    _testDropCollection(_opCtx.get(), _nss, true, {}, opts);
+}
+
 void _testDropCollectionThrowsExceptionIfThereAreIndexesInProgress(OperationContext* opCtx,
                                                                    const NamespaceString& nss) {
     writeConflictRetry(opCtx, "testDropCollectionWithIndexesInProgress", nss.ns(), [opCtx, nss] {
@@ -314,7 +383,8 @@ void _testDropCollectionThrowsExceptionIfThereAreIndexesInProgress(OperationCont
         ASSERT_GREATER_THAN(indexCatalog->numIndexesInProgress(opCtx), 0);
 
         WriteUnitOfWork wuow(opCtx);
-        ASSERT_THROWS_CODE(db->dropCollection(opCtx, nss.ns()), MsgAssertionException, 40461);
+        ASSERT_THROWS_CODE(
+            db->dropCollection(opCtx, nss.ns()).transitional_ignore(), AssertionException, 40461);
     });
 }
 
@@ -331,4 +401,163 @@ TEST_F(DatabaseTest,
     _testDropCollectionThrowsExceptionIfThereAreIndexesInProgress(_opCtx.get(), _nss);
 }
 
+TEST_F(DatabaseTest, RenameCollectionPreservesUuidOfSourceCollectionAndUpdatesUuidCatalog) {
+    auto opCtx = _opCtx.get();
+    auto fromNss = _nss;
+    auto toNss = NamespaceString(fromNss.getSisterNS("bar"));
+    ASSERT_NOT_EQUALS(fromNss, toNss);
+
+    writeConflictRetry(opCtx, "testRenameCollection", fromNss.ns(), [=] {
+        AutoGetOrCreateDb autoDb(opCtx, fromNss.db(), MODE_X);
+        auto db = autoDb.getDb();
+        ASSERT_TRUE(db);
+
+        auto fromUuid = UUID::gen();
+
+        auto&& uuidCatalog = UUIDCatalog::get(opCtx);
+        ASSERT_EQUALS(NamespaceString(), uuidCatalog.lookupNSSByUUID(fromUuid));
+
+        WriteUnitOfWork wuow(opCtx);
+        CollectionOptions fromCollectionOptions;
+        fromCollectionOptions.uuid = fromUuid;
+        ASSERT_TRUE(db->createCollection(opCtx, fromNss.ns(), fromCollectionOptions));
+        ASSERT_EQUALS(fromNss, uuidCatalog.lookupNSSByUUID(fromUuid));
+
+        auto stayTemp = false;
+        ASSERT_OK(db->renameCollection(opCtx, fromNss.ns(), toNss.ns(), stayTemp));
+
+        ASSERT_FALSE(db->getCollection(opCtx, fromNss));
+        auto toCollection = db->getCollection(opCtx, toNss);
+        ASSERT_TRUE(toCollection);
+
+        auto catalogEntry = toCollection->getCatalogEntry();
+        auto toCollectionOptions = catalogEntry->getCollectionOptions(opCtx);
+
+        auto toUuid = toCollectionOptions.uuid;
+        ASSERT_TRUE(toUuid);
+        ASSERT_EQUALS(fromUuid, *toUuid);
+
+        ASSERT_EQUALS(toNss, uuidCatalog.lookupNSSByUUID(*toUuid));
+
+        wuow.commit();
+    });
+}
+
+TEST_F(DatabaseTest,
+       MakeUniqueCollectionNamespaceReturnsFailedToParseIfModelDoesNotContainPercentSign) {
+    writeConflictRetry(_opCtx.get(), "testMakeUniqueCollectionNamespace", _nss.ns(), [this] {
+        AutoGetOrCreateDb autoDb(_opCtx.get(), _nss.db(), MODE_X);
+        auto db = autoDb.getDb();
+        ASSERT_TRUE(db);
+        ASSERT_EQUALS(
+            ErrorCodes::FailedToParse,
+            db->makeUniqueCollectionNamespace(_opCtx.get(), "CollectionModelWithoutPercentSign"));
+
+        // Generated namespace has to satisfy namespace length constraints so we will reject
+        // any collection model where the first substituted percent sign will not be in the
+        // generated namespace. See NamespaceString::MaxNsCollectionLen.
+        auto dbPrefix = _nss.db() + ".";
+        auto modelTooLong =
+            (StringBuilder() << dbPrefix
+                             << std::string('x',
+                                            NamespaceString::MaxNsCollectionLen - dbPrefix.size())
+                             << "%")
+                .str();
+        ASSERT_EQUALS(ErrorCodes::FailedToParse,
+                      db->makeUniqueCollectionNamespace(_opCtx.get(), modelTooLong));
+    });
+}
+
+TEST_F(DatabaseTest, MakeUniqueCollectionNamespaceReplacesPercentSignsWithRandomCharacters) {
+    writeConflictRetry(_opCtx.get(), "testMakeUniqueCollectionNamespace", _nss.ns(), [this] {
+        AutoGetOrCreateDb autoDb(_opCtx.get(), _nss.db(), MODE_X);
+        auto db = autoDb.getDb();
+        ASSERT_TRUE(db);
+
+        auto model = "tmp%%%%"_sd;
+        pcrecpp::RE re(_nss.db() + "\\.tmp[0-9A-Za-z][0-9A-Za-z][0-9A-Za-z][0-9A-Za-z]");
+
+        auto nss1 = unittest::assertGet(db->makeUniqueCollectionNamespace(_opCtx.get(), model));
+        if (!re.FullMatch(nss1.ns())) {
+            FAIL((StringBuilder() << "First generated namespace \"" << nss1.ns()
+                                  << "\" does not match reqular expression \""
+                                  << re.pattern()
+                                  << "\"")
+                     .str());
+        }
+
+        // Create collection using generated namespace so that makeUniqueCollectionNamespace() will
+        // not return the same namespace the next time. This is because we check the existing
+        // collections in the database for collisions while generating the namespace.
+        {
+            WriteUnitOfWork wuow(_opCtx.get());
+            ASSERT_TRUE(db->createCollection(_opCtx.get(), nss1.ns()));
+            wuow.commit();
+        }
+
+        auto nss2 = unittest::assertGet(db->makeUniqueCollectionNamespace(_opCtx.get(), model));
+        if (!re.FullMatch(nss2.ns())) {
+            FAIL((StringBuilder() << "Second generated namespace \"" << nss2.ns()
+                                  << "\" does not match reqular expression \""
+                                  << re.pattern()
+                                  << "\"")
+                     .str());
+        }
+
+        // Second generated namespace should not collide with the first because a collection with
+        // name matching nss1 now exists.
+        ASSERT_NOT_EQUALS(nss1, nss2);
+    });
+}
+
+TEST_F(
+    DatabaseTest,
+    MakeUniqueCollectionNamespaceReturnsNamespaceExistsIfGeneratedNamesMatchExistingCollections) {
+    writeConflictRetry(_opCtx.get(), "testMakeUniqueCollectionNamespace", _nss.ns(), [this] {
+        AutoGetOrCreateDb autoDb(_opCtx.get(), _nss.db(), MODE_X);
+        auto db = autoDb.getDb();
+        ASSERT_TRUE(db);
+
+        auto model = "tmp%"_sd;
+
+        // Create all possible collections matching model with single percent sign.
+        const auto charsToChooseFrom =
+            "0123456789"
+            "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+            "abcdefghijklmnopqrstuvwxyz"_sd;
+        for (const auto c : charsToChooseFrom) {
+            NamespaceString nss(_nss.db(), model.substr(0, model.find('%')) + std::string(1U, c));
+            WriteUnitOfWork wuow(_opCtx.get());
+            ASSERT_TRUE(db->createCollection(_opCtx.get(), nss.ns()));
+            wuow.commit();
+        }
+
+        // makeUniqueCollectionNamespace() returns NamespaceExists because it will not be able to
+        // generate a namespace that will not collide with an existings collection.
+        ASSERT_EQUALS(ErrorCodes::NamespaceExists,
+                      db->makeUniqueCollectionNamespace(_opCtx.get(), model));
+    });
+}
+
+TEST_F(DatabaseTest, DBLockCanBePassedToAutoGetDb) {
+    NamespaceString nss("test", "coll");
+    Lock::DBLock lock(_opCtx.get(), nss.db(), MODE_X);
+    {
+        AutoGetDb db(_opCtx.get(), nss.db(), std::move(lock));
+        ASSERT(_opCtx.get()->lockState()->isDbLockedForMode(nss.db(), MODE_X));
+    }
+    // The moved lock should go out of scope here, so the database should no longer be locked.
+    ASSERT_FALSE(_opCtx.get()->lockState()->isDbLockedForMode(nss.db(), MODE_X));
+}
+
+TEST_F(DatabaseTest, DBLockCanBePassedToAutoGetCollectionOrViewForReadCommand) {
+    NamespaceString nss("test", "coll");
+    Lock::DBLock lock(_opCtx.get(), nss.db(), MODE_X);
+    {
+        AutoGetCollectionOrViewForReadCommand coll(_opCtx.get(), nss, std::move(lock));
+        ASSERT(_opCtx.get()->lockState()->isDbLockedForMode(nss.db(), MODE_X));
+    }
+    // The moved lock should go out of scope here, so the database should no longer be locked.
+    ASSERT_FALSE(_opCtx.get()->lockState()->isDbLockedForMode(nss.db(), MODE_X));
+}
 }  // namespace

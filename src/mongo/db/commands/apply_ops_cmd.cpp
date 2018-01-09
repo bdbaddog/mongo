@@ -30,21 +30,22 @@
 
 #include "mongo/platform/basic.h"
 
-#include <string>
 #include <vector>
 
+#include "mongo/bson/util/bson_check.h"
+#include "mongo/bson/util/bson_extract.h"
 #include "mongo/db/auth/authorization_manager.h"
 #include "mongo/db/auth/authorization_manager_global.h"
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/catalog/document_validation.h"
+#include "mongo/db/catalog/uuid_catalog.h"
 #include "mongo/db/client.h"
 #include "mongo/db/commands.h"
-#include "mongo/db/commands/apply_ops_cmd_common.h"
+#include "mongo/db/commands/oplog_application_checks.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/jsobj.h"
-#include "mongo/db/matcher/matcher.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/repl/apply_ops.h"
 #include "mongo/db/repl/oplog.h"
@@ -53,136 +54,232 @@
 #include "mongo/db/service_context.h"
 #include "mongo/util/log.h"
 #include "mongo/util/scopeguard.h"
+#include "mongo/util/uuid.h"
 
 namespace mongo {
-
-using std::string;
-using std::stringstream;
-
 namespace {
 
-class ApplyOpsCmd : public Command {
-public:
-    ApplyOpsCmd() : Command("applyOps") {}
+bool checkCOperationType(const BSONObj& opObj, const StringData opName) {
+    BSONElement opTypeElem = opObj["op"];
+    checkBSONType(BSONType::String, opTypeElem);
+    const StringData opType = opTypeElem.checkAndGetStringData();
 
-    virtual bool slaveOk() const {
+    if (opType == "c"_sd) {
+        BSONElement oElem = opObj["o"];
+        checkBSONType(BSONType::Object, oElem);
+        BSONObj o = oElem.Obj();
+
+        if (o.firstElement().fieldNameStringData() == opName) {
+            return true;
+        }
+    }
+    return false;
+};
+
+/**
+ * Returns kNeedsSuperuser, if the provided applyOps command contains an empty applyOps command or
+ * createCollection/renameCollection commands are mixed in applyOps batch.
+ *
+ * Returns kNeedForceAndUseUUID if an operation contains a UUID, and will create a collection with
+ * the user-specified UUID.
+ *
+ * Returns kNeedsUseUUID if the operation contains a UUID.
+ *
+ * Returns kOk if no conditions which must be specially handled are detected.
+ *
+ * May throw exceptions if the input is malformed.
+ */
+OplogApplicationValidity validateApplyOpsCommand(const BSONObj& cmdObj) {
+    const size_t maxApplyOpsDepth = 10;
+    std::stack<std::pair<size_t, BSONObj>> toCheck;
+
+    auto operationContainsUUID = [](const BSONObj& opObj) {
+        auto anyTopLevelElementIsUUID = [](const BSONObj& opObj) {
+            for (const BSONElement opElement : opObj) {
+                if (opElement.type() == BSONType::BinData &&
+                    opElement.binDataType() == BinDataType::newUUID) {
+                    return true;
+                }
+            }
+            return false;
+        };
+        if (anyTopLevelElementIsUUID(opObj)) {
+            return true;
+        }
+
+        BSONElement opTypeElem = opObj["op"];
+        checkBSONType(BSONType::String, opTypeElem);
+        const StringData opType = opTypeElem.checkAndGetStringData();
+
+        if (opType == "c"_sd) {
+            BSONElement oElem = opObj["o"];
+            checkBSONType(BSONType::Object, oElem);
+            BSONObj o = oElem.Obj();
+
+            if (anyTopLevelElementIsUUID(o)) {
+                return true;
+            }
+        }
+
+        return false;
+    };
+
+    OplogApplicationValidity ret = OplogApplicationValidity::kOk;
+
+    // Insert the top level applyOps command into the stack.
+    toCheck.emplace(std::make_pair(0, cmdObj));
+
+    while (!toCheck.empty()) {
+        size_t depth;
+        BSONObj applyOpsObj;
+        std::tie(depth, applyOpsObj) = toCheck.top();
+        toCheck.pop();
+
+        checkBSONType(BSONType::Array, applyOpsObj.firstElement());
+        // Check if the applyOps command is empty. This is probably not something that should
+        // happen, so require a superuser to do this.
+        if (applyOpsObj.firstElement().Array().empty()) {
+            return OplogApplicationValidity::kNeedsSuperuser;
+        }
+
+        // createCollection and renameCollection are only allowed to be applied
+        // individually. Ensure there is no create/renameCollection in a batch
+        // of size greater than 1.
+        if (applyOpsObj.firstElement().Array().size() > 1) {
+            for (const BSONElement& e : applyOpsObj.firstElement().Array()) {
+                checkBSONType(BSONType::Object, e);
+                auto oplogEntry = e.Obj();
+                if (checkCOperationType(oplogEntry, "create"_sd) ||
+                    checkCOperationType(oplogEntry, "renameCollection"_sd)) {
+                    return OplogApplicationValidity::kNeedsSuperuser;
+                }
+            }
+        }
+
+        // For each applyOps command, iterate the ops.
+        for (BSONElement element : applyOpsObj.firstElement().Array()) {
+            checkBSONType(BSONType::Object, element);
+            BSONObj opObj = element.Obj();
+
+            bool opHasUUIDs = operationContainsUUID(opObj);
+
+            if (serverGlobalParams.featureCompatibility.getVersion() ==
+                ServerGlobalParams::FeatureCompatibility::Version::kFullyDowngradedTo34) {
+                uassert(ErrorCodes::OplogOperationUnsupported,
+                        "applyOps with UUID requires upgrading to FeatureCompatibilityVersion 3.6",
+                        !opHasUUIDs);
+            }
+
+            // If the op uses any UUIDs at all then the user must possess extra privileges.
+            if (opHasUUIDs && ret == OplogApplicationValidity::kOk)
+                ret = OplogApplicationValidity::kNeedsUseUUID;
+            if (opHasUUIDs && checkCOperationType(opObj, "create"_sd)) {
+                // If the op is 'c' and forces the server to ingest a collection
+                // with a specific, user defined UUID.
+                ret = OplogApplicationValidity::kNeedsForceAndUseUUID;
+            }
+
+            // If the op contains a nested applyOps...
+            if (checkCOperationType(opObj, "applyOps"_sd)) {
+                // And we've recursed too far, then bail out.
+                uassert(ErrorCodes::FailedToParse,
+                        "Too many nested applyOps",
+                        depth < maxApplyOpsDepth);
+
+                // Otherwise, if the op contains an applyOps, but we haven't recursed too far:
+                // extract the applyOps command, and insert it into the stack.
+                checkBSONType(BSONType::Object, opObj["o"]);
+                BSONObj oObj = opObj["o"].Obj();
+                toCheck.emplace(std::make_pair(depth + 1, std::move(oObj)));
+            }
+        }
+    }
+
+    return ret;
+}
+
+class ApplyOpsCmd : public BasicCommand {
+public:
+    ApplyOpsCmd() : BasicCommand("applyOps") {}
+
+    bool slaveOk() const override {
         return false;
     }
 
-    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
+    bool supportsWriteConcern(const BSONObj& cmd) const override {
         return true;
     }
 
-    virtual void help(stringstream& help) const {
+    void help(std::stringstream& help) const override {
         help << "internal (sharding)\n{ applyOps : [ ] , preCondition : [ { ns : ... , q : ... , "
                 "res : ... } ] }";
     }
 
-
-    virtual Status checkAuthForOperation(OperationContext* opCtx,
-                                         const std::string& dbname,
-                                         const BSONObj& cmdObj) {
-        return checkAuthForApplyOpsCommand(opCtx, dbname, cmdObj);
+    Status checkAuthForOperation(OperationContext* opCtx,
+                                 const std::string& dbname,
+                                 const BSONObj& cmdObj) override {
+        OplogApplicationValidity validity = validateApplyOpsCommand(cmdObj);
+        return OplogApplicationChecks::checkAuthForCommand(opCtx, dbname, cmdObj, validity);
     }
 
-    virtual bool run(OperationContext* opCtx,
-                     const string& dbname,
-                     const BSONObj& cmdObj,
-                     string& errmsg,
-                     BSONObjBuilder& result) {
+    bool run(OperationContext* opCtx,
+             const std::string& dbname,
+             const BSONObj& cmdObj,
+             BSONObjBuilder& result) override {
         validateApplyOpsCommand(cmdObj);
 
         boost::optional<DisableDocumentValidation> maybeDisableValidation;
         if (shouldBypassDocumentValidationForCommand(cmdObj))
             maybeDisableValidation.emplace(opCtx);
 
-        if (cmdObj.firstElement().type() != Array) {
-            errmsg = "ops has to be an array";
-            return false;
+        auto status = OplogApplicationChecks::checkOperationArray(cmdObj.firstElement());
+        if (!status.isOK()) {
+            return appendCommandStatus(result, status);
         }
 
-        BSONObj ops = cmdObj.firstElement().Obj();
+        // TODO (SERVER-30217): When a write concern is provided to the applyOps command, we
+        // normally wait on the OpTime of whichever operation successfully completed last. This is
+        // erroneous, however, if the last operation in the array happens to be a write no-op and
+        // thus isn’t assigned an OpTime. Let the second to last operation in the applyOps be write
+        // A, the last operation in applyOps be write B. Let B do a no-op write and let the
+        // operation that caused B to be a no-op be C. If C has an OpTime after A but before B,
+        // then we won’t wait for C to be replicated and it could be rolled back, even though B
+        // was acknowledged. To fix this, we should wait for replication of the node’s last applied
+        // OpTime if the last write operation was a no-op write.
 
-        {
-            // check input
-            BSONObjIterator i(ops);
-            while (i.more()) {
-                BSONElement e = i.next();
-                if (!_checkOperation(e, errmsg)) {
-                    return false;
-                }
+        // We set the OplogApplication::Mode argument based on the mode argument given in the
+        // command object. If no mode is given, default to the 'kApplyOpsCmd' mode.
+        repl::OplogApplication::Mode oplogApplicationMode =
+            repl::OplogApplication::Mode::kApplyOpsCmd;  // the default mode.
+        std::string oplogApplicationModeString;
+        status = bsonExtractStringField(
+            cmdObj, ApplyOps::kOplogApplicationModeFieldName, &oplogApplicationModeString);
+
+        if (status.isOK()) {
+            auto modeSW = repl::OplogApplication::parseMode(oplogApplicationModeString);
+            if (!modeSW.isOK()) {
+                // Unable to parse the mode argument.
+                return appendCommandStatus(
+                    result,
+                    modeSW.getStatus().withContext(str::stream() << "Could not parse " +
+                                                       ApplyOps::kOplogApplicationModeFieldName));
             }
+            oplogApplicationMode = modeSW.getValue();
+        } else if (status != ErrorCodes::NoSuchKey) {
+            // NoSuchKey means the user did not supply a mode.
+            return appendCommandStatus(result,
+                                       Status(status.code(),
+                                              str::stream()
+                                                  << "Could not parse out "
+                                                  << ApplyOps::kOplogApplicationModeFieldName
+                                                  << ": "
+                                                  << status.reason()));
         }
 
-        auto client = opCtx->getClient();
-        auto lastOpAtOperationStart = repl::ReplClientInfo::forClient(client).getLastOp();
-        ScopeGuard lastOpSetterGuard =
-            MakeObjGuard(repl::ReplClientInfo::forClient(client),
-                         &repl::ReplClientInfo::setLastOpToSystemLastOpTime,
-                         opCtx);
-
-        auto applyOpsStatus = appendCommandStatus(result, applyOps(opCtx, dbname, cmdObj, &result));
-
-        if (repl::ReplClientInfo::forClient(client).getLastOp() != lastOpAtOperationStart) {
-            // If this operation has already generated a new lastOp, don't bother setting it
-            // here. No-op applyOps will not generate a new lastOp, so we still need the guard to
-            // fire in that case.
-            lastOpSetterGuard.Dismiss();
-        }
+        auto applyOpsStatus = appendCommandStatus(
+            result, applyOps(opCtx, dbname, cmdObj, oplogApplicationMode, &result));
 
         return applyOpsStatus;
-    }
-
-private:
-    /**
-     * Returns true if 'e' contains a valid operation.
-     */
-    bool _checkOperation(const BSONElement& e, string& errmsg) {
-        if (e.type() != Object) {
-            errmsg = str::stream() << "op not an object: " << e.fieldName();
-            return false;
-        }
-        BSONObj obj = e.Obj();
-        // op - operation type
-        BSONElement opElement = obj.getField("op");
-        if (opElement.eoo()) {
-            errmsg = str::stream() << "op does not contain required \"op\" field: "
-                                   << e.fieldName();
-            return false;
-        }
-        if (opElement.type() != mongo::String) {
-            errmsg = str::stream() << "\"op\" field is not a string: " << e.fieldName();
-            return false;
-        }
-        // operation type -- see logOp() comments for types
-        const char* opType = opElement.valuestrsafe();
-        if (*opType == '\0') {
-            errmsg = str::stream() << "\"op\" field value cannot be empty: " << e.fieldName();
-            return false;
-        }
-
-        // ns - namespace
-        // Only operations of type 'n' are allowed to have an empty namespace.
-        BSONElement nsElement = obj.getField("ns");
-        if (nsElement.eoo()) {
-            errmsg = str::stream() << "op does not contain required \"ns\" field: "
-                                   << e.fieldName();
-            return false;
-        }
-        if (nsElement.type() != mongo::String) {
-            errmsg = str::stream() << "\"ns\" field is not a string: " << e.fieldName();
-            return false;
-        }
-        if (nsElement.String().find('\0') != std::string::npos) {
-            errmsg = str::stream() << "namespaces cannot have embedded null characters";
-            return false;
-        }
-        if (*opType != 'n' && nsElement.String().empty()) {
-            errmsg = str::stream() << "\"ns\" field value cannot be empty when op type is not 'n': "
-                                   << e.fieldName();
-            return false;
-        }
-        return true;
     }
 
 } applyOpsCmd;

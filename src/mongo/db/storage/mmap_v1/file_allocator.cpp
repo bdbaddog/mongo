@@ -130,7 +130,7 @@ FileAllocator::FileAllocator() : _failed() {}
 
 
 void FileAllocator::start() {
-    stdx::thread t(stdx::bind(&FileAllocator::run, this));
+    stdx::thread t([this] { run(this); });
     t.detach();
 }
 
@@ -326,7 +326,7 @@ void FileAllocator::checkFailure() {
     if (_failed) {
         // we want to log the problem (diskfull.js expects it) but we do not want to dump a stack
         // trace
-        msgassertedNoTrace(12520, "new file allocation failure");
+        msgasserted(12520, "new file allocation failure");
     }
 }
 

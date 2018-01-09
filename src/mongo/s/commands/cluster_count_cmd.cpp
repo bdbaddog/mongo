@@ -47,9 +47,9 @@
 namespace mongo {
 namespace {
 
-class ClusterCountCmd : public Command {
+class ClusterCountCmd : public ErrmsgCommandDeprecated {
 public:
-    ClusterCountCmd() : Command("count") {}
+    ClusterCountCmd() : ErrmsgCommandDeprecated("count") {}
 
     bool slaveOk() const override {
         return true;
@@ -71,11 +71,11 @@ public:
         out->push_back(Privilege(parseResourcePattern(dbname, cmdObj), actions));
     }
 
-    bool run(OperationContext* opCtx,
-             const std::string& dbname,
-             const BSONObj& cmdObj,
-             std::string& errmsg,
-             BSONObjBuilder& result) override {
+    bool errmsgRun(OperationContext* opCtx,
+                   const std::string& dbname,
+                   const BSONObj& cmdObj,
+                   std::string& errmsg,
+                   BSONObjBuilder& result) override {
         const NamespaceString nss(parseNs(dbname, cmdObj));
         uassert(ErrorCodes::InvalidNamespace,
                 str::stream() << "Invalid namespace specified '" << nss.ns() << "'",
@@ -141,14 +141,16 @@ public:
         auto countCmdObj = countCmdBuilder.done();
 
         BSONObj viewDefinition;
-        auto swShardResponses = scatterGatherForNamespace(opCtx,
-                                                          nss,
-                                                          countCmdObj,
-                                                          ReadPreferenceSetting::get(opCtx),
-                                                          filter,
-                                                          collation,
-                                                          true,  // do shard versioning
-                                                          &viewDefinition);
+        auto swShardResponses =
+            scatterGatherVersionedTargetByRoutingTable(opCtx,
+                                                       dbname,
+                                                       nss,
+                                                       countCmdObj,
+                                                       ReadPreferenceSetting::get(opCtx),
+                                                       Shard::RetryPolicy::kIdempotent,
+                                                       filter,
+                                                       collation,
+                                                       &viewDefinition);
 
         if (ErrorCodes::CommandOnShardedViewNotSupportedOnMongod == swShardResponses.getStatus()) {
             if (viewDefinition.isEmpty()) {
@@ -162,7 +164,7 @@ public:
 
             // Rewrite the count command as an aggregation.
 
-            auto countRequest = CountRequest::parseFromBSON(dbname, cmdObj, false);
+            auto countRequest = CountRequest::parseFromBSON(nss, cmdObj, false);
             if (!countRequest.isOK()) {
                 return appendCommandStatus(result, countRequest.getStatus());
             }
@@ -182,12 +184,11 @@ public:
                 resolvedView.asExpandedViewAggregation(aggRequestOnView.getValue());
             auto resolvedAggCmd = resolvedAggRequest.serializeToCommandObj().toBson();
 
-            BSONObjBuilder aggResult;
-            Command::findCommand("aggregate")
-                ->run(opCtx, dbname, resolvedAggCmd, errmsg, aggResult);
+            BSONObj aggResult = Command::runCommandDirectly(
+                opCtx, OpMsgRequest::fromDBAndBody(dbname, std::move(resolvedAggCmd)));
 
             result.resetToEmpty();
-            ViewResponseFormatter formatter(aggResult.obj());
+            ViewResponseFormatter formatter(aggResult);
             auto formatStatus = formatter.appendAsCountResponse(&result);
             if (!formatStatus.isOK()) {
                 return appendCommandStatus(result, formatStatus);
@@ -269,14 +270,16 @@ public:
         Timer timer;
 
         BSONObj viewDefinition;
-        auto swShardResponses = scatterGatherForNamespace(opCtx,
-                                                          nss,
-                                                          explainCmd,
-                                                          ReadPreferenceSetting::get(opCtx),
-                                                          targetingQuery,
-                                                          targetingCollation,
-                                                          true,  // do shard versioning
-                                                          &viewDefinition);
+        auto swShardResponses =
+            scatterGatherVersionedTargetByRoutingTable(opCtx,
+                                                       dbname,
+                                                       nss,
+                                                       explainCmd,
+                                                       ReadPreferenceSetting::get(opCtx),
+                                                       Shard::RetryPolicy::kIdempotent,
+                                                       targetingQuery,
+                                                       targetingCollation,
+                                                       &viewDefinition);
 
         long long millisElapsed = timer.millis();
 
@@ -286,7 +289,7 @@ public:
                                   << ErrorCodes::errorString(swShardResponses.getStatus().code()),
                     !viewDefinition.isEmpty());
 
-            auto countRequest = CountRequest::parseFromBSON(dbname, cmdObj, true);
+            auto countRequest = CountRequest::parseFromBSON(nss, cmdObj, true);
             if (!countRequest.isOK()) {
                 return countRequest.getStatus();
             }

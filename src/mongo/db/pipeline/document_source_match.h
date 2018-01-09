@@ -37,17 +37,30 @@
 
 namespace mongo {
 
-class DocumentSourceMatch final : public DocumentSource {
+class DocumentSourceMatch : public DocumentSource {
 public:
-    // virtuals from DocumentSource
-    GetNextResult getNext() final;
-    const char* getSourceName() const final;
-    Value serialize(boost::optional<ExplainOptions::Verbosity> explain = boost::none) const final;
+    virtual ~DocumentSourceMatch() = default;
+
+    GetNextResult getNext() override;
     boost::intrusive_ptr<DocumentSource> optimize() final;
     BSONObjSet getOutputSorts() final {
         return pSource ? pSource->getOutputSorts()
                        : SimpleBSONObjComparator::kInstance.makeBSONObjSet();
     }
+
+    const char* getSourceName() const override;
+
+    StageConstraints constraints(Pipeline::SplitState pipeState) const override {
+        return {StreamType::kStreaming,
+                PositionRequirement::kNone,
+                HostTypeRequirement::kNone,
+                DiskUseRequirement::kNoDiskUse,
+                FacetRequirement::kAllowed,
+                ChangeStreamRequirement::kWhitelist};
+    }
+
+    Value serialize(
+        boost::optional<ExplainOptions::Verbosity> explain = boost::none) const override;
 
     /**
      * Attempts to combine with any subsequent $match stages, joining the query objects with a
@@ -125,11 +138,6 @@ public:
     splitSourceBy(const std::set<std::string>& fields, const StringMap<std::string>& renames);
 
     /**
-     * Given a document 'input', extract 'fields' and produce a BSONObj with those values.
-     */
-    static BSONObj getObjectForMatch(const Document& input, const std::set<std::string>& fields);
-
-    /**
      * Returns a new DocumentSourceMatch with a MatchExpression that, if executed on the
      * sub-document at 'path', is equivalent to 'expression'.
      *
@@ -146,19 +154,18 @@ public:
         const std::string& path,
         const boost::intrusive_ptr<ExpressionContext>& expCtx);
 
-private:
+protected:
     DocumentSourceMatch(const BSONObj& query,
-                        const boost::intrusive_ptr<ExpressionContext>& pExpCtx);
+                        const boost::intrusive_ptr<ExpressionContext>& expCtx);
 
-    void addDependencies(DepsTracker* deps) const;
-
+private:
     std::unique_ptr<MatchExpression> _expression;
-
-    // Cache the dependencies so that we know what fields we need to serialize to BSON for matching.
-    DepsTracker _dependencies;
 
     BSONObj _predicate;
     const bool _isTextQuery;
+
+    // Cache the dependencies so that we know what fields we need to serialize to BSON for matching.
+    DepsTracker _dependencies;
 };
 
 }  // namespace mongo

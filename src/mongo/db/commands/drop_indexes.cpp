@@ -64,7 +64,7 @@ using std::stringstream;
 using std::vector;
 
 /* "dropIndexes" is now the preferred form - "deleteIndexes" deprecated */
-class CmdDropIndexes : public Command {
+class CmdDropIndexes : public BasicCommand {
 public:
     virtual bool slaveOk() const {
         return false;
@@ -83,11 +83,10 @@ public:
         out->push_back(Privilege(parseResourcePattern(dbname, cmdObj), actions));
     }
 
-    CmdDropIndexes() : Command("dropIndexes", "deleteIndexes") {}
+    CmdDropIndexes() : BasicCommand("dropIndexes", "deleteIndexes") {}
     bool run(OperationContext* opCtx,
              const string& dbname,
              const BSONObj& jsobj,
-             string& errmsg,
              BSONObjBuilder& result) {
         const NamespaceString nss = parseNsCollectionRequired(dbname, jsobj);
         return appendCommandStatus(result, dropIndexes(opCtx, nss, jsobj, &result));
@@ -95,7 +94,7 @@ public:
 
 } cmdDropIndexes;
 
-class CmdReIndex : public Command {
+class CmdReIndex : public ErrmsgCommandDeprecated {
 public:
     virtual bool slaveOk() const {
         return true;
@@ -113,13 +112,13 @@ public:
         actions.addAction(ActionType::reIndex);
         out->push_back(Privilege(parseResourcePattern(dbname, cmdObj), actions));
     }
-    CmdReIndex() : Command("reIndex") {}
+    CmdReIndex() : ErrmsgCommandDeprecated("reIndex") {}
 
-    bool run(OperationContext* opCtx,
-             const string& dbname,
-             const BSONObj& jsobj,
-             string& errmsg,
-             BSONObjBuilder& result) {
+    bool errmsgRun(OperationContext* opCtx,
+                   const string& dbname,
+                   const BSONObj& jsobj,
+                   string& errmsg,
+                   BSONObjBuilder& result) {
         DBDirectClient db(opCtx);
 
         const NamespaceString toReIndexNs = parseNsCollectionRequired(dbname, jsobj);
@@ -142,7 +141,7 @@ public:
         BackgroundOperation::assertNoBgOpInProgForNs(toReIndexNs.ns());
 
         const auto featureCompatibilityVersion =
-            serverGlobalParams.featureCompatibility.version.load();
+            serverGlobalParams.featureCompatibility.getVersion();
         const auto defaultIndexVersion =
             IndexDescriptor::getDefaultIndexVersion(featureCompatibilityVersion);
 
@@ -219,7 +218,6 @@ public:
         // snapshot so are unable to be used.
         auto replCoord = repl::ReplicationCoordinator::get(opCtx);
         auto snapshotName = replCoord->reserveSnapshotName(opCtx);
-        replCoord->forceSnapshotCreation();  // Ensures a newer snapshot gets created even if idle.
         collection->setMinimumVisibleSnapshot(snapshotName);
 
         result.append("nIndexes", static_cast<int>(indexInfoObjs.getValue().size()));

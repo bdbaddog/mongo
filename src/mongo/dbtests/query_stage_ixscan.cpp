@@ -29,6 +29,7 @@
 #include "mongo/platform/basic.h"
 
 #include "mongo/client/dbclientinterface.h"
+#include "mongo/db/catalog/index_catalog.h"
 #include "mongo/db/client.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/exec/index_scan.h"
@@ -53,7 +54,7 @@ public:
     virtual void setup() {
         WriteUnitOfWork wunit(&_opCtx);
 
-        _ctx.db()->dropCollection(&_opCtx, ns());
+        _ctx.db()->dropCollection(&_opCtx, ns()).transitional_ignore();
         _coll = _ctx.db()->createCollection(&_opCtx, ns());
 
         ASSERT_OK(_coll->getIndexCatalog()->createIndexOnEmptyCollection(
@@ -69,7 +70,7 @@ public:
     void insert(const BSONObj& doc) {
         WriteUnitOfWork wunit(&_opCtx);
         OpDebug* const nullOpDebug = nullptr;
-        ASSERT_OK(_coll->insertDocument(&_opCtx, doc, nullOpDebug, false));
+        ASSERT_OK(_coll->insertDocument(&_opCtx, InsertStatement(doc), nullOpDebug, false));
         wunit.commit();
     }
 

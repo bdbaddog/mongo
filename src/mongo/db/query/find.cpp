@@ -36,7 +36,6 @@
 #include "mongo/client/dbclientinterface.h"
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/catalog/collection.h"
-#include "mongo/db/catalog/database_holder.h"
 #include "mongo/db/client.h"
 #include "mongo/db/clientcursor.h"
 #include "mongo/db/commands.h"
@@ -52,7 +51,7 @@
 #include "mongo/db/query/internal_plans.h"
 #include "mongo/db/query/plan_summary_stats.h"
 #include "mongo/db/query/query_planner_params.h"
-#include "mongo/db/repl/replication_coordinator_global.h"
+#include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/s/collection_sharding_state.h"
 #include "mongo/db/server_options.h"
 #include "mongo/db/server_parameters.h"
@@ -74,14 +73,6 @@ using stdx::make_unique;
 
 // Failpoint for checking whether we've received a getmore.
 MONGO_FP_DECLARE(failReceivedGetmore);
-
-bool isCursorTailable(const ClientCursor* cursor) {
-    return cursor->queryOptions() & QueryOption_CursorTailable;
-}
-
-bool isCursorAwaitData(const ClientCursor* cursor) {
-    return cursor->queryOptions() & QueryOption_AwaitData;
-}
 
 bool shouldSaveCursor(OperationContext* opCtx,
                       const Collection* collection,
@@ -278,13 +269,16 @@ Message getMore(OperationContext* opCtx,
                 ? boost::optional<int>{autoDb.getDb()->getProfilingLevel()}
                 : boost::none;
             statsTracker.emplace(opCtx, *nssForCurOp, Top::LockType::NotLocked, profilingLevel);
+            auto view = autoDb.getDb()
+                ? autoDb.getDb()->getViewCatalog()->lookup(opCtx, nssForCurOp->ns())
+                : nullptr;
             uassert(
                 ErrorCodes::CommandNotSupportedOnView,
                 str::stream() << "Namespace " << nssForCurOp->ns()
                               << " is a view. OP_GET_MORE operations are not supported on views. "
                               << "Only clients which support the getMore command can be used to "
                                  "query views.",
-                !autoDb.getDb()->getViewCatalog()->lookup(opCtx, nssForCurOp->ns()));
+                !view);
         }
     } else {
         readLock.emplace(opCtx, nss);
@@ -298,17 +292,15 @@ Message getMore(OperationContext* opCtx,
         uassert(
             ErrorCodes::OperationFailed, "collection dropped between getMore calls", collection);
         cursorManager = collection->getCursorManager();
+
+        // This checks to make sure the operation is allowed on a replicated node.  Since we are not
+        // passing in a query object (necessary to check SlaveOK query option), we allow reads
+        // whether we are PRIMARY or SECONDARY.
+        uassertStatusOK(
+            repl::ReplicationCoordinator::get(opCtx)->checkCanServeReadsFor(opCtx, nss, true));
     }
 
     LOG(5) << "Running getMore, cursorid: " << cursorid;
-
-    // This checks to make sure the operation is allowed on a replicated node.  Since we are not
-    // passing in a query object (necessary to check SlaveOK query option), the only state where
-    // reads are allowed is PRIMARY (or master in master/slave).  This function uasserts if
-    // reads are not okay.
-    Status status =
-        repl::getGlobalReplicationCoordinator()->checkCanServeReadsFor_UNSAFE(opCtx, nss, true);
-    uassertStatusOK(status);
 
     // A pin performs a CC lookup and if there is a CC, increments the CC's pin value so it
     // doesn't time out.  Also informs ClientCursor that there is somebody actively holding the
@@ -332,7 +324,7 @@ Message getMore(OperationContext* opCtx,
             cursorid = 0;
             resultFlags = ResultFlag_CursorNotFound;
         } else {
-            invariant(ccPin == ErrorCodes::QueryPlanKilled);
+            invariant(ccPin == ErrorCodes::QueryPlanKilled || ccPin == ErrorCodes::Unauthorized);
             uassertStatusOK(ccPin.getStatus());
         }
     } else {
@@ -361,6 +353,11 @@ Message getMore(OperationContext* opCtx,
         if (cc->isReadCommitted())
             uassertStatusOK(opCtx->recoveryUnit()->setReadFromMajorityCommittedSnapshot());
 
+        uassert(40548,
+                "OP_GET_MORE operations are not supported on tailable aggregations. Only clients "
+                "which support the getMore command can be used on tailable aggregations.",
+                readLock || !cc->isAwaitData());
+
         // If the operation that spawned this cursor had a time limit set, apply leftover
         // time to this getmore.
         if (cc->getLeftoverMaxTimeMicros() < Microseconds::max()) {
@@ -381,7 +378,7 @@ Message getMore(OperationContext* opCtx,
 
         uint64_t notifierVersion = 0;
         std::shared_ptr<CappedInsertNotifier> notifier;
-        if (isCursorAwaitData(cc)) {
+        if (cc->isAwaitData()) {
             invariant(readLock->getCollection()->isCapped());
             // Retrieve the notifier which we will wait on until new data arrives. We make sure
             // to do this in the lock because once we drop the lock it is possible for the
@@ -396,7 +393,7 @@ Message getMore(OperationContext* opCtx,
 
         PlanExecutor* exec = cc->getExecutor();
         exec->reattachToOperationContext(opCtx);
-        exec->restoreState();
+        uassertStatusOK(exec->restoreState());
 
         auto planSummary = Explain::getPlanSummary(exec);
         {
@@ -422,7 +419,7 @@ Message getMore(OperationContext* opCtx,
 
         // If this is an await data cursor, and we hit EOF without generating any results, then
         // we block waiting for new data to arrive.
-        if (isCursorAwaitData(cc) && state == PlanExecutor::IS_EOF && numResults == 0) {
+        if (cc->isAwaitData() && state == PlanExecutor::IS_EOF && numResults == 0) {
             // Save the PlanExecutor and drop our locks.
             exec->saveState();
             readLock.reset();
@@ -431,13 +428,15 @@ Message getMore(OperationContext* opCtx,
             // the total operation latency.
             curOp.pauseTimer();
             Seconds timeout(1);
-            notifier->wait(notifierVersion, timeout);
+            notifier->waitUntil(notifierVersion,
+                                opCtx->getServiceContext()->getPreciseClockSource()->now() +
+                                    timeout);
             notifier.reset();
             curOp.resumeTimer();
 
             // Reacquiring locks.
             readLock.emplace(opCtx, nss);
-            exec->restoreState();
+            uassertStatusOK(exec->restoreState());
 
             // We woke up because either the timed_wait expired, or there was more data. Either
             // way, attempt to generate another batch of results.
@@ -466,7 +465,7 @@ Message getMore(OperationContext* opCtx,
         //    case, the pin's destructor will be invoked, which will call release() on the pin.
         //    Because our ClientCursorPin is declared after our lock is declared, this will happen
         //    under the lock if any locking was necessary.
-        if (!shouldSaveCursorGetMore(state, exec, isCursorTailable(cc))) {
+        if (!shouldSaveCursorGetMore(state, exec, cc->isTailable())) {
             ccPin.getValue().deleteUnderlying();
 
             // cc is now invalid, as is the executor
@@ -528,8 +527,14 @@ std::string runQuery(OperationContext* opCtx,
     beginQueryOp(opCtx, nss, q.query, q.ntoreturn, q.ntoskip);
 
     // Parse the qm into a CanonicalQuery.
-
-    auto statusWithCQ = CanonicalQuery::canonicalize(opCtx, q, ExtensionsCallbackReal(opCtx, &nss));
+    const boost::intrusive_ptr<ExpressionContext> expCtx;
+    auto statusWithCQ =
+        CanonicalQuery::canonicalize(opCtx,
+                                     q,
+                                     expCtx,
+                                     ExtensionsCallbackReal(opCtx, &nss),
+                                     MatchExpressionParser::kAllowAllSpecialFeatures &
+                                         ~MatchExpressionParser::AllowedFeatures::kIsolated);
     if (!statusWithCQ.isOK()) {
         uasserted(17287,
                   str::stream() << "Can't canonicalize query: "
@@ -552,6 +557,16 @@ std::string runQuery(OperationContext* opCtx,
                       << nss.ns()
                       << " is a view. Legacy find operations are not supported on views. "
                       << "Only clients which support the find command can be used to query views.");
+    }
+
+    {
+        const QueryRequest& qr = cq->getQueryRequest();
+
+        // uassert if we are not on a primary, and not a secondary with SlaveOk query parameter set.
+        // TODO(SERVER-31293): Don't set slaveOk for reads with a read pref of "primary".
+        const bool slaveOK = qr.isSlaveOk() || qr.hasReadPref();
+        uassertStatusOK(
+            repl::ReplicationCoordinator::get(opCtx)->checkCanServeReadsFor(opCtx, nss, slaveOK));
     }
 
     // We have a parsed query. Time to get the execution plan for it.
@@ -595,12 +610,6 @@ std::string runQuery(OperationContext* opCtx,
         opCtx->setDeadlineAfterNowBy(Milliseconds{qr.getMaxTimeMS()});
     }
     opCtx->checkForInterrupt();  // May trigger maxTimeAlwaysTimeOut fail point.
-
-    // uassert if we are not on a primary, and not a secondary with SlaveOk query parameter set.
-    bool slaveOK = qr.isSlaveOk() || qr.hasReadPref();
-    Status serveReadsStatus =
-        repl::getGlobalReplicationCoordinator()->checkCanServeReadsFor_UNSAFE(opCtx, nss, slaveOK);
-    uassertStatusOK(serveReadsStatus);
 
     // Run the query.
     // bb is used to hold query results

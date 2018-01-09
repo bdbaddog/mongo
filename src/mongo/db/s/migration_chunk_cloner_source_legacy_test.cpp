@@ -29,8 +29,7 @@
 #include "mongo/platform/basic.h"
 
 #include "mongo/client/remote_command_targeter_mock.h"
-#include "mongo/db/catalog/collection.h"
-#include "mongo/db/db_raii.h"
+#include "mongo/db/catalog/catalog_raii.h"
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/repl/replication_coordinator_mock.h"
@@ -246,14 +245,14 @@ TEST_F(MigrationChunkClonerSourceLegacyTest, CorrectDocumentsFetched) {
 
         WriteUnitOfWork wuow(operationContext());
 
-        cloner.onInsertOp(operationContext(), createCollectionDocument(90));
-        cloner.onInsertOp(operationContext(), createCollectionDocument(150));
-        cloner.onInsertOp(operationContext(), createCollectionDocument(151));
-        cloner.onInsertOp(operationContext(), createCollectionDocument(210));
+        cloner.onInsertOp(operationContext(), createCollectionDocument(90), {});
+        cloner.onInsertOp(operationContext(), createCollectionDocument(150), {});
+        cloner.onInsertOp(operationContext(), createCollectionDocument(151), {});
+        cloner.onInsertOp(operationContext(), createCollectionDocument(210), {});
 
-        cloner.onDeleteOp(operationContext(), createCollectionDocument(80));
-        cloner.onDeleteOp(operationContext(), createCollectionDocument(199));
-        cloner.onDeleteOp(operationContext(), createCollectionDocument(220));
+        cloner.onDeleteOp(operationContext(), createCollectionDocument(80), {}, {});
+        cloner.onDeleteOp(operationContext(), createCollectionDocument(199), {}, {});
+        cloner.onDeleteOp(operationContext(), createCollectionDocument(220), {}, {});
 
         wuow.commit();
     }

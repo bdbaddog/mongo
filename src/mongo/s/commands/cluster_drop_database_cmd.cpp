@@ -45,9 +45,9 @@
 namespace mongo {
 namespace {
 
-class DropDatabaseCmd : public Command {
+class DropDatabaseCmd : public BasicCommand {
 public:
-    DropDatabaseCmd() : Command("dropDatabase") {}
+    DropDatabaseCmd() : BasicCommand("dropDatabase") {}
 
     bool slaveOk() const override {
         return true;
@@ -72,7 +72,6 @@ public:
     bool run(OperationContext* opCtx,
              const std::string& dbname,
              const BSONObj& cmdObj,
-             std::string& errmsg,
              BSONObjBuilder& result) override {
         uassert(ErrorCodes::IllegalOperation,
                 "Cannot drop the config database",
@@ -82,11 +81,15 @@ public:
                 "have to pass 1 as db parameter",
                 cmdObj.firstElement().isNumber() && cmdObj.firstElement().number() == 1);
 
-        auto const catalogClient = Grid::get(opCtx)->catalogClient(opCtx);
+        auto const catalogClient = Grid::get(opCtx)->catalogClient();
 
-        // Lock the database globally to prevent conflicts with simultaneous database
-        // creation/modification.
-        auto scopedDistLock = uassertStatusOK(catalogClient->getDistLockManager()->lock(
+        // Remove the backwards compatible lock after 3.6 ships.
+        auto backwardsCompatibleDbDistLock = uassertStatusOK(
+            catalogClient->getDistLockManager()->lock(opCtx,
+                                                      dbname + "-movePrimary",
+                                                      "dropDatabase",
+                                                      DistLockManager::kDefaultLockTimeout));
+        auto dbDistLock = uassertStatusOK(catalogClient->getDistLockManager()->lock(
             opCtx, dbname, "dropDatabase", DistLockManager::kDefaultLockTimeout));
 
         auto const catalogCache = Grid::get(opCtx)->catalogCache();
@@ -103,16 +106,20 @@ public:
 
         uassertStatusOK(dbInfoStatus.getStatus());
 
-        catalogClient->logChange(opCtx,
-                                 "dropDatabase.start",
-                                 dbname,
-                                 BSONObj(),
-                                 ShardingCatalogClient::kMajorityWriteConcern);
+        catalogClient
+            ->logChange(opCtx,
+                        "dropDatabase.start",
+                        dbname,
+                        BSONObj(),
+                        ShardingCatalogClient::kMajorityWriteConcern)
+            .transitional_ignore();
 
         auto& dbInfo = dbInfoStatus.getValue();
 
         // Drop the database's collections from metadata
         for (const auto& nss : getAllShardedCollectionsForDb(opCtx, dbname)) {
+            auto collDistLock = uassertStatusOK(catalogClient->getDistLockManager()->lock(
+                opCtx, nss.ns(), "dropCollection", DistLockManager::kDefaultLockTimeout));
             uassertStatusOK(catalogClient->dropCollection(opCtx, nss));
         }
 
@@ -145,8 +152,13 @@ public:
         // Invalidate the database so the next access will do a full reload
         catalogCache->purgeDatabase(dbname);
 
-        catalogClient->logChange(
-            opCtx, "dropDatabase", dbname, BSONObj(), ShardingCatalogClient::kMajorityWriteConcern);
+        catalogClient
+            ->logChange(opCtx,
+                        "dropDatabase",
+                        dbname,
+                        BSONObj(),
+                        ShardingCatalogClient::kMajorityWriteConcern)
+            .transitional_ignore();
 
         result.append("dropped", dbname);
         return true;
@@ -160,7 +172,7 @@ private:
     static void _dropDatabaseFromShard(OperationContext* opCtx,
                                        const ShardId& shardId,
                                        const std::string& dbName) {
-        const auto dropDatabaseCommandBSON = [opCtx, &dbName] {
+        const auto dropDatabaseCommandBSON = [opCtx] {
             BSONObjBuilder builder;
             builder.append("dropDatabase", 1);
 

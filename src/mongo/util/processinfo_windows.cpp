@@ -81,7 +81,7 @@ boost::optional<unsigned long> ProcessInfo::getNumAvailableCores() {
     DWORD_PTR process_mask, system_mask;
 
     if (GetProcessAffinityMask(GetCurrentProcess(), &process_mask, &system_mask)) {
-        std::bitset<32> mask(process_mask);
+        std::bitset<sizeof(process_mask) * 8> mask(process_mask);
         if (mask.count() > 0)
             return mask.count();
     }
@@ -117,6 +117,39 @@ int ProcessInfo::getResidentSize() {
     }
 
     return _wconvertmtos(pmc.WorkingSetSize);
+}
+
+double ProcessInfo::getMaxSystemFileCachePercentage() {
+    SIZE_T minCacheSize = 0;
+    SIZE_T maxCacheSize = 0;
+    DWORD flags = 0;
+    BOOL status = GetSystemFileCacheSize(&minCacheSize, &maxCacheSize, &flags);
+    if (!status) {
+        DWORD gle = GetLastError();
+        severe() << "GetSystemFileCacheSize failed with " << errnoWithDescription(gle);
+        fassertFailed(40667);
+    }
+
+    if (!(flags & FILE_CACHE_MAX_HARD_ENABLE)) {
+        return 1.0;
+    }
+
+    MEMORYSTATUSEX mse;
+    mse.dwLength = sizeof(mse);
+    status = GlobalMemoryStatusEx(&mse);
+    if (!status) {
+        DWORD gle = GetLastError();
+        severe() << "GlobalMemoryStatusEx failed with " << errnoWithDescription(gle);
+        fassertFailed(40668);
+    }
+
+    DWORDLONG totalMemorySize = mse.ullTotalPhys;
+    if (totalMemorySize == 0) {
+        severe() << "Total memory is 0";
+        fassertFailed(40669);
+    }
+
+    return static_cast<double>(maxCacheSize) / totalMemorySize;
 }
 
 double ProcessInfo::getSystemMemoryPressurePercentage() {
@@ -291,7 +324,12 @@ void ProcessInfo::SystemInfo::collectSystemInfo() {
     // get OS version info
     ZeroMemory(&osvi, sizeof(osvi));
     osvi.dwOSVersionInfoSize = sizeof(osvi);
+#pragma warning(push)
+// GetVersionEx is deprecated
+#pragma warning(disable : 4996)
     if (GetVersionEx((OSVERSIONINFO*)&osvi)) {
+#pragma warning(pop)
+
         verstr << osvi.dwMajorVersion << "." << osvi.dwMinorVersion;
         if (osvi.wServicePackMajor)
             verstr << " SP" << osvi.wServicePackMajor;
@@ -299,6 +337,12 @@ void ProcessInfo::SystemInfo::collectSystemInfo() {
 
         osName = "Microsoft ";
         switch (osvi.dwMajorVersion) {
+            case 10:
+                if (osvi.wProductType == VER_NT_WORKSTATION)
+                    osName += "Windows 10";
+                else
+                    osName += "Windows Server 2016";
+                break;
             case 6:
                 switch (osvi.dwMinorVersion) {
                     case 3:
@@ -344,25 +388,8 @@ void ProcessInfo::SystemInfo::collectSystemInfo() {
                         break;
                 }
                 break;
-            case 5:
-                switch (osvi.dwMinorVersion) {
-                    case 2:
-                        osName += "Windows Server 2003";
-                        break;
-                    case 1:
-                        osName += "Windows XP";
-                        break;
-                    case 0:
-                        if (osvi.wProductType == VER_NT_WORKSTATION)
-                            osName += "Windows 2000 Professional";
-                        else
-                            osName += "Windows 2000 Server";
-                        break;
-                    default:
-                        osName += "Windows NT version ";
-                        osName += verstr.str();
-                        break;
-                }
+            default:
+                osName += "Windows";
                 break;
         }
     } else {

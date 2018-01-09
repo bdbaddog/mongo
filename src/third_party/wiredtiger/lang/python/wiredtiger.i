@@ -1,5 +1,5 @@
 /*-
- * Public Domain 2014-2017 MongoDB, Inc.
+ * Public Domain 2014-2018 MongoDB, Inc.
  * Public Domain 2008-2014 WiredTiger, Inc.
  *
  * This is free and unencumbered software released into the public domain.
@@ -489,6 +489,7 @@ NOTFOUND_OK(__wt_cursor::prev)
 NOTFOUND_OK(__wt_cursor::remove)
 NOTFOUND_OK(__wt_cursor::search)
 NOTFOUND_OK(__wt_cursor::update)
+NOTFOUND_OK(__wt_cursor::_modify)
 ANY_OK(__wt_modify::__wt_modify)
 ANY_OK(__wt_modify::~__wt_modify)
 
@@ -509,7 +510,7 @@ COMPARE_NOTFOUND_OK(__wt_cursor::_search_near)
 %exception wiredtiger_strerror;
 %exception wiredtiger_version;
 %exception diagnostic_build;
-%exception verbose_build;
+%exception timestamp_build;
 
 /* WT_ASYNC_OP customization. */
 /* First, replace the varargs get / set methods with Python equivalents. */
@@ -555,6 +556,13 @@ OVERRIDE_METHOD(__wt_cursor, WT_CURSOR, search_near, (self))
 %typemap(in,numinputs=0) (uint64_t *recnop) (uint64_t recno) { $1 = &recno; }
 %typemap(frearg) (uint64_t *recnop) "";
 %typemap(argout) (uint64_t *recnop) { $result = PyLong_FromUnsignedLongLong(*$1); }
+
+/* Handle returned hexadecimal timestamps. */
+%typemap(in,numinputs=0) (char *hex_timestamp) (char tsbuf[2 * WT_TIMESTAMP_SIZE + 1]) { $1 = tsbuf; }
+%typemap(argout) (char *hex_timestamp) {
+	if (*$1)
+		$result = SWIG_FromCharPtr($1);
+}
 
 %{
 typedef int int_void;
@@ -1001,16 +1009,12 @@ int diagnostic_build() {
 #endif
 }
 
-int verbose_build() {
-#ifdef HAVE_VERBOSE
-	return 1;
-#else
-	return 0;
-#endif
+int timestamp_build() {
+	return WT_TIMESTAMP_SIZE > 0;
 }
 %}
 int diagnostic_build();
-int verbose_build();
+int timestamp_build();
 
 /* Remove / rename parts of the C API that we don't want in Python. */
 %immutable __wt_cursor::session;

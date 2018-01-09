@@ -1,5 +1,5 @@
 /*-
- * Copyright (c) 2014-2017 MongoDB, Inc.
+ * Copyright (c) 2014-2018 MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -54,6 +54,7 @@ __lsm_worker_general_op(
 	bool force;
 
 	*completed = false;
+
 	/*
 	 * Return if this thread cannot process a bloom, drop or flush.
 	 */
@@ -101,8 +102,8 @@ static WT_THREAD_RET
 __lsm_worker(void *arg)
 {
 	WT_DECL_RET;
-	WT_LSM_WORK_UNIT *entry;
 	WT_LSM_WORKER_ARGS *cookie;
+	WT_LSM_WORK_UNIT *entry;
 	WT_SESSION_IMPL *session;
 	bool progress, ran;
 

@@ -93,20 +93,19 @@ public:
     Status init();
 
     /**
-     * Outputs a possible plan.  Leaves in the plan are tagged with an index to use.
-     * Returns true if a plan was outputted, false if no more plans will be outputted.
-     *
-     * 'tree' is set to point to the query tree.  A QueryAssignment is built from this tree.
-     * Caller owns the pointer.  Note that 'tree' itself points into data owned by the
-     * provided CanonicalQuery.
+     * Outputs a possible plan. Leaves in the plan are tagged with an index to use.
+     * Returns a MatchExpression representing a point in the query tree (which can be
+     * used to build a QueryAssignment) or nullptr if no more plans will be outputted.
+     * While owned by the caller, the MatchExpression returned points into data that is
+     * owned elsewhere.
      *
      * Nodes in 'tree' are tagged with indices that should be used to answer the tagged nodes.
-     * Only nodes that have a field name (isLogical() == false) will be tagged.
+     * Only nodes that have a field name (getCategory() != kLogical) will be tagged.
      *
      * The output tree is a clone identical to that used to initialize the enumerator, with tags
      * added in order to indicate index usage.
      */
-    bool getNext(MatchExpression** tree);
+    std::unique_ptr<MatchExpression> getNext();
 
 private:
     //
@@ -436,6 +435,17 @@ private:
                                  MatchExpression* mandatoryPred,
                                  const std::set<IndexID>& mandatoryIndices,
                                  AndAssignment* andAssignment);
+
+    /**
+     * Assigns predicates in 'predsOverLeadingField' and 'idxToNotFirst' to 'indexAssign'. Assumes
+     * that the index is not multikey. Also assumes that that the index is of a type used to answer
+     * "mandatory predicates" such as text or geoNear.
+     */
+    void assignToNonMultikeyMandatoryIndex(
+        const IndexEntry& index,
+        const std::vector<MatchExpression*>& predsOverLeadingField,
+        const IndexToPredMap& idxToNotFirst,
+        OneIndexAssignment* indexAssign);
 
     /**
      * Try to assign predicates in 'tryCompound' to 'thisIndex' as compound assignments.

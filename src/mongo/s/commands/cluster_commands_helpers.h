@@ -56,63 +56,85 @@ void appendWriteConcernErrorToCmdResponse(const ShardId& shardID,
 /**
  * Returns a copy of 'cmdObj' with 'version' appended.
  */
-BSONObj appendShardVersion(const BSONObj& cmdObj, ChunkVersion version);
+BSONObj appendShardVersion(BSONObj cmdObj, ChunkVersion version);
 
 /**
- * Broadcasts 'cmdObj' to all shards and returns the responses as a vector.
+ * Utility for dispatching unversioned commands to all shards in a cluster.
  *
- * Returns a non-OK status if a failure occurs on *this* node during execution.
- * Otherwise, returns success and a list of responses from shards (including errors from the shards
- * or errors reaching the shards).
+ * Returns a non-OK status if a failure occurs on *this* node during execution. Otherwise, returns
+ * success and a list of responses from shards (including errors from the shards or errors reaching
+ * the shards).
+ *
+ * Note, if this mongos has not refreshed its shard list since
+ * 1) a shard has been *added* through a different mongos, a request will not be sent to the added
+ *    shard
+ * 2) a shard has been *removed* through a different mongos, this function will return a
+ *    ShardNotFound error status.
  */
-StatusWith<std::vector<AsyncRequestsSender::Response>> scatterGather(
+StatusWith<std::vector<AsyncRequestsSender::Response>> scatterGatherUnversionedTargetAllShards(
     OperationContext* opCtx,
     const std::string& dbName,
+    boost::optional<NamespaceString> nss,
     const BSONObj& cmdObj,
-    const ReadPreferenceSetting& readPref);
+    const ReadPreferenceSetting& readPref,
+    Shard::RetryPolicy retryPolicy);
 
 /**
- * Uses the routing table cache to broadcast a command on a namespace. By default, attaches
- * shardVersions to the outgoing requests to shards, and retargets and retries if it receives a
- * stale shardVersion error from any shard.
+ * Utility for dispatching versioned commands on a namespace, deciding which shards to
+ * target by applying the passed-in query and collation to the local routing table cache.
  *
- * If 'query' is specified, only shards that own data for the namespace are targeted. Otherwise,
- * all shards are targeted.
+ * Throws on seeing a StaleConfigException from any shard.
  *
- * Returns a non-OK status if a failure occurs on *this* node during execution or on seeing an error
- * from a shard that means the operation as a whole should fail, such as a exceeding retries for
- * stale shardVersion errors.
- * Otherwise, returns success and a list of responses from shards (including errors from the shards
- * or errors reaching the shards).
+ * Optionally populates a 'viewDefinition' out parameter if a shard's result contains a view
+ * definition. The viewDefinition can be used to re-run the command as an aggregation.
  *
- * @appendShardVersion: if false, does not attach shardVersions to the outgoing requests.
- * @viewDefinition: if a shard returns an error saying that the request was on a view, the shard
- *                  will also return a view definition. The returned viewDefinition is stored in
- *                  this parameter, so that the caller can re-run the operation as an aggregation.
+ * Return value is the same as scatterGatherUnversionedTargetAllShards().
  */
-StatusWith<std::vector<AsyncRequestsSender::Response>> scatterGatherForNamespace(
+StatusWith<std::vector<AsyncRequestsSender::Response>> scatterGatherVersionedTargetByRoutingTable(
     OperationContext* opCtx,
+    const std::string& dbName,
     const NamespaceString& nss,
     const BSONObj& cmdObj,
     const ReadPreferenceSetting& readPref,
-    const boost::optional<BSONObj> query,
-    const boost::optional<BSONObj> collation,
-    const bool appendShardVersion = true,
-    BSONObj* viewDefinition = nullptr);
+    Shard::RetryPolicy retryPolicy,
+    const BSONObj& query,
+    const BSONObj& collation,
+    BSONObj* viewDefinition);
+
+/**
+ * Utility for dispatching commands on a namespace, but with special hybrid versioning:
+ * - If the namespace is unsharded, a version is attached (so this node can find out if its routing
+ * table was stale, and the namespace is actually sharded), and only the primary shard is targeted.
+ * - If the namespace is sharded, no version is attached, and the request is broadcast to all
+ * shards.
+ *
+ * Throws on seeing a StaleConfigException.
+ *
+ * Return value is the same as scatterGatherUnversionedTargetAllShards().
+ */
+StatusWith<std::vector<AsyncRequestsSender::Response>> scatterGatherOnlyVersionIfUnsharded(
+    OperationContext* opCtx,
+    const std::string& dbName,
+    const NamespaceString& nss,
+    const BSONObj& cmdObj,
+    const ReadPreferenceSetting& readPref,
+    Shard::RetryPolicy retryPolicy);
 
 /**
  * Attaches each shard's response or error status by the shard's connection string in a top-level
  * field called 'raw' in 'output'.
  *
  * If all shards that errored had the same error, writes the common error code to 'output'. Writes a
- * string representation of all errors to 'errmsg.'
+ * string representation of all errors to 'errmsg.' Errors codes in 'ignoredErrors' are not treated
+ * as errors if any shard returned success.
  *
- * Returns true if all the shards reported success.
+ * Returns true if any shard reports success and only ignored errors occur.
  */
 bool appendRawResponses(OperationContext* opCtx,
                         std::string* errmsg,
                         BSONObjBuilder* output,
-                        std::vector<AsyncRequestsSender::Response> shardResponses);
+                        std::vector<AsyncRequestsSender::Response> shardResponses,
+                        std::set<ErrorCodes::Error> ignoredErrors = {});
 
 /**
  * Utility function to compute a single error code from a vector of command results.

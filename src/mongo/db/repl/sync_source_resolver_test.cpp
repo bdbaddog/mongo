@@ -158,7 +158,7 @@ TEST_F(SyncSourceResolverTest, InvalidConstruction) {
     // Null task executor.
     ASSERT_THROWS_CODE_AND_WHAT(
         SyncSourceResolver(nullptr, &selector, lastOpTimeFetched, requiredOpTime, onCompletion),
-        UserException,
+        AssertionException,
         ErrorCodes::BadValue,
         "task executor cannot be null");
 
@@ -166,14 +166,14 @@ TEST_F(SyncSourceResolverTest, InvalidConstruction) {
     ASSERT_THROWS_CODE_AND_WHAT(
         SyncSourceResolver(
             &getExecutor(), nullptr, lastOpTimeFetched, requiredOpTime, onCompletion),
-        UserException,
+        AssertionException,
         ErrorCodes::BadValue,
         "sync source selector cannot be null");
 
     // Null last fetched optime.
     ASSERT_THROWS_CODE_AND_WHAT(
         SyncSourceResolver(&getExecutor(), &selector, OpTime(), requiredOpTime, onCompletion),
-        UserException,
+        AssertionException,
         ErrorCodes::BadValue,
         "last fetched optime cannot be null");
 
@@ -183,19 +183,19 @@ TEST_F(SyncSourceResolverTest, InvalidConstruction) {
                                                    lastOpTimeFetched,
                                                    OpTime(Timestamp(Seconds(50), 1U), 1LL),
                                                    onCompletion),
-                                UserException,
+                                AssertionException,
                                 ErrorCodes::BadValue,
                                 "required optime (if provided) must be more recent than last "
-                                "fetched optime. requiredOpTime: { ts: Timestamp 50000|1, t: 1 }, "
-                                "lastOpTimeFetched: { ts: Timestamp 100000|1, t: 1 }");
+                                "fetched optime. requiredOpTime: { ts: Timestamp(50, 1), t: 1 }, "
+                                "lastOpTimeFetched: { ts: Timestamp(100, 1), t: 1 }");
     ASSERT_THROWS_CODE_AND_WHAT(
         SyncSourceResolver(
             &getExecutor(), &selector, lastOpTimeFetched, lastOpTimeFetched, onCompletion),
-        UserException,
+        AssertionException,
         ErrorCodes::BadValue,
         "required optime (if provided) must be more recent than last fetched optime. "
-        "requiredOpTime: { ts: Timestamp 100000|1, t: 1 }, lastOpTimeFetched: { ts: Timestamp "
-        "100000|1, t: 1 }");
+        "requiredOpTime: { ts: Timestamp(100, 1), t: 1 }, lastOpTimeFetched: { ts: Timestamp("
+        "100, 1), t: 1 }");
 
     // Null callback function.
     ASSERT_THROWS_CODE_AND_WHAT(SyncSourceResolver(&getExecutor(),
@@ -203,7 +203,7 @@ TEST_F(SyncSourceResolverTest, InvalidConstruction) {
                                                    lastOpTimeFetched,
                                                    requiredOpTime,
                                                    SyncSourceResolver::OnCompletionFn()),
-                                UserException,
+                                AssertionException,
                                 ErrorCodes::BadValue,
                                 "callback function cannot be null");
 }
@@ -297,7 +297,21 @@ void _scheduleFirstOplogEntryFetcherResponse(executor::NetworkInterfaceMock* net
  * Generates oplog entries with the given optime.
  */
 BSONObj _makeOplogEntry(Timestamp ts, long long term) {
-    return OplogEntry(OpTime(ts, term), 1LL, OpTypeEnum::kNoop, NamespaceString("a.a"), BSONObj())
+    return OplogEntry(OpTime(ts, term),                 // optime
+                      1LL,                              // hash
+                      OpTypeEnum::kNoop,                // op type
+                      NamespaceString("a.a"),           // namespace
+                      boost::none,                      // uuid
+                      boost::none,                      // fromMigrate
+                      repl::OplogEntry::kOplogVersion,  // version
+                      BSONObj(),                        // o
+                      boost::none,                      // o2
+                      {},                               // sessionInfo
+                      boost::none,                      // wall clock time
+                      boost::none,                      // statement id
+                      boost::none,  // optime of previous write within same transaction
+                      boost::none,  // pre-image optime
+                      boost::none)  // post-image optime
         .toBSON();
 }
 
@@ -521,7 +535,7 @@ TEST_F(SyncSourceResolverTest,
 TEST_F(SyncSourceResolverTest,
        SyncSourceResolverWillTryOtherSourcesWhenTheFirstNodeHasAnEmptyOplog) {
     HostAndPort candidate1("node1", 12345);
-    HostAndPort candidate2("node1", 12345);
+    HostAndPort candidate2("node2", 12345);
     _selector->setChooseNewSyncSourceResult_forTest(candidate1);
     ASSERT_OK(_resolver->startup());
     ASSERT_TRUE(_resolver->isActive());
@@ -546,7 +560,7 @@ TEST_F(SyncSourceResolverTest,
 TEST_F(SyncSourceResolverTest,
        SyncSourceResolverWillTryOtherSourcesWhenTheFirstNodeHasAnEmptyFirstOplogEntry) {
     HostAndPort candidate1("node1", 12345);
-    HostAndPort candidate2("node1", 12345);
+    HostAndPort candidate2("node2", 12345);
     _selector->setChooseNewSyncSourceResult_forTest(candidate1);
     ASSERT_OK(_resolver->startup());
     ASSERT_TRUE(_resolver->isActive());
@@ -569,9 +583,35 @@ TEST_F(SyncSourceResolverTest,
 }
 
 TEST_F(SyncSourceResolverTest,
+       SyncSourceResolverWillTryOtherSourcesWhenFirstNodeContainsBadOplogEntry) {
+    HostAndPort candidate1("node1", 12345);
+    HostAndPort candidate2("node2", 12345);
+    _selector->setChooseNewSyncSourceResult_forTest(candidate1);
+    ASSERT_OK(_resolver->startup());
+    ASSERT_TRUE(_resolver->isActive());
+
+    _scheduleFirstOplogEntryFetcherResponse(
+        getNet(), _selector.get(), candidate1, candidate2, {BSON("t" << 1)});
+
+    ASSERT_TRUE(_resolver->isActive());
+    ASSERT_EQUALS(candidate1, _selector->getLastBlacklistedSyncSource_forTest());
+    ASSERT_EQUALS(getExecutor().now() +
+                      SyncSourceResolver::kFirstOplogEntryNullTimestampBlacklistDuration,
+                  _selector->getLastBlacklistExpiration_forTest());
+
+    _scheduleFirstOplogEntryFetcherResponse(
+        getNet(), _selector.get(), candidate2, HostAndPort(), Timestamp(10, 2));
+    _scheduleRBIDResponse(getNet(), candidate2);
+
+    _resolver->join();
+    ASSERT_FALSE(_resolver->isActive());
+    ASSERT_EQUALS(candidate2, unittest::assertGet(_response.syncSourceStatus));
+}
+
+TEST_F(SyncSourceResolverTest,
        SyncSourceResolverWillTryOtherSourcesWhenFirstNodeContainsOplogEntryWithNullTimestamp) {
     HostAndPort candidate1("node1", 12345);
-    HostAndPort candidate2("node1", 12345);
+    HostAndPort candidate2("node2", 12345);
     _selector->setChooseNewSyncSourceResult_forTest(candidate1);
     ASSERT_OK(_resolver->startup());
     ASSERT_TRUE(_resolver->isActive());
@@ -594,6 +634,26 @@ TEST_F(SyncSourceResolverTest,
     ASSERT_EQUALS(candidate2, unittest::assertGet(_response.syncSourceStatus));
 }
 
+
+TEST_F(SyncSourceResolverTest, SyncSourceResolverWillSucceedWithExtraFields) {
+    HostAndPort candidate1("node1", 12345);
+    _selector->setChooseNewSyncSourceResult_forTest(candidate1);
+    ASSERT_OK(_resolver->startup());
+    ASSERT_TRUE(_resolver->isActive());
+
+    _scheduleFirstOplogEntryFetcherResponse(getNet(),
+                                            _selector.get(),
+                                            candidate1,
+                                            HostAndPort(),
+                                            {BSON("ts" << Timestamp(1, 1) << "t" << 1 << "note"
+                                                       << "a")});
+
+    _scheduleRBIDResponse(getNet(), candidate1);
+
+    _resolver->join();
+    ASSERT_FALSE(_resolver->isActive());
+    ASSERT_EQUALS(candidate1, unittest::assertGet(_response.syncSourceStatus));
+}
 /**
  * Constructs and schedules a network interface response using the given documents to the required
  * optime on the sync source candidate.

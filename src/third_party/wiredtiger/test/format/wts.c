@@ -1,5 +1,5 @@
 /*-
- * Public Domain 2014-2017 MongoDB, Inc.
+ * Public Domain 2014-2018 MongoDB, Inc.
  * Public Domain 2008-2014 WiredTiger, Inc.
  *
  * This is free and unencumbered software released into the public domain.
@@ -185,6 +185,12 @@ wts_open(const char *home, bool set_api, WT_CONNECTION **connp)
 	if (DATASOURCE("lsm") || g.c_cache < 20)
 		CONFIG_APPEND(p, ",eviction_dirty_trigger=95");
 
+	/* Checkpoints. */
+	if (g.c_checkpoint_flag == CHECKPOINT_WIREDTIGER)
+		CONFIG_APPEND(p,
+		    ",checkpoint=(wait=%" PRIu32 ",log_size=%" PRIu32 ")",
+		    g.c_checkpoint_wait, MEGABYTE(g.c_checkpoint_log_size));
+
 	/* Eviction worker configuration. */
 	if (g.c_evict_max != 0)
 		CONFIG_APPEND(p,
@@ -193,12 +199,14 @@ wts_open(const char *home, bool set_api, WT_CONNECTION **connp)
 	/* Logging configuration. */
 	if (g.c_logging)
 		CONFIG_APPEND(p,
-		    ",log=(enabled=true,archive=%d,prealloc=%d"
-		    ",compressor=\"%s\")",
+		    ",log=(enabled=true,archive=%d,"
+		    "prealloc=%d,file_max=%" PRIu32 ",compressor=\"%s\")",
 		    g.c_logging_archive ? 1 : 0,
 		    g.c_logging_prealloc ? 1 : 0,
+		    KILOBYTE(g.c_logging_file_max),
 		    compressor(g.c_logging_compression_flag));
 
+	/* Encryption. */
 	if (g.c_encryption)
 		CONFIG_APPEND(p,
 		    ",encryption=(name=%s)", encryptor(g.c_encryption_flag));
@@ -224,11 +232,12 @@ wts_open(const char *home, bool set_api, WT_CONNECTION **connp)
 		if (mmrand(NULL, 0, 5) == 1 &&
 		    memcmp(g.uri, "file:", strlen("file:")) == 0)
 			CONFIG_APPEND(p,
-			    ",statistics=(fast)"
-			    ",statistics_log=(wait=5,sources=(\"file:\"))");
+			    ",statistics=(fast),statistics_log="
+			    "(json,on_close,wait=5,sources=(\"file:\"))");
 		else
 			CONFIG_APPEND(p,
-			    ",statistics=(fast),statistics_log=(wait=5)");
+			    ",statistics=(fast),statistics_log="
+			    "(json,on_close,wait=5)");
 	} else
 		CONFIG_APPEND(p,
 		    ",statistics=(%s)", g.c_statistics ? "fast" : "none");
@@ -528,6 +537,7 @@ wts_verify(const char *tag)
 	WT_CONNECTION *conn;
 	WT_DECL_RET;
 	WT_SESSION *session;
+	char config_buf[64];
 
 	if (g.c_verify == 0)
 		return;
@@ -540,10 +550,25 @@ wts_verify(const char *tag)
 		(void)g.wt_api->msg_printf(g.wt_api, session,
 		    "=============== verify start ===============");
 
-	/* Session operations for LSM can return EBUSY. */
+	if (g.c_txn_timestamps && g.timestamp > 0) {
+		/*
+		 * Bump the oldest timestamp, otherwise recent operation will
+		 * prevent verify from running.
+		 */
+		testutil_check(__wt_snprintf(
+		    config_buf, sizeof(config_buf),
+		    "oldest_timestamp=%" PRIx64, g.timestamp));
+		testutil_check(conn->set_timestamp(conn, config_buf));
+	}
+
+	/*
+	 * Verify can return EBUSY if the handle isn't available. Don't yield
+	 * and retry, in the case of LSM, the handle may not be available for
+	 * a long time.
+	 */
 	ret = session->verify(session, g.uri, "strict");
-	if (ret != 0 && !(ret == EBUSY && DATASOURCE("lsm")))
-		testutil_die(ret, "session.verify: %s: %s", g.uri, tag);
+	testutil_assertfmt(
+	    ret == 0 || ret == EBUSY, "session.verify: %s: %s", g.uri, tag);
 
 	if (g.logging != 0)
 		(void)g.wt_api->msg_printf(g.wt_api, session,
@@ -565,7 +590,7 @@ wts_stats(void)
 	FILE *fp;
 	size_t len;
 	char *stat_name;
-	const char *pval, *desc;
+	const char *desc, *pval;
 	uint64_t v;
 
 	/* Ignore statistics if they're not configured. */

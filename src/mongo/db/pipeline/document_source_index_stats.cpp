@@ -39,7 +39,7 @@ namespace mongo {
 using boost::intrusive_ptr;
 
 REGISTER_DOCUMENT_SOURCE(indexStats,
-                         LiteParsedDocumentSourceDefault::parse,
+                         DocumentSourceIndexStats::LiteParsed::parse,
                          DocumentSourceIndexStats::createFromBson);
 
 const char* DocumentSourceIndexStats::getSourceName() const {
@@ -50,7 +50,7 @@ DocumentSource::GetNextResult DocumentSourceIndexStats::getNext() {
     pExpCtx->checkForInterrupt();
 
     if (_indexStatsMap.empty()) {
-        _indexStatsMap = _mongod->getIndexStats(pExpCtx->opCtx, pExpCtx->ns);
+        _indexStatsMap = pExpCtx->mongoProcessInterface->getIndexStats(pExpCtx->opCtx, pExpCtx->ns);
         _indexStatsIter = _indexStatsMap.begin();
     }
 
@@ -70,8 +70,7 @@ DocumentSource::GetNextResult DocumentSourceIndexStats::getNext() {
 }
 
 DocumentSourceIndexStats::DocumentSourceIndexStats(const intrusive_ptr<ExpressionContext>& pExpCtx)
-    : DocumentSourceNeedsMongod(pExpCtx),
-      _processName(str::stream() << getHostNameCached() << ":" << serverGlobalParams.port) {}
+    : DocumentSource(pExpCtx), _processName(getHostNameCachedAndPort()) {}
 
 intrusive_ptr<DocumentSource> DocumentSourceIndexStats::createFromBson(
     BSONElement elem, const intrusive_ptr<ExpressionContext>& pExpCtx) {

@@ -32,21 +32,63 @@
 
 namespace mongo {
 
-class DocumentSourceCurrentOp final : public DocumentSourceNeedsMongod {
+class DocumentSourceCurrentOp final : public DocumentSource {
 public:
-    using ConnMode = MongodInterface::CurrentOpConnectionsMode;
-    using UserMode = MongodInterface::CurrentOpUserMode;
+    class LiteParsed final : public LiteParsedDocumentSource {
+    public:
+        static std::unique_ptr<LiteParsed> parse(const AggregationRequest& request,
+                                                 const BSONElement& spec);
+
+        explicit LiteParsed(bool allUsers) : _allUsers(allUsers) {}
+
+        stdx::unordered_set<NamespaceString> getInvolvedNamespaces() const final {
+            return stdx::unordered_set<NamespaceString>();
+        }
+
+        PrivilegeVector requiredPrivileges(bool isMongos) const final {
+            PrivilegeVector privileges;
+
+            // In a sharded cluster, we always need the inprog privilege to run $currentOp.
+            if (isMongos || _allUsers) {
+                privileges.push_back({ResourcePattern::forClusterResource(), ActionType::inprog});
+            }
+
+            return privileges;
+        }
+
+        bool isInitialSource() const final {
+            return true;
+        }
+
+    private:
+        const bool _allUsers;
+    };
+
+    using TruncationMode = MongoProcessInterface::CurrentOpTruncateMode;
+    using ConnMode = MongoProcessInterface::CurrentOpConnectionsMode;
+    using UserMode = MongoProcessInterface::CurrentOpUserMode;
 
     static boost::intrusive_ptr<DocumentSourceCurrentOp> create(
         const boost::intrusive_ptr<ExpressionContext>& pExpCtx,
         ConnMode includeIdleConnections = ConnMode::kExcludeIdle,
-        UserMode includeOpsFromAllUsers = UserMode::kExcludeOthers);
+        UserMode includeOpsFromAllUsers = UserMode::kExcludeOthers,
+        TruncationMode truncateOps = TruncationMode::kNoTruncation);
 
     GetNextResult getNext() final;
 
     const char* getSourceName() const final;
 
-    InitialSourceType getInitialSourceType() const final;
+    StageConstraints constraints(Pipeline::SplitState pipeState) const final {
+        StageConstraints constraints(StreamType::kStreaming,
+                                     PositionRequirement::kFirst,
+                                     HostTypeRequirement::kAnyShard,
+                                     DiskUseRequirement::kNoDiskUse,
+                                     FacetRequirement::kNotAllowed);
+
+        constraints.isIndependentOfAnyCollection = true;
+        constraints.requiresInputDocSource = false;
+        return constraints;
+    }
 
     static boost::intrusive_ptr<DocumentSource> createFromBson(
         BSONElement spec, const boost::intrusive_ptr<ExpressionContext>& pExpCtx);
@@ -56,13 +98,16 @@ public:
 private:
     DocumentSourceCurrentOp(const boost::intrusive_ptr<ExpressionContext>& pExpCtx,
                             ConnMode includeIdleConnections = ConnMode::kExcludeIdle,
-                            UserMode includeOpsFromAllUsers = UserMode::kExcludeOthers)
-        : DocumentSourceNeedsMongod(pExpCtx),
+                            UserMode includeOpsFromAllUsers = UserMode::kExcludeOthers,
+                            TruncationMode truncateOps = TruncationMode::kNoTruncation)
+        : DocumentSource(pExpCtx),
           _includeIdleConnections(includeIdleConnections),
-          _includeOpsFromAllUsers(includeOpsFromAllUsers) {}
+          _includeOpsFromAllUsers(includeOpsFromAllUsers),
+          _truncateOps(truncateOps) {}
 
     ConnMode _includeIdleConnections = ConnMode::kExcludeIdle;
     UserMode _includeOpsFromAllUsers = UserMode::kExcludeOthers;
+    TruncationMode _truncateOps = TruncationMode::kNoTruncation;
 
     std::string _shardName;
 

@@ -45,16 +45,22 @@ namespace mongo {
 class OperationContext;
 class LogicalTime;
 class ServiceContext;
-class ShardingCatalogClient;
+class KeysCollectionClient;
+
+extern int KeysRotationIntervalSec;
 
 /**
- * This is responsible for providing keys that can be used for HMAC computation. This also supports
- * automatic key rotation that happens on a configurable interval.
+ * The KeysCollectionManager queries the config servers for keys that can be used for
+ * HMAC computation. It maintains an internal background thread that is used to periodically
+ * refresh the local key cache against the keys collection stored on the config servers.
  */
 class KeysCollectionManager {
 public:
+    static const Seconds kKeyValidInterval;
+    static const std::string kKeyManagerPurposeString;
+
     KeysCollectionManager(std::string purpose,
-                          ShardingCatalogClient* client,
+                          std::unique_ptr<KeysCollectionClient> client,
                           Seconds keyValidForInterval);
 
     /**
@@ -73,7 +79,8 @@ public:
      *
      * Throws ErrorCode::ExceededTimeLimit if it times out.
      */
-    StatusWith<KeysCollectionDocument> getKeyForSigning(const LogicalTime& forThisTime);
+    StatusWith<KeysCollectionDocument> getKeyForSigning(OperationContext* opCtx,
+                                                        const LogicalTime& forThisTime);
 
     /**
      * Request this manager to perform a refresh.
@@ -97,6 +104,11 @@ public:
      * is the config primary.
      */
     void enableKeyGenerator(OperationContext* opCtx, bool doEnable);
+
+    /**
+     * Returns true if the refresher has ever successfully returned keys from the config server.
+     */
+    bool hasSeenKeys();
 
 private:
     /**
@@ -143,6 +155,11 @@ private:
          */
         void stop();
 
+        /**
+         * Returns true if keys have ever successfully been returned from the config server.
+         */
+        bool hasSeenKeys();
+
     private:
         void _doPeriodicRefresh(ServiceContext* service,
                                 std::string threadName,
@@ -155,6 +172,7 @@ private:
         stdx::thread _backgroundThread;
         std::shared_ptr<RefreshFunc> _doRefresh;
 
+        bool _hasSeenKeys = false;
         bool _inShutdown = false;
     };
 
@@ -169,9 +187,9 @@ private:
      */
     StatusWith<KeysCollectionDocument> _getKey(const LogicalTime& forThisTime);
 
+    std::unique_ptr<KeysCollectionClient> _client;
     const std::string _purpose;
     const Seconds _keyValidForInterval;
-    ShardingCatalogClient* _catalogClient;
 
     // No mutex needed since the members below have their own mutexes.
     KeysCollectionCacheReader _keysCache;

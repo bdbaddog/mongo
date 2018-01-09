@@ -31,7 +31,9 @@
 #include <map>
 #include <string>
 
+#include "mongo/base/status_with.h"
 #include "mongo/base/string_data.h"
+#include "mongo/bson/timestamp.h"
 #include "mongo/db/storage/journal_listener.h"
 #include "mongo/db/storage/kv/kv_catalog.h"
 #include "mongo/db/storage/kv/kv_database_catalog_entry_base.h"
@@ -89,6 +91,10 @@ public:
         return _supportsDocLocking;
     }
 
+    virtual bool supportsDBLocking() const {
+        return _supportsDBLocking;
+    }
+
     virtual Status closeDatabase(OperationContext* opCtx, StringData db);
 
     virtual Status dropDatabase(OperationContext* opCtx, StringData db);
@@ -106,6 +112,16 @@ public:
     virtual Status repairRecordStore(OperationContext* opCtx, const std::string& ns);
 
     virtual void cleanShutdown();
+
+    virtual void setStableTimestamp(Timestamp stableTimestamp) override;
+
+    virtual void setInitialDataTimestamp(Timestamp initialDataTimestamp) override;
+
+    virtual void setOldestTimestamp(Timestamp oldestTimestamp) override;
+
+    virtual bool supportsRecoverToStableTimestamp() const override;
+
+    virtual void replicationBatchIsComplete() const override;
 
     SnapshotManager* getSnapshotManager() const final;
 
@@ -127,6 +143,12 @@ public:
         return _catalog.get();
     }
 
+    /**
+     * Drop abandoned idents. Returns a parallel list of index name, index spec pairs to rebuild.
+     */
+    StatusWith<std::vector<StorageEngine::CollectionIndexNamePair>> reconcileCatalogAndIdents(
+        OperationContext* opCtx) override;
+
 private:
     class RemoveDBChange;
 
@@ -138,6 +160,7 @@ private:
     std::unique_ptr<KVEngine> _engine;
 
     const bool _supportsDocLocking;
+    const bool _supportsDBLocking;
 
     std::unique_ptr<RecordStore> _catalogRecordStore;
     std::unique_ptr<KVCatalog> _catalog;

@@ -127,7 +127,7 @@ PlanStage::StageState MultiPlanStage::doWork(WorkingSetID* out) {
         // if the best solution fails. Alternatively we could try to
         // defer cache insertion to be after the first produced result.
 
-        _collection->infoCache()->getPlanCache()->remove(*_query);
+        _collection->infoCache()->getPlanCache()->remove(*_query).transitional_ignore();
 
         _bestPlanIdx = _backupPlanIdx;
         _backupPlanIdx = kNoSuchPlan;
@@ -150,14 +150,13 @@ Status MultiPlanStage::tryYield(PlanYieldPolicy* yieldPolicy) {
     //   3) we need to yield and retry due to a WriteConflictException.
     // In all cases, the actual yielding happens here.
     if (yieldPolicy->shouldYield()) {
-        bool alive = yieldPolicy->yield(_fetcher.get());
+        auto yieldStatus = yieldPolicy->yield(_fetcher.get());
 
-        if (!alive) {
+        if (!yieldStatus.isOK()) {
             _failure = true;
-            Status failStat(ErrorCodes::QueryPlanKilled,
-                            "PlanExecutor killed during plan selection");
-            _statusMemberId = WorkingSetCommon::allocateStatusMember(_candidates[0].ws, failStat);
-            return failStat;
+            _statusMemberId =
+                WorkingSetCommon::allocateStatusMember(_candidates[0].ws, yieldStatus);
+            return yieldStatus;
         }
     }
 
@@ -323,7 +322,13 @@ Status MultiPlanStage::pickBestPlan(PlanYieldPolicy* yieldPolicy) {
         }
 
         if (validSolutions) {
-            _collection->infoCache()->getPlanCache()->add(*_query, solutions, ranking.release());
+            _collection->infoCache()
+                ->getPlanCache()
+                ->add(*_query,
+                      solutions,
+                      ranking.release(),
+                      getOpCtx()->getServiceContext()->getPreciseClockSource()->now())
+                .transitional_ignore();
         }
     }
 

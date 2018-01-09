@@ -66,7 +66,7 @@ public:
             _database = _context.db();
             _collection = _database->getCollection(&_opCtx, ns());
             if (_collection) {
-                _database->dropCollection(&_opCtx, ns());
+                _database->dropCollection(&_opCtx, ns()).transitional_ignore();
             }
             _collection = _database->createCollection(&_opCtx, ns());
             wunit.commit();
@@ -109,9 +109,11 @@ protected:
             oid.init();
             b.appendOID("_id", &oid);
             b.appendElements(o);
-            _collection->insertDocument(&_opCtx, b.obj(), nullOpDebug, false);
+            _collection->insertDocument(&_opCtx, InsertStatement(b.obj()), nullOpDebug, false)
+                .transitional_ignore();
         } else {
-            _collection->insertDocument(&_opCtx, o, nullOpDebug, false);
+            _collection->insertDocument(&_opCtx, InsertStatement(o), nullOpDebug, false)
+                .transitional_ignore();
         }
         wunit.commit();
     }
@@ -163,10 +165,9 @@ public:
                 .value());
 
         // Check findOne() returning object, requiring indexed scan without index.
-        ASSERT_THROWS(Helpers::findOne(&_opCtx, _collection, query, ret, true),
-                      MsgAssertionException);
+        ASSERT_THROWS(Helpers::findOne(&_opCtx, _collection, query, ret, true), AssertionException);
         // Check findOne() returning location, requiring indexed scan without index.
-        ASSERT_THROWS(Helpers::findOne(&_opCtx, _collection, query, true), MsgAssertionException);
+        ASSERT_THROWS(Helpers::findOne(&_opCtx, _collection, query, true), AssertionException);
 
         addIndex(IndexSpec().addKey("b").unique(false));
 
@@ -193,7 +194,7 @@ public:
             Database* db = ctx.db();
             if (db->getCollection(&_opCtx, ns())) {
                 _collection = NULL;
-                db->dropCollection(&_opCtx, ns());
+                db->dropCollection(&_opCtx, ns()).transitional_ignore();
             }
             _collection = db->createCollection(&_opCtx, ns(), CollectionOptions(), false);
             wunit.commit();
@@ -294,8 +295,7 @@ public:
 };
 
 /**
- * An exception triggered during a get more request destroys the ClientCursor used by the get
- * more, preventing further iteration of the cursor in subsequent get mores.
+ * Setting killAllOperations causes further getmores to fail.
  */
 class GetMoreKillOp : public ClientBase {
 public:
@@ -312,7 +312,6 @@ public:
 
         // Create a cursor on the collection, with a batch size of 200.
         unique_ptr<DBClientCursor> cursor = _client.query(ns, "", 0, 0, 0, 0, 200);
-        CursorId cursorId = cursor->getCursorId();
 
         // Count 500 results, spanning a few batches of documents.
         for (int i = 0; i < 500; ++i) {
@@ -323,23 +322,16 @@ public:
         // Set the killop kill all flag, forcing the next get more to fail with a kill op
         // exception.
         getGlobalServiceContext()->setKillAllOperations();
-        while (cursor->more()) {
-            cursor->next();
-        }
+        ASSERT_THROWS_CODE(([&] {
+                               while (cursor->more()) {
+                                   cursor->next();
+                               }
+                           }()),
+                           AssertionException,
+                           ErrorCodes::InterruptedAtShutdown);
 
         // Revert the killop kill all flag.
         getGlobalServiceContext()->unsetKillAllOperations();
-
-        // Check that the cursor has been removed.
-        {
-            AutoGetCollectionForReadCommand ctx(&_opCtx, NamespaceString(ns));
-            ASSERT(0 == ctx.getCollection()->getCursorManager()->numCursors());
-        }
-
-        ASSERT_FALSE(CursorManager::eraseCursorGlobal(&_opCtx, cursorId));
-
-        // Check that a subsequent get more fails with the cursor removed.
-        ASSERT_THROWS(_client.getMore(ns, cursorId), UserException);
     }
 };
 
@@ -375,8 +367,10 @@ public:
 
         // Send a get more with a namespace that is incorrect ('spoofed') for this cursor id.
         // This is the invalaid get more request described in the comment preceding this class.
-        _client.getMore("unittests.querytests.GetMoreInvalidRequest_WRONG_NAMESPACE_FOR_CURSOR",
-                        cursor->getCursorId());
+        ASSERT_THROWS(
+            _client.getMore("unittests.querytests.GetMoreInvalidRequest_WRONG_NAMESPACE_FOR_CURSOR",
+                            cursor->getCursorId()),
+            AssertionException);
 
         // Check that the cursor still exists
         {
@@ -485,9 +479,7 @@ public:
         insert(ns, BSON("a" << 3));
 
         // We have overwritten the previous cursor position and should encounter a dead cursor.
-        if (c->more()) {
-            ASSERT_THROWS(c->nextSafe(), AssertionException);
-        }
+        ASSERT_THROWS(c->more() ? c->nextSafe() : BSONObj(), AssertionException);
     }
 };
 
@@ -511,9 +503,7 @@ public:
         insert(ns, BSON("a" << 4));
 
         // We have overwritten the previous cursor position and should encounter a dead cursor.
-        if (c->more()) {
-            ASSERT_THROWS(c->nextSafe(), AssertionException);
-        }
+        ASSERT_THROWS(c->more() ? c->nextSafe() : BSONObj(), AssertionException);
     }
 };
 
@@ -549,9 +539,8 @@ public:
     void run() {
         const char* ns = "unittests.querytests.TailCappedOnly";
         _client.insert(ns, BSONObj());
-        unique_ptr<DBClientCursor> c =
-            _client.query(ns, BSONObj(), 0, 0, 0, QueryOption_CursorTailable);
-        ASSERT(c->isDead());
+        ASSERT_THROWS(_client.query(ns, BSONObj(), 0, 0, 0, QueryOption_CursorTailable),
+                      AssertionException);
     }
 };
 
@@ -619,29 +608,29 @@ public:
         _client.dropCollection(ns);
         _client.createCollection(ns, 10, true);
 
-        insert(ns, BSON("ts" << 0));
-        insert(ns, BSON("ts" << 1));
-        insert(ns, BSON("ts" << 2));
+        insert(ns, BSON("ts" << Timestamp(1000, 0)));
+        insert(ns, BSON("ts" << Timestamp(1000, 1)));
+        insert(ns, BSON("ts" << Timestamp(1000, 2)));
         unique_ptr<DBClientCursor> c =
             _client.query(ns,
-                          QUERY("ts" << GT << 1).hint(BSON("$natural" << 1)),
+                          QUERY("ts" << GT << Timestamp(1000, 1)).hint(BSON("$natural" << 1)),
                           0,
                           0,
                           0,
                           QueryOption_OplogReplay);
         ASSERT(c->more());
-        ASSERT_EQUALS(2, c->next().getIntField("ts"));
+        ASSERT_EQUALS(2u, c->next()["ts"].timestamp().getInc());
         ASSERT(!c->more());
 
-        insert(ns, BSON("ts" << 3));
+        insert(ns, BSON("ts" << Timestamp(1000, 3)));
         c = _client.query(ns,
-                          QUERY("ts" << GT << 1).hint(BSON("$natural" << 1)),
+                          QUERY("ts" << GT << Timestamp(1000, 1)).hint(BSON("$natural" << 1)),
                           0,
                           0,
                           0,
                           QueryOption_OplogReplay);
         ASSERT(c->more());
-        ASSERT_EQUALS(2, c->next().getIntField("ts"));
+        ASSERT_EQUALS(2u, c->next()["ts"].timestamp().getInc());
         ASSERT(c->more());
     }
 };
@@ -677,18 +666,19 @@ public:
             LogicalClock::get(&_opCtx)->reserveTicks(1).asTimestamp().asLL());
         Date_t three = Date_t::fromMillisSinceEpoch(
             LogicalClock::get(&_opCtx)->reserveTicks(1).asTimestamp().asLL());
-        insert(ns, BSON("ts" << one));
-        insert(ns, BSON("ts" << two));
-        insert(ns, BSON("ts" << three));
+        insert(ns, BSON("ts" << Timestamp(one)));
+        insert(ns, BSON("ts" << Timestamp(two)));
+        insert(ns, BSON("ts" << Timestamp(three)));
         unique_ptr<DBClientCursor> c =
             _client.query(ns,
-                          QUERY("ts" << GTE << two).hint(BSON("$natural" << 1)),
+                          QUERY("ts" << GTE << Timestamp(two)).hint(BSON("$natural" << 1)),
                           0,
                           0,
                           0,
-                          QueryOption_OplogReplay | QueryOption_CursorTailable);
+                          QueryOption_OplogReplay | QueryOption_CursorTailable |
+                              DBClientCursor::QueryOptionLocal_forceOpQuery);
         ASSERT(c->more());
-        ASSERT_EQUALS(two, c->next()["ts"].Date());
+        ASSERT_EQUALS(Timestamp(two), c->next()["ts"].timestamp());
         long long cursorId = c->getCursorId();
 
         auto pinnedCursor = unittest::assertGet(
@@ -709,16 +699,16 @@ public:
         _client.dropCollection(ns);
         _client.createCollection(ns, 10, true);
 
-        insert(ns, BSON("ts" << 0));
-        insert(ns, BSON("ts" << 1));
-        insert(ns, BSON("ts" << 2));
-        unique_ptr<DBClientCursor> c =
-            _client.query(ns,
-                          QUERY("ts" << GT << 1).hint(BSON("$natural" << 1)).explain(),
-                          0,
-                          0,
-                          0,
-                          QueryOption_OplogReplay);
+        insert(ns, BSON("ts" << Timestamp(1000, 0)));
+        insert(ns, BSON("ts" << Timestamp(1000, 1)));
+        insert(ns, BSON("ts" << Timestamp(1000, 2)));
+        unique_ptr<DBClientCursor> c = _client.query(
+            ns,
+            QUERY("ts" << GT << Timestamp(1000, 1)).hint(BSON("$natural" << 1)).explain(),
+            0,
+            0,
+            0,
+            QueryOption_OplogReplay);
         ASSERT(c->more());
 
         // Check number of results and filterSet flag in explain.
@@ -1347,9 +1337,12 @@ public:
             insertNext();
         }
 
-        while (c->more()) {
-            c->next();
-        }
+        ASSERT_THROWS(([&] {
+                          while (c->more()) {
+                              c->nextSafe();
+                          }
+                      }()),
+                      AssertionException);
     }
 
     void insertNext() {
@@ -1460,12 +1453,12 @@ public:
                                        << false),
                                   info));
 
-        int i = 0;
+        unsigned i = 0;
         int max = 1;
 
         while (1) {
             int oldCount = count();
-            _client.insert(ns(), BSON("ts" << i++));
+            _client.insert(ns(), BSON("ts" << Timestamp(1000, i++)));
             int newCount = count();
             if (oldCount == newCount || newCount < max)
                 break;
@@ -1475,16 +1468,23 @@ public:
         }
 
         for (int k = 0; k < 5; ++k) {
-            _client.insert(ns(), BSON("ts" << i++));
-            int min =
-                _client.query(ns(), Query().sort(BSON("$natural" << 1)))->next()["ts"].numberInt();
-            for (int j = -1; j < i; ++j) {
+            _client.insert(ns(), BSON("ts" << Timestamp(1000, i++)));
+            unsigned min = _client.query(ns(), Query().sort(BSON("$natural" << 1)))
+                               ->next()["ts"]
+                               .timestamp()
+                               .getInc();
+            for (unsigned j = -1; j < i; ++j) {
                 unique_ptr<DBClientCursor> c =
-                    _client.query(ns(), QUERY("ts" << GTE << j), 0, 0, 0, QueryOption_OplogReplay);
+                    _client.query(ns(),
+                                  QUERY("ts" << GTE << Timestamp(1000, j)),
+                                  0,
+                                  0,
+                                  0,
+                                  QueryOption_OplogReplay);
                 ASSERT(c->more());
                 BSONObj next = c->next();
                 ASSERT(!next["ts"].eoo());
-                ASSERT_EQUALS((j > min ? j : min), next["ts"].numberInt());
+                ASSERT_EQUALS((j > min ? j : min), next["ts"].timestamp().getInc());
             }
         }
     }
@@ -1509,21 +1509,28 @@ public:
                                        << false),
                                   info));
 
-        int i = 0;
-        for (; i < 150; _client.insert(ns(), BSON("ts" << i++)))
+        unsigned i = 0;
+        for (; i < 150; _client.insert(ns(), BSON("ts" << Timestamp(1000, i++))))
             ;
 
         for (int k = 0; k < 5; ++k) {
-            _client.insert(ns(), BSON("ts" << i++));
-            int min =
-                _client.query(ns(), Query().sort(BSON("$natural" << 1)))->next()["ts"].numberInt();
-            for (int j = -1; j < i; ++j) {
+            _client.insert(ns(), BSON("ts" << Timestamp(1000, i++)));
+            unsigned min = _client.query(ns(), Query().sort(BSON("$natural" << 1)))
+                               ->next()["ts"]
+                               .timestamp()
+                               .getInc();
+            for (unsigned j = -1; j < i; ++j) {
                 unique_ptr<DBClientCursor> c =
-                    _client.query(ns(), QUERY("ts" << GTE << j), 0, 0, 0, QueryOption_OplogReplay);
+                    _client.query(ns(),
+                                  QUERY("ts" << GTE << Timestamp(1000, j)),
+                                  0,
+                                  0,
+                                  0,
+                                  QueryOption_OplogReplay);
                 ASSERT(c->more());
                 BSONObj next = c->next();
                 ASSERT(!next["ts"].eoo());
-                ASSERT_EQUALS((j > min ? j : min), next["ts"].numberInt());
+                ASSERT_EQUALS((j > min ? j : min), next["ts"].timestamp().getInc());
             }
         }
 
@@ -1543,8 +1550,8 @@ public:
         size_t startNumCursors = numCursorsOpen();
 
         // Check OplogReplay mode with missing collection.
-        unique_ptr<DBClientCursor> c0 =
-            _client.query(ns(), QUERY("ts" << GTE << 50), 0, 0, 0, QueryOption_OplogReplay);
+        unique_ptr<DBClientCursor> c0 = _client.query(
+            ns(), QUERY("ts" << GTE << Timestamp(1000, 50)), 0, 0, 0, QueryOption_OplogReplay);
         ASSERT(!c0->more());
 
         BSONObj info;
@@ -1560,16 +1567,17 @@ public:
                                   info));
 
         // Check OplogReplay mode with empty collection.
-        unique_ptr<DBClientCursor> c =
-            _client.query(ns(), QUERY("ts" << GTE << 50), 0, 0, 0, QueryOption_OplogReplay);
+        unique_ptr<DBClientCursor> c = _client.query(
+            ns(), QUERY("ts" << GTE << Timestamp(1000, 50)), 0, 0, 0, QueryOption_OplogReplay);
         ASSERT(!c->more());
 
         // Check with some docs in the collection.
-        for (int i = 100; i < 150; _client.insert(ns(), BSON("ts" << i++)))
+        for (int i = 100; i < 150; _client.insert(ns(), BSON("ts" << Timestamp(1000, i++))))
             ;
-        c = _client.query(ns(), QUERY("ts" << GTE << 50), 0, 0, 0, QueryOption_OplogReplay);
+        c = _client.query(
+            ns(), QUERY("ts" << GTE << Timestamp(1000, 50)), 0, 0, 0, QueryOption_OplogReplay);
         ASSERT(c->more());
-        ASSERT_EQUALS(100, c->next()["ts"].numberInt());
+        ASSERT_EQUALS(100u, c->next()["ts"].timestamp().getInc());
 
         // Check that no persistent cursors outlast our queries above.
         ASSERT_EQUALS(startNumCursors, numCursorsOpen());
@@ -1609,10 +1617,10 @@ public:
                                        << "size"
                                        << 8192),
                                   info));
-        _client.insert(ns(), BSON("ts" << 0));
+        _client.insert(ns(), BSON("ts" << Timestamp(1000, 0)));
         Message message;
         assembleQueryRequest(ns(),
-                             BSON("ts" << GTE << 0),
+                             BSON("ts" << GTE << Timestamp(1000, 0)),
                              0,
                              0,
                              0,

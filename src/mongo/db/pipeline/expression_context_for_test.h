@@ -29,29 +29,41 @@
 #pragma once
 
 #include "mongo/db/pipeline/expression_context.h"
+#include "mongo/db/pipeline/stub_mongo_process_interface.h"
+#include "mongo/db/query/datetime/date_time_support.h"
+#include "mongo/db/query/query_test_service_context.h"
 
 namespace mongo {
 
 /**
- * An ExpressionContext that can have state like the collation and resolved namespace map
- * manipulated after construction. In contrast, a regular ExpressionContext requires the collation
- * and resolved namespaces to be provided on construction and does not allow them to be subsequently
+ * An ExpressionContext with a default OperationContext that can have state (like the resolved
+ * namespace map) manipulated after construction. In contrast, a regular ExpressionContext requires
+ * the resolved namespaces to be provided on construction and does not allow them to be subsequently
  * mutated.
  */
 class ExpressionContextForTest : public ExpressionContext {
 public:
-    ExpressionContextForTest() = default;
+    static constexpr TimeZoneDatabase* kNullTimeZoneDatabase = nullptr;
+
+    ExpressionContextForTest()
+        : ExpressionContextForTest(NamespaceString{"test"_sd, "namespace"_sd}) {}
+
+    ExpressionContextForTest(NamespaceString nss)
+        : ExpressionContext(
+              std::move(nss), std::make_shared<StubMongoProcessInterface>(), kNullTimeZoneDatabase),
+          _testOpCtx(_serviceContext.makeOperationContext()) {
+        TimeZoneDatabase::set(_serviceContext.getServiceContext(),
+                              stdx::make_unique<TimeZoneDatabase>());
+
+        // As we don't have the TimeZoneDatabase prior to ExpressionContext construction, we must
+        // initialize with a nullptr and set post-construction.
+        timeZoneDatabase = TimeZoneDatabase::get(_serviceContext.getServiceContext());
+        opCtx = _testOpCtx.get();
+    }
 
     ExpressionContextForTest(OperationContext* opCtx, const AggregationRequest& request)
-        : ExpressionContext(opCtx, request, nullptr, {}) {}
-
-    /**
-     * Changes the collation used by this ExpressionContext. Must not be changed after parsing a
-     * Pipeline with this ExpressionContext.
-     */
-    void setCollator(std::unique_ptr<CollatorInterface> collator) {
-        ExpressionContext::setCollator(std::move(collator));
-    }
+        : ExpressionContext(
+              opCtx, request, nullptr, std::make_shared<StubMongoProcessInterface>(), {}) {}
 
     /**
      * Sets the resolved definition for an involved namespace.
@@ -59,6 +71,10 @@ public:
     void setResolvedNamespace(const NamespaceString& nss, ResolvedNamespace resolvedNamespace) {
         _resolvedNamespaces[nss.coll()] = std::move(resolvedNamespace);
     }
+
+private:
+    QueryTestServiceContext _serviceContext;
+    ServiceContext::UniqueOperationContext _testOpCtx;
 };
 
 }  // namespace mongo

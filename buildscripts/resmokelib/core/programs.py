@@ -12,8 +12,8 @@ import os.path
 import stat
 
 from . import process as _process
-from .. import utils
 from .. import config
+from .. import utils
 
 
 def mongod_program(logger, executable=None, process_kwargs=None, **kwargs):
@@ -34,14 +34,38 @@ def mongod_program(logger, executable=None, process_kwargs=None, **kwargs):
 
     # Turn on replication heartbeat logging.
     if "replSet" in kwargs and "logComponentVerbosity" not in suite_set_parameters:
-        suite_set_parameters["logComponentVerbosity"] = {"replication": {"heartbeats": 2}}
+        suite_set_parameters["logComponentVerbosity"] = {
+            "replication": {"heartbeats": 2, "rollback": 2}
+        }
+
+    # orphanCleanupDelaySecs controls an artificial delay before cleaning up an orphaned chunk
+    # that has migrated off of a shard, meant to allow most dependent queries on secondaries to
+    # complete first. It defaults to 900, or 15 minutes, which is prohibitively long for tests.
+    # Setting it in the .yml file overrides this.
+    if "shardsvr" in kwargs and "orphanCleanupDelaySecs" not in suite_set_parameters:
+        suite_set_parameters["orphanCleanupDelaySecs"] = 0
+
+    # The LogicalSessionCache does automatic background refreshes in the server. This is
+    # race-y for tests, since tests trigger their own immediate refreshes instead. Turn off
+    # background refreshing for tests. Set in the .yml file to override this.
+    if "disableLogicalSessionCacheRefresh" not in suite_set_parameters:
+        suite_set_parameters["disableLogicalSessionCacheRefresh"] = True
+
+    # The periodic no-op writer writes an oplog entry of type='n' once every 10 seconds. This has
+    # the potential to mask issues such as SERVER-31609 because it allows the operationTime of
+    # cluster to advance even if the client is blocked for other reasons. We should disable the
+    # periodic no-op writer. Set in the .yml file to override this.
+    if "replSet" in kwargs and "writePeriodicNoops" not in suite_set_parameters:
+        suite_set_parameters["writePeriodicNoops"] = False
 
     _apply_set_parameters(args, suite_set_parameters)
 
     shortcut_opts = {
         "nojournal": config.NO_JOURNAL,
         "nopreallocj": config.NO_PREALLOC_JOURNAL,
+        "serviceExecutor": config.SERVICE_EXECUTOR,
         "storageEngine": config.STORAGE_ENGINE,
+        "transportLayer": config.TRANSPORT_LAYER,
         "wiredTigerCollectionConfigString": config.WT_COLL_CONFIG,
         "wiredTigerEngineConfigString": config.WT_ENGINE_CONFIG,
         "wiredTigerIndexConfigString": config.WT_INDEX_CONFIG,
@@ -119,11 +143,13 @@ def mongos_program(logger, executable=None, process_kwargs=None, **kwargs):
     return _process.Process(logger, args, **process_kwargs)
 
 
-def mongo_shell_program(logger, executable=None, filename=None, process_kwargs=None, **kwargs):
+def mongo_shell_program(logger, executable=None, connection_string=None, filename=None,
+                        process_kwargs=None, **kwargs):
     """
-    Returns a Process instance that starts a mongo shell with arguments
-    constructed from 'kwargs'.
+    Returns a Process instance that starts a mongo shell with the given connection string and
+    arguments constructed from 'kwargs'.
     """
+    connection_string = utils.default_if_none(config.SHELL_CONN_STRING, connection_string)
 
     executable = utils.default_if_none(executable, config.DEFAULT_MONGO_EXECUTABLE)
     args = [executable]
@@ -134,9 +160,11 @@ def mongo_shell_program(logger, executable=None, filename=None, process_kwargs=N
     shortcut_opts = {
         "noJournal": (config.NO_JOURNAL, False),
         "noJournalPrealloc": (config.NO_PREALLOC_JOURNAL, False),
+        "serviceExecutor": (config.SERVICE_EXECUTOR, ""),
         "storageEngine": (config.STORAGE_ENGINE, ""),
         "storageEngineCacheSizeGB": (config.STORAGE_ENGINE_CACHE_SIZE, ""),
         "testName": (os.path.splitext(os.path.basename(filename))[0], ""),
+        "transportLayer": (config.TRANSPORT_LAYER, ""),
         "wiredTigerCollectionConfigString": (config.WT_COLL_CONFIG, ""),
         "wiredTigerEngineConfigString": (config.WT_ENGINE_CONFIG, ""),
         "wiredTigerIndexConfigString": (config.WT_INDEX_CONFIG, ""),
@@ -173,6 +201,12 @@ def mongo_shell_program(logger, executable=None, filename=None, process_kwargs=N
     if "eval_prepend" in kwargs:
         eval_sb.append(str(kwargs.pop("eval_prepend")))
 
+    # If nodb is specified, pass the connection string through TestData so it can be used inside the
+    # test, then delete it so it isn't given as an argument to the mongo shell.
+    if "nodb" in kwargs and connection_string is not None:
+        test_data["connectionString"] = connection_string
+        connection_string = None
+
     for var_name in global_vars:
         _format_shell_vars(eval_sb, var_name, global_vars[var_name])
 
@@ -180,7 +214,11 @@ def mongo_shell_program(logger, executable=None, filename=None, process_kwargs=N
         eval_sb.append(str(kwargs.pop("eval")))
 
     # Load this file to allow a callback to validate collections before shutting down mongod.
-    eval_sb.append("load('jstests/libs/override_methods/validate_collections_on_shutdown.js')");
+    eval_sb.append("load('jstests/libs/override_methods/validate_collections_on_shutdown.js');")
+
+    # Load a callback to check UUID consistency before shutting down a ShardingTest.
+    eval_sb.append(
+        "load('jstests/libs/override_methods/check_uuids_consistent_across_cluster.js');")
 
     eval_str = "; ".join(eval_sb)
     args.append("--eval")
@@ -192,8 +230,21 @@ def mongo_shell_program(logger, executable=None, filename=None, process_kwargs=N
     if config.SHELL_WRITE_MODE is not None:
         kwargs["writeMode"] = config.SHELL_WRITE_MODE
 
+    if connection_string is not None:
+        # The --host and --port options are ignored by the mongo shell when an explicit connection
+        # string is specified. We remove these options to avoid any ambiguity with what server the
+        # logged mongo shell invocation will connect to.
+        if "port" in kwargs:
+            kwargs.pop("port")
+
+        if "host" in kwargs:
+            kwargs.pop("host")
+
     # Apply the rest of the command line arguments.
     _apply_kwargs(args, kwargs)
+
+    if connection_string is not None:
+        args.append(connection_string)
 
     # Have the mongos shell run the specified file.
     args.append(filename)
@@ -242,6 +293,7 @@ def dbtest_program(logger, executable=None, suites=None, process_kwargs=None, **
 
     return generic_program(logger, args, process_kwargs=process_kwargs, **kwargs)
 
+
 def generic_program(logger, args, process_kwargs=None, **kwargs):
     """
     Returns a Process instance that starts an arbitrary executable with
@@ -277,6 +329,7 @@ def _format_test_data_set_parameters(set_parameters):
             raise TypeError("Non-scalar setParameter values are not currently supported.")
         params.append("%s=%s" % (param_name, param_value))
     return ",".join(params)
+
 
 def _apply_set_parameters(args, set_parameter):
     """

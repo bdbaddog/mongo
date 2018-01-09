@@ -29,14 +29,19 @@
 #pragma once
 
 #include <memory>
+#include <utility>
 #include <vector>
 
 #include "mongo/db/cursor_id.h"
+#include "mongo/db/generic_cursor.h"
+#include "mongo/db/kill_sessions.h"
 #include "mongo/db/namespace_string.h"
+#include "mongo/db/session_killer.h"
 #include "mongo/platform/random.h"
 #include "mongo/s/query/cluster_client_cursor.h"
 #include "mongo/stdx/mutex.h"
 #include "mongo/stdx/unordered_map.h"
+#include "mongo/util/concurrency/with_lock.h"
 #include "mongo/util/time_support.h"
 
 namespace mongo {
@@ -76,11 +81,11 @@ public:
     //
 
     enum class CursorType {
-        // Represents a cursor operating on an unsharded namespace.
-        NamespaceNotSharded,
+        // Represents a cursor retrieving data from a single remote source.
+        SingleTarget,
 
-        // Represents a cursor operating on a sharded namespace.
-        NamespaceSharded,
+        // Represents a cursor retrieving data from multiple remote sources.
+        MultiTarget,
     };
 
     enum class CursorLifetime {
@@ -100,11 +105,11 @@ public:
     };
 
     struct Stats {
-        // Count of open cursors registered with CursorType::NamespaceSharded.
-        size_t cursorsSharded = 0;
+        // Count of open cursors registered with CursorType::MultiTarget.
+        size_t cursorsMultiTarget = 0;
 
-        // Count of open cursors registered with CursorType::NamespaceNotSharded.
-        size_t cursorsNotSharded = 0;
+        // Count of open cursors registered with CursorType::SingleTarget.
+        size_t cursorsSingleTarget = 0;
 
         // Count of pinned cursors.
         size_t cursorsPinned = 0;
@@ -154,13 +159,31 @@ public:
          *
          * Can block.
          */
-        StatusWith<ClusterQueryResult> next(OperationContext* opCtx);
+        StatusWith<ClusterQueryResult> next(RouterExecStage::ExecContext);
+
+        /**
+         * Sets the operation context for the cursor. Must be called before the first call to
+         * next().
+         */
+        void reattachToOperationContext(OperationContext* opCtx);
+
+        /**
+         * Detaches the cursor from its current OperationContext.
+         */
+        void detachFromOperationContext();
 
         /**
          * Returns whether or not the underlying cursor is tailing a capped collection.  Cannot be
          * called after returnCursor() is called.  A cursor must be owned.
          */
         bool isTailable() const;
+
+        /**
+         * Returns whether or not the underlying cursor is tailing a capped collection and was
+         * created with the 'awaitData' flag set.  Cannot be called after returnCursor() is called.
+         * A cursor must be owned.
+         */
+        bool isTailableAndAwaitData() const;
 
         /**
          * Returns the set of authenticated users when this cursor was created. Cannot be called
@@ -181,6 +204,11 @@ public:
          * Returns the cursor id for the underlying cursor, or zero if no cursor is owned.
          */
         CursorId getCursorId() const;
+
+        /**
+         * Returns the read preference setting for this cursor.
+         */
+        boost::optional<ReadPreferenceSetting> getReadPreference() const;
 
         /**
          * Returns the number of result documents returned so far by this cursor via the next()
@@ -252,7 +280,7 @@ public:
      * Kills and reaps all cursors currently owned by this cursor manager, and puts the manager
      * into the shutting down state where it will not accept any new cursors for registration.
      */
-    void shutdown();
+    void shutdown(OperationContext* opCtx);
 
     /**
      * Registers the given cursor with this manager, and returns the registered cursor's id, or
@@ -286,9 +314,11 @@ public:
      *
      * Does not block.
      */
+    enum AuthCheck { kCheckSession = true, kNoCheckSession = false };
     StatusWith<PinnedCursor> checkOutCursor(const NamespaceString& nss,
                                             CursorId cursorId,
-                                            OperationContext* opCtx);
+                                            OperationContext* opCtx,
+                                            AuthCheck checkSessionAuth = kCheckSession);
 
     /**
      * Informs the manager that the given cursor should be killed.  The cursor need not necessarily
@@ -322,13 +352,13 @@ public:
      * as 'kill pending'. Returns the number of cursors that were marked as inactive.
      *
      * If no other non-const methods are called simultaneously, it is guaranteed that this method
-     * will delete all non-pinned cursors marked as 'kill pending'.  Otherwise, no such guarantee is
+     * will delete all non-pinned cursors marked as 'kill pending'. Otherwise, no such guarantee is
      * made (this is due to the fact that the blocking kill for each cursor is performed outside of
      * the cursor manager lock).
      *
      * Can block.
      */
-    std::size_t reapZombieCursors();
+    std::size_t reapZombieCursors(OperationContext* opCtx);
 
     /**
      * Returns the number of open cursors on a ClusterCursorManager, broken down by type.
@@ -336,6 +366,24 @@ public:
      * Does not block.
      */
     Stats stats() const;
+
+    /**
+     * Appends sessions that have open cursors in this cursor manager to the given set of lsids.
+     */
+    void appendActiveSessions(LogicalSessionIdSet* lsids) const;
+
+    /**
+     * Returns a list of GenericCursors for all cursors in the cursor manager.
+     */
+    std::vector<GenericCursor> getAllCursors() const;
+
+    std::pair<Status, int> killCursorsWithMatchingSessions(OperationContext* opCtx,
+                                                           const SessionKiller::Matcher& matcher);
+
+    /**
+     * Returns a list of all open cursors for the given session.
+     */
+    stdx::unordered_set<CursorId> getCursorsForSession(LogicalSessionId lsid) const;
 
     /**
      * Returns the namespace associated with the given cursor id, by examining the 'namespace
@@ -387,7 +435,7 @@ private:
      *
      * Not thread-safe.
      */
-    CursorEntry* getEntry_inlock(const NamespaceString& nss, CursorId cursorId);
+    CursorEntry* _getEntry(WithLock, NamespaceString const& nss, CursorId cursorId);
 
     /**
      * De-registers the given cursor, and returns an owned pointer to the underlying
@@ -398,8 +446,9 @@ private:
      *
      * Not thread-safe.
      */
-    StatusWith<std::unique_ptr<ClusterClientCursor>> detachCursor_inlock(const NamespaceString& nss,
-                                                                         CursorId cursorId);
+    StatusWith<std::unique_ptr<ClusterClientCursor>> _detachCursor(WithLock,
+                                                                   NamespaceString const& nss,
+                                                                   CursorId cursorId);
 
     /**
      * CursorEntry is a moveable, non-copyable container for a single cursor.
@@ -417,7 +466,8 @@ private:
             : _cursor(std::move(cursor)),
               _cursorType(cursorType),
               _cursorLifetime(cursorLifetime),
-              _lastActive(lastActive) {
+              _lastActive(lastActive),
+              _lsid(_cursor->getLsid()) {
             invariant(_cursor);
         }
 
@@ -446,6 +496,10 @@ private:
 
         bool isCursorOwned() const {
             return static_cast<bool>(_cursor);
+        }
+
+        boost::optional<LogicalSessionId> getLsid() const {
+            return _lsid;
         }
 
         /**
@@ -481,9 +535,10 @@ private:
         std::unique_ptr<ClusterClientCursor> _cursor;
         bool _killPending = false;
         bool _isInactive = false;
-        CursorType _cursorType = CursorType::NamespaceNotSharded;
+        CursorType _cursorType = CursorType::SingleTarget;
         CursorLifetime _cursorLifetime = CursorLifetime::Mortal;
         Date_t _lastActive;
+        boost::optional<LogicalSessionId> _lsid;
     };
 
     /**
