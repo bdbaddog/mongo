@@ -90,10 +90,7 @@ std::vector<RemoteCommandRequest> QuorumChecker::getRequests() const {
         hbArgs.setSetName(_rsConfig->getReplSetName());
         hbArgs.setProtocolVersion(1);
         hbArgs.setConfigVersion(_rsConfig->getConfigVersion());
-        if (serverGlobalParams.featureCompatibility.getVersion() !=
-            ServerGlobalParams::FeatureCompatibility::Version::kFullyDowngradedTo34) {
-            hbArgs.setHeartbeatVersion(1);
-        }
+        hbArgs.setHeartbeatVersion(1);
         hbArgs.setCheckEmpty(isInitialConfig);
         hbArgs.setSenderHost(myConfig.getHostAndPort());
         hbArgs.setSenderId(myConfig.getId());
@@ -103,10 +100,7 @@ std::vector<RemoteCommandRequest> QuorumChecker::getRequests() const {
         ReplSetHeartbeatArgsV1 hbArgs;
         hbArgs.setSetName(_rsConfig->getReplSetName());
         hbArgs.setConfigVersion(_rsConfig->getConfigVersion());
-        if (serverGlobalParams.featureCompatibility.getVersion() !=
-            ServerGlobalParams::FeatureCompatibility::Version::kFullyDowngradedTo34) {
-            hbArgs.setHeartbeatVersion(1);
-        }
+        hbArgs.setHeartbeatVersion(1);
         if (isInitialConfig) {
             hbArgs.setCheckEmpty();
         }
@@ -279,7 +273,7 @@ void QuorumChecker::_tabulateHeartbeatResponse(const RemoteCommandRequest& reque
         }
         return;
     }
-    invariant(false);
+    MONGO_UNREACHABLE;
 }
 
 bool QuorumChecker::hasReceivedSufficientResponses() const {

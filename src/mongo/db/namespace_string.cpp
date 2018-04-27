@@ -36,40 +36,7 @@
 #include "mongo/util/mongoutils/str.h"
 
 namespace mongo {
-
-using std::string;
-
 namespace {
-
-/**
- *  A map of characters to escape. Instead of printing certain characters we output
- *  based on the following table.
- */
-const string escapeTable[256] = {
-    ".00",  ".01",  ".02",  ".03",  ".04",  ".05",  ".06",  ".07",  ".08",  ".09",  ".10",  ".11",
-    ".12",  ".13",  ".14",  ".15",  ".16",  ".17",  ".18",  ".19",  ".20",  ".21",  ".22",  ".23",
-    ".24",  ".25",  ".26",  ".27",  ".28",  ".29",  ".30",  ".31",  ".32",  ".33",  ".34",  ".35",
-    ".36",  ".37",  ".38",  ".39",  ".40",  ".41",  ".42",  ".43",  ".44",  ".45",  ".",    ".47",
-    "0",    "1",    "2",    "3",    "4",    "5",    "6",    "7",    "8",    "9",    ".58",  ".59",
-    ".60",  ".61",  ".62",  ".63",  ".64",  "A",    "B",    "C",    "D",    "E",    "F",    "G",
-    "H",    "I",    "J",    "K",    "L",    "M",    "N",    "O",    "P",    "Q",    "R",    "S",
-    "T",    "U",    "V",    "W",    "X",    "Y",    "Z",    ".91",  ".92",  ".93",  ".94",  "_",
-    ".96",  "a",    "b",    "c",    "d",    "e",    "f",    "g",    "h",    "i",    "j",    "k",
-    "l",    "m",    "n",    "o",    "p",    "q",    "r",    "s",    "t",    "u",    "v",    "w",
-    "x",    "y",    "z",    ".123", ".124", ".125", ".126", ".127", ".128", ".129", ".130", ".131",
-    ".132", ".133", ".134", ".135", ".136", ".137", ".138", ".139", ".140", ".141", ".142", ".143",
-    ".144", ".145", ".146", ".147", ".148", ".149", ".150", ".151", ".152", ".153", ".154", ".155",
-    ".156", ".157", ".158", ".159", ".160", ".161", ".162", ".163", ".164", ".165", ".166", ".167",
-    ".168", ".169", ".170", ".171", ".172", ".173", ".174", ".175", ".176", ".177", ".178", ".179",
-    ".180", ".181", ".182", ".183", ".184", ".185", ".186", ".187", ".188", ".189", ".190", ".191",
-    ".192", ".193", ".194", ".195", ".196", ".197", ".198", ".199", ".200", ".201", ".202", ".203",
-    ".204", ".205", ".206", ".207", ".208", ".209", ".210", ".211", ".212", ".213", ".214", ".215",
-    ".216", ".217", ".218", ".219", ".220", ".221", ".222", ".223", ".224", ".225", ".226", ".227",
-    ".228", ".229", ".230", ".231", ".232", ".233", ".234", ".235", ".236", ".237", ".238", ".239",
-    ".240", ".241", ".242", ".243", ".244", ".245", ".246", ".247", ".248", ".249", ".250", ".251",
-    ".252", ".253", ".254", ".255"};
-
-const char kServerConfiguration[] = "admin.system.version";
 
 constexpr auto listCollectionsCursorCol = "$cmd.listCollections"_sd;
 constexpr auto listIndexesCursorNSPrefix = "$cmd.listIndexes."_sd;
@@ -82,12 +49,17 @@ constexpr StringData NamespaceString::kAdminDb;
 constexpr StringData NamespaceString::kLocalDb;
 constexpr StringData NamespaceString::kConfigDb;
 constexpr StringData NamespaceString::kSystemDotViewsCollectionName;
-constexpr StringData NamespaceString::kShardConfigCollectionsCollectionName;
-constexpr StringData NamespaceString::kSystemKeysCollectionName;
 
-const NamespaceString NamespaceString::kServerConfigurationNamespace(kServerConfiguration);
+const NamespaceString NamespaceString::kServerConfigurationNamespace(NamespaceString::kAdminDb,
+                                                                     "system.version");
 const NamespaceString NamespaceString::kSessionTransactionsTableNamespace(
     NamespaceString::kConfigDb, "transactions");
+const NamespaceString NamespaceString::kShardConfigCollectionsNamespace(NamespaceString::kConfigDb,
+                                                                        "cache.collections");
+const NamespaceString NamespaceString::kShardConfigDatabasesNamespace(NamespaceString::kConfigDb,
+                                                                      "cache.databases");
+const NamespaceString NamespaceString::kSystemKeysNamespace(NamespaceString::kAdminDb,
+                                                            "system.keys");
 const NamespaceString NamespaceString::kRsOplogNamespace(NamespaceString::kLocalDb, "oplog.rs");
 
 bool NamespaceString::isListCollectionsCursorNS() const {
@@ -107,9 +79,9 @@ bool NamespaceString::isLegalClientSystemNS() const {
     if (db() == "admin") {
         if (ns() == "admin.system.roles")
             return true;
-        if (ns() == kServerConfiguration)
+        if (ns() == kServerConfigurationNamespace.ns())
             return true;
-        if (ns() == kSystemKeysCollectionName)
+        if (ns() == kSystemKeysNamespace.ns())
             return true;
         if (ns() == "admin.system.new_users")
             return true;
@@ -119,6 +91,7 @@ bool NamespaceString::isLegalClientSystemNS() const {
         if (ns() == "config.system.sessions")
             return true;
     }
+
     if (ns() == "local.system.replset")
         return true;
 
@@ -159,6 +132,11 @@ NamespaceString NamespaceString::getTargetNSForListIndexes() const {
     return NamespaceString(db(), coll().substr(listIndexesCursorNSPrefix.size()));
 }
 
+std::string NamespaceString::getSisterNS(StringData local) const {
+    verify(local.size() && local[0] != '.');
+    return db().toString() + "." + local.toString();
+}
+
 boost::optional<NamespaceString> NamespaceString::getTargetNSForGloballyManagedNamespace() const {
     // Globally managed namespaces are of the form '$cmd.commandName.<targetNs>' or simply
     // '$cmd.commandName'.
@@ -175,7 +153,7 @@ bool NamespaceString::isDropPendingNamespace() const {
 }
 
 NamespaceString NamespaceString::makeDropPendingNamespace(const repl::OpTime& opTime) const {
-    mongo::StringBuilder ss;
+    StringBuilder ss;
     ss << db() << "." << dropPendingNSPrefix;
     ss << opTime.getSecs() << "i" << opTime.getTimestamp().getInc() << "t" << opTime.getTerm();
     ss << "." << coll();
@@ -210,10 +188,8 @@ StatusWith<repl::OpTime> NamespaceString::getDropPendingNamespaceOpTime() const 
     long long seconds;
     auto status = parseNumberFromString(opTimeStr.substr(0, incrementSeparatorIndex), &seconds);
     if (!status.isOK()) {
-        return Status(
-            status.code(),
-            str::stream() << "Invalid timestamp seconds in drop-pending namespace: " << _ns << ": "
-                          << status.reason());
+        return status.withContext(
+            str::stream() << "Invalid timestamp seconds in drop-pending namespace: " << _ns);
     }
 
     unsigned int increment;
@@ -222,19 +198,15 @@ StatusWith<repl::OpTime> NamespaceString::getDropPendingNamespaceOpTime() const 
                                                termSeparatorIndex - (incrementSeparatorIndex + 1)),
                               &increment);
     if (!status.isOK()) {
-        return Status(status.code(),
-                      str::stream() << "Invalid timestamp increment in drop-pending namespace: "
-                                    << _ns
-                                    << ": "
-                                    << status.reason());
+        return status.withContext(
+            str::stream() << "Invalid timestamp increment in drop-pending namespace: " << _ns);
     }
 
     long long term;
     status = mongo::parseNumberFromString(opTimeStr.substr(termSeparatorIndex + 1), &term);
     if (!status.isOK()) {
-        return Status(status.code(),
-                      str::stream() << "Invalid term in drop-pending namespace: " << _ns << ": "
-                                    << status.reason());
+        return status.withContext(str::stream() << "Invalid term in drop-pending namespace: "
+                                                << _ns);
     }
 
     return repl::OpTime(Timestamp(Seconds(seconds), increment), term);
@@ -255,21 +227,38 @@ Status NamespaceString::checkLengthForRename(
     return Status::OK();
 }
 
-string NamespaceString::escapeDbName(const StringData dbname) {
-    std::string escapedDbName;
-
-    // pre-alloc the return string as it will always be the same as dbname at a minimum.
-    escapedDbName.reserve(dbname.size());
-
-    for (unsigned char c : dbname) {
-        escapedDbName += escapeTable[c];
+bool NamespaceString::isReplicated() const {
+    if (isLocal()) {
+        return false;
     }
-    return escapedDbName;
+
+    // Of collections not in the `local` database, only `system` collections might not be
+    // replicated.
+    if (!isSystem()) {
+        return true;
+    }
+
+    if (isSystemDotProfile()) {
+        return false;
+    }
+
+    // E.g: `system.version` is replicated.
+    return true;
 }
 
+std::string NamespaceStringOrUUID::toString() const {
+    if (_nss)
+        return _nss->toString();
+    else
+        return _uuid->toString();
+}
 
 std::ostream& operator<<(std::ostream& stream, const NamespaceString& nss) {
     return stream << nss.toString();
+}
+
+std::ostream& operator<<(std::ostream& stream, const NamespaceStringOrUUID& nsOrUUID) {
+    return stream << nsOrUUID.toString();
 }
 
 }  // namespace mongo

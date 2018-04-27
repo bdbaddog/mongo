@@ -64,6 +64,14 @@ void fillOutPlannerParams(OperationContext* opCtx,
                           QueryPlannerParams* plannerParams);
 
 /**
+ * Determines whether or not to wait for oplog visibility for a query. This is only used for
+ * collection scans on the oplog.
+ */
+bool shouldWaitForOplogVisibility(OperationContext* opCtx,
+                                  const Collection* collection,
+                                  bool tailable);
+
+/**
  * Get a plan executor for a query.
  *
  * If the query is valid and an executor could be created, returns a StatusWith with the
@@ -91,8 +99,16 @@ StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> getExecutorFind
     Collection* collection,
     const NamespaceString& nss,
     std::unique_ptr<CanonicalQuery> canonicalQuery,
-    PlanExecutor::YieldPolicy yieldPolicy,
     size_t plannerOptions = QueryPlannerParams::DEFAULT);
+
+/**
+ * Returns a plan executor for a legacy OP_QUERY find.
+ */
+StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> getExecutorLegacyFind(
+    OperationContext* opCtx,
+    Collection* collection,
+    const NamespaceString& nss,
+    std::unique_ptr<CanonicalQuery> canonicalQuery);
 
 /**
  * If possible, turn the provided QuerySolution into a QuerySolution that uses a DistinctNode
@@ -114,8 +130,7 @@ StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> getExecutorDist
     OperationContext* opCtx,
     Collection* collection,
     const std::string& ns,
-    ParsedDistinct* parsedDistinct,
-    PlanExecutor::YieldPolicy yieldPolicy);
+    ParsedDistinct* parsedDistinct);
 
 /*
  * Get a PlanExecutor for a query executing as part of a count command.
@@ -125,11 +140,7 @@ StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> getExecutorDist
  * executing a count.
  */
 StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> getExecutorCount(
-    OperationContext* opCtx,
-    Collection* collection,
-    const CountRequest& request,
-    bool explain,
-    PlanExecutor::YieldPolicy yieldPolicy);
+    OperationContext* opCtx, Collection* collection, const CountRequest& request, bool explain);
 
 /**
  * Get a PlanExecutor for a delete operation. 'parsedDelete' describes the query predicate
@@ -179,9 +190,6 @@ StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> getExecutorUpda
  * If an executor could not be created, returns a Status indicating why.
  */
 StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> getExecutorGroup(
-    OperationContext* opCtx,
-    Collection* collection,
-    const GroupRequest& request,
-    PlanExecutor::YieldPolicy yieldPolicy);
+    OperationContext* opCtx, Collection* collection, const GroupRequest& request);
 
 }  // namespace mongo

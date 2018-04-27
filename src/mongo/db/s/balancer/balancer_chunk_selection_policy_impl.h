@@ -29,6 +29,7 @@
 #pragma once
 
 #include "mongo/db/s/balancer/balancer_chunk_selection_policy.h"
+#include "mongo/db/s/balancer/balancer_random.h"
 
 namespace mongo {
 
@@ -36,7 +37,7 @@ class ClusterStatistics;
 
 class BalancerChunkSelectionPolicyImpl final : public BalancerChunkSelectionPolicy {
 public:
-    BalancerChunkSelectionPolicyImpl(ClusterStatistics* clusterStats);
+    BalancerChunkSelectionPolicyImpl(ClusterStatistics* clusterStats, BalancerRandomSource& random);
     ~BalancerChunkSelectionPolicyImpl();
 
     StatusWith<SplitInfoVector> selectChunksToSplit(OperationContext* opCtx) override;
@@ -69,11 +70,15 @@ private:
         OperationContext* opCtx,
         const NamespaceString& nss,
         const ShardStatisticsVector& shardStats,
-        bool aggressiveBalanceHint);
+        bool aggressiveBalanceHint,
+        std::set<ShardId>* usedShards);
 
     // Source for obtaining cluster statistics. Not owned and must not be destroyed before the
     // policy object is destroyed.
     ClusterStatistics* const _clusterStats;
+
+    // Source of randomness when metadata needs to be randomized.
+    BalancerRandomSource& _random;
 };
 
 }  // namespace mongo

@@ -30,7 +30,7 @@
 
 #include "mongo/db/s/session_catalog_migration_source.h"
 
-#include "mongo/db/catalog/catalog_raii.h"
+#include "mongo/db/catalog_raii.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/namespace_string.h"
@@ -78,6 +78,7 @@ repl::OplogEntry makeOplogEntry(repl::OpTime opTime,
                                 const BSONObj& oField,
                                 const boost::optional<BSONObj>& o2Field,
                                 const OperationSessionInfo& sessionInfo,
+                                Date_t wallClockTime,
                                 const boost::optional<StmtId>& statementId) {
     return repl::OplogEntry(opTime,                           // optime
                             hash,                             // hash
@@ -89,7 +90,8 @@ repl::OplogEntry makeOplogEntry(repl::OpTime opTime,
                             oField,                           // o
                             o2Field,                          // o2
                             sessionInfo,                      // session info
-                            boost::none,                      // wall clock time
+                            boost::none,                      // upsert
+                            wallClockTime,                    // wall clock time
                             statementId,                      // statement id
                             boost::none,   // optime of previous write within same transaction
                             boost::none,   // pre-image optime
@@ -99,13 +101,14 @@ repl::OplogEntry makeOplogEntry(repl::OpTime opTime,
 /**
  * Creates a special "write history lost" sentinel oplog entry.
  */
-repl::OplogEntry makeSentinelOplogEntry(OperationSessionInfo sessionInfo) {
+repl::OplogEntry makeSentinelOplogEntry(OperationSessionInfo sessionInfo, Date_t wallClockTime) {
     return makeOplogEntry({},                         // optime
                           hashGenerator.nextInt64(),  // hash
                           repl::OpTypeEnum::kNoop,    // op type
                           {},                         // o
                           Session::kDeadEndSentinel,  // o2
                           sessionInfo,                // session info
+                          wallClockTime,              // wall clock time
                           kIncompleteHistoryStmtId);  // statement id
 }
 
@@ -113,9 +116,7 @@ repl::OplogEntry makeSentinelOplogEntry(OperationSessionInfo sessionInfo) {
 
 SessionCatalogMigrationSource::SessionCatalogMigrationSource(OperationContext* opCtx,
                                                              NamespaceString ns)
-    : _ns(std::move(ns)),
-      _rollbackIdAtInit(
-          uassertStatusOK(repl::ReplicationProcess::get(opCtx)->getRollbackID(opCtx))) {
+    : _ns(std::move(ns)), _rollbackIdAtInit(repl::ReplicationProcess::get(opCtx)->getRollbackID()) {
     // Sort is not needed for correctness. This is just for making it easier to write deterministic
     // tests.
     Query query;
@@ -219,13 +220,6 @@ bool SessionCatalogMigrationSource::_hasMoreOplogFromSessionCatalog() {
         !_sessionOplogIterators.empty() || _currentOplogIterator;
 }
 
-// Important: The no-op oplog entry for findAndModify should always be returned first before the
-// actual operation.
-repl::OplogEntry SessionCatalogMigrationSource::_getLastFetchedOplogFromSessionCatalog() {
-    stdx::lock_guard<stdx::mutex> lk(_sessionCloneMutex);
-    return _lastFetchedOplogBuffer.back();
-}
-
 bool SessionCatalogMigrationSource::_fetchNextOplogFromSessionCatalog(OperationContext* opCtx) {
     stdx::unique_lock<stdx::mutex> lk(_sessionCloneMutex);
 
@@ -256,12 +250,6 @@ bool SessionCatalogMigrationSource::_fetchNextOplogFromSessionCatalog(OperationC
 bool SessionCatalogMigrationSource::_hasNewWrites() {
     stdx::lock_guard<stdx::mutex> lk(_newOplogMutex);
     return _lastFetchedNewWriteOplog || !_newWriteOpTimeList.empty();
-}
-
-repl::OplogEntry SessionCatalogMigrationSource::_getLastFetchedNewWriteOplog() {
-    stdx::lock_guard<stdx::mutex> lk(_newOplogMutex);
-    invariant(_lastFetchedNewWriteOplog);
-    return *_lastFetchedNewWriteOplog;
 }
 
 bool SessionCatalogMigrationSource::_fetchNextNewWriteOplog(OperationContext* opCtx) {
@@ -325,8 +313,7 @@ repl::OplogEntry SessionCatalogMigrationSource::SessionOplogIterator::getNext(
         if (excep.code() == ErrorCodes::IncompleteTransactionHistory) {
             // Note: no need to check if in replicaSet mode because having an iterator implies
             // oplog exists.
-            auto rollbackId =
-                uassertStatusOK(repl::ReplicationProcess::get(opCtx)->getRollbackID(opCtx));
+            auto rollbackId = repl::ReplicationProcess::get(opCtx)->getRollbackID();
 
             uassert(40656,
                     str::stream() << "rollback detected, rollbackId was " << _initialRollbackId
@@ -339,7 +326,8 @@ repl::OplogEntry SessionCatalogMigrationSource::SessionOplogIterator::getNext(
             OperationSessionInfo sessionInfo;
             sessionInfo.setSessionId(_record.getSessionId());
             sessionInfo.setTxnNumber(_record.getTxnNum());
-            auto oplog = makeSentinelOplogEntry(sessionInfo);
+            auto oplog = makeSentinelOplogEntry(
+                sessionInfo, opCtx->getServiceContext()->getFastClockSource()->now());
 
             _writeHistoryIterator.reset();
 

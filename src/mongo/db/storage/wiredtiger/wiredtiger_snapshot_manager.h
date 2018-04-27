@@ -35,7 +35,6 @@
 #include "mongo/base/disallow_copying.h"
 #include "mongo/bson/timestamp.h"
 #include "mongo/db/storage/snapshot_manager.h"
-#include "mongo/db/storage/wiredtiger/wiredtiger_util.h"
 #include "mongo/stdx/mutex.h"
 
 namespace mongo {
@@ -46,18 +45,11 @@ class WiredTigerSnapshotManager final : public SnapshotManager {
     MONGO_DISALLOW_COPYING(WiredTigerSnapshotManager);
 
 public:
-    explicit WiredTigerSnapshotManager(WT_CONNECTION* conn) {
-        invariantWTOK(conn->open_session(conn, NULL, NULL, &_session));
-        _conn = conn;
-    }
+    WiredTigerSnapshotManager() = default;
 
-    ~WiredTigerSnapshotManager() {
-        shutdown();
-    }
-
-    Status prepareForCreateSnapshot(OperationContext* opCtx) final;
     void setCommittedSnapshot(const Timestamp& timestamp) final;
-    void cleanupUnneededSnapshots() final;
+    void setLocalSnapshot(const Timestamp& timestamp) final;
+    boost::optional<Timestamp> getLocalSnapshot() final;
     void dropAllSnapshots() final;
 
     //
@@ -65,11 +57,16 @@ public:
     //
 
     /**
-     * Prepares for a shutdown of the WT_CONNECTION.
+     * Sets the read timestamp on a transaction.
+     *
+     * Reads will be reflect the state of data as of the specified timestamp.
+     *
+     * If roundToOldest is true, rounds the timestamp up to the oldest_timestamp if it is larger.
+     * The default is false.
      */
-    void shutdown();
-
-    Status beginTransactionAtTimestamp(Timestamp pointInTime, WT_SESSION* session) const;
+    Status setTransactionReadTimestamp(Timestamp pointInTime,
+                                       WT_SESSION* session,
+                                       bool roundToOldest = false) const;
 
     /**
      * Starts a transaction and returns the SnapshotName used.
@@ -77,6 +74,14 @@ public:
      * Throws if there is currently no committed snapshot.
      */
     Timestamp beginTransactionOnCommittedSnapshot(WT_SESSION* session) const;
+
+    /**
+     * Starts a transaction on the last stable local timestamp, set by setLocalSnapshot.
+     *
+     * Throws if no local snapshot has been set.
+     */
+    void beginTransactionOnLocalSnapshot(WT_SESSION* session, bool ignorePrepare) const;
+
 
     /**
      * Starts a transaction on the oplog using an appropriate timestamp for oplog visiblity.
@@ -94,9 +99,12 @@ public:
     boost::optional<Timestamp> getMinSnapshotForNextCommittedRead() const;
 
 private:
-    mutable stdx::mutex _mutex;  // Guards all members.
+    // Snapshot to use for reads at a commit timestamp.
+    mutable stdx::mutex _committedSnapshotMutex;  // Guards _committedSnapshot.
     boost::optional<Timestamp> _committedSnapshot;
-    WT_SESSION* _session;
-    WT_CONNECTION* _conn;
+
+    // Snapshot to use for reads at a local stable timestamp.
+    mutable stdx::mutex _localSnapshotMutex;  // Guards _localSnapshot.
+    boost::optional<Timestamp> _localSnapshot;
 };
 }

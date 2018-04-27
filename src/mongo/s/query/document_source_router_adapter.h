@@ -49,7 +49,8 @@ public:
                 PositionRequirement::kFirst,
                 HostTypeRequirement::kMongoS,
                 DiskUseRequirement::kNoDiskUse,
-                FacetRequirement::kNotAllowed};
+                FacetRequirement::kNotAllowed,
+                TransactionRequirement::kAllowed};
     }
 
     GetNextResult getNext() final;
@@ -58,6 +59,7 @@ public:
     void detachFromOperationContext() final;
     Value serialize(boost::optional<ExplainOptions::Verbosity> explain) const final;
     bool remotesExhausted();
+    std::size_t getNumRemotes() const;
 
     void setExecContext(RouterExecStage::ExecContext execContext) {
         _execContext = execContext;

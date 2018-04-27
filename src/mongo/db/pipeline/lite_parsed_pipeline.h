@@ -93,8 +93,6 @@ public:
 
     /**
      * Returns true if the pipeline has a $changeStream stage.
-     *
-     * TODO SERVER-29506 Require $changeStream to be the first stage.
      */
     bool hasChangeStream() const {
         return std::any_of(_stageSpecs.begin(), _stageSpecs.end(), [](auto&& spec) {
@@ -118,6 +116,24 @@ public:
         return std::all_of(_stageSpecs.cbegin(), _stageSpecs.cend(), [](const auto& spec) {
             return spec->allowedToPassthroughFromMongos();
         });
+    }
+
+    /**
+     * Verifies that this pipeline is allowed to run with the specified read concern. This ensures
+     * that each stage is compatible, and throws a UserException if not.
+     */
+    void assertSupportsReadConcern(OperationContext* opCtx,
+                                   boost::optional<ExplainOptions::Verbosity> explain) const {
+        auto readConcern = repl::ReadConcernArgs::get(opCtx);
+        uassert(ErrorCodes::InvalidOptions,
+                str::stream() << "Explain for the aggregate command "
+                                 "does not support non-local "
+                                 "readConcern levels",
+                !explain || readConcern.getLevel() == repl::ReadConcernLevel::kLocalReadConcern);
+
+        for (auto&& spec : _stageSpecs) {
+            spec->assertSupportsReadConcern(readConcern);
+        }
     }
 
 private:

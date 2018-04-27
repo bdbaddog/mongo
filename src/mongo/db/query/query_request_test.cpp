@@ -240,22 +240,6 @@ TEST(QueryRequestTest, AllowTailableWithNaturalSort) {
     ASSERT_BSONOBJ_EQ(result.getValue()->getSort(), BSON("$natural" << 1));
 }
 
-TEST(QueryRequestTest, IsIsolatedReturnsTrueWithIsolated) {
-    ASSERT_TRUE(QueryRequest::isQueryIsolated(BSON("$isolated" << 1)));
-}
-
-TEST(QueryRequestTest, IsIsolatedReturnsTrueWithAtomic) {
-    ASSERT_TRUE(QueryRequest::isQueryIsolated(BSON("$atomic" << 1)));
-}
-
-TEST(QueryRequestTest, IsIsolatedReturnsFalseWithIsolated) {
-    ASSERT_FALSE(QueryRequest::isQueryIsolated(BSON("$isolated" << false)));
-}
-
-TEST(QueryRequestTest, IsIsolatedReturnsFalseWithAtomic) {
-    ASSERT_FALSE(QueryRequest::isQueryIsolated(BSON("$atomic" << false)));
-}
-
 //
 // Test compatibility of various projection and sort objects.
 //
@@ -712,17 +696,6 @@ TEST(QueryRequestTest, ParseFromCommandShowRecordIdWrongType) {
     ASSERT_NOT_OK(result.getStatus());
 }
 
-TEST(QueryRequestTest, ParseFromCommandSnapshotWrongType) {
-    BSONObj cmdObj = fromjson(
-        "{find: 'testns',"
-        "filter:  {a: 1},"
-        "snapshot: 3}");
-    const NamespaceString nss("test.testns");
-    bool isExplain = false;
-    auto result = QueryRequest::makeFromFindCommand(nss, cmdObj, isExplain);
-    ASSERT_NOT_OK(result.getStatus());
-}
-
 TEST(QueryRequestTest, ParseFromCommandTailableWrongType) {
     BSONObj cmdObj = fromjson(
         "{find: 'testns',"
@@ -924,28 +897,6 @@ TEST(QueryRequestTest, ParseFromCommandMinMaxDifferentFieldsError) {
     ASSERT_NOT_OK(result.getStatus());
 }
 
-TEST(QueryRequestTest, ParseFromCommandSnapshotPlusSortError) {
-    BSONObj cmdObj = fromjson(
-        "{find: 'testns',"
-        "sort: {a: 3},"
-        "snapshot: true}");
-    const NamespaceString nss("test.testns");
-    bool isExplain = false;
-    auto result = QueryRequest::makeFromFindCommand(nss, cmdObj, isExplain);
-    ASSERT_NOT_OK(result.getStatus());
-}
-
-TEST(QueryRequestTest, ParseFromCommandSnapshotPlusHintError) {
-    BSONObj cmdObj = fromjson(
-        "{find: 'testns',"
-        "snapshot: true,"
-        "hint: {a: 1}}");
-    const NamespaceString nss("test.testns");
-    bool isExplain = false;
-    auto result = QueryRequest::makeFromFindCommand(nss, cmdObj, isExplain);
-    ASSERT_NOT_OK(result.getStatus());
-}
-
 TEST(QueryRequestTest, ParseCommandForbidNonMetaSortOnFieldWithMetaProject) {
     BSONObj cmdObj;
 
@@ -1044,7 +995,6 @@ TEST(QueryRequestTest, DefaultQueryParametersCorrect) {
     ASSERT_EQUALS(0, qr->getMaxTimeMS());
     ASSERT_EQUALS(false, qr->returnKey());
     ASSERT_EQUALS(false, qr->showRecordId());
-    ASSERT_EQUALS(false, qr->isSnapshot());
     ASSERT_EQUALS(false, qr->hasReadPref());
     ASSERT_EQUALS(false, qr->isTailable());
     ASSERT_EQUALS(false, qr->isSlaveOk());
@@ -1062,7 +1012,6 @@ TEST(QueryRequestTest, DefaultQueryParametersCorrect) {
 TEST(QueryRequestTest, ParseFromCommandForbidExtraField) {
     BSONObj cmdObj = fromjson(
         "{find: 'testns',"
-        "snapshot: true,"
         "foo: {a: 1}}");
     const NamespaceString nss("test.testns");
     bool isExplain = false;
@@ -1073,7 +1022,6 @@ TEST(QueryRequestTest, ParseFromCommandForbidExtraField) {
 TEST(QueryRequestTest, ParseFromCommandForbidExtraOption) {
     BSONObj cmdObj = fromjson(
         "{find: 'testns',"
-        "snapshot: true,"
         "foo: true}");
     const NamespaceString nss("test.testns");
     bool isExplain = false;
@@ -1215,15 +1163,9 @@ TEST(QueryRequestTest, ConvertToAggregationWithShowRecordIdFails) {
     ASSERT_NOT_OK(qr.asAggregationCommand());
 }
 
-TEST(QueryRequestTest, ConvertToAggregationWithSnapshotFails) {
-    QueryRequest qr(testns);
-    qr.setSnapshot(true);
-    ASSERT_NOT_OK(qr.asAggregationCommand());
-}
-
 TEST(QueryRequestTest, ConvertToAggregationWithTailableFails) {
     QueryRequest qr(testns);
-    qr.setTailableMode(TailableMode::kTailable);
+    qr.setTailableMode(TailableModeEnum::kTailable);
     ASSERT_NOT_OK(qr.asAggregationCommand());
 }
 
@@ -1241,7 +1183,7 @@ TEST(QueryRequestTest, ConvertToAggregationWithNoCursorTimeoutFails) {
 
 TEST(QueryRequestTest, ConvertToAggregationWithAwaitDataFails) {
     QueryRequest qr(testns);
-    qr.setTailableMode(TailableMode::kTailableAndAwaitData);
+    qr.setTailableMode(TailableModeEnum::kTailableAndAwaitData);
     ASSERT_NOT_OK(qr.asAggregationCommand());
 }
 

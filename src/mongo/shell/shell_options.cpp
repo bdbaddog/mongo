@@ -39,8 +39,8 @@
 #include "mongo/base/status.h"
 #include "mongo/bson/util/builder.h"
 #include "mongo/client/mongo_uri.h"
-#include "mongo/client/sasl_client_authenticate.h"
 #include "mongo/config.h"
+#include "mongo/db/auth/sasl_command_constants.h"
 #include "mongo/db/server_options.h"
 #include "mongo/rpc/protocol.h"
 #include "mongo/shell/shell_utils.h"
@@ -123,7 +123,7 @@ Status addMongoShellOptions(moe::OptionSection* options) {
                            "gssapiServiceName",
                            moe::String,
                            "Service name to use when authenticating using GSSAPI/Kerberos")
-        .setDefault(moe::Value(std::string(saslDefaultServiceName)));
+        .setDefault(moe::Value(saslDefaultServiceName.toString()));
 
     authenticationOptions.addOptionChaining(
         "gssapiHostName",
@@ -142,10 +142,19 @@ Status addMongoShellOptions(moe::OptionSection* options) {
     options->addOptionChaining(
         "ipv6", "ipv6", moe::Switch, "enable IPv6 support (disabled by default)");
 
-    options->addOptionChaining("disableJavaScriptJIT",
-                               "disableJavaScriptJIT",
-                               moe::Switch,
-                               "disable the Javascript Just In Time compiler");
+    options
+        ->addOptionChaining("disableJavaScriptJIT",
+                            "disableJavaScriptJIT",
+                            moe::Switch,
+                            "disable the Javascript Just In Time compiler")
+        .incompatibleWith("enableJavaScriptJIT");
+
+    options
+        ->addOptionChaining("enableJavaScriptJIT",
+                            "enableJavaScriptJIT",
+                            moe::Switch,
+                            "enable the Javascript Just In Time compiler")
+        .incompatibleWith("disableJavaScriptJIT");
 
     options
         ->addOptionChaining("disableJavaScriptProtection",
@@ -272,6 +281,7 @@ Status storeMongoShellOptions(const moe::Environment& params,
 #endif
     if (params.count("ipv6")) {
         mongo::enableIPv6();
+        shellGlobalParams.enableIPv6 = true;
     }
     if (params.count("verbose")) {
         logger::globalLogDomain()->setMinimumLoggedSeverity(logger::LogSeverity::Debug(1));
@@ -338,6 +348,9 @@ Status storeMongoShellOptions(const moe::Environment& params,
     }
     if (params.count("disableJavaScriptJIT")) {
         shellGlobalParams.nojit = true;
+    }
+    if (params.count("enableJavaScriptJIT")) {
+        shellGlobalParams.nojit = false;
     }
     if (params.count("files")) {
         shellGlobalParams.files = params["files"].as<vector<string>>();

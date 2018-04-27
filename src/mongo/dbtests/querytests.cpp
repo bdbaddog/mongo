@@ -635,58 +635,6 @@ public:
     }
 };
 
-class OplogReplaySlaveReadTill : public ClientBase {
-public:
-    ~OplogReplaySlaveReadTill() {
-        _client.dropCollection("unittests.querytests.OplogReplaySlaveReadTill");
-    }
-    void run() {
-        const char* ns = "unittests.querytests.OplogReplaySlaveReadTill";
-
-        // Create a capped collection of size 10.
-        _client.dropCollection(ns);
-        _client.createCollection(ns, 10, true);
-
-        Lock::DBLock lk(&_opCtx, "unittests", MODE_X);
-        OldClientContext ctx(&_opCtx, ns);
-
-        BSONObj info;
-        _client.runCommand("unittests",
-                           BSON("create"
-                                << "querytests.OplogReplaySlaveReadTill"
-                                << "capped"
-                                << true
-                                << "size"
-                                << 8192),
-                           info);
-
-        Date_t one = Date_t::fromMillisSinceEpoch(
-            LogicalClock::get(&_opCtx)->reserveTicks(1).asTimestamp().asLL());
-        Date_t two = Date_t::fromMillisSinceEpoch(
-            LogicalClock::get(&_opCtx)->reserveTicks(1).asTimestamp().asLL());
-        Date_t three = Date_t::fromMillisSinceEpoch(
-            LogicalClock::get(&_opCtx)->reserveTicks(1).asTimestamp().asLL());
-        insert(ns, BSON("ts" << Timestamp(one)));
-        insert(ns, BSON("ts" << Timestamp(two)));
-        insert(ns, BSON("ts" << Timestamp(three)));
-        unique_ptr<DBClientCursor> c =
-            _client.query(ns,
-                          QUERY("ts" << GTE << Timestamp(two)).hint(BSON("$natural" << 1)),
-                          0,
-                          0,
-                          0,
-                          QueryOption_OplogReplay | QueryOption_CursorTailable |
-                              DBClientCursor::QueryOptionLocal_forceOpQuery);
-        ASSERT(c->more());
-        ASSERT_EQUALS(Timestamp(two), c->next()["ts"].timestamp());
-        long long cursorId = c->getCursorId();
-
-        auto pinnedCursor = unittest::assertGet(
-            ctx.db()->getCollection(&_opCtx, ns)->getCursorManager()->pinCursor(&_opCtx, cursorId));
-        ASSERT_EQUALS(three.toULL(), pinnedCursor.getCursor()->getSlaveReadTill().asULL());
-    }
-};
-
 class OplogReplayExplain : public ClientBase {
 public:
     ~OplogReplayExplain() {
@@ -1291,6 +1239,12 @@ public:
         _n = 0;
     }
     void run() {
+        // SERVER-32698 Skipping this test for mobile SE:
+        // Capped collection isn't properly supported yet with mobile SE.
+        if (mongo::storageGlobalParams.engine == "mobile") {
+            return;
+        }
+
         string err;
         OldClientWriteContext ctx(&_opCtx, ns());
 
@@ -1439,10 +1393,14 @@ class ClientCursorTest : public CollectionBase {
 class FindingStart : public CollectionBase {
 public:
     FindingStart() : CollectionBase("findingstart") {}
+    static const char* ns() {
+        return "local.querytests.findingstart";
+    }
 
     void run() {
         BSONObj info;
-        ASSERT(_client.runCommand("unittests",
+        // Must use local db so that the collection is not replicated, to allow autoIndexId:false.
+        ASSERT(_client.runCommand("local",
                                   BSON("create"
                                        << "querytests.findingstart"
                                        << "capped"
@@ -1487,18 +1445,23 @@ public:
                 ASSERT_EQUALS((j > min ? j : min), next["ts"].timestamp().getInc());
             }
         }
+        ASSERT(_client.dropCollection(ns()));
     }
 };
 
 class FindingStartPartiallyFull : public CollectionBase {
 public:
     FindingStartPartiallyFull() : CollectionBase("findingstart") {}
+    static const char* ns() {
+        return "local.querytests.findingstart";
+    }
 
     void run() {
         size_t startNumCursors = numCursorsOpen();
 
         BSONObj info;
-        ASSERT(_client.runCommand("unittests",
+        // Must use local db so that the collection is not replicated, to allow autoIndexId:false.
+        ASSERT(_client.runCommand("local",
                                   BSON("create"
                                        << "querytests.findingstart"
                                        << "capped"
@@ -1535,6 +1498,7 @@ public:
         }
 
         ASSERT_EQUALS(startNumCursors, numCursorsOpen());
+        ASSERT(_client.dropCollection(ns()));
     }
 };
 
@@ -1545,6 +1509,9 @@ public:
 class FindingStartStale : public CollectionBase {
 public:
     FindingStartStale() : CollectionBase("findingstart") {}
+    static const char* ns() {
+        return "local.querytests.findingstart";
+    }
 
     void run() {
         size_t startNumCursors = numCursorsOpen();
@@ -1555,7 +1522,8 @@ public:
         ASSERT(!c0->more());
 
         BSONObj info;
-        ASSERT(_client.runCommand("unittests",
+        // Must use local db so that the collection is not replicated, to allow autoIndexId:false.
+        ASSERT(_client.runCommand("local",
                                   BSON("create"
                                        << "querytests.findingstart"
                                        << "capped"
@@ -1581,6 +1549,8 @@ public:
 
         // Check that no persistent cursors outlast our queries above.
         ASSERT_EQUALS(startNumCursors, numCursorsOpen());
+
+        ASSERT(_client.dropCollection(ns()));
     }
 };
 
@@ -1724,7 +1694,6 @@ public:
         add<TailCappedOnly>();
         add<TailableQueryOnId>();
         add<OplogReplayMode>();
-        add<OplogReplaySlaveReadTill>();
         add<OplogReplayExplain>();
         add<ArrayId>();
         add<UnderscoreNs>();

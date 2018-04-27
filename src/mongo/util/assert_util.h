@@ -220,7 +220,11 @@ MONGO_COMPILER_NORETURN void invariantOKFailed(const char* expr,
                                                const Status& status,
                                                const char* file,
                                                unsigned line) noexcept;
-void wasserted(const char* expr, const char* file, unsigned line);
+MONGO_COMPILER_NORETURN void invariantOKFailedWithMsg(const char* expr,
+                                                      const Status& status,
+                                                      const std::string& msg,
+                                                      const char* file,
+                                                      unsigned line) noexcept;
 
 #define fassertFailed MONGO_fassertFailed
 #define MONGO_fassertFailed(...) ::mongo::fassertFailedWithLocation(__VA_ARGS__, __FILE__, __LINE__)
@@ -270,6 +274,14 @@ inline void fassertWithLocation(int msgid, bool testOK, const char* file, unsign
     }
 }
 
+template <typename T>
+inline T fassertWithLocation(int msgid, StatusWith<T> sw, const char* file, unsigned line) {
+    if (MONGO_unlikely(!sw.isOK())) {
+        fassertFailedWithStatusWithLocation(msgid, sw.getStatus(), file, line);
+    }
+    return std::move(sw.getValue());
+}
+
 inline void fassertWithLocation(int msgid, const Status& status, const char* file, unsigned line) {
     if (MONGO_unlikely(!status.isOK())) {
         fassertFailedWithStatusWithLocation(msgid, status, file, line);
@@ -283,6 +295,14 @@ inline void fassertNoTraceWithLocation(int msgid, bool testOK, const char* file,
     if (MONGO_unlikely(!testOK)) {
         fassertFailedNoTraceWithLocation(msgid, file, line);
     }
+}
+
+template <typename T>
+inline T fassertNoTraceWithLocation(int msgid, StatusWith<T> sw, const char* file, unsigned line) {
+    if (MONGO_unlikely(!sw.isOK())) {
+        fassertFailedWithStatusNoTraceWithLocation(msgid, sw.getStatus(), file, line);
+    }
+    return std::move(sw.getValue());
 }
 
 inline void fassertNoTraceWithLocation(int msgid,
@@ -362,6 +382,35 @@ inline T uassertStatusOKWithLocation(StatusWith<T> sw, const char* file, unsigne
 }
 
 /**
+ * Like uassertStatusOK(status), but also takes an expression that evaluates to  something
+ * convertible to std::string to add more context to error messages. This contextExpr is only
+ * evaluated if the status is not OK.
+ */
+#define uassertStatusOKWithContext(status, contextExpr) \
+    ::mongo::uassertStatusOKWithContextAndLocation(     \
+        status, [&]() -> std::string { return (contextExpr); }, __FILE__, __LINE__)
+template <typename ContextExpr>
+inline void uassertStatusOKWithContextAndLocation(const Status& status,
+                                                  ContextExpr&& contextExpr,
+                                                  const char* file,
+                                                  unsigned line) {
+    if (MONGO_unlikely(!status.isOK())) {
+        uassertedWithLocation(
+            status.withContext(std::forward<ContextExpr>(contextExpr)()), file, line);
+    }
+}
+
+template <typename T, typename ContextExpr>
+inline T uassertStatusOKWithContextAndLocation(StatusWith<T> sw,
+                                               ContextExpr&& contextExpr,
+                                               const char* file,
+                                               unsigned line) {
+    uassertStatusOKWithContextAndLocation(
+        sw.getStatus(), std::forward<ContextExpr>(contextExpr), file, line);
+    return std::move(sw.getValue());
+}
+
+/**
  * massert is like uassert but it logs the message before throwing.
  */
 #define massert(msgid, msg, expr) \
@@ -381,41 +430,6 @@ inline void massertStatusOKWithLocation(const Status& status, const char* file, 
 }
 
 /**
- * fassert is our fatal assert: if it fails, the process dies.
- *
- * Use this rather than invariant for cases that are possible, but we have chosen not to implement
- * recovery logic for.
- */
-#define fassertStatusOK MONGO_fassertStatusOK
-#define MONGO_fassertStatusOK(...) \
-    ::mongo::fassertStatusOKWithLocation(__VA_ARGS__, __FILE__, __LINE__)
-template <typename T>
-inline T fassertStatusOKWithLocation(int msgid, StatusWith<T> sw, const char* file, unsigned line) {
-    if (MONGO_unlikely(!sw.isOK())) {
-        fassertFailedWithStatusWithLocation(msgid, sw.getStatus(), file, line);
-    }
-    return std::move(sw.getValue());
-}
-
-inline void fassertStatusOKWithLocation(int msgid,
-                                        const Status& s,
-                                        const char* file,
-                                        unsigned line) {
-    if (MONGO_unlikely(!s.isOK())) {
-        fassertFailedWithStatusWithLocation(msgid, s, file, line);
-    }
-}
-
-/* warning only - keeps going */
-#define wassert MONGO_wassert
-#define MONGO_wassert(_Expression)                                \
-    do {                                                          \
-        if (MONGO_unlikely(!(_Expression))) {                     \
-            ::mongo::wasserted(#_Expression, __FILE__, __LINE__); \
-        }                                                         \
-    } while (false)
-
-/**
  * verify is deprecated. It is like invariant() in debug builds and massert() in release builds.
  */
 #define verify(expression) MONGO_verify(expression)
@@ -426,19 +440,49 @@ inline void fassertStatusOKWithLocation(int msgid,
         }                                                            \
     } while (false)
 
-#define invariantOK MONGO_invariantOK
-#define MONGO_invariantOK(expression)                                                         \
-    do {                                                                                      \
-        const ::mongo::Status _invariantOK_status = expression;                               \
-        if (MONGO_unlikely(!_invariantOK_status.isOK())) {                                    \
-            ::mongo::invariantOKFailed(#expression, _invariantOK_status, __FILE__, __LINE__); \
-        }                                                                                     \
-    } while (false)
+inline void invariantWithLocation(const Status& status,
+                                  const char* expr,
+                                  const char* file,
+                                  unsigned line) {
+    if (MONGO_unlikely(!status.isOK())) {
+        ::mongo::invariantOKFailed(expr, status, file, line);
+    }
+}
 
-#define dassertOK MONGO_dassertOK
-#define MONGO_dassertOK(expression) \
-    if (kDebugBuild)                \
-    invariantOK(expression)
+template <typename T>
+inline T invariantWithLocation(StatusWith<T> sw,
+                               const char* expr,
+                               const char* file,
+                               unsigned line) {
+    if (MONGO_unlikely(!sw.isOK())) {
+        ::mongo::invariantOKFailed(expr, sw.getStatus(), file, line);
+    }
+    return std::move(sw.getValue());
+}
+
+template <typename ContextExpr>
+inline void invariantWithContextAndLocation(const Status& status,
+                                            const char* expr,
+                                            ContextExpr&& contextExpr,
+                                            const char* file,
+                                            unsigned line) {
+    if (MONGO_unlikely(!status.isOK())) {
+        ::mongo::invariantOKFailedWithMsg(
+            expr, status, std::forward<ContextExpr>(contextExpr)(), file, line);
+    }
+}
+
+template <typename T, typename ContextExpr>
+inline T invariantWithContextAndLocation(StatusWith<T> sw,
+                                         const char* expr,
+                                         ContextExpr&& contextExpr,
+                                         const char* file,
+                                         unsigned line) {
+    if (MONGO_unlikely(!sw.isOK())) {
+        ::mongo::invariantOKFailedWithMsg(expr, sw.getStatus(), contextExpr(), file, line);
+    }
+    return std::move(sw.getValue());
+}
 
 // some special ids that we want to duplicate
 

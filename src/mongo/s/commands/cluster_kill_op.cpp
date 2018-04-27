@@ -41,6 +41,7 @@
 #include "mongo/db/audit.h"
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/commands.h"
+#include "mongo/db/commands/kill_op_cmd_base.h"
 #include "mongo/rpc/metadata.h"
 #include "mongo/s/client/shard.h"
 #include "mongo/s/client/shard_registry.h"
@@ -51,40 +52,37 @@
 namespace mongo {
 namespace {
 
-class ClusterKillOpCommand : public BasicCommand {
+class ClusterKillOpCommand : public KillOpCmdBase {
 public:
-    ClusterKillOpCommand() : BasicCommand("killOp") {}
-
-
-    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
-        return false;
-    }
-
-    bool slaveOk() const final {
-        return true;
-    }
-
-    bool adminOnly() const final {
-        return true;
-    }
-
-    Status checkAuthForCommand(Client* client,
-                               const std::string& dbname,
-                               const BSONObj& cmdObj) final {
-        bool isAuthorized = AuthorizationSession::get(client)->isAuthorizedForActionsOnResource(
-            ResourcePattern::forClusterResource(), ActionType::killop);
-        return isAuthorized ? Status::OK() : Status(ErrorCodes::Unauthorized, "Unauthorized");
-    }
-
     bool run(OperationContext* opCtx,
              const std::string& db,
              const BSONObj& cmdObj,
              BSONObjBuilder& result) final {
+
+        BSONElement element = cmdObj.getField("op");
+        uassert(50759, "Did not provide \"op\" field", element.ok());
+
+        if (isKillingLocalOp(element)) {
+            const unsigned int opId = KillOpCmdBase::parseOpId(cmdObj);
+            killLocalOperation(opCtx, opId);
+
+            // killOp always reports success once past the auth check.
+            return true;
+        } else if (element.type() == BSONType::String) {
+            // It's a string. Should be of the form shardid:opid.
+            return killShardOperation(opCtx, element.str(), result);
+        }
+
+        uasserted(50760,
+                  str::stream() << "\"op\" field was of unsupported type " << element.type());
+    }
+
+private:
+    bool killShardOperation(OperationContext* opCtx,
+                            const std::string& opToKill,
+                            BSONObjBuilder& result) {
         // The format of op is shardid:opid
         // This is different than the format passed to the mongod killOp command.
-        std::string opToKill;
-        uassertStatusOK(bsonExtractStringField(cmdObj, "op", &opToKill));
-
         const auto opSepPos = opToKill.find(':');
 
         uassert(28625,
@@ -103,7 +101,7 @@ public:
         // Will throw if shard id is not found
         auto shardStatus = grid.shardRegistry()->getShard(opCtx, shardIdent);
         if (!shardStatus.isOK()) {
-            return appendCommandStatus(result, shardStatus.getStatus());
+            return CommandHelpers::appendCommandStatus(result, shardStatus.getStatus());
         }
         auto shard = shardStatus.getValue();
 
@@ -123,7 +121,6 @@ public:
         // whether the shard reported success or not.
         return true;
     }
-
 } clusterKillOpCommand;
 
 }  // namespace

@@ -4,7 +4,7 @@
  * The index build should resume when the secondary is restarted.
  */
 
-// @tags: [requires_persistence, requires_journaling]
+// @tags: [requires_persistence, requires_journaling, requires_replication]
 (function() {
     'use strict';
 
@@ -75,4 +75,5 @@
     assert.soon(function() {
         return 2 == secondDB.getCollection(collectionName).getIndexes().length;
     }, "Index build not resumed after restart", 30000, 50);
+    replTest.stopSet();
 }());

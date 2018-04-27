@@ -46,13 +46,7 @@ class Environment;
 
 namespace moe = mongo::optionenvironment;
 
-struct MongodGlobalParams {
-    bool scriptingEnabled = true;  // --noscripting
-
-    boost::optional<std::vector<std::string>> whitelistedClusterNetwork;
-};
-
-extern MongodGlobalParams mongodGlobalParams;
+extern bool skipShardingConfigurationChecks;
 
 Status addMongodOptions(moe::OptionSection* options);
 
@@ -85,7 +79,4 @@ Status canonicalizeMongodOptions(moe::Environment* params);
 StatusWith<repl::ReplSettings> parseMongodReplicationOptions(const moe::Environment& params);
 
 Status storeMongodOptions(const moe::Environment& params);
-
-void setGlobalReplSettings(const repl::ReplSettings& settings);
-const repl::ReplSettings& getGlobalReplSettings();
 }

@@ -69,8 +69,7 @@ public:
     void clearAppliedThrough(OperationContext* opCtx, const Timestamp& writeTimestamp) override;
     OpTime getAppliedThrough(OperationContext* opCtx) const override;
 
-    void writeCheckpointTimestamp(OperationContext* opCtx, const Timestamp& timestamp) override;
-    Timestamp getCheckpointTimestamp(OperationContext* opCtx) override;
+    Status createInternalCollections(OperationContext* opCtx) override;
 
 private:
     mutable stdx::mutex _initialSyncFlagMutex;
@@ -80,7 +79,6 @@ private:
     OpTime _appliedThrough;
     OpTime _minValid;
     Timestamp _oplogTruncateAfterPoint;
-    Timestamp _checkpointTimestamp;
 };
 
 }  // namespace repl

@@ -56,21 +56,6 @@ public:
         _lastOp = OpTime();
     }
 
-    void setLastSnapshot(Timestamp name) {
-        _lastSnapshot = name;
-    }
-    Timestamp getLastSnapshot() const {
-        return _lastSnapshot;
-    }
-
-    // Only used for master/slave
-    void setRemoteID(OID rid) {
-        _remoteId = rid;
-    }
-    OID getRemoteID() const {
-        return _remoteId;
-    }
-
     /**
      * Use this to set the LastOp to the latest known OpTime in the oplog.
      * This is necessary when doing no-op writes, as we need to set the client's lastOp to a proper
@@ -82,8 +67,6 @@ private:
     static const long long kUninitializedTerm = -1;
 
     OpTime _lastOp = OpTime();
-    Timestamp _lastSnapshot;
-    OID _remoteId = OID();
 };
 
 }  // namespace repl

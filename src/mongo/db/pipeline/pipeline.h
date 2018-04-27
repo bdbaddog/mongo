@@ -39,6 +39,8 @@
 #include "mongo/db/pipeline/value.h"
 #include "mongo/db/query/explain_options.h"
 #include "mongo/db/query/query_knobs.h"
+#include "mongo/executor/task_executor.h"
+#include "mongo/s/query/async_results_merger_params_gen.h"
 #include "mongo/stdx/functional.h"
 #include "mongo/util/intrusive_counter.h"
 #include "mongo/util/timer.h"
@@ -268,13 +270,34 @@ public:
     }
 
     /**
+     * Removes and returns the first stage of the pipeline. Returns nullptr if the pipeline is
+     * empty.
+     */
+    boost::intrusive_ptr<DocumentSource> popFront();
+
+    /**
+     * Removes and returns the last stage of the pipeline. Returns nullptr if the pipeline is empty.
+     */
+    boost::intrusive_ptr<DocumentSource> popBack();
+
+    /**
+     * Adds the given stage to the end of the pipeline.
+     */
+    void pushBack(boost::intrusive_ptr<DocumentSource>);
+
+    /**
+     * Removes and returns the first stage of the pipeline if its name is 'targetStageName'.
+     * Returns nullptr if there is no first stage with that name.
+     */
+    boost::intrusive_ptr<DocumentSource> popFrontWithName(StringData targetStageName);
+
+    /**
      * Removes and returns the first stage of the pipeline if its name is 'targetStageName' and the
      * given 'predicate' function, if present, returns 'true' when called with a pointer to the
      * stage. Returns nullptr if there is no first stage which meets these criteria.
      */
-    boost::intrusive_ptr<DocumentSource> popFrontWithCriteria(
-        StringData targetStageName,
-        stdx::function<bool(const DocumentSource* const)> predicate = nullptr);
+    boost::intrusive_ptr<DocumentSource> popFrontWithNameAndCriteria(
+        StringData targetStageName, stdx::function<bool(const DocumentSource* const)> predicate);
 
     /**
      * PipelineD is a "sister" class that has additional functionality for the Pipeline. It exists
@@ -286,15 +309,6 @@ public:
     friend class PipelineD;
 
 private:
-    class Optimizations {
-    public:
-        // This contains static functions that optimize pipelines in various ways.
-        // This is a class rather than a namespace so that it can be a friend of Pipeline.
-        // It is defined in pipeline_optimizations.h.
-        class Sharded;
-    };
-
-    friend class Optimizations::Sharded;
     friend class PipelineDeleter;
 
     /**
@@ -338,21 +352,29 @@ private:
      * is present then it must come last in the pipeline, while initial stages such as $indexStats
      * must be at the start.
      */
-    void validatePipeline() const;
+    void validate(bool isFacetPipeline) const;
 
     /**
-     * Throws if the $facet pipeline fails any of a set of semantic checks. For example, the
-     * pipeline cannot be empty and may not contain any initial stages.
+     * Performs validation checking specific to top-level pipelines. Throws if the pipeline is
+     * invalid.
+     */
+    void validateTopLevelPipeline() const;
+
+    /**
+     * Performs validation checking specific to nested $facet pipelines. Throws if the pipeline is
+     * invalid.
      */
     void validateFacetPipeline() const;
 
     /**
-     * Helper method which validates that each stage in pipeline is in a legal position. For
-     * example, $out must be at the end, while a $match stage with a text query must be at the
-     * start. Note that this method accepts an initial source as the first stage, which is illegal
-     * for $facet pipelines.
+     * Performs common validation for top-level or facet pipelines. Throws if the pipeline is
+     * invalid.
+     *
+     * Includes checking for illegal stage positioning. For example, $out must be at the end, while
+     * a $match stage with a text query must be at the start. Note that this method accepts an
+     * initial source as the first stage, which is illegal for $facet pipelines.
      */
-    void ensureAllStagesAreInLegalPositions() const;
+    void validateCommon() const;
 
     /**
      * Returns Status::OK if the pipeline can run on mongoS, or an error with a message explaining

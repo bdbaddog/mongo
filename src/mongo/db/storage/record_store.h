@@ -315,7 +315,7 @@ public:
     virtual bool isCapped() const = 0;
 
     virtual void setCappedCallback(CappedCallback*) {
-        invariant(false);
+        MONGO_UNREACHABLE;
     }
 
     /**
@@ -543,7 +543,7 @@ public:
      * Only called if compactSupported() returns true.
      */
     virtual bool compactsInPlace() const {
-        invariant(false);
+        MONGO_UNREACHABLE;
     }
 
     /**
@@ -556,7 +556,7 @@ public:
                            RecordStoreCompactAdaptor* adaptor,
                            const CompactOptions* options,
                            CompactStats* stats) {
-        invariant(false);
+        MONGO_UNREACHABLE;
     }
 
     /**
@@ -624,8 +624,15 @@ public:
      *
      * Since this is called inside of a WriteUnitOfWork while holding a std::mutex, it is
      * illegal to acquire any LockManager locks inside of this function.
+     *
+     * If `orderedCommit` is true, the storage engine can assume the input `opTime` has become
+     * visible in the oplog. Otherwise the storage engine must continue to maintain its own
+     * visibility management. Calls with `orderedCommit` true will not be concurrent with calls of
+     * `orderedCommit` false.
      */
-    virtual Status oplogDiskLocRegister(OperationContext* opCtx, const Timestamp& opTime) {
+    virtual Status oplogDiskLocRegister(OperationContext* opCtx,
+                                        const Timestamp& opTime,
+                                        bool orderedCommit) {
         return Status::OK();
     }
 

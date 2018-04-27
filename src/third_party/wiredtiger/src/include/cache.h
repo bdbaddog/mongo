@@ -54,6 +54,10 @@ typedef enum __wt_cache_op {
 	WT_SYNC_WRITE_LEAVES
 } WT_CACHE_OP;
 
+#define	WT_LAS_NUM_SESSIONS	5
+#define	WT_LAS_SWEEP_ENTRIES	(20 * WT_THOUSAND)
+#define	WT_LAS_SWEEP_SEC	2
+
 /*
  * WiredTiger cache structure.
  */
@@ -105,12 +109,16 @@ struct __wt_cache {
 	WT_CONDVAR *evict_cond;		/* Eviction server condition */
 	WT_SPINLOCK evict_walk_lock;	/* Eviction walk location */
 
-	u_int eviction_dirty_target;    /* Percent to allow dirty */
-	u_int eviction_dirty_trigger;	/* Percent to trigger dirty eviction */
-	u_int eviction_trigger;		/* Percent to trigger eviction */
-	u_int eviction_target;		/* Percent to end eviction */
+	/*
+	 * Eviction threshold percentages use double type to allow for
+	 * specifying percentages less than one.
+	 */
+	double eviction_dirty_target;	/* Percent to allow dirty */
+	double eviction_dirty_trigger;	/* Percent to trigger dirty eviction */
+	double eviction_trigger;	/* Percent to trigger eviction */
+	double eviction_target;		/* Percent to end eviction */
 
-	u_int eviction_checkpoint_target;/* Percent to reduce dirty
+	double eviction_checkpoint_target;/* Percent to reduce dirty
 					   to during checkpoint scrubs */
 	double eviction_scrub_limit;	/* Percent of cache to trigger
 					   dirty eviction during checkpoint
@@ -187,7 +195,6 @@ struct __wt_cache {
 	 * the lookaside table (other than eviction server and worker threads
 	 * and the sweep thread, all of which have their own lookaside cursors).
 	 */
-#define	WT_LAS_NUM_SESSIONS 5
 	WT_SPINLOCK	 las_lock;
 	WT_SESSION_IMPL *las_session[WT_LAS_NUM_SESSIONS];
 	bool las_session_inuse[WT_LAS_NUM_SESSIONS];
@@ -196,7 +203,9 @@ struct __wt_cache {
 	uint64_t las_entry_count;       /* Count of entries in lookaside */
 	uint64_t las_pageid;		/* Lookaside table page ID counter */
 
-	WT_SPINLOCK	 las_sweep_lock;
+	bool las_reader;		/* Indicate an LAS reader to sweep */
+	WT_RWLOCK las_sweepwalk_lock;
+	WT_SPINLOCK las_sweep_lock;
 	WT_ITEM las_sweep_key;		/* Track sweep position. */
 	uint32_t las_sweep_dropmin;	/* Minimum btree ID in current set. */
 	uint8_t *las_sweep_dropmap;	/* Bitmap of dropped btree IDs. */

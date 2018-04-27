@@ -67,16 +67,16 @@ class ValidateCmd : public BasicCommand {
 public:
     ValidateCmd() : BasicCommand("validate") {}
 
-    virtual bool slaveOk() const {
-        return true;
+    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
+        return AllowedOnSecondary::kAlways;
     }
 
-    virtual void help(stringstream& h) const {
-        h << "Validate contents of a namespace by scanning its data structures for correctness.  "
-             "Slow.\n"
-             "Add full:true option to do a more thorough check\n"
-             "Add scandata:false to skip the scan of the collection data without skipping scans "
-             "of any indexes";
+    std::string help() const override {
+        return "Validate contents of a namespace by scanning its data structures for correctness.  "
+               "Slow.\n"
+               "Add full:true option to do a more thorough check\n"
+               "Add scandata:false to skip the scan of the collection data without skipping scans "
+               "of any indexes";
     }
 
     virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
@@ -84,7 +84,7 @@ public:
     }
     virtual void addRequiredPrivileges(const std::string& dbname,
                                        const BSONObj& cmdObj,
-                                       std::vector<Privilege>* out) {
+                                       std::vector<Privilege>* out) const {
         ActionSet actions;
         actions.addAction(ActionType::validate);
         out->push_back(Privilege(parseResourcePattern(dbname, cmdObj), actions));
@@ -100,7 +100,7 @@ public:
             return true;
         }
 
-        const NamespaceString nss(parseNsCollectionRequired(dbname, cmdObj));
+        const NamespaceString nss(CommandHelpers::parseNsCollectionRequired(dbname, cmdObj));
 
         const bool full = cmdObj["full"].trueValue();
         const bool scanData = cmdObj["scandata"].trueValue();
@@ -114,7 +114,7 @@ public:
         }
 
         if (!nss.isNormal() && full) {
-            appendCommandStatus(
+            CommandHelpers::appendCommandStatus(
                 result,
                 {ErrorCodes::CommandFailed, "Can only run full validate on a regular collection"});
             return false;
@@ -129,11 +129,12 @@ public:
         Collection* collection = ctx.getDb() ? ctx.getDb()->getCollection(opCtx, nss) : NULL;
         if (!collection) {
             if (ctx.getDb() && ctx.getDb()->getViewCatalog()->lookup(opCtx, nss.ns())) {
-                return appendCommandStatus(
+                return CommandHelpers::appendCommandStatus(
                     result, {ErrorCodes::CommandNotSupportedOnView, "Cannot validate a view"});
             }
 
-            appendCommandStatus(result, {ErrorCodes::NamespaceNotFound, "ns not found"});
+            CommandHelpers::appendCommandStatus(result,
+                                                {ErrorCodes::NamespaceNotFound, "ns not found"});
             return false;
         }
 
@@ -175,7 +176,7 @@ public:
                     opCtx->waitForConditionOrInterrupt(_validationNotifier, lock);
                 }
             } catch (AssertionException& e) {
-                appendCommandStatus(
+                CommandHelpers::appendCommandStatus(
                     result,
                     {ErrorCodes::CommandFailed,
                      str::stream() << "Exception during validation: " << e.toString()});
@@ -195,7 +196,7 @@ public:
         Status status =
             collection->validate(opCtx, level, background, std::move(collLk), &results, &result);
         if (!status.isOK()) {
-            return appendCommandStatus(result, status);
+            return CommandHelpers::appendCommandStatus(result, status);
         }
 
         CollectionCatalogEntry* catalogEntry = collection->getCatalogEntry();
@@ -206,26 +207,11 @@ public:
         bool skipUUIDCheck = nss.coll() == "system.indexes" || nss.coll() == "system.namespaces";
 
         if (!skipUUIDCheck) {
-            ServerGlobalParams::FeatureCompatibility::Version version =
-                serverGlobalParams.featureCompatibility.getVersion();
-
-            if (version == ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo36) {
-                // All collections must have a UUID.
-                if (!opts.uuid) {
-                    results.errors.push_back(str::stream() << "UUID missing on collection "
-                                                           << nss.ns()
-                                                           << " but SchemaVersion=3.6");
-                    results.valid = false;
-                }
-            } else if (version ==
-                       ServerGlobalParams::FeatureCompatibility::Version::kFullyDowngradedTo34) {
-                // All collections must not have a UUID.
-                if (opts.uuid) {
-                    results.errors.push_back(str::stream() << "UUID present in collection "
-                                                           << nss.ns()
-                                                           << " but SchemaVersion=3.4");
-                    results.valid = false;
-                }
+            // All collections must have a UUID.
+            if (!opts.uuid) {
+                results.errors.push_back(str::stream() << "UUID missing on collection " << nss.ns()
+                                                       << " but SchemaVersion=3.6");
+                results.valid = false;
             }
         }
 

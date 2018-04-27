@@ -27,9 +27,11 @@
 
 #include "mongo/platform/basic.h"
 
-#include "mongo/db/catalog/catalog_raii.h"
+#include "mongo/db/catalog_raii.h"
+#include "mongo/db/dbdirectclient.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/s/collection_sharding_state.h"
+#include "mongo/db/s/shard_server_op_observer.h"
 #include "mongo/db/s/sharding_state.h"
 #include "mongo/db/s/type_shard_identity.h"
 #include "mongo/s/shard_server_test_fixture.h"
@@ -39,7 +41,7 @@ namespace {
 
 const NamespaceString kTestNss("TestDB", "TestColl");
 
-class CollShardingStateTest : public ShardServerTestFixture {
+class CollectionShardingStateTest : public ShardServerTestFixture {
 public:
     void setUp() override {
         ShardServerTestFixture::setUp();
@@ -62,106 +64,63 @@ private:
     int _initCallCount = 0;
 };
 
-TEST_F(CollShardingStateTest, GlobalInitGetsCalledAfterWriteCommits) {
-    // Must hold a lock to call initializeFromShardIdentity, which is called by the op observer on
-    // the shard identity document.
-    Lock::GlobalWrite lock(operationContext());
-
-    CollectionShardingState collShardingState(getServiceContext(),
-                                              NamespaceString::kServerConfigurationNamespace);
-
+TEST_F(CollectionShardingStateTest, GlobalInitGetsCalledAfterWriteCommits) {
     ShardIdentityType shardIdentity;
     shardIdentity.setConfigsvrConnString(
         ConnectionString(ConnectionString::SET, "a:1,b:2", "config"));
     shardIdentity.setShardName("a");
     shardIdentity.setClusterId(OID::gen());
 
-    WriteUnitOfWork wuow(operationContext());
-    collShardingState.onInsertOp(operationContext(), shardIdentity.toBSON(), {});
-
-    ASSERT_EQ(0, getInitCallCount());
-
-    wuow.commit();
-
+    DBDirectClient client(operationContext());
+    client.insert("admin.system.version", shardIdentity.toBSON());
     ASSERT_EQ(1, getInitCallCount());
 }
 
-TEST_F(CollShardingStateTest, GlobalInitDoesntGetCalledIfWriteAborts) {
-    // Must hold a lock to call initializeFromShardIdentity, which is called by the op observer on
-    // the shard identity document.
-    Lock::GlobalWrite lock(operationContext());
-
-    CollectionShardingState collShardingState(getServiceContext(),
-                                              NamespaceString::kServerConfigurationNamespace);
-
+TEST_F(CollectionShardingStateTest, GlobalInitDoesntGetCalledIfWriteAborts) {
     ShardIdentityType shardIdentity;
     shardIdentity.setConfigsvrConnString(
         ConnectionString(ConnectionString::SET, "a:1,b:2", "config"));
     shardIdentity.setShardName("a");
     shardIdentity.setClusterId(OID::gen());
 
-    {
-        WriteUnitOfWork wuow(operationContext());
-        collShardingState.onInsertOp(operationContext(), shardIdentity.toBSON(), {});
+    // This part of the test ensures that the collection exists for the AutoGetCollection below to
+    // find and also validates that the initializer does not get called for non-sharding documents
+    DBDirectClient client(operationContext());
+    client.insert("admin.system.version", BSON("_id" << 1));
+    ASSERT_EQ(0, getInitCallCount());
 
+    {
+        AutoGetCollection autoColl(
+            operationContext(), NamespaceString("admin.system.version"), MODE_IX);
+
+        WriteUnitOfWork wuow(operationContext());
+        ASSERT_OK(autoColl.getCollection()->insertDocument(
+            operationContext(), shardIdentity.toBSON(), {}, false));
         ASSERT_EQ(0, getInitCallCount());
     }
 
     ASSERT_EQ(0, getInitCallCount());
 }
 
-TEST_F(CollShardingStateTest, GlobalInitDoesntGetsCalledIfNSIsNotForShardIdentity) {
-    // Must hold a lock to call initializeFromShardIdentity, which is called by the op observer on
-    // the shard identity document.
-    Lock::GlobalWrite lock(operationContext());
-
-    CollectionShardingState collShardingState(getServiceContext(), NamespaceString("admin.user"));
-
+TEST_F(CollectionShardingStateTest, GlobalInitDoesntGetsCalledIfNSIsNotForShardIdentity) {
     ShardIdentityType shardIdentity;
     shardIdentity.setConfigsvrConnString(
         ConnectionString(ConnectionString::SET, "a:1,b:2", "config"));
     shardIdentity.setShardName("a");
     shardIdentity.setClusterId(OID::gen());
 
-    WriteUnitOfWork wuow(operationContext());
-    collShardingState.onInsertOp(operationContext(), shardIdentity.toBSON(), {});
-
-    ASSERT_EQ(0, getInitCallCount());
-
-    wuow.commit();
-
+    DBDirectClient client(operationContext());
+    client.insert("admin.user", shardIdentity.toBSON());
     ASSERT_EQ(0, getInitCallCount());
 }
 
-TEST_F(CollShardingStateTest, OnInsertOpThrowWithIncompleteShardIdentityDocument) {
-    // Must hold a lock to call CollectionShardingState::onInsertOp.
-    Lock::GlobalWrite lock(operationContext());
-
-    CollectionShardingState collShardingState(getServiceContext(),
-                                              NamespaceString::kServerConfigurationNamespace);
-
+TEST_F(CollectionShardingStateTest, OnInsertOpThrowWithIncompleteShardIdentityDocument) {
     ShardIdentityType shardIdentity;
     shardIdentity.setShardName("a");
 
-    ASSERT_THROWS(collShardingState.onInsertOp(operationContext(), shardIdentity.toBSON(), {}),
-                  AssertionException);
-}
-
-TEST_F(CollShardingStateTest, GlobalInitDoesntGetsCalledIfShardIdentityDocWasNotInserted) {
-    // Must hold a lock to call CollectionShardingState::onInsertOp.
-    Lock::GlobalWrite lock(operationContext());
-
-    CollectionShardingState collShardingState(getServiceContext(),
-                                              NamespaceString::kServerConfigurationNamespace);
-
-    WriteUnitOfWork wuow(operationContext());
-    collShardingState.onInsertOp(operationContext(), BSON("_id" << 1), {});
-
-    ASSERT_EQ(0, getInitCallCount());
-
-    wuow.commit();
-
-    ASSERT_EQ(0, getInitCallCount());
+    DBDirectClient client(operationContext());
+    client.insert("admin.system.version", shardIdentity.toBSON());
+    ASSERT(!client.getLastError().empty());
 }
 
 /**
@@ -170,16 +129,20 @@ TEST_F(CollShardingStateTest, GlobalInitDoesntGetsCalledIfShardIdentityDocWasNot
  * that DeleteState's constructor will extract from its `doc` argument into its member
  * DeleteState::documentKey.
  */
-auto makeAMetadata(BSONObj const& keyPattern) -> std::unique_ptr<CollectionMetadata> {
+std::unique_ptr<CollectionMetadata> makeAMetadata(BSONObj const& keyPattern) {
     const OID epoch = OID::gen();
     auto range = ChunkRange(BSON("key" << MINKEY), BSON("key" << MAXKEY));
     auto chunk = ChunkType(kTestNss, std::move(range), ChunkVersion(1, 0, epoch), ShardId("other"));
-    auto cm = ChunkManager::makeNew(
+    auto rt = RoutingTableHistory::makeNew(
         kTestNss, UUID::gen(), KeyPattern(keyPattern), nullptr, false, epoch, {std::move(chunk)});
+    std::shared_ptr<ChunkManager> cm = std::make_shared<ChunkManager>(rt, Timestamp(100, 0));
+
     return stdx::make_unique<CollectionMetadata>(std::move(cm), ShardId("this"));
 }
 
-TEST_F(CollShardingStateTest, MakeDeleteStateUnsharded) {
+using DeleteStateTest = ShardServerTestFixture;
+
+TEST_F(DeleteStateTest, MakeDeleteStateUnsharded) {
     AutoGetCollection autoColl(operationContext(), kTestNss, MODE_IX);
     auto* css = CollectionShardingState::get(operationContext(), kTestNss);
 
@@ -194,14 +157,14 @@ TEST_F(CollShardingStateTest, MakeDeleteStateUnsharded) {
 
     // First, check that an order for deletion from an unsharded collection (where css has not been
     // "refreshed" with chunk metadata) extracts just the "_id" field:
-    auto deleteState = css->makeDeleteState(doc);
+    auto deleteState = ShardObserverDeleteState::make(operationContext(), css, doc);
     ASSERT_BSONOBJ_EQ(deleteState.documentKey,
                       BSON("_id"
                            << "hello"));
     ASSERT_FALSE(deleteState.isMigrating);
 }
 
-TEST_F(CollShardingStateTest, MakeDeleteStateShardedWithoutIdInShardKey) {
+TEST_F(DeleteStateTest, MakeDeleteStateShardedWithoutIdInShardKey) {
     AutoGetCollection autoColl(operationContext(), kTestNss, MODE_IX);
     auto* css = CollectionShardingState::get(operationContext(), kTestNss);
 
@@ -219,7 +182,7 @@ TEST_F(CollShardingStateTest, MakeDeleteStateShardedWithoutIdInShardKey) {
                     << true);
 
     // Verify the shard key is extracted, in correct order, followed by the "_id" field.
-    auto deleteState = css->makeDeleteState(doc);
+    auto deleteState = ShardObserverDeleteState::make(operationContext(), css, doc);
     ASSERT_BSONOBJ_EQ(deleteState.documentKey,
                       BSON("key" << 100 << "key3"
                                  << "abc"
@@ -228,7 +191,7 @@ TEST_F(CollShardingStateTest, MakeDeleteStateShardedWithoutIdInShardKey) {
     ASSERT_FALSE(deleteState.isMigrating);
 }
 
-TEST_F(CollShardingStateTest, MakeDeleteStateShardedWithIdInShardKey) {
+TEST_F(DeleteStateTest, MakeDeleteStateShardedWithIdInShardKey) {
     AutoGetCollection autoColl(operationContext(), kTestNss, MODE_IX);
     auto* css = CollectionShardingState::get(operationContext(), kTestNss);
 
@@ -245,7 +208,7 @@ TEST_F(CollShardingStateTest, MakeDeleteStateShardedWithIdInShardKey) {
                            << 100);
 
     // Verify the shard key is extracted with "_id" in the right place.
-    auto deleteState = css->makeDeleteState(doc);
+    auto deleteState = ShardObserverDeleteState::make(operationContext(), css, doc);
     ASSERT_BSONOBJ_EQ(deleteState.documentKey,
                       BSON("key" << 100 << "_id"
                                  << "hello"
@@ -254,7 +217,7 @@ TEST_F(CollShardingStateTest, MakeDeleteStateShardedWithIdInShardKey) {
     ASSERT_FALSE(deleteState.isMigrating);
 }
 
-TEST_F(CollShardingStateTest, MakeDeleteStateShardedWithIdHashInShardKey) {
+TEST_F(DeleteStateTest, MakeDeleteStateShardedWithIdHashInShardKey) {
     AutoGetCollection autoColl(operationContext(), kTestNss, MODE_IX);
     auto* css = CollectionShardingState::get(operationContext(), kTestNss);
 
@@ -269,7 +232,7 @@ TEST_F(CollShardingStateTest, MakeDeleteStateShardedWithIdHashInShardKey) {
                            << 100);
 
     // Verify the shard key is extracted with "_id" in the right place, not hashed.
-    auto deleteState = css->makeDeleteState(doc);
+    auto deleteState = ShardObserverDeleteState::make(operationContext(), css, doc);
     ASSERT_BSONOBJ_EQ(deleteState.documentKey,
                       BSON("_id"
                            << "hello"));

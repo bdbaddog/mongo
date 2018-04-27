@@ -42,6 +42,7 @@
 #include "mongo/bson/simple_bsonobj_comparator.h"
 #include "mongo/db/background.h"
 #include "mongo/db/catalog/collection_catalog_entry.h"
+#include "mongo/db/catalog/collection_options.h"
 #include "mongo/db/catalog/database_catalog_entry.h"
 #include "mongo/db/catalog/document_validation.h"
 #include "mongo/db/catalog/index_consistency.h"
@@ -59,7 +60,7 @@
 #include "mongo/db/operation_context.h"
 #include "mongo/db/ops/update_request.h"
 #include "mongo/db/query/collation/collator_factory_interface.h"
-#include "mongo/db/repl/replication_coordinator_global.h"
+#include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/server_parameters.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/storage/key_string.h"
@@ -128,11 +129,11 @@ std::unique_ptr<CollatorInterface> parseCollation(OperationContext* opCtx,
               << collationSpec;
         fassertFailedNoTrace(40144);
     }
-    invariantOK(collator.getStatus());
+    invariant(collator.getStatus());
 
     return std::move(collator.getValue());
 }
-}
+}  // namespace
 
 using std::unique_ptr;
 using std::endl;
@@ -267,7 +268,9 @@ Status CollectionImpl::checkValidation(OperationContext* opCtx, const BSONObj& d
 StatusWithMatchExpression CollectionImpl::parseValidator(
     OperationContext* opCtx,
     const BSONObj& validator,
-    MatchExpressionParser::AllowedFeatureSet allowedFeatures) const {
+    MatchExpressionParser::AllowedFeatureSet allowedFeatures,
+    boost::optional<ServerGlobalParams::FeatureCompatibility::Version>
+        maxFeatureCompatibilityVersion) const {
     if (validator.isEmpty())
         return {nullptr};
 
@@ -292,6 +295,9 @@ StatusWithMatchExpression CollectionImpl::parseValidator(
     // The MatchExpression and contained ExpressionContext created as part of the validator are
     // owned by the Collection and will outlive the OperationContext they were created under.
     expCtx->opCtx = nullptr;
+
+    // Enforce a maximum feature version if requested.
+    expCtx->maxFeatureCompatibilityVersion = maxFeatureCompatibilityVersion;
 
     auto statusWithMatcher =
         MatchExpressionParser::parse(validator, expCtx, ExtensionsCallbackNoop(), allowedFeatures);
@@ -334,7 +340,7 @@ Status CollectionImpl::insertDocuments(OperationContext* opCtx,
         const BSONObj& data = extraData.getData();
         const auto collElem = data["collectionNS"];
         // If the failpoint specifies no collection or matches the existing one, fail.
-        if (!collElem || _ns == collElem.str()) {
+        if (!collElem || _ns.ns() == collElem.str()) {
             const std::string msg = str::stream()
                 << "Failpoint (failCollectionInserts) has been enabled (" << data
                 << "), so rejecting insert (first doc): " << begin->doc;
@@ -393,7 +399,7 @@ Status CollectionImpl::insertDocument(OperationContext* opCtx,
         const BSONObj& data = extraData.getData();
         const auto collElem = data["collectionNS"];
         // If the failpoint specifies no collection or matches the existing one, fail.
-        if (!collElem || _ns == collElem.str()) {
+        if (!collElem || _ns.ns() == collElem.str()) {
             const std::string msg = str::stream()
                 << "Failpoint (failCollectionInserts) has been enabled (" << data
                 << "), so rejecting insert: " << doc;
@@ -505,11 +511,16 @@ Status CollectionImpl::_insertDocuments(OperationContext* opCtx,
     return status;
 }
 
+bool CollectionImpl::haveCappedWaiters() {
+    // Waiters keep a shared_ptr to '_cappedNotifier', so there are waiters if this CollectionImpl's
+    // shared_ptr is not unique (use_count > 1).
+    return _cappedNotifier.use_count() > 1;
+}
+
 void CollectionImpl::notifyCappedWaitersIfNeeded() {
     // If there is a notifier object and another thread is waiting on it, then we notify
-    // waiters of this document insert. Waiters keep a shared_ptr to '_cappedNotifier', so
-    // there are waiters if this CollectionImpl's shared_ptr is not unique (use_count > 1).
-    if (_cappedNotifier && !_cappedNotifier.unique())
+    // waiters of this document insert.
+    if (haveCappedWaiters())
         _cappedNotifier->notifyAll();
 }
 
@@ -907,6 +918,14 @@ Status CollectionImpl::setValidator(OperationContext* opCtx, BSONObj validatorDo
 
     _details->updateValidator(opCtx, validatorDoc, getValidationLevel(), getValidationAction());
 
+    opCtx->recoveryUnit()->onRollback([
+        this,
+        oldValidator = std::move(_validator),
+        oldValidatorDoc = std::move(_validatorDoc)
+    ]() mutable {
+        this->_validator = std::move(oldValidator);
+        this->_validatorDoc = std::move(oldValidatorDoc);
+    });
     _validator = std::move(statusWithMatcher.getValue());
     _validatorDoc = std::move(validatorDoc);
     return Status::OK();
@@ -972,9 +991,12 @@ Status CollectionImpl::setValidationLevel(OperationContext* opCtx, StringData ne
         return status.getStatus();
     }
 
+    auto oldValidationLevel = _validationLevel;
     _validationLevel = status.getValue();
 
     _details->updateValidator(opCtx, _validatorDoc, getValidationLevel(), getValidationAction());
+    opCtx->recoveryUnit()->onRollback(
+        [this, oldValidationLevel]() { this->_validationLevel = oldValidationLevel; });
 
     return Status::OK();
 }
@@ -987,9 +1009,12 @@ Status CollectionImpl::setValidationAction(OperationContext* opCtx, StringData n
         return status.getStatus();
     }
 
+    auto oldValidationAction = _validationAction;
     _validationAction = status.getValue();
 
     _details->updateValidator(opCtx, _validatorDoc, getValidationLevel(), getValidationAction());
+    opCtx->recoveryUnit()->onRollback(
+        [this, oldValidationAction]() { this->_validationAction = oldValidationAction; });
 
     return Status::OK();
 }
@@ -999,6 +1024,19 @@ Status CollectionImpl::updateValidator(OperationContext* opCtx,
                                        StringData newLevel,
                                        StringData newAction) {
     invariant(opCtx->lockState()->isCollectionLockedForMode(ns().toString(), MODE_X));
+
+    opCtx->recoveryUnit()->onRollback([
+        this,
+        oldValidator = std::move(_validator),
+        oldValidatorDoc = std::move(_validatorDoc),
+        oldValidationLevel = _validationLevel,
+        oldValidationAction = _validationAction
+    ]() mutable {
+        this->_validator = std::move(oldValidator);
+        this->_validatorDoc = std::move(oldValidatorDoc);
+        this->_validationLevel = oldValidationLevel;
+        this->_validationAction = oldValidationAction;
+    });
 
     _details->updateValidator(opCtx, newValidator, newLevel, newAction);
     _validatorDoc = std::move(newValidator);
@@ -1182,6 +1220,54 @@ void _reportValidationResults(OperationContext* opCtx,
         output->append("indexDetails", indexDetails->done());
     }
 }
+template <typename T>
+void addErrorIfUnequal(T stored, T cached, StringData name, ValidateResults* results) {
+    if (stored != cached) {
+        results->valid = false;
+        results->errors.push_back(str::stream() << "stored value for " << name
+                                                << " does not match cached value: "
+                                                << stored
+                                                << " != "
+                                                << cached);
+    }
+}
+
+void _validateCatalogEntry(OperationContext* opCtx,
+                           CollectionImpl* coll,
+                           BSONObj validatorDoc,
+                           ValidateResults* results) {
+    CollectionOptions options = coll->getCatalogEntry()->getCollectionOptions(opCtx);
+    addErrorIfUnequal(options.uuid, coll->uuid(), "UUID", results);
+    const CollatorInterface* collation = coll->getDefaultCollator();
+    addErrorIfUnequal(options.collation.isEmpty(), !collation, "simple collation", results);
+    if (!options.collation.isEmpty() && collation)
+        addErrorIfUnequal(options.collation.toString(),
+                          collation->getSpec().toBSON().toString(),
+                          "collation",
+                          results);
+    addErrorIfUnequal(options.capped, coll->isCapped(), "is capped", results);
+
+    addErrorIfUnequal(options.validator.toString(), validatorDoc.toString(), "validator", results);
+    if (!options.validator.isEmpty() && !validatorDoc.isEmpty()) {
+        addErrorIfUnequal(options.validationAction.length() ? options.validationAction : "error",
+                          coll->getValidationAction().toString(),
+                          "validation action",
+                          results);
+        addErrorIfUnequal(options.validationLevel.length() ? options.validationLevel : "strict",
+                          coll->getValidationLevel().toString(),
+                          "validation level",
+                          results);
+    }
+
+    addErrorIfUnequal(options.isView(), false, "is a view", results);
+    auto status = options.validateForStorage();
+    if (!status.isOK()) {
+        results->valid = false;
+        results->errors.push_back(str::stream() << "collection options are not valid for storage: "
+                                                << options.toBSON());
+    }
+}
+
 }  // namespace
 
 Status CollectionImpl::validate(OperationContext* opCtx,
@@ -1200,11 +1286,16 @@ Status CollectionImpl::validate(OperationContext* opCtx,
         RecordStoreValidateAdaptor indexValidator = RecordStoreValidateAdaptor(
             opCtx, &indexConsistency, level, &_indexCatalog, &indexNsResultsMap);
 
-
         // Validate the record store
-        log(LogComponent::kIndex) << "validating collection " << ns().toString() << endl;
+        std::string uuidString = str::stream()
+            << " (UUID: " << (uuid() ? uuid()->toString() : "none") << ")";
+        log(LogComponent::kIndex) << "validating collection " << ns().toString() << uuidString
+                                  << endl;
         _validateRecordStore(
             opCtx, _recordStore, level, background, &indexValidator, results, output);
+
+        // Validate in-memory catalog information with the persisted info.
+        _validateCatalogEntry(opCtx, this, _validatorDoc, results);
 
         // Validate indexes and check for mismatches.
         if (results->valid) {
@@ -1233,9 +1324,10 @@ Status CollectionImpl::validate(OperationContext* opCtx,
 
         if (!results->valid) {
             log(LogComponent::kIndex) << "validating collection " << ns().toString() << " failed"
-                                      << endl;
+                                      << uuidString << endl;
         } else {
-            log(LogComponent::kIndex) << "validated collection " << ns().toString() << endl;
+            log(LogComponent::kIndex) << "validated collection " << ns().toString() << uuidString
+                                      << endl;
         }
     } catch (DBException& e) {
         if (ErrorCodes::isInterruption(e.code())) {

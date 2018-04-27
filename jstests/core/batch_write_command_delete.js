@@ -1,7 +1,13 @@
 // Cannot implicitly shard accessed collections because of following errmsg: A single
 // update/delete on a sharded collection must contain an exact match on _id or contain the shard
 // key.
-// @tags: [assumes_unsharded_collection, requires_non_retryable_writes]
+//
+// @tags: [
+//   assumes_unsharded_collection,
+//   assumes_write_concern_unchanged,
+//   requires_non_retryable_writes,
+//   requires_fastcount,
+// ]
 
 //
 // Ensures that mongod respects the batch write protocols for delete
@@ -166,7 +172,7 @@ request = {
     ordered: true
 };
 result = coll.runCommand(request);
-assert.commandWorked(result);
+assert.commandWorkedIgnoringWriteErrors(result);
 assert.eq(1, result.n);
 assert(result.writeErrors != null);
 assert.eq(1, result.writeErrors.length);
@@ -187,7 +193,7 @@ request = {
     ordered: false
 };
 result = coll.runCommand(request);
-assert.commandWorked(result);
+assert.commandWorkedIgnoringWriteErrors(result);
 assert.eq(1, result.n);
 assert.eq(2, result.writeErrors.length);
 

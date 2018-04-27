@@ -34,12 +34,21 @@ namespace mongo {
 
 class DocumentSourceCurrentOp final : public DocumentSource {
 public:
+    using TruncationMode = MongoProcessInterface::CurrentOpTruncateMode;
+    using ConnMode = MongoProcessInterface::CurrentOpConnectionsMode;
+    using LocalOpsMode = MongoProcessInterface::CurrentOpLocalOpsMode;
+    using SessionMode = MongoProcessInterface::CurrentOpSessionsMode;
+    using UserMode = MongoProcessInterface::CurrentOpUserMode;
+
+    static constexpr StringData kStageName = "$currentOp"_sd;
+
     class LiteParsed final : public LiteParsedDocumentSource {
     public:
         static std::unique_ptr<LiteParsed> parse(const AggregationRequest& request,
                                                  const BSONElement& spec);
 
-        explicit LiteParsed(bool allUsers) : _allUsers(allUsers) {}
+        LiteParsed(UserMode allUsers, LocalOpsMode localOps)
+            : _allUsers(allUsers), _localOps(localOps) {}
 
         stdx::unordered_set<NamespaceString> getInvolvedNamespaces() const final {
             return stdx::unordered_set<NamespaceString>();
@@ -48,30 +57,48 @@ public:
         PrivilegeVector requiredPrivileges(bool isMongos) const final {
             PrivilegeVector privileges;
 
-            // In a sharded cluster, we always need the inprog privilege to run $currentOp.
-            if (isMongos || _allUsers) {
+            // In a sharded cluster, we always need the inprog privilege to run $currentOp on the
+            // shards. If we are only looking up local mongoS operations, we do not need inprog to
+            // view our own ops but *do* require it to view other users' ops.
+            if (_allUsers == UserMode::kIncludeAll ||
+                (isMongos && _localOps == LocalOpsMode::kRemoteShardOps)) {
                 privileges.push_back({ResourcePattern::forClusterResource(), ActionType::inprog});
             }
 
             return privileges;
         }
 
+        bool allowedToForwardFromMongos() const final {
+            return _localOps == LocalOpsMode::kRemoteShardOps;
+        }
+
+        bool allowedToPassthroughFromMongos() const final {
+            return _localOps == LocalOpsMode::kRemoteShardOps;
+        }
+
         bool isInitialSource() const final {
             return true;
         }
 
-    private:
-        const bool _allUsers;
-    };
+        void assertSupportsReadConcern(const repl::ReadConcernArgs& readConcern) const {
+            uassert(ErrorCodes::InvalidOptions,
+                    str::stream() << "Aggregation stage " << kStageName
+                                  << " requires read concern local but found "
+                                  << readConcern.toString(),
+                    readConcern.getLevel() == repl::ReadConcernLevel::kLocalReadConcern);
+        }
 
-    using TruncationMode = MongoProcessInterface::CurrentOpTruncateMode;
-    using ConnMode = MongoProcessInterface::CurrentOpConnectionsMode;
-    using UserMode = MongoProcessInterface::CurrentOpUserMode;
+    private:
+        const UserMode _allUsers;
+        const LocalOpsMode _localOps;
+    };
 
     static boost::intrusive_ptr<DocumentSourceCurrentOp> create(
         const boost::intrusive_ptr<ExpressionContext>& pExpCtx,
         ConnMode includeIdleConnections = ConnMode::kExcludeIdle,
+        SessionMode includeIdleSessions = SessionMode::kIncludeIdle,
         UserMode includeOpsFromAllUsers = UserMode::kExcludeOthers,
+        LocalOpsMode showLocalOpsOnMongoS = LocalOpsMode::kRemoteShardOps,
         TruncationMode truncateOps = TruncationMode::kNoTruncation);
 
     GetNextResult getNext() final;
@@ -81,9 +108,12 @@ public:
     StageConstraints constraints(Pipeline::SplitState pipeState) const final {
         StageConstraints constraints(StreamType::kStreaming,
                                      PositionRequirement::kFirst,
-                                     HostTypeRequirement::kAnyShard,
+                                     (_showLocalOpsOnMongoS == LocalOpsMode::kLocalMongosOps
+                                          ? HostTypeRequirement::kLocalOnly
+                                          : HostTypeRequirement::kAnyShard),
                                      DiskUseRequirement::kNoDiskUse,
-                                     FacetRequirement::kNotAllowed);
+                                     FacetRequirement::kNotAllowed,
+                                     TransactionRequirement::kNotAllowed);
 
         constraints.isIndependentOfAnyCollection = true;
         constraints.requiresInputDocSource = false;
@@ -97,16 +127,22 @@ public:
 
 private:
     DocumentSourceCurrentOp(const boost::intrusive_ptr<ExpressionContext>& pExpCtx,
-                            ConnMode includeIdleConnections = ConnMode::kExcludeIdle,
-                            UserMode includeOpsFromAllUsers = UserMode::kExcludeOthers,
-                            TruncationMode truncateOps = TruncationMode::kNoTruncation)
+                            ConnMode includeIdleConnections,
+                            SessionMode includeIdleSessions,
+                            UserMode includeOpsFromAllUsers,
+                            LocalOpsMode showLocalOpsOnMongoS,
+                            TruncationMode truncateOps)
         : DocumentSource(pExpCtx),
           _includeIdleConnections(includeIdleConnections),
+          _includeIdleSessions(includeIdleSessions),
           _includeOpsFromAllUsers(includeOpsFromAllUsers),
+          _showLocalOpsOnMongoS(showLocalOpsOnMongoS),
           _truncateOps(truncateOps) {}
 
     ConnMode _includeIdleConnections = ConnMode::kExcludeIdle;
+    SessionMode _includeIdleSessions = SessionMode::kIncludeIdle;
     UserMode _includeOpsFromAllUsers = UserMode::kExcludeOthers;
+    LocalOpsMode _showLocalOpsOnMongoS = LocalOpsMode::kRemoteShardOps;
     TruncationMode _truncateOps = TruncationMode::kNoTruncation;
 
     std::string _shardName;

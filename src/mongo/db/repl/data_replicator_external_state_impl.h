@@ -48,8 +48,6 @@ public:
 
     executor::TaskExecutor* getTaskExecutor() const override;
 
-    OldThreadPool* getDbWorkThreadPool() const override;
-
     OpTimeWithTerm getCurrentTermAndLastCommittedOpTime() override;
 
     void processMetadata(const rpc::ReplSetMetadata& replMetadata,
@@ -61,20 +59,14 @@ public:
 
     std::unique_ptr<OplogBuffer> makeInitialSyncOplogBuffer(OperationContext* opCtx) const override;
 
-    std::unique_ptr<OplogBuffer> makeSteadyStateOplogBuffer(OperationContext* opCtx) const override;
-
     StatusWith<ReplSetConfig> getCurrentConfig() const override;
 
 private:
     StatusWith<OpTime> _multiApply(OperationContext* opCtx,
                                    MultiApplier::Operations ops,
-                                   MultiApplier::ApplyOperationFn applyOperation) override;
-
-    Status _multiSyncApply(MultiApplier::OperationPtrs* ops) override;
-
-    Status _multiInitialSyncApply(MultiApplier::OperationPtrs* ops,
-                                  const HostAndPort& source,
-                                  AtomicUInt32* fetchCount) override;
+                                   OplogApplier::Observer* observer,
+                                   const HostAndPort& source,
+                                   ThreadPool* writerPool) override;
 
 protected:
     ReplicationCoordinator* getReplicationCoordinator() const;

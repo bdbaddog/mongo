@@ -154,7 +154,10 @@ int handleBatchHelper(SessionsCollection* sessionsCollection,
     Locker::LockSnapshot snapshot;
     invariant(locker->saveLockStateAndUnlock(&snapshot));
 
-    const auto guard = MakeGuard([&] { locker->restoreLockState(snapshot); });
+    const auto guard = MakeGuard([&] {
+        UninterruptibleLockGuard noInterrupt(opCtx->lockState());
+        locker->restoreLockState(opCtx, snapshot);
+    });
 
     // Top-level locks are freed, release any potential low-level (storage engine-specific
     // locks). If we are yielding, we are at a safe place to do so.
@@ -231,12 +234,12 @@ public:
                 uassertStatusOK(Grid::get(_opCtx)->catalogCache()->getCollectionRoutingInfo(
                     _opCtx, NamespaceString(SessionsCollection::kSessionsFullNS)));
             _cm = routingInfo.cm();
-            _primary = routingInfo.primary();
+            _primary = routingInfo.db().primary();
         }
         ShardId shardId;
         if (_cm) {
             const auto chunk = _cm->findIntersectingChunkWithSimpleCollation(lsid.toBSON());
-            shardId = chunk->getShardId();
+            shardId = chunk.getShardId();
         } else {
             shardId = _primary->getId();
         }

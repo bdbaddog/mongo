@@ -8,7 +8,7 @@
 
 #define	WT_OPTRACK_MAXRECS (16384)
 #define	WT_OPTRACK_BUFSIZE (WT_OPTRACK_MAXRECS * sizeof(WT_OPTRACK_RECORD))
-#define	WT_OPTRACK_VERSION 1
+#define	WT_OPTRACK_VERSION 2
 
 /*
  * WT_OPTRACK_HEADER --
@@ -18,6 +18,7 @@
 struct __wt_optrack_header {
 	uint32_t optrack_version;
 	uint32_t optrack_session_internal;
+	uint32_t optrack_tsc_nsec_ratio;
 };
 
 /*
@@ -51,12 +52,12 @@ struct __wt_optrack_record {
 	WT_OPTRACK_RECORD *__tr;					\
 	__tr = &((s)->optrack_buf[					\
 	    (s)->optrackbuf_ptr % WT_OPTRACK_MAXRECS]);			\
-	__tr->op_timestamp = __wt_rdtsc(s);				\
+	__tr->op_timestamp = __wt_clock(s);				\
 	__tr->op_id = __func_id;					\
 	__tr->op_type = optype;						\
 									\
 	if (++(s)->optrackbuf_ptr == WT_OPTRACK_MAXRECS) {		\
-		(s)->optrack_offset += __wt_optrack_flush_buffer(s);	\
+		__wt_optrack_flush_buffer(s);				\
 		(s)->optrackbuf_ptr = 0;				\
 	}								\
 } while (0)

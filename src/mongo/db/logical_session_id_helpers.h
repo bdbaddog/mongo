@@ -36,6 +36,8 @@
 
 namespace mongo {
 
+constexpr size_t kMaximumUserNameLengthForLogicalSessions = 10000;
+
 /**
  * Get the currently logged in user's UID digest.
  */
@@ -69,7 +71,5 @@ LogicalSessionToClient makeLogicalSessionToClient(const LogicalSessionId& lsid);
 LogicalSessionIdSet makeLogicalSessionIds(const std::vector<LogicalSessionFromClient>& sessions,
                                           OperationContext* opCtx,
                                           std::initializer_list<Privilege> allowSpoof = {});
-
-Status SessionsCommandFCV34Status(StringData command);
 
 }  // namespace mongo

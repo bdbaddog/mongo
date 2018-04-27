@@ -41,6 +41,7 @@
 
 #include "mongo/db/log_process_details.h"
 #include "mongo/db/server_options.h"
+#include "mongo/db/service_context.h"
 #include "mongo/platform/process_id.h"
 #include "mongo/stdx/thread.h"
 #include "mongo/util/assert_util.h"
@@ -187,7 +188,7 @@ void signalProcessingThread(LogFileStatus rotate) {
                 lastSignalTimeSeconds = signalTimeSeconds;
                 fassert(16782, rotateLogs(serverGlobalParams.logRenameOnRotate));
                 if (rotate == LogFileStatus::kNeedToRotateLogFile) {
-                    logProcessDetailsForLogRotate();
+                    logProcessDetailsForLogRotate(getGlobalServiceContext());
                 }
                 break;
             default:

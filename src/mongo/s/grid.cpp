@@ -37,12 +37,9 @@
 #include "mongo/executor/task_executor.h"
 #include "mongo/executor/task_executor_pool.h"
 #include "mongo/s/balancer_configuration.h"
-#include "mongo/s/catalog/sharding_catalog_client.h"
 #include "mongo/s/catalog_cache.h"
 #include "mongo/s/client/shard_factory.h"
-#include "mongo/s/client/shard_registry.h"
 #include "mongo/s/query/cluster_cursor_manager.h"
-#include "mongo/stdx/memory.h"
 #include "mongo/util/log.h"
 
 namespace mongo {
@@ -86,6 +83,15 @@ void Grid::init(std::unique_ptr<ShardingCatalogClient> catalogClient,
     _network = network;
 
     _shardRegistry->init();
+}
+
+bool Grid::isShardingInitialized() const {
+    return _shardingInitialized.load();
+}
+
+void Grid::setShardingInitialized() {
+    invariant(!_shardingInitialized.load());
+    _shardingInitialized.store(true);
 }
 
 Grid::CustomConnectionPoolStatsFn Grid::getCustomConnectionPoolStatsFn() const {

@@ -86,10 +86,10 @@ BSONObj selectMedianKey(OperationContext* opCtx,
 
 class SplitCollectionCmd : public ErrmsgCommandDeprecated {
 public:
-    SplitCollectionCmd() : ErrmsgCommandDeprecated("split", "split") {}
+    SplitCollectionCmd() : ErrmsgCommandDeprecated("split") {}
 
-    bool slaveOk() const override {
-        return true;
+    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
+        return AllowedOnSecondary::kAlways;
     }
 
     bool adminOnly() const override {
@@ -100,17 +100,17 @@ public:
         return false;
     }
 
-    void help(std::stringstream& help) const override {
-        help << " example: - split the shard that contains give key\n"
-             << "   { split : 'alleyinsider.blog.posts' , find : { ts : 1 } }\n"
-             << " example: - split the shard that contains the key with this as the middle\n"
-             << "   { split : 'alleyinsider.blog.posts' , middle : { ts : 1 } }\n"
-             << " NOTE: this does not move the chunks, it just creates a logical separation.";
+    std::string help() const override {
+        return " example: - split the shard that contains give key\n"
+               "   { split : 'alleyinsider.blog.posts' , find : { ts : 1 } }\n"
+               " example: - split the shard that contains the key with this as the middle\n"
+               "   { split : 'alleyinsider.blog.posts' , middle : { ts : 1 } }\n"
+               " NOTE: this does not move the chunks, it just creates a logical separation.";
     }
 
     Status checkAuthForCommand(Client* client,
                                const std::string& dbname,
-                               const BSONObj& cmdObj) override {
+                               const BSONObj& cmdObj) const override {
         if (!AuthorizationSession::get(client)->isAuthorizedForActionsOnResource(
                 ResourcePattern::forExactNamespace(NamespaceString(parseNs(dbname, cmdObj))),
                 ActionType::splitChunk)) {
@@ -120,7 +120,7 @@ public:
     }
 
     std::string parseNs(const std::string& dbname, const BSONObj& cmdObj) const override {
-        return parseNsFullyQualified(dbname, cmdObj);
+        return CommandHelpers::parseNsFullyQualified(cmdObj);
     }
 
     bool errmsgRun(OperationContext* opCtx,
@@ -189,7 +189,7 @@ public:
             return false;
         }
 
-        std::shared_ptr<Chunk> chunk;
+        boost::optional<Chunk> chunk;
 
         if (!find.isEmpty()) {
             // find
@@ -200,7 +200,7 @@ public:
                 return false;
             }
 
-            chunk = cm->findIntersectingChunkWithSimpleCollation(shardKey);
+            chunk.emplace(cm->findIntersectingChunkWithSimpleCollation(shardKey));
         } else if (!bounds.isEmpty()) {
             // bounds
             if (!cm->getShardKeyPattern().isShardKey(bounds[0].Obj()) ||
@@ -215,7 +215,7 @@ public:
             BSONObj minKey = cm->getShardKeyPattern().normalizeShardKey(bounds[0].Obj());
             BSONObj maxKey = cm->getShardKeyPattern().normalizeShardKey(bounds[1].Obj());
 
-            chunk = cm->findIntersectingChunkWithSimpleCollation(minKey);
+            chunk.emplace(cm->findIntersectingChunkWithSimpleCollation(minKey));
 
             if (chunk->getMin().woCompare(minKey) != 0 || chunk->getMax().woCompare(maxKey) != 0) {
                 errmsg = str::stream() << "no chunk found with the shard key bounds "
@@ -236,7 +236,7 @@ public:
             // Check shard key size when manually provided
             uassertStatusOK(ShardKeyPattern::checkShardKeySize(middle));
 
-            chunk = cm->findIntersectingChunkWithSimpleCollation(middle);
+            chunk.emplace(cm->findIntersectingChunkWithSimpleCollation(middle));
 
             if (chunk->getMin().woCompare(middle) == 0 || chunk->getMax().woCompare(middle) == 0) {
                 errmsg = str::stream() << "new split key " << middle
@@ -274,7 +274,7 @@ public:
 
         // This invalidation is only necessary so that auto-split can begin to track statistics for
         // the chunks produced after the split instead of the single original chunk.
-        Grid::get(opCtx)->catalogCache()->onStaleConfigError(std::move(routingInfo));
+        Grid::get(opCtx)->catalogCache()->onStaleShardVersion(std::move(routingInfo));
 
         return true;
     }

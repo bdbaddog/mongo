@@ -40,6 +40,7 @@
 #include "mongo/bson/timestamp.h"
 #include "mongo/db/record_id.h"
 #include "mongo/platform/decimal128.h"
+#include "mongo/util/assert_util.h"
 
 namespace mongo {
 
@@ -246,7 +247,9 @@ public:
             return _buf[0] & 0x7f;
         }
         void setSizeByte(uint8_t size) {
-            dassert(size < kMaxBytesNeeded);
+            // This error can only occur in cases where the key is not only too long, but also
+            // has too many fields requiring type bits.
+            uassert(ErrorCodes::KeyTooLong, "The key is too long", size < kMaxBytesNeeded);
             _buf[0] = 0x80 | size;
         }
 
@@ -297,8 +300,23 @@ public:
         appendRecordId(rid);
     }
 
+    static size_t getKeySize(const char* buffer,
+                             size_t len,
+                             Ordering ord,
+                             const TypeBits& typeBits);
     static BSONObj toBson(StringData data, Ordering ord, const TypeBits& types);
-    static BSONObj toBson(const char* buffer, size_t len, Ordering ord, const TypeBits& types);
+    /**
+     * Decodes the given KeyString buffer into it's BSONObj representation. This is marked as
+     * noexcept since the assumption is that 'buffer' is a valid KeyString buffer and this method
+     * is not expected to throw.
+     *
+     * If the buffer provided may not be valid, use the 'safe' version instead.
+     */
+    static BSONObj toBson(const char* buffer,
+                          size_t len,
+                          Ordering ord,
+                          const TypeBits& types) noexcept;
+    static BSONObj toBsonSafe(const char* buffer, size_t len, Ordering ord, const TypeBits& types);
 
     /**
      * Decodes a RecordId from the end of a buffer.

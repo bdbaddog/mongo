@@ -70,6 +70,8 @@ struct ShardMetadataUtilTest : public ShardServerTestFixture {
         ShardCollectionType shardCollectionType =
             assertGet(ShardCollectionType::fromBSON(builder.obj()));
 
+        shardCollectionType.setRefreshing(true);
+
         ASSERT_OK(updateShardCollectionsEntry(operationContext(),
                                               BSON(ShardCollectionType::ns(kNss.ns())),
                                               shardCollectionType.toBSON(),
@@ -194,14 +196,11 @@ TEST_F(ShardMetadataUtilTest, UpdateAndReadCollectionsEntry) {
 TEST_F(ShardMetadataUtilTest, PersistedRefreshSignalStartAndFinish) {
     setUpCollection();
 
-    // Signal refresh start
-    ASSERT_OK(setPersistedRefreshFlags(operationContext(), kNss));
-
     ShardCollectionType shardCollectionsEntry =
         assertGet(readShardCollectionsEntry(operationContext(), kNss));
 
     ASSERT_EQUALS(*shardCollectionsEntry.getUUID(), uuid);
-    ASSERT_EQUALS(shardCollectionsEntry.getNss(), kNss.ns());
+    ASSERT_EQUALS(shardCollectionsEntry.getNss().ns(), kNss.ns());
     ASSERT_EQUALS(shardCollectionsEntry.getEpoch(), maxCollVersion.epoch());
     ASSERT_BSONOBJ_EQ(shardCollectionsEntry.getKeyPattern().toBSON(), keyPattern.toBSON());
     ASSERT_BSONOBJ_EQ(shardCollectionsEntry.getDefaultCollation(), defaultCollation);
@@ -210,7 +209,11 @@ TEST_F(ShardMetadataUtilTest, PersistedRefreshSignalStartAndFinish) {
     ASSERT(!shardCollectionsEntry.hasLastRefreshedCollectionVersion());
 
     // Signal refresh start again to make sure nothing changes
-    ASSERT_OK(setPersistedRefreshFlags(operationContext(), kNss));
+    ASSERT_OK(updateShardCollectionsEntry(operationContext(),
+                                          BSON(ShardCollectionType::ns() << kNss.ns()),
+                                          BSON(ShardCollectionType::refreshing() << true),
+                                          BSONObj(),
+                                          false));
 
     RefreshState state = assertGet(getPersistedRefreshFlags(operationContext(), kNss));
 
@@ -322,7 +325,7 @@ TEST_F(ShardMetadataUtilTest, DropChunksAndDeleteCollectionsEntry) {
     ASSERT_OK(dropChunksAndDeleteCollectionsEntry(operationContext(), kNss));
     checkCollectionIsEmpty(kChunkMetadataNss);
     // Collections collection should be empty because it only had one entry.
-    checkCollectionIsEmpty(NamespaceString(ShardCollectionType::ConfigNS));
+    checkCollectionIsEmpty(NamespaceString::kShardConfigCollectionsNamespace);
 }
 
 }  // namespace

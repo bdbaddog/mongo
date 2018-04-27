@@ -31,8 +31,8 @@
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/auth/authorization_session.h"
-#include "mongo/db/catalog/catalog_raii.h"
 #include "mongo/db/catalog/database_catalog_entry.h"
+#include "mongo/db/catalog_raii.h"
 #include "mongo/db/client.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/matcher/expression.h"
@@ -57,11 +57,8 @@ intmax_t dbSize(const string& database);
 
 class CmdListDatabases : public BasicCommand {
 public:
-    bool slaveOk() const final {
-        return false;
-    }
-    bool slaveOverrideOk() const final {
-        return true;
+    AllowedOnSecondary secondaryAllowed(ServiceContext*) const final {
+        return AllowedOnSecondary::kOptIn;
     }
     bool adminOnly() const final {
         return true;
@@ -69,9 +66,9 @@ public:
     bool supportsWriteConcern(const BSONObj& cmd) const final {
         return false;
     }
-    void help(stringstream& help) const final {
-        help << "{ listDatabases:1, [filter: <filterObject>] [, nameOnly: true ] }\n"
-                "list databases on this server";
+    std::string help() const final {
+        return "{ listDatabases:1, [filter: <filterObject>] [, nameOnly: true ] }\n"
+               "list databases on this server";
     }
 
     /* listDatabases is always authorized,
@@ -81,7 +78,7 @@ public:
      */
     Status checkAuthForCommand(Client* client,
                                const std::string& dbname,
-                               const BSONObj& cmdObj) final {
+                               const BSONObj& cmdObj) const final {
         return Status::OK();
     }
 
@@ -95,11 +92,11 @@ public:
         std::unique_ptr<MatchExpression> filter;
         if (auto filterElt = jsobj[kFilterField]) {
             if (filterElt.type() != BSONType::Object) {
-                return appendCommandStatus(result,
-                                           {ErrorCodes::TypeMismatch,
-                                            str::stream() << "Field '" << kFilterField
-                                                          << "' must be of type Object in: "
-                                                          << jsobj});
+                return CommandHelpers::appendCommandStatus(
+                    result,
+                    {ErrorCodes::TypeMismatch,
+                     str::stream() << "Field '" << kFilterField << "' must be of type Object in: "
+                                   << jsobj});
             }
             // The collator is null because database metadata objects are compared using simple
             // binary comparison.
@@ -108,7 +105,7 @@ public:
             auto statusWithMatcher =
                 MatchExpressionParser::parse(filterElt.Obj(), std::move(expCtx));
             if (!statusWithMatcher.isOK()) {
-                return appendCommandStatus(result, statusWithMatcher.getStatus());
+                return CommandHelpers::appendCommandStatus(result, statusWithMatcher.getStatus());
             }
             filter = std::move(statusWithMatcher.getValue());
         }
@@ -117,7 +114,7 @@ public:
         vector<string> dbNames;
         StorageEngine* storageEngine = getGlobalServiceContext()->getGlobalStorageEngine();
         {
-            Lock::GlobalLock lk(opCtx, MODE_IS, UINT_MAX);
+            Lock::GlobalLock lk(opCtx, MODE_IS, Date_t::max());
             storageEngine->listDatabases(&dbNames);
         }
 

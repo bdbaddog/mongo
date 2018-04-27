@@ -85,9 +85,6 @@ public:
     virtual ReplicationCoordinator::StatusAndDuration awaitReplication(
         OperationContext* opCtx, const OpTime& opTime, const WriteConcernOptions& writeConcern);
 
-    virtual ReplicationCoordinator::StatusAndDuration awaitReplicationOfLastOpForClient(
-        OperationContext* opCtx, const WriteConcernOptions& writeConcern);
-
     virtual Status stepDown(OperationContext* opCtx,
                             bool force,
                             const Milliseconds& waitTime,
@@ -113,8 +110,6 @@ public:
                                                 bool slaveOk);
 
     virtual bool shouldRelaxIndexConstraints(OperationContext* opCtx, const NamespaceString& ns);
-
-    virtual Status setLastOptimeForSlave(const OID& rid, const Timestamp& ts);
 
     virtual void setMyLastAppliedOpTime(const OpTime& opTime);
     virtual void setMyLastDurableOpTime(const OpTime& opTime);
@@ -201,8 +196,6 @@ public:
     virtual Status processReplSetUpdatePosition(const UpdatePositionArgs& updates,
                                                 long long* configVersion);
 
-    virtual Status processHandshake(OperationContext* opCtx, const HandshakeArgs& handshake);
-
     virtual bool buildsIndexes();
 
     virtual std::vector<HostAndPort> getHostsWrittenTo(const OpTime& op, bool durablyWritten);
@@ -219,6 +212,8 @@ public:
 
     virtual void resetLastOpTimesFromOplog(OperationContext* opCtx, DataConsistency consistency);
 
+    bool lastOpTimesWereReset() const;
+
     virtual bool shouldChangeSyncSource(const HostAndPort& currentSource,
                                         const rpc::ReplSetMetadata& replMetadata,
                                         boost::optional<rpc::OplogQueryMetadata> oqMetadata);
@@ -229,8 +224,7 @@ public:
                                               const ReplSetRequestVotesArgs& args,
                                               ReplSetRequestVotesResponse* response);
 
-    void prepareReplMetadata(OperationContext* opCtx,
-                             const BSONObj& metadataRequestObj,
+    void prepareReplMetadata(const BSONObj& metadataRequestObj,
                              const OpTime& lastOpTimeFromClient,
                              BSONObjBuilder* builder) const override;
 
@@ -247,7 +241,7 @@ public:
 
     virtual Status updateTerm(OperationContext* opCtx, long long term);
 
-    virtual Timestamp reserveSnapshotName(OperationContext* opCtx);
+    virtual Timestamp getMinimumVisibleSnapshot(OperationContext* opCtx) override;
 
     virtual void dropAllSnapshots() override;
 
@@ -272,10 +266,8 @@ public:
     void setGetConfigReturnValue(ReplSetConfig returnValue);
 
     /**
-     * Sets the function to generate the return value for calls to awaitReplication() and
-     * awaitReplicationOfLastOpForClient().
-     * 'opTime' is the optime passed to awaitReplication() and set to null when called from
-     * awaitReplicationOfLastOpForClient().
+     * Sets the function to generate the return value for calls to awaitReplication().
+     * 'opTime' is the optime passed to awaitReplication().
      */
     using AwaitReplicationReturnValueFunction = stdx::function<StatusAndDuration(const OpTime&)>;
     void setAwaitReplicationReturnValueFunction(
@@ -294,6 +286,8 @@ public:
 
     virtual Status abortCatchupIfNeeded() override;
 
+    void signalDropPendingCollectionsRemovedFromStorage() final;
+
 private:
     AtomicUInt64 _snapshotNameGenerator;
     ServiceContext* const _service;
@@ -306,6 +300,7 @@ private:
         return StatusAndDuration(Status::OK(), Milliseconds(0));
     };
     bool _alwaysAllowWrites = false;
+    bool _resetLastOpTimesCalled = false;
 };
 
 }  // namespace repl

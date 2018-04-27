@@ -40,9 +40,9 @@
 #include "mongo/db/dbhelpers.h"
 #include "mongo/db/index/index_access_method.h"
 #include "mongo/db/jsobj.h"
+#include "mongo/db/repl/oplog_entry.h"
 #include "mongo/db/repl/repl_settings.h"
 #include "mongo/db/repl/replication_coordinator.h"
-#include "mongo/db/repl/replication_coordinator_global.h"
 #include "mongo/db/server_parameters.h"
 #include "mongo/db/stats/timer_stats.h"
 #include "mongo/db/storage/mmap_v1/mmap.h"
@@ -149,39 +149,31 @@ void prefetchRecordPages(OperationContext* opCtx,
 }  // namespace
 
 // prefetch for an oplog operation
-void prefetchPagesForReplicatedOp(OperationContext* opCtx, Database* db, const BSONObj& op) {
+void prefetchPagesForReplicatedOp(OperationContext* opCtx,
+                                  Database* db,
+                                  const OplogEntry& oplogEntry) {
     invariant(db);
     const ReplSettings::IndexPrefetchConfig prefetchConfig =
-        getGlobalReplicationCoordinator()->getIndexPrefetchConfig();
-    const char* opField;
-    const char* opType = op.getStringField("op");
-    switch (*opType) {
-        case 'i':  // insert
-        case 'd':  // delete
-            opField = "o";
-            break;
-        case 'u':  // update
-            opField = "o2";
-            break;
-        default:
-            // prefetch ignores other ops
-            return;
-    }
+        ReplicationCoordinator::get(opCtx)->getIndexPrefetchConfig();
 
-    BSONObj obj = op.getObjectField(opField);
-    const char* ns = op.getStringField("ns");
+    // Prefetch ignores non-CRUD operations.
+    if (!oplogEntry.isCrudOpType()) {
+        return;
+    }
 
     // This will have to change for engines other than MMAP V1, because they might not have
     // means for directly prefetching pages from the collection. For this purpose, acquire S
     // lock on the database, instead of optimizing with IS.
-    Lock::CollectionLock collLock(opCtx->lockState(), ns, MODE_S);
+    const auto& nss = oplogEntry.getNamespace();
+    Lock::CollectionLock collLock(opCtx->lockState(), nss.ns(), MODE_S);
 
-    Collection* collection = db->getCollection(opCtx, ns);
+    Collection* collection = db->getCollection(opCtx, nss);
     if (!collection) {
         return;
     }
 
-    LOG(4) << "index prefetch for op " << *opType;
+    auto opType = oplogEntry.getOpType();
+    LOG(4) << "index prefetch for op " << OpType_serializer(opType);
 
     // should we prefetch index pages on updates? if the update is in-place and doesn't change
     // indexed values, it is actually slower - a lot slower if there are a dozen indexes or
@@ -198,6 +190,8 @@ void prefetchPagesForReplicatedOp(OperationContext* opCtx, Database* db, const B
     // a way to achieve that would be to prefetch the record first, and then afterwards do
     // this part.
     //
+    auto obj = oplogEntry.getOperationToApply();
+    invariant(!obj.isEmpty());
     prefetchIndexPages(opCtx, collection, prefetchConfig, obj);
 
     // do not prefetch the data for inserts; it doesn't exist yet
@@ -206,11 +200,11 @@ void prefetchPagesForReplicatedOp(OperationContext* opCtx, Database* db, const B
     // when we delete.  note if done we only want to touch the first page.
     //
     // update: do record prefetch.
-    if ((*opType == 'u') &&
+    if ((opType == OpTypeEnum::kUpdate) &&
         // do not prefetch the data for capped collections because
         // they typically do not have an _id index for findById() to use.
         !collection->isCapped()) {
-        prefetchRecordPages(opCtx, db, ns, obj);
+        prefetchRecordPages(opCtx, db, nss.ns().c_str(), obj);
     }
 }
 
@@ -221,12 +215,12 @@ public:
     virtual ~ReplIndexPrefetch() {}
 
     const char* _value() {
-        if (getGlobalReplicationCoordinator()->getReplicationMode() !=
+        if (ReplicationCoordinator::get(getGlobalServiceContext())->getReplicationMode() !=
             ReplicationCoordinator::modeReplSet) {
             return "uninitialized";
         }
         ReplSettings::IndexPrefetchConfig ip =
-            getGlobalReplicationCoordinator()->getIndexPrefetchConfig();
+            ReplicationCoordinator::get(getGlobalServiceContext())->getIndexPrefetchConfig();
         switch (ip) {
             case ReplSettings::IndexPrefetchConfig::PREFETCH_NONE:
                 return "none";
@@ -244,7 +238,7 @@ public:
     }
 
     virtual Status set(const BSONElement& newValueElement) {
-        if (getGlobalReplicationCoordinator()->getReplicationMode() !=
+        if (ReplicationCoordinator::get(getGlobalServiceContext())->getReplicationMode() !=
             ReplicationCoordinator::modeReplSet) {
             return Status(ErrorCodes::BadValue, "replication is not enabled");
         }
@@ -269,7 +263,8 @@ public:
                           str::stream() << "unrecognized indexPrefetch setting: " << prefetch);
         }
 
-        getGlobalReplicationCoordinator()->setIndexPrefetchConfig(prefetchConfig);
+        ReplicationCoordinator::get(getGlobalServiceContext())
+            ->setIndexPrefetchConfig(prefetchConfig);
         return Status::OK();
     }
 

@@ -422,21 +422,51 @@ MongoURI MongoURI::parseImpl(const std::string& url) {
         addTXTOptions(parseOptions(connectionOptions, url), canonicalHost, url, isSeedlist);
 
     // If a replica set option was specified, store it in the 'setName' field.
-    const auto optIter = options.find("replicaSet");
+    auto optIter = options.find("replicaSet");
     std::string setName;
     if (optIter != end(options)) {
         setName = optIter->second;
         invariant(!setName.empty());
     }
 
+    // If an appname option was specified, validate that is 128 bytes or less.
+    optIter = options.find("appname");
+    if (optIter != end(options) && optIter->second.length() > 128) {
+        uasserted(ErrorCodes::FailedToParse,
+                  str::stream() << "appname cannot exceed 128 characters: " << optIter->second);
+    }
+
+    boost::optional<bool> retryWrites = boost::none;
+    optIter = options.find("retryWrites");
+    if (optIter != end(options)) {
+        if (optIter->second == "true") {
+            retryWrites.reset(true);
+        } else if (optIter->second == "false") {
+            retryWrites.reset(false);
+        } else {
+            uasserted(ErrorCodes::FailedToParse,
+                      str::stream() << "retryWrites must be either \"true\" or \"false\"");
+        }
+    }
+
     ConnectionString cs(
         setName.empty() ? ConnectionString::MASTER : ConnectionString::SET, servers, setName);
-    return MongoURI(std::move(cs), username, password, database, std::move(options));
+    return MongoURI(
+        std::move(cs), username, password, database, std::move(retryWrites), std::move(options));
 }
 
 StatusWith<MongoURI> MongoURI::parse(const std::string& url) try {
     return parseImpl(url);
 } catch (const std::exception&) {
     return exceptionToStatus();
+}
+
+const boost::optional<std::string> MongoURI::getAppName() const {
+    const auto optIter = _options.find("appname");
+    if (optIter != end(_options)) {
+        return optIter->second;
+    } else {
+        return boost::none;
+    }
 }
 }  // namespace mongo

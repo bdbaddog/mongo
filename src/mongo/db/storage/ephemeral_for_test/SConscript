@@ -28,7 +28,7 @@ env.Library(
         '$BUILD_DIR/mongo/db/namespace_string',
         '$BUILD_DIR/mongo/db/catalog/collection_options',
         '$BUILD_DIR/mongo/db/index/index_descriptor',
-        '$BUILD_DIR/mongo/db/repl/repl_coordinator_global',
+        '$BUILD_DIR/mongo/db/repl/repl_coordinator_interface',
         '$BUILD_DIR/mongo/db/storage/index_entry_comparison',
         '$BUILD_DIR/mongo/db/storage/journal_listener',
         '$BUILD_DIR/mongo/db/storage/kv/kv_prefix',
@@ -39,12 +39,12 @@ env.Library(
     target= 'storage_ephemeral_for_test',
     source= [
         'ephemeral_for_test_init.cpp',
-        ],
+    ],
     LIBDEPS= [
         'storage_ephemeral_for_test_core',
         '$BUILD_DIR/mongo/db/storage/kv/kv_engine'
-        ]
-    )
+    ],
+)
 
 env.CppUnitTest(
    target='storage_ephemeral_for_test_btree_test',
@@ -75,4 +75,8 @@ env.CppUnitTest(
         '$BUILD_DIR/mongo/db/storage/storage_options',
         'storage_ephemeral_for_test_core',
         ],
-    )
+    LIBDEPS_PRIVATE=[
+        '$BUILD_DIR/mongo/db/auth/authorization_manager_mock_init',
+        '$BUILD_DIR/mongo/db/repl/service_context_repl_mock_init',
+    ],
+)

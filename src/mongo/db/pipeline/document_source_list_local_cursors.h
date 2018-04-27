@@ -70,6 +70,14 @@ public:
         bool allowedToForwardFromMongos() const final {
             return false;
         }
+
+        void assertSupportsReadConcern(const repl::ReadConcernArgs& readConcern) const {
+            uassert(ErrorCodes::InvalidOptions,
+                    str::stream() << "Aggregation stage " << kStageName
+                                  << " requires read concern local but found "
+                                  << readConcern.toString(),
+                    readConcern.getLevel() == repl::ReadConcernLevel::kLocalReadConcern);
+        }
     };
 
     GetNextResult getNext() final;
@@ -87,7 +95,8 @@ public:
                                      PositionRequirement::kFirst,
                                      HostTypeRequirement::kLocalOnly,
                                      DiskUseRequirement::kNoDiskUse,
-                                     FacetRequirement::kNotAllowed);
+                                     FacetRequirement::kNotAllowed,
+                                     TransactionRequirement::kNotAllowed);
 
         constraints.isIndependentOfAnyCollection = true;
         constraints.requiresInputDocSource = false;

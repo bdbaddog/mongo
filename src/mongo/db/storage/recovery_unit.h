@@ -35,6 +35,8 @@
 #include "mongo/base/disallow_copying.h"
 #include "mongo/base/status.h"
 #include "mongo/bson/timestamp.h"
+#include "mongo/db/repl/read_concern_level.h"
+#include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/storage/snapshot.h"
 
 namespace mongo {
@@ -71,11 +73,42 @@ public:
     virtual void abortUnitOfWork() = 0;
 
     /**
-     * Waits until all commits that happened before this call are durable. Returns true, unless the
-     * storage engine cannot guarantee durability, which should never happen when isDurable()
-     * returned true. This cannot be called from inside a unit of work, and should fail if it is.
+     * Must be called after beginUnitOfWork and before calling either abortUnitOfWork or
+     * commitUnitOfWork. Transitions the current transaction (unit of work) to the
+     * "prepared" state. Must be overridden by storage engines that support prepared
+     * transactions.
+     *
+     * Must be preceded by a call to setPrepareTimestamp().
+     *
+     * It is not valid to call commitUnitOfWork() afterward without calling setCommitTimestamp()
+     * with a value greater than or equal to the prepare timestamp.
+     * This cannot be called after setTimestamp or setCommitTimestamp.
+     */
+    virtual void prepareUnitOfWork() {
+        uasserted(ErrorCodes::CommandNotSupported,
+                  "This storage engine does not support prepared transactions");
+    }
+
+    /**
+     * Waits until all commits that happened before this call are durable in the journal. Returns
+     * true, unless the storage engine cannot guarantee durability, which should never happen when
+     * isDurable() returned true. This cannot be called from inside a unit of work, and should
+     * fail if it is.
      */
     virtual bool waitUntilDurable() = 0;
+
+    /**
+     * Unlike `waitUntilDurable`, this method takes a stable checkpoint, making durable any writes
+     * on unjournaled tables that are behind the current stable timestamp. If the storage engine
+     * is starting from an "unstable" checkpoint, this method call will turn into an unstable
+     * checkpoint.
+     *
+     * This must not be called by a system taking user writes until after a stable timestamp is
+     * passed to the storage engine.
+     */
+    virtual bool waitUntilUnjournaledWritesDurable() {
+        return waitUntilDurable();
+    }
 
     /**
      * When this is called, if there is an open transaction, it is closed. On return no
@@ -90,12 +123,11 @@ public:
      * transaction resources while minimizing the critical section between generating a new
      * timestamp and setting it using setTimestamp.
      */
-    virtual void prepareSnapshot() {}
+    virtual void preallocateSnapshot() {}
 
     /**
-     * Informs this RecoveryUnit that all future reads through it should be from a snapshot
-     * marked as Majority Committed. Snapshots should still be separately acquired and newer
-     * committed snapshots should be used if available whenever implementations would normally
+     * Obtains a majority committed snapshot. Snapshots should still be separately acquired and
+     * newer committed snapshots should be used if available whenever implementations would normally
      * change snapshots.
      *
      * If no snapshot has yet been marked as Majority Committed, returns a status with error code
@@ -107,28 +139,49 @@ public:
      * StorageEngines that don't support a SnapshotManager should use the default
      * implementation.
      */
-    virtual Status setReadFromMajorityCommittedSnapshot() {
+    virtual Status obtainMajorityCommittedSnapshot() {
         return {ErrorCodes::CommandNotSupported,
                 "Current storage engine does not support majority readConcerns"};
     }
 
     /**
-     * Returns true if setReadFromMajorityCommittedSnapshot() has been called.
+     * Set this operation's readConcern level and replication mode on the recovery unit.
      */
-    virtual bool isReadingFromMajorityCommittedSnapshot() const {
-        return false;
+    void setReadConcernLevelAndReplicationMode(repl::ReadConcernLevel readConcernLevel,
+                                               repl::ReplicationCoordinator::Mode replicationMode) {
+        _readConcernLevel = readConcernLevel;
+        _replicationMode = replicationMode;
+    }
+
+    /**
+     * Returns the readConcern level of this recovery unit.
+     */
+    repl::ReadConcernLevel getReadConcernLevel() const {
+        return _readConcernLevel;
+    }
+
+    /**
+     * Tells the recovery unit to read at the last applied timestamp, tracked by the SnapshotManger.
+     * This should only be set to true for local and available read concerns. This should be used to
+     * read from a consistent state on a secondary while replicated batches are being applied.
+     */
+    void setShouldReadAtLastAppliedTimestamp(bool value) {
+        invariant(!value || _readConcernLevel == repl::ReadConcernLevel::kLocalReadConcern ||
+                  _readConcernLevel == repl::ReadConcernLevel::kAvailableReadConcern);
+        _shouldReadAtLastAppliedTimestamp = value;
     }
 
     /**
      * Returns the Timestamp being used by this recovery unit or boost::none if not reading from
-     * a majority committed snapshot.
-     *
-     * It is possible for reads to occur from later snapshots, but they may not occur from earlier
-     * snapshots.
+     * a point in time. Any point in time returned will reflect either:
+     *  - A timestamp set via call to setPointInTimeReadTimestamp()
+     *  - A majority committed snapshot timestamp (chosen by the storage engine when read-majority
+     *    has been enabled via call to obtainMajorityCommittedSnapshot())
      */
-    virtual boost::optional<Timestamp> getMajorityCommittedSnapshot() const {
-        dassert(!isReadingFromMajorityCommittedSnapshot());
-        return {};
+    virtual boost::optional<Timestamp> getPointInTimeReadTimestamp() const {
+        invariant(_readConcernLevel != repl::ReadConcernLevel::kMajorityReadConcern &&
+                  _readConcernLevel != repl::ReadConcernLevel::kSnapshotReadConcern);
+        return boost::none;
     }
 
     /**
@@ -161,15 +214,28 @@ public:
      * must not be called while a commit timestamp is set.
      */
     virtual void setCommitTimestamp(Timestamp timestamp) {}
+
     virtual void clearCommitTimestamp() {}
+
     virtual Timestamp getCommitTimestamp() {
         return {};
     }
 
     /**
-     * Chooses which timestamp to use for read transactions.
+     * Sets a prepare timestamp for the current transaction. A subsequent call to
+     * prepareUnitOfWork() is expected and required.
+     * This cannot be called after setTimestamp or setCommitTimestamp.
+     * This must be called inside a WUOW and may only be called once.
      */
-    virtual Status selectSnapshot(Timestamp timestamp) {
+    virtual void setPrepareTimestamp(Timestamp timestamp) {
+        uasserted(ErrorCodes::CommandNotSupported,
+                  "This storage engine does not support prepared transactions");
+    }
+
+    /**
+     * Sets which timestamp to use for read transactions.
+     */
+    virtual Status setPointInTimeReadTimestamp(Timestamp timestamp) {
         return Status(ErrorCodes::CommandNotSupported,
                       "point-in-time reads are not implemented for this storage engine");
     }
@@ -292,8 +358,13 @@ public:
      */
     virtual void setRollbackWritesDisabled() = 0;
 
+    virtual void setOrderedCommit(bool orderedCommit) = 0;
+
 protected:
     RecoveryUnit() {}
+    repl::ReplicationCoordinator::Mode _replicationMode = repl::ReplicationCoordinator::modeNone;
+    repl::ReadConcernLevel _readConcernLevel = repl::ReadConcernLevel::kLocalReadConcern;
+    bool _shouldReadAtLastAppliedTimestamp = false;
 };
 
 }  // namespace mongo

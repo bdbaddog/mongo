@@ -57,8 +57,8 @@ class KillAllSessionsCommand final : public BasicCommand {
 public:
     KillAllSessionsCommand() : BasicCommand("killAllSessions") {}
 
-    bool slaveOk() const override {
-        return true;
+    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
+        return AllowedOnSecondary::kAlways;
     }
     bool adminOnly() const override {
         return false;
@@ -66,18 +66,12 @@ public:
     bool supportsWriteConcern(const BSONObj& cmd) const override {
         return false;
     }
-    void help(std::stringstream& help) const override {
-        help << "kill all logical sessions, for a user, and their operations";
+    std::string help() const override {
+        return "kill all logical sessions, for a user, and their operations";
     }
     Status checkAuthForOperation(OperationContext* opCtx,
                                  const std::string& dbname,
-                                 const BSONObj& cmdObj) override {
-
-        if (serverGlobalParams.featureCompatibility.getVersion() !=
-            ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo36) {
-            return SessionsCommandFCV34Status(getName());
-        }
-
+                                 const BSONObj& cmdObj) const override {
         AuthorizationSession* authSession = AuthorizationSession::get(opCtx->getClient());
         if (!authSession->isAuthorizedForPrivilege(
                 Privilege{ResourcePattern::forClusterResource(), ActionType::killAnySession})) {
@@ -91,12 +85,6 @@ public:
                      const std::string& db,
                      const BSONObj& cmdObj,
                      BSONObjBuilder& result) override {
-
-        if (serverGlobalParams.featureCompatibility.getVersion() !=
-            ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo36) {
-            return appendCommandStatus(result, SessionsCommandFCV34Status(getName()));
-        }
-
         IDLParserErrorContext ctx("KillAllSessionsCmd");
         auto ksc = KillAllSessionsCmd::parse(ctx, cmdObj);
 
@@ -113,7 +101,8 @@ public:
             }
         }
 
-        return appendCommandStatus(result, killSessionsCmdHelper(opCtx, result, patterns));
+        return CommandHelpers::appendCommandStatus(result,
+                                                   killSessionsCmdHelper(opCtx, result, patterns));
     }
 } killAllSessionsCommand;
 

@@ -29,6 +29,8 @@
 #pragma once
 
 #include "mongo/db/repl/optime.h"
+#include "mongo/s/catalog/sharding_catalog_client.h"
+#include "mongo/s/client/shard_registry.h"
 #include "mongo/stdx/functional.h"
 #include "mongo/stdx/memory.h"
 #include "mongo/stdx/mutex.h"
@@ -37,11 +39,9 @@ namespace mongo {
 
 class BalancerConfiguration;
 class CatalogCache;
-class ShardingCatalogClient;
 class ClusterCursorManager;
 class OperationContext;
 class ServiceContext;
-class ShardRegistry;
 
 namespace executor {
 struct ConnectionPoolStats;
@@ -80,6 +80,18 @@ public:
               std::unique_ptr<BalancerConfiguration> balancerConfig,
               std::unique_ptr<executor::TaskExecutorPool> executorPool,
               executor::NetworkInterface* network);
+
+    /**
+     * Used to check if sharding is initialized for usage of global sharding services. Protected by
+     * an atomic access guard.
+     */
+    bool isShardingInitialized() const;
+
+    /**
+     * Used to indicate the sharding initialization process is complete. Should only be called once
+     * in the lifetime of a server. Protected by an atomic access guard.
+     */
+    void setShardingInitialized();
 
     /**
      * If the instance as which this sharding component is running (config/shard/mongos) uses
@@ -172,6 +184,8 @@ private:
     executor::NetworkInterface* _network{nullptr};
 
     CustomConnectionPoolStatsFn _customConnectionPoolStatsFn;
+
+    AtomicBool _shardingInitialized{false};
 
     // Protects _configOpTime.
     mutable stdx::mutex _mutex;

@@ -40,7 +40,6 @@
 #include "mongo/db/query/canonical_query.h"
 #include "mongo/db/query/get_executor.h"
 #include "mongo/db/query/query_planner_common.h"
-#include "mongo/db/repl/replication_coordinator_global.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/log.h"
 #include "mongo/util/mongoutils/str.h"
@@ -110,18 +109,7 @@ const DeleteRequest* ParsedDelete::getRequest() const {
 }
 
 PlanExecutor::YieldPolicy ParsedDelete::yieldPolicy() const {
-    if (_request->isGod()) {
-        return PlanExecutor::NO_YIELD;
-    }
-    if (_request->getYieldPolicy() == PlanExecutor::YIELD_AUTO && isIsolated()) {
-        return PlanExecutor::WRITE_CONFLICT_RETRY_ONLY;  // Don't yield locks.
-    }
-    return _request->getYieldPolicy();
-}
-
-bool ParsedDelete::isIsolated() const {
-    return _canonicalQuery.get() ? _canonicalQuery->isIsolated()
-                                 : QueryRequest::isQueryIsolated(_request->getQuery());
+    return _request->isGod() ? PlanExecutor::NO_YIELD : _request->getYieldPolicy();
 }
 
 bool ParsedDelete::hasParsedQuery() const {

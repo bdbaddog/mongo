@@ -119,9 +119,9 @@ bool IndexFilterCommand::run(OperationContext* opCtx,
                              const string& dbname,
                              const BSONObj& cmdObj,
                              BSONObjBuilder& result) {
-    const NamespaceString nss(parseNsCollectionRequired(dbname, cmdObj));
+    const NamespaceString nss(CommandHelpers::parseNsCollectionRequired(dbname, cmdObj));
     Status status = runIndexFilterCommand(opCtx, nss.ns(), cmdObj, &result);
-    return appendCommandStatus(result, status);
+    return CommandHelpers::appendCommandStatus(result, status);
 }
 
 
@@ -129,21 +129,17 @@ bool IndexFilterCommand::supportsWriteConcern(const BSONObj& cmd) const {
     return false;
 }
 
-bool IndexFilterCommand::slaveOk() const {
-    return false;
+Command::AllowedOnSecondary IndexFilterCommand::secondaryAllowed(ServiceContext*) const {
+    return AllowedOnSecondary::kOptIn;
 }
 
-bool IndexFilterCommand::slaveOverrideOk() const {
-    return true;
-}
-
-void IndexFilterCommand::help(stringstream& ss) const {
-    ss << helpText;
+std::string IndexFilterCommand::help() const {
+    return helpText;
 }
 
 Status IndexFilterCommand::checkAuthForCommand(Client* client,
                                                const std::string& dbname,
-                                               const BSONObj& cmdObj) {
+                                               const BSONObj& cmdObj) const {
     AuthorizationSession* authzSession = AuthorizationSession::get(client);
     ResourcePattern pattern = parseResourcePattern(dbname, cmdObj);
 
@@ -317,7 +313,7 @@ Status ClearFilters::clear(OperationContext* opCtx,
                                          expCtx,
                                          extensionsCallback,
                                          MatchExpressionParser::kAllowAllSpecialFeatures);
-        invariantOK(statusWithCQ.getStatus());
+        invariant(statusWithCQ.getStatus());
         std::unique_ptr<CanonicalQuery> cq = std::move(statusWithCQ.getValue());
 
         // Remove plan cache entry.

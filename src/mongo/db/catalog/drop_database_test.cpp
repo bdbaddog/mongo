@@ -39,6 +39,7 @@
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/op_observer.h"
 #include "mongo/db/op_observer_noop.h"
+#include "mongo/db/op_observer_registry.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/repl/drop_pending_collection_reaper.h"
 #include "mongo/db/repl/oplog.h"
@@ -97,7 +98,8 @@ repl::OpTime OpObserverMock::onDropCollection(OperationContext* opCtx,
     uassert(
         ErrorCodes::OperationFailed, "onDropCollection() failed", !onDropCollectionThrowsException);
 
-    return opTime;
+    OpObserver::Times::get(opCtx).reservedOpTimes.push_back(opTime);
+    return {};
 }
 
 class DropDatabaseTest : public ServiceContextMongoDTest {
@@ -136,16 +138,18 @@ void DropDatabaseTest::setUp() {
     auto replCoord = stdx::make_unique<repl::ReplicationCoordinatorMock>(service);
     _replCoord = replCoord.get();
     repl::ReplicationCoordinator::set(service, std::move(replCoord));
-    repl::setOplogCollectionName();
+    repl::setOplogCollectionName(service);
     repl::createOplog(_opCtx.get());
 
     // Ensure that we are primary.
     ASSERT_OK(_replCoord->setFollowerMode(repl::MemberState::RS_PRIMARY));
 
     // Use OpObserverMock to track notifications for collection and database drops.
-    auto opObserver = stdx::make_unique<OpObserverMock>();
-    _opObserver = opObserver.get();
-    service->setOpObserver(std::move(opObserver));
+    OpObserverRegistry* opObserverRegistry =
+        dynamic_cast<OpObserverRegistry*>(service->getOpObserver());
+    auto mockObserver = stdx::make_unique<OpObserverMock>();
+    _opObserver = mockObserver.get();
+    opObserverRegistry->addObserver(std::move(mockObserver));
 
     _nss = NamespaceString("test.foo");
 }
@@ -334,7 +338,7 @@ void _testDropDatabaseResetsDropPendingStateIfAwaitReplicationFails(OperationCon
 
 TEST_F(DropDatabaseTest,
        DropDatabaseResetsDropPendingStateIfAwaitReplicationFailsAndDatabaseIsPresent) {
-    // Update ReplicationCoordinatorMock so that awaitReplicationOfLastOpForClient() fails.
+    // Update ReplicationCoordinatorMock so that awaitReplication() fails.
     _replCoord->setAwaitReplicationReturnValueFunction([](const repl::OpTime&) {
         return repl::ReplicationCoordinator::StatusAndDuration(
             Status(ErrorCodes::WriteConcernFailed, ""), Milliseconds(0));
@@ -345,7 +349,7 @@ TEST_F(DropDatabaseTest,
 
 TEST_F(DropDatabaseTest,
        DropDatabaseResetsDropPendingStateIfAwaitReplicationFailsAndDatabaseIsMissing) {
-    // Update ReplicationCoordinatorMock so that awaitReplicationOfLastOpForClient() fails.
+    // Update ReplicationCoordinatorMock so that awaitReplication() fails.
     _replCoord->setAwaitReplicationReturnValueFunction([this](const repl::OpTime&) {
         _removeDatabaseFromCatalog(_opCtx.get(), _nss.db());
         return repl::ReplicationCoordinator::StatusAndDuration(
@@ -359,10 +363,11 @@ TEST_F(DropDatabaseTest,
        DropDatabaseReleasesLocksWhileCallingAwaitReplicationIfCalledWhileHoldingGlobalLock) {
     // The applyOps command holds the global lock while calling dropDatabase().
     // dropDatabase() should detect this and release the global lock temporarily if it needs to call
-    // ReplicationCoordinator::awaitReplicationOfLastOpForClient().
+    // ReplicationCoordinator::awaitReplication().
     bool isAwaitReplicationCalled = false;
     _replCoord->setAwaitReplicationReturnValueFunction([&, this](const repl::OpTime& opTime) {
         isAwaitReplicationCalled = true;
+        // This test does not set the client's last optime.
         ASSERT_EQUALS(opTime, repl::OpTime());
         ASSERT_FALSE(_opCtx->lockState()->isW());
         ASSERT_FALSE(_opCtx->lockState()->isDbLockedForMode(_nss.db(), MODE_X));
@@ -407,7 +412,7 @@ TEST_F(DropDatabaseTest,
 
 TEST_F(DropDatabaseTest,
        DropDatabaseReturnsNamespaceNotFoundIfDatabaseIsRemovedAfterCollectionsDropsAreReplicated) {
-    // Update ReplicationCoordinatorMock so that awaitReplicationOfLastOpForClient() fails.
+    // Update ReplicationCoordinatorMock so that awaitReplication() fails.
     _replCoord->setAwaitReplicationReturnValueFunction([this](const repl::OpTime&) {
         _removeDatabaseFromCatalog(_opCtx.get(), _nss.db());
         return repl::ReplicationCoordinator::StatusAndDuration(Status::OK(), Milliseconds(0));
@@ -452,6 +457,15 @@ TEST_F(DropDatabaseTest,
     auto db = autoDb.getDb();
     ASSERT_TRUE(db);
     ASSERT_FALSE(db->isDropPending(_opCtx.get()));
+}
+
+TEST_F(DropDatabaseTest, DropDatabaseFailsToDropAdmin) {
+    NamespaceString adminNSS(NamespaceString::kAdminDb, "foo");
+    _createCollection(_opCtx.get(), adminNSS);
+    ASSERT_THROWS_CODE_AND_WHAT(dropDatabase(_opCtx.get(), adminNSS.db().toString()).ignore(),
+                                AssertionException,
+                                ErrorCodes::IllegalOperation,
+                                "Dropping the 'admin' database is prohibited.");
 }
 
 }  // namespace

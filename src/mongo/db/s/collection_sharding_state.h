@@ -32,21 +32,15 @@
 #include <string>
 
 #include "mongo/base/disallow_copying.h"
-#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonobj.h"
 #include "mongo/db/namespace_string.h"
-#include "mongo/db/s/collection_range_deleter.h"
 #include "mongo/db/s/metadata_manager.h"
-#include "mongo/util/concurrency/notification.h"
+#include "mongo/db/s/sharding_migration_critical_section.h"
+#include "mongo/util/decorable.h"
 
 namespace mongo {
 
-class BalancerConfiguration;
-class BSONObj;
-struct ChunkVersion;
-class CollectionMetadata;
-class MigrationSourceManager;
 class OperationContext;
-class Timestamp;
 
 /**
  * Contains all sharding-related runtime state for a given collection. One such object is assigned
@@ -56,7 +50,7 @@ class Timestamp;
  * Synchronization rules: In order to look-up this object in the instance's sharding map, one must
  * have some lock on the respective collection.
  */
-class CollectionShardingState {
+class CollectionShardingState : public Decorable<CollectionShardingState> {
     MONGO_DISALLOW_COPYING(CollectionShardingState);
 
 public:
@@ -66,22 +60,6 @@ public:
      * Instantiates a new per-collection sharding state as unsharded.
      */
     CollectionShardingState(ServiceContext* sc, NamespaceString nss);
-    ~CollectionShardingState();
-
-    /**
-     * Details of documents being removed from a sharded collection.
-     */
-    struct DeleteState {
-        // Contains the fields of the document that are in the collection's shard key, and "_id".
-        BSONObj documentKey;
-
-        // True if the document being deleted belongs to a chunk which, while still in the shard,
-        // is being migrated out. (Not to be confused with "fromMigrate", which tags operations
-        // that are steps in performing the migration.)
-        bool isMigrating;
-    };
-
-    DeleteState makeDeleteState(BSONObj const& doc);
 
     /**
      * Obtains the sharding state for the specified collection. If it does not exist, it will be
@@ -93,12 +71,17 @@ public:
     static CollectionShardingState* get(OperationContext* opCtx, const NamespaceString& nss);
     static CollectionShardingState* get(OperationContext* opCtx, const std::string& ns);
 
+    static void resetAll(OperationContext* opCtx);
+    static void report(OperationContext* opCtx, BSONObjBuilder* builder);
+
     /**
      * Returns the chunk metadata for the collection. The metadata it represents lives as long as
      * the object itself, and the collection, exist. After dropping the collection lock, the
      * collection may no longer exist, but it is still safe to destroy the object.
+     * The metadata is tied to a specific point in time (atClusterTime) and the time is retrieved
+     * from the operation context (opCtx).
      */
-    ScopedCollectionMetadata getMetadata();
+    ScopedCollectionMetadata getMetadata(OperationContext* opCtx);
 
     /**
      * BSON output of the pending metadata into a BSONArray
@@ -158,23 +141,16 @@ public:
     std::vector<ScopedCollectionMetadata> overlappingMetadata(ChunkRange const& range) const;
 
     /**
-     * Returns the active migration source manager, if one is available.
+     * Methods to control the collection's critical section. Must be called with the collection X
+     * lock held.
      */
-    MigrationSourceManager* getMigrationSourceManager();
+    void enterCriticalSectionCatchUpPhase(OperationContext* opCtx);
+    void enterCriticalSectionCommitPhase(OperationContext* opCtx);
+    void exitCriticalSection(OperationContext* opCtx);
 
-    /**
-     * Attaches a migration source manager to this collection's sharding state. Must be called with
-     * collection X lock. May not be called if there is a migration source manager already
-     * installed. Must be followed by a call to clearMigrationSourceManager.
-     */
-    void setMigrationSourceManager(OperationContext* opCtx, MigrationSourceManager* sourceMgr);
-
-    /**
-     * Removes a migration source manager from this collection's sharding state. Must be called with
-     * collection X lock. May not be called if there isn't a migration source manager installed
-     * already through a previous call to setMigrationSourceManager.
-     */
-    void clearMigrationSourceManager(OperationContext* opCtx);
+    auto getCriticalSectionSignal(ShardingMigrationCriticalSection::Operation op) const {
+        return _critSec.getSignal(op);
+    }
 
     /**
      * Checks whether the shard version in the context is compatible with the shard version of the
@@ -191,7 +167,7 @@ public:
      * Returns whether this collection is sharded. Valid only if mongoD is primary.
      * TODO SERVER-24960: This method may return a false positive until SERVER-24960 is fixed.
      */
-    bool collectionIsSharded();
+    bool collectionIsSharded(OperationContext* opCtx);
 
     /**
      * Tracks deletion of any documents within the range, returning when deletion is complete.
@@ -217,70 +193,7 @@ public:
      */
     boost::optional<ChunkRange> getNextOrphanRange(BSONObj const& startingFrom);
 
-    /**
-     * Replication oplog OpObserver hooks. Informs the sharding system of changes that may be
-     * relevant to ongoing operations.
-     *
-     * The global exclusive lock is expected to be held by the caller of any of these functions.
-     */
-    void onInsertOp(OperationContext* opCtx,
-                    const BSONObj& insertedDoc,
-                    const repl::OpTime& opTime);
-    void onUpdateOp(OperationContext* opCtx,
-                    const BSONObj& query,
-                    const BSONObj& update,
-                    const BSONObj& updatedDoc,
-                    const repl::OpTime& opTime,
-                    const repl::OpTime& prePostImageOpTime);
-    void onDeleteOp(OperationContext* opCtx,
-                    const DeleteState& deleteState,
-                    const repl::OpTime& opTime,
-                    const repl::OpTime& preImageOpTime);
-    void onDropCollection(OperationContext* opCtx, const NamespaceString& collectionName);
-
 private:
-    /**
-     * This runs on updates to the shard's persisted cache of the config server's
-     * config.collections collection.
-     *
-     * If an update occurs to the 'lastRefreshedCollectionVersion' field, registers a task on the
-     * opCtx -- to run after writes from the oplog are committed and visible to reads -- to notify
-     * the catalog cache loader of a new collection version and clear the routing table so the next
-     * caller with routing information will provoke a routing table refresh. When
-     * 'lastRefreshedCollectionVersion' is in 'update', it means that a chunk metadata refresh
-     * finished being applied to the collection's locally persisted metadata store.
-     *
-     * If an update occurs to the 'enterCriticalSectionSignal' field, simply clear the routing table
-     * immediately. This will provoke the next secondary caller to refresh through the primary,
-     * blocking behind the critical section.
-     *
-     * query - BSON with an _id that identifies which collections entry is being updated.
-     * update - the update being applied to the collections entry.
-     * updatedDoc - the document identified by 'query' with the 'update' applied.
-     *
-     * This only runs on secondaries.
-     * The global exclusive lock is expected to be held by the caller.
-     */
-    void _onConfigCollectionsUpdateOp(OperationContext* opCtx,
-                                      const BSONObj& query,
-                                      const BSONObj& update,
-                                      const BSONObj& updatedDoc);
-
-    /**
-     * Invalidates the in-memory routing table cache when a collection is dropped, so the next
-     * caller with routing information will provoke a routing table refresh and see the drop.
-     *
-     * Registers a task on the opCtx -- to run after writes from the oplog are committed and visible
-     * to reads.
-     *
-     * query - BSON with an _id field that identifies which collections entry is being updated.
-     *
-     * This only runs on secondaries.
-     * The global exclusive lock is expected to be held by the caller.
-     */
-    void _onConfigDeleteInvalidateCachedMetadataAndNotify(OperationContext* opCtx,
-                                                          const BSONObj& query);
-
     /**
      * Checks whether the shard version of the operation matches that of the collection.
      *
@@ -299,35 +212,13 @@ private:
                               ChunkVersion* expectedShardVersion,
                               ChunkVersion* actualShardVersion);
 
-    /**
-     * If the collection is sharded, finds the chunk that contains the specified document, and
-     * increments the size tracked for that chunk by the specified amount of data written, in
-     * bytes. Returns the number of total bytes on that chunk, after the data is written.
-     */
-    uint64_t _incrementChunkOnInsertOrUpdate(OperationContext* opCtx,
-                                             const BSONObj& document,
-                                             long dataWritten);
-
-    /**
-     * Returns true if the total number of bytes on the specified chunk nears the max size of
-     * a shard.
-     */
-    bool _shouldSplitChunk(OperationContext* opCtx,
-                           const ShardKeyPattern& shardKeyPattern,
-                           const Chunk& chunk);
-
     // Namespace this state belongs to.
     const NamespaceString _nss;
 
     // Contains all the metadata associated with this collection.
     std::shared_ptr<MetadataManager> _metadataManager;
 
-    // If this collection is serving as a source shard for chunk migration, this value will be
-    // non-null. To write this value there needs to be X-lock on the collection in order to
-    // synchronize with other callers, which read it.
-    //
-    // NOTE: The value is not owned by this class.
-    MigrationSourceManager* _sourceMgr{nullptr};
+    ShardingMigrationCriticalSection _critSec;
 
     // for access to _metadataManager
     friend auto CollectionRangeDeleter::cleanUpNextRange(OperationContext*,

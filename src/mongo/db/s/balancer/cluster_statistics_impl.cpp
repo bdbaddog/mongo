@@ -32,10 +32,11 @@
 
 #include "mongo/db/s/balancer/cluster_statistics_impl.h"
 
+#include <algorithm>
+
 #include "mongo/base/status_with.h"
 #include "mongo/bson/util/bson_extract.h"
 #include "mongo/client/read_preference.h"
-#include "mongo/s/catalog/sharding_catalog_client.h"
 #include "mongo/s/catalog/type_shard.h"
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/grid.h"
@@ -44,10 +45,6 @@
 #include "mongo/util/mongoutils/str.h"
 
 namespace mongo {
-
-using std::string;
-using std::vector;
-
 namespace {
 
 const char kVersionField[] = "version";
@@ -60,7 +57,7 @@ const char kVersionField[] = "version";
  *  ShardNotFound if shard by that id is not available on the registry
  *  NoSuchKey if the version could not be retrieved
  */
-StatusWith<string> retrieveShardMongoDVersion(OperationContext* opCtx, ShardId shardId) {
+StatusWith<std::string> retrieveShardMongoDVersion(OperationContext* opCtx, ShardId shardId) {
     auto shardRegistry = Grid::get(opCtx)->shardRegistry();
     auto shardStatus = shardRegistry->getShard(opCtx, shardId);
     if (!shardStatus.isOK()) {
@@ -83,7 +80,7 @@ StatusWith<string> retrieveShardMongoDVersion(OperationContext* opCtx, ShardId s
 
     BSONObj serverStatus = std::move(commandResponse.getValue().response);
 
-    string version;
+    std::string version;
     Status status = bsonExtractStringField(serverStatus, kVersionField, &version);
     if (!status.isOK()) {
         return status;
@@ -96,11 +93,11 @@ StatusWith<string> retrieveShardMongoDVersion(OperationContext* opCtx, ShardId s
 
 using ShardStatistics = ClusterStatistics::ShardStatistics;
 
-ClusterStatisticsImpl::ClusterStatisticsImpl() = default;
+ClusterStatisticsImpl::ClusterStatisticsImpl(BalancerRandomSource& random) : _random(random) {}
 
 ClusterStatisticsImpl::~ClusterStatisticsImpl() = default;
 
-StatusWith<vector<ShardStatistics>> ClusterStatisticsImpl::getStats(OperationContext* opCtx) {
+StatusWith<std::vector<ShardStatistics>> ClusterStatisticsImpl::getStats(OperationContext* opCtx) {
     // Get a list of all the shards that are participating in this balance round along with any
     // maximum allowed quotas and current utilization. We get the latter by issuing
     // db.serverStatus() (mem.mapped) to all shards.
@@ -112,9 +109,11 @@ StatusWith<vector<ShardStatistics>> ClusterStatisticsImpl::getStats(OperationCon
         return shardsStatus.getStatus();
     }
 
-    const vector<ShardType> shards(std::move(shardsStatus.getValue().value));
+    auto& shards = shardsStatus.getValue().value;
 
-    vector<ShardStatistics> stats;
+    std::shuffle(shards.begin(), shards.end(), _random);
+
+    std::vector<ShardStatistics> stats;
 
     for (const auto& shard : shards) {
         const auto shardSizeStatus = [&]() -> StatusWith<long long> {
@@ -128,14 +127,12 @@ StatusWith<vector<ShardStatistics>> ClusterStatisticsImpl::getStats(OperationCon
         if (!shardSizeStatus.isOK()) {
             const auto& status = shardSizeStatus.getStatus();
 
-            return {status.code(),
-                    str::stream() << "Unable to obtain shard utilization information for "
-                                  << shard.getName()
-                                  << " due to "
-                                  << status.reason()};
+            return status.withContext(str::stream()
+                                      << "Unable to obtain shard utilization information for "
+                                      << shard.getName());
         }
 
-        string mongoDVersion;
+        std::string mongoDVersion;
 
         auto mongoDVersionStatus = retrieveShardMongoDVersion(opCtx, shard.getName());
         if (mongoDVersionStatus.isOK()) {
@@ -147,7 +144,7 @@ StatusWith<vector<ShardStatistics>> ClusterStatisticsImpl::getStats(OperationCon
                   << causedBy(mongoDVersionStatus.getStatus());
         }
 
-        std::set<string> shardTags;
+        std::set<std::string> shardTags;
 
         for (const auto& shardTag : shard.getTags()) {
             shardTags.insert(shardTag);

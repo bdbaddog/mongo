@@ -79,6 +79,14 @@ public:
             return false;
         }
 
+        void assertSupportsReadConcern(const repl::ReadConcernArgs& readConcern) const {
+            uassert(ErrorCodes::InvalidOptions,
+                    str::stream() << "Aggregation stage " << kStageName
+                                  << " requires read concern local but found "
+                                  << readConcern.toString(),
+                    readConcern.getLevel() == repl::ReadConcernLevel::kLocalReadConcern);
+        }
+
     private:
         const ListSessionsSpec _spec;
     };
@@ -98,7 +106,8 @@ public:
                                      PositionRequirement::kFirst,
                                      HostTypeRequirement::kLocalOnly,
                                      DiskUseRequirement::kNoDiskUse,
-                                     FacetRequirement::kNotAllowed);
+                                     FacetRequirement::kNotAllowed,
+                                     TransactionRequirement::kNotAllowed);
 
         constraints.isIndependentOfAnyCollection = true;
         constraints.requiresInputDocSource = false;

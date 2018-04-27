@@ -39,7 +39,6 @@
 #include "mongo/stdx/memory.h"
 #include "mongo/util/clock_source.h"
 #include "mongo/util/debug_util.h"
-#include "mongo/util/net/listen.h"
 #include "mongo/util/processinfo.h"
 
 namespace mongo {
@@ -48,7 +47,7 @@ namespace {
 
 static bool blockSupported = false;
 
-MONGO_INITIALIZER_WITH_PREREQUISITES(RecordBlockSupported, ("SystemInfo"))(InitializerContext* cx) {
+MONGO_INITIALIZER(RecordBlockSupported)(InitializerContext* cx) {
     blockSupported = ProcessInfo::blockCheckSupported();
     return Status::OK();
 }

@@ -34,6 +34,7 @@
 #include "mongo/db/auth/user_name.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/logical_session_id.h"
+#include "mongo/s/query/cluster_client_cursor_params.h"
 #include "mongo/s/query/cluster_query_result.h"
 #include "mongo/s/query/router_exec_stage.h"
 #include "mongo/util/time_support.h"
@@ -90,6 +91,11 @@ public:
     virtual void detachFromOperationContext() = 0;
 
     /**
+     * Return the current context the cursor is attached to, if any.
+     */
+    virtual OperationContext* getCurrentOperationContext() const = 0;
+
+    /**
      * Returns whether or not this cursor is tailable.
      */
     virtual bool isTailable() const = 0;
@@ -100,9 +106,14 @@ public:
     virtual bool isTailableAndAwaitData() const = 0;
 
     /**
-     * Returns the set of authenticated users when this cursor was created.
+     * Returns the original command object which created this cursor.
      */
-    virtual UserNameIterator getAuthenticatedUsers() const = 0;
+    virtual BSONObj getOriginatingCommand() const = 0;
+
+    /**
+     * Returns a reference to the vector of remote hosts involved in this operation.
+     */
+    virtual std::size_t getNumRemotes() const = 0;
 
     /**
      * Returns the number of result documents returned so far by this cursor via the next() method.
@@ -140,9 +151,42 @@ public:
     virtual boost::optional<LogicalSessionId> getLsid() const = 0;
 
     /**
+     * Returns the transaction number for this cursor.
+     */
+    virtual boost::optional<TxnNumber> getTxnNumber() const = 0;
+
+    /**
      * Returns the readPreference for this cursor.
      */
     virtual boost::optional<ReadPreferenceSetting> getReadPreference() const = 0;
+
+    //
+    // maxTimeMS support.
+    //
+
+    /**
+     * Returns the amount of time execution time available to this cursor. Only valid at the
+     * beginning of a getMore request, and only really for use by the maxTime tracking code.
+     *
+     * Microseconds::max() == infinity, values less than 1 mean no time left.
+     */
+    Microseconds getLeftoverMaxTimeMicros() const {
+        return _leftoverMaxTimeMicros;
+    }
+
+    /**
+     * Sets the amount of execution time available to this cursor. This is only called when an
+     * operation that uses a cursor is finishing, to update its remaining time.
+     *
+     * Microseconds::max() == infinity, values less than 1 mean no time left.
+     */
+    void setLeftoverMaxTimeMicros(Microseconds leftoverMaxTimeMicros) {
+        _leftoverMaxTimeMicros = leftoverMaxTimeMicros;
+    }
+
+private:
+    // Unused maxTime budget for this cursor.
+    Microseconds _leftoverMaxTimeMicros = Microseconds::max();
 };
 
 }  // namespace mongo

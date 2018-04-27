@@ -43,6 +43,28 @@
 
 namespace mongo {
 
+// Including builder.h here would cause a cycle.
+template <typename Allocator>
+class StringBuilderImpl;
+
+template <typename T>
+class StatusWith;
+
+// Using extern constexpr to prevent the compiler from allocating storage as a poor man's c++17
+// inline constexpr variable.
+// TODO delete extern in c++17 because inline is the default for constexper variables.
+template <typename T>
+extern constexpr bool isStatusWith = false;
+template <typename T>
+extern constexpr bool isStatusWith<StatusWith<T>> = true;
+
+template <typename T>
+extern constexpr bool isStatusOrStatusWith =
+    std::is_same<T, mongo::Status>::value || isStatusWith<T>;
+
+template <typename T>
+using StatusOrStatusWith = std::conditional_t<std::is_void<T>::value, Status, StatusWith<T>>;
+
 /**
  * StatusWith is used to return an error or a value.
  * This class is designed to make exception-free code cleaner by not needing as many out
@@ -62,10 +84,12 @@ namespace mongo {
  */
 template <typename T>
 class MONGO_WARN_UNUSED_RESULT_CLASS StatusWith {
-    MONGO_STATIC_ASSERT_MSG(!(std::is_same<T, mongo::Status>::value),
-                            "StatusWith<Status> is banned.");
+    MONGO_STATIC_ASSERT_MSG(!isStatusOrStatusWith<T>,
+                            "StatusWith<Status> and StatusWith<StatusWith<T>> are banned.");
 
 public:
+    using value_type = T;
+
     /**
      * for the error case
      */
@@ -109,7 +133,6 @@ public:
         return _status.isOK();
     }
 
-
     /**
      * This method is a transitional tool, to facilitate transition to compile-time enforced status
      * checking.
@@ -136,7 +159,18 @@ StatusWith<T> makeStatusWith(Args&&... args) {
 }
 
 template <typename T>
-std::ostream& operator<<(std::ostream& stream, const StatusWith<T>& sw) {
+auto operator<<(std::ostream& stream, const StatusWith<T>& sw)
+    -> decltype(stream << sw.getValue())  // SFINAE on T streamability.
+{
+    if (sw.isOK())
+        return stream << sw.getValue();
+    return stream << sw.getStatus();
+}
+
+template <typename Allocator, typename T>
+auto operator<<(StringBuilderImpl<Allocator>& stream, const StatusWith<T>& sw)
+    -> decltype(stream << sw.getValue())  // SFINAE on T streamability.
+{
     if (sw.isOK())
         return stream << sw.getValue();
     return stream << sw.getStatus();

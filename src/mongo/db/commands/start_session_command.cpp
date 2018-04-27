@@ -51,8 +51,8 @@ class StartSessionCommand final : public BasicCommand {
 public:
     StartSessionCommand() : BasicCommand("startSession") {}
 
-    bool slaveOk() const override {
-        return true;
+    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
+        return AllowedOnSecondary::kAlways;
     }
     bool adminOnly() const override {
         return false;
@@ -60,18 +60,12 @@ public:
     bool supportsWriteConcern(const BSONObj& cmd) const override {
         return false;
     }
-    void help(std::stringstream& help) const override {
-        help << "start a logical session";
+    std::string help() const override {
+        return "start a logical session";
     }
     Status checkAuthForOperation(OperationContext* opCtx,
                                  const std::string& dbname,
-                                 const BSONObj& cmdObj) override {
-
-        if (serverGlobalParams.featureCompatibility.getVersion() !=
-            ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo36) {
-            return SessionsCommandFCV34Status(getName());
-        }
-
+                                 const BSONObj& cmdObj) const override {
         return Status::OK();
     }
 
@@ -79,12 +73,6 @@ public:
                      const std::string& db,
                      const BSONObj& cmdObj,
                      BSONObjBuilder& result) override {
-
-        if (serverGlobalParams.featureCompatibility.getVersion() !=
-            ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo36) {
-            return appendCommandStatus(result, SessionsCommandFCV34Status(getName()));
-        }
-
         auto client = opCtx->getClient();
         ServiceContext* serviceContext = client->getServiceContext();
 
@@ -96,7 +84,7 @@ public:
         } catch (...) {
             auto status = exceptionToStatus();
 
-            return appendCommandStatus(result, status);
+            return CommandHelpers::appendCommandStatus(result, status);
         }
 
         lsCache->startSession(opCtx, record.get());

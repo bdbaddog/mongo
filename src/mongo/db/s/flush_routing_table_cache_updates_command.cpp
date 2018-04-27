@@ -35,13 +35,14 @@
 #include "mongo/db/auth/authorization_manager.h"
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/auth/privilege.h"
-#include "mongo/db/catalog/catalog_raii.h"
+#include "mongo/db/catalog_raii.h"
 #include "mongo/db/client.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/repl/repl_client_info.h"
 #include "mongo/db/s/migration_source_manager.h"
 #include "mongo/db/s/operation_sharding_state.h"
+#include "mongo/db/s/shard_filtering_metadata_refresh.h"
 #include "mongo/db/s/sharding_state.h"
 #include "mongo/s/catalog_cache_loader.h"
 #include "mongo/s/grid.h"
@@ -51,108 +52,95 @@
 namespace mongo {
 namespace {
 
-class FlushRoutingTableCacheUpdates : public BasicCommand {
+class FlushRoutingTableCacheUpdatesCmd final
+    : public TypedCommand<FlushRoutingTableCacheUpdatesCmd> {
 public:
-    // Support deprecated name 'forceRoutingTableRefresh' for backwards compatibility with 3.6.0.
-    FlushRoutingTableCacheUpdates()
-        : BasicCommand("_flushRoutingTableCacheUpdates", "forceRoutingTableRefresh") {}
+    using Request = _flushRoutingTableCacheUpdates;
 
-    void help(std::stringstream& help) const override {
-        help << "Internal command which waits for any pending routing table cache updates for a "
-                "particular namespace to be written locally. The operationTime returned in the "
-                "response metadata is guaranteed to be at least as late as the last routing table "
-                "cache update to the local disk. Takes a 'forceRemoteRefresh' option to make this "
-                "node refresh its cache from the config server before waiting for the last refresh "
-                "to be persisted.";
+    // Support deprecated name 'forceRoutingTableRefresh' for backwards compatibility with 3.6.0.
+    FlushRoutingTableCacheUpdatesCmd()
+        : TypedCommand<FlushRoutingTableCacheUpdatesCmd>(Request::kCommandName,
+                                                         "forceRoutingTableRefresh") {}
+
+    std::string help() const override {
+        return "Internal command which waits for any pending routing table cache updates for a "
+               "particular namespace to be written locally. The operationTime returned in the "
+               "response metadata is guaranteed to be at least as late as the last routing table "
+               "cache update to the local disk. Takes a 'forceRemoteRefresh' option to make this "
+               "node refresh its cache from the config server before waiting for the last refresh "
+               "to be persisted.";
     }
 
     bool adminOnly() const override {
         return true;
     }
 
-    bool slaveOk() const override {
-        return false;
+    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
+        return AllowedOnSecondary::kNever;
     }
 
-    bool supportsWriteConcern(const BSONObj& cmd) const override {
-        return false;
-    }
+    class Invocation final : public InvocationBase {
+    public:
+        using InvocationBase::InvocationBase;
 
-    std::string parseNs(const std::string& dbname, const BSONObj& cmdObj) const override {
-        return parseNsFullyQualified(dbname, cmdObj);
-    }
-
-    Status checkAuthForCommand(Client* client,
-                               const std::string& dbname,
-                               const BSONObj& cmdObj) override {
-        if (!AuthorizationSession::get(client)->isAuthorizedForActionsOnResource(
-                ResourcePattern::forClusterResource(), ActionType::internal)) {
-            return Status(ErrorCodes::Unauthorized, "Unauthorized");
+        bool supportsWriteConcern() const override {
+            return false;
         }
-        return Status::OK();
-    }
 
-    void addRequiredPrivileges(const std::string& dbname,
-                               const BSONObj& cmdObj,
-                               std::vector<Privilege>* out) override {
-        ActionSet actions;
-        actions.addAction(ActionType::internal);
-        out->push_back(Privilege(ResourcePattern::forClusterResource(), actions));
-    }
+        NamespaceString ns() const override {
+            return request().getCommandParameter();
+        }
 
-    bool run(OperationContext* opCtx,
-             const std::string& dbname,
-             const BSONObj& cmdObj,
-             BSONObjBuilder& result) override {
-        auto const shardingState = ShardingState::get(opCtx);
-        uassertStatusOK(shardingState->canAcceptShardedCommands());
+        void doCheckAuthorization(OperationContext* opCtx) const override {
+            uassert(ErrorCodes::Unauthorized,
+                    "Unauthorized",
+                    AuthorizationSession::get(opCtx->getClient())
+                        ->isAuthorizedForActionsOnResource(ResourcePattern::forClusterResource(),
+                                                           ActionType::internal));
+        }
 
-        uassert(ErrorCodes::IllegalOperation,
-                "Can't issue _flushRoutingTableCacheUpdates from 'eval'",
-                !opCtx->getClient()->isInDirectClient());
+        void typedRun(OperationContext* opCtx) {
+            auto const shardingState = ShardingState::get(opCtx);
+            uassertStatusOK(shardingState->canAcceptShardedCommands());
 
-        uassert(ErrorCodes::IllegalOperation,
-                "Can't call _flushRoutingTableCacheUpdates if in read-only mode",
-                !storageGlobalParams.readOnly);
+            uassert(ErrorCodes::IllegalOperation,
+                    "Can't issue _flushRoutingTableCacheUpdates from 'eval'",
+                    !opCtx->getClient()->isInDirectClient());
 
-        auto& oss = OperationShardingState::get(opCtx);
+            uassert(ErrorCodes::IllegalOperation,
+                    "Can't call _flushRoutingTableCacheUpdates if in read-only mode",
+                    !storageGlobalParams.readOnly);
 
-        const NamespaceString nss(parseNs(dbname, cmdObj));
-        const auto request = _flushRoutingTableCacheUpdatesRequest::parse(
-            IDLParserErrorContext("_FlushRoutingTableCacheUpdatesRequest"), cmdObj);
+            auto& oss = OperationShardingState::get(opCtx);
 
-        {
-            AutoGetCollection autoColl(opCtx, nss, MODE_IS);
+            {
+                AutoGetCollection autoColl(opCtx, ns(), MODE_IS);
 
-            // If the primary is in the critical section, secondaries must wait for the commit to
-            // finish on the primary in case a secondary's caller has an afterClusterTime inclusive
-            // of the commit (and new writes to the committed chunk) that hasn't yet propagated back
-            // to this shard. This ensures the read your own writes causal consistency guarantee.
-            auto css = CollectionShardingState::get(opCtx, nss);
-            if (css->getMigrationSourceManager()) {
+                // If the primary is in the critical section, secondaries must wait for the commit
+                // to finish on the primary in case a secondary's caller has an afterClusterTime
+                // inclusive of the commit (and new writes to the committed chunk) that hasn't yet
+                // propagated back to this shard. This ensures the read your own writes causal
+                // consistency guarantee.
+                auto const css = CollectionShardingState::get(opCtx, ns());
                 auto criticalSectionSignal =
-                    css->getMigrationSourceManager()->getMigrationCriticalSectionSignal(true);
+                    css->getCriticalSectionSignal(ShardingMigrationCriticalSection::kRead);
                 if (criticalSectionSignal) {
                     oss.setMigrationCriticalSectionSignal(criticalSectionSignal);
                 }
             }
+
+            oss.waitForMigrationCriticalSectionSignal(opCtx);
+
+            if (request().getSyncFromConfig()) {
+                LOG(1) << "Forcing remote routing table refresh for " << ns();
+                forceShardFilteringMetadataRefresh(opCtx, ns());
+            }
+
+            CatalogCacheLoader::get(opCtx).waitForCollectionFlush(opCtx, ns());
+
+            repl::ReplClientInfo::forClient(opCtx->getClient()).setLastOpToSystemLastOpTime(opCtx);
         }
-
-        oss.waitForMigrationCriticalSectionSignal(opCtx);
-
-        if (request.getSyncFromConfig()) {
-            LOG(1) << "Forcing remote routing table refresh for " << nss;
-            ChunkVersion unusedShardVersion;
-            uassertStatusOK(shardingState->refreshMetadataNow(opCtx, nss, &unusedShardVersion));
-        }
-
-        CatalogCacheLoader::get(opCtx).waitForCollectionFlush(opCtx, nss);
-
-        repl::ReplClientInfo::forClient(opCtx->getClient()).setLastOpToSystemLastOpTime(opCtx);
-
-        return true;
-    }
-
+    };
 } _flushRoutingTableCacheUpdatesCmd;
 
 }  // namespace

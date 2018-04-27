@@ -33,7 +33,7 @@
 #include "mongo/db/s/balancer/type_migration.h"
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/config_server_test_fixture.h"
-#include "mongo/s/migration_secondary_throttle_options.h"
+#include "mongo/s/request_types/migration_secondary_throttle_options.h"
 
 namespace mongo {
 namespace {
@@ -71,7 +71,7 @@ void ScopedMigrationRequestTest::checkMigrationsCollectionForDocument(
         operationContext(),
         ReadPreferenceSetting{ReadPreference::PrimaryOnly},
         repl::ReadConcernLevel::kMajorityReadConcern,
-        NamespaceString(MigrationType::ConfigNS),
+        MigrationType::ConfigNS,
         BSON(MigrationType::name(chunkName)),
         BSONObj(),
         boost::none);
@@ -161,7 +161,7 @@ TEST_F(ScopedMigrationRequestTest, CreateScopedMigrationRequestOnRecovery) {
     // still removes the document corresponding to the MigrationRequest.
     {
         ScopedMigrationRequest scopedMigrationRequest = ScopedMigrationRequest::createForRecovery(
-            operationContext(), NamespaceString(migrateInfo.ns), migrateInfo.minKey);
+            operationContext(), migrateInfo.nss, migrateInfo.minKey);
 
         checkMigrationsCollectionForDocument(migrateInfo.getName(), 1);
     }

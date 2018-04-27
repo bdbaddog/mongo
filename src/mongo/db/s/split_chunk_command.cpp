@@ -41,6 +41,7 @@
 #include "mongo/db/s/operation_sharding_state.h"
 #include "mongo/db/s/sharding_state.h"
 #include "mongo/db/s/split_chunk.h"
+#include "mongo/s/catalog/type_chunk.h"
 #include "mongo/s/stale_exception.h"
 #include "mongo/util/log.h"
 #include "mongo/util/mongoutils/str.h"
@@ -57,19 +58,19 @@ class SplitChunkCommand : public ErrmsgCommandDeprecated {
 public:
     SplitChunkCommand() : ErrmsgCommandDeprecated("splitChunk") {}
 
-    void help(std::stringstream& help) const override {
-        help << "internal command usage only\n"
-                "example:\n"
-                " { splitChunk:\"db.foo\" , keyPattern: {a:1} , min : {a:100} , max: {a:200} { "
-                "splitKeys : [ {a:150} , ... ]}";
+    std::string help() const override {
+        return "internal command usage only\n"
+               "example:\n"
+               " { splitChunk:\"db.foo\" , keyPattern: {a:1} , min : {a:100} , max: {a:200} { "
+               "splitKeys : [ {a:150} , ... ]}";
     }
 
-    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
+    bool supportsWriteConcern(const BSONObj& cmd) const override {
         return false;
     }
 
-    bool slaveOk() const override {
-        return false;
+    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
+        return AllowedOnSecondary::kNever;
     }
 
     bool adminOnly() const override {
@@ -78,7 +79,7 @@ public:
 
     Status checkAuthForCommand(Client* client,
                                const std::string& dbname,
-                               const BSONObj& cmdObj) override {
+                               const BSONObj& cmdObj) const override {
         if (!AuthorizationSession::get(client)->isAuthorizedForActionsOnResource(
                 ResourcePattern::forClusterResource(), ActionType::internal)) {
             return Status(ErrorCodes::Unauthorized, "Unauthorized");
@@ -87,7 +88,7 @@ public:
     }
 
     std::string parseNs(const std::string& dbname, const BSONObj& cmdObj) const override {
-        return parseNsFullyQualified(dbname, cmdObj);
+        return CommandHelpers::parseNsFullyQualified(cmdObj);
     }
 
     bool errmsgRun(OperationContext* opCtx,
@@ -95,19 +96,11 @@ public:
                    const BSONObj& cmdObj,
                    std::string& errmsg,
                    BSONObjBuilder& result) override {
-
         uassertStatusOK(ShardingState::get(opCtx)->canAcceptShardedCommands());
 
-        //
-        // Check whether parameters passed to splitChunk are sound
-        //
         const NamespaceString nss = NamespaceString(parseNs(dbname, cmdObj));
-        if (!nss.isValid()) {
-            errmsg = str::stream() << "invalid namespace '" << nss.toString()
-                                   << "' specified for command";
-            return false;
-        }
 
+        // Check whether parameters passed to splitChunk are sound
         BSONObj keyPatternObj;
         {
             BSONElement keyPatternElem;
@@ -126,7 +119,7 @@ public:
         string shardName;
         auto parseShardNameStatus = bsonExtractStringField(cmdObj, "from", &shardName);
         if (!parseShardNameStatus.isOK())
-            return appendCommandStatus(result, parseShardNameStatus);
+            return CommandHelpers::appendCommandStatus(result, parseShardNameStatus);
 
         log() << "received splitChunk request: " << redact(cmdObj);
 
@@ -147,18 +140,7 @@ public:
         }
 
         OID expectedCollectionEpoch;
-        if (cmdObj.hasField("epoch")) {
-            auto epochStatus = bsonExtractOIDField(cmdObj, "epoch", &expectedCollectionEpoch);
-            uassert(
-                ErrorCodes::InvalidOptions, "unable to parse collection epoch", epochStatus.isOK());
-        } else {
-            // Backwards compatibility with v3.4 mongos, which will send 'shardVersion' and not
-            // 'epoch'.
-            const auto& oss = OperationShardingState::get(opCtx);
-            uassert(
-                ErrorCodes::InvalidOptions, "collection version is missing", oss.hasShardVersion());
-            expectedCollectionEpoch = oss.getShardVersion(nss).epoch();
-        }
+        uassertStatusOK(bsonExtractOIDField(cmdObj, "epoch", &expectedCollectionEpoch));
 
         auto statusWithOptionalChunkRange = splitChunk(
             opCtx, nss, keyPatternObj, chunkRange, splitKeys, shardName, expectedCollectionEpoch);

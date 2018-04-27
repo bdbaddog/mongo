@@ -65,7 +65,6 @@ class ReplSetMetadata;
 namespace repl {
 
 class BackgroundSync;
-class HandshakeArgs;
 class IsMasterResponse;
 class OplogReader;
 class OpTime;
@@ -78,16 +77,6 @@ class ReplSetHtmlSummary;
 class ReplSetRequestVotesArgs;
 class ReplSetRequestVotesResponse;
 class UpdatePositionArgs;
-
-/**
- * Global variable that contains a std::string telling why master/slave halted
- *
- * "dead" means something really bad happened like replication falling completely out of sync.
- * when non-null, we are dead and the string is informational
- *
- * TODO(dannenberg) remove when master slave goes
- */
-extern const char* replAllDead;
 
 /**
  * The ReplicationCoordinator is responsible for coordinating the interaction of replication
@@ -134,17 +123,16 @@ public:
      */
     virtual const ReplSettings& getSettings() const = 0;
 
-    enum Mode { modeNone = 0, modeReplSet, modeMasterSlave };
+    enum Mode { modeNone = 0, modeReplSet };
 
     /**
-     * Returns a value indicating whether this node was configured at start-up to run
-     * standalone, as part of a master-slave pair, or as a member of a replica set.
+     * Returns a value indicating whether this node was configured at start-up to run standalone or
+     * as a member of a replica set.
      */
     virtual Mode getReplicationMode() const = 0;
 
     /**
-     * Returns true if this node is configured to be a member of a replica set or master/slave
-     * setup.
+     * Returns true if this node is configured to be a member of a replica set.
      */
     virtual bool isReplEnabled() const = 0;
 
@@ -199,13 +187,6 @@ public:
                                                const WriteConcernOptions& writeConcern) = 0;
 
     /**
-     * Like awaitReplication(), above, but waits for the replication of the last operation
-     * performed on the client associated with "opCtx".
-     */
-    virtual StatusAndDuration awaitReplicationOfLastOpForClient(
-        OperationContext* opCtx, const WriteConcernOptions& writeConcern) = 0;
-
-    /**
      * Causes this node to relinquish being primary for at least 'stepdownTime'.  If 'force' is
      * false, before doing so it will wait for 'waitTime' for one other node to be within 10
      * seconds of this node's optime before stepping down. Returns a Status with the code
@@ -226,9 +207,8 @@ public:
     virtual bool isMasterForReportingPurposes() = 0;
 
     /**
-     * Returns true if it is valid for this node to accept writes on the given database.
-     * Currently this is true only if this node is Primary, master in master/slave,
-     * a standalone, or is writing to the local database.
+     * Returns true if it is valid for this node to accept writes on the given database.  Currently
+     * this is true only if this node is Primary, a standalone, or is writing to the local database.
      *
      * If a node was started with the replSet argument, but has not yet received a config, it
      * will not be able to receive writes to a database other than local (it will not be
@@ -297,12 +277,6 @@ public:
      */
     virtual bool shouldRelaxIndexConstraints(OperationContext* opCtx,
                                              const NamespaceString& ns) = 0;
-
-    /**
-     * Updates our internal tracking of the last OpTime applied for the given slave
-     * identified by "rid".  Only valid to call in master/slave mode
-     */
-    virtual Status setLastOptimeForSlave(const OID& rid, const Timestamp& ts) = 0;
 
     /**
      * Updates our internal tracking of the last OpTime applied to this node.
@@ -403,12 +377,6 @@ public:
      * TODO(spencer): Use term instead.
      */
     virtual OID getElectionId() = 0;
-
-    /**
-     * Returns the RID for this node.  The RID is used to identify this node to our sync source
-     * when sending updates about our replication progress.
-     */
-    virtual OID getMyRID() const = 0;
 
     /**
      * Returns the id for this node as specified in the current replica set configuration.
@@ -542,7 +510,7 @@ public:
 
     /**
      * Handles an incoming isMaster command for a replica set node.  Should not be
-     * called on a master-slave or standalone node.
+     * called on a standalone node.
      */
     virtual void fillIsMasterForReplSet(IsMasterResponse* result) = 0;
 
@@ -698,16 +666,6 @@ public:
                                                 long long* configVersion) = 0;
 
     /**
-     * Handles an incoming Handshake command. Associates the node's 'remoteID' with its
-     * 'handshake' object. This association is used to update internal representation of
-     * replication progress and to forward the node's replication progress upstream when this
-     * node is being chained through in master/slave replication.
-     *
-     * Returns ErrorCodes::IllegalOperation if we're not running with master/slave replication.
-     */
-    virtual Status processHandshake(OperationContext* opCtx, const HandshakeArgs& handshake) = 0;
-
-    /**
      * Returns a bool indicating whether or not this node builds indexes.
      */
     virtual bool buildsIndexes() = 0;
@@ -767,8 +725,7 @@ public:
      * Prepares a metadata object with the ReplSetMetadata and the OplogQueryMetadata depending
      * on what has been requested.
      */
-    virtual void prepareReplMetadata(OperationContext* opCtx,
-                                     const BSONObj& metadataRequestObj,
+    virtual void prepareReplMetadata(const BSONObj& metadataRequestObj,
                                      const OpTime& lastOpTimeFromClient,
                                      BSONObjBuilder* builder) const = 0;
 
@@ -804,20 +761,19 @@ public:
     virtual Status updateTerm(OperationContext* opCtx, long long term) = 0;
 
     /**
-     * Reserves a unique SnapshotName.
+     * Returns the minimum visible snapshot for this operation.
      *
      * This name is guaranteed to compare > all names reserved before and < all names reserved
      * after.
      *
      * This method will not take any locks or attempt to access storage using the passed-in
-     * OperationContext. It will only be used to track reserved SnapshotNames by each operation so
-     * that awaitReplicationOfLastOpForClient() can correctly wait for the reserved snapshot to be
-     * visible.
+     * OperationContext. It will only be used to return reserved SnapshotNames by each operation so
+     * callers can correctly wait for the reserved snapshot to be visible.
      *
      * A null OperationContext can be used in cases where the snapshot to wait for should not be
      * adjusted.
      */
-    virtual Timestamp reserveSnapshotName(OperationContext* opCtx) = 0;
+    virtual Timestamp getMinimumVisibleSnapshot(OperationContext* opCtx) = 0;
 
     /**
      * Blocks until either the current committed snapshot is at least as high as 'untilSnapshot',
@@ -871,6 +827,11 @@ public:
      * Abort catchup if the node is in catchup mode.
      */
     virtual Status abortCatchupIfNeeded() = 0;
+
+    /**
+     * Signals that drop pending collections have been removed from storage.
+     */
+    virtual void signalDropPendingCollectionsRemovedFromStorage() = 0;
 
     /**
      * Returns true if logOp() should not append an entry to the oplog for the namespace for this

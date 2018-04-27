@@ -14,12 +14,17 @@ selector:
   roots:
   - jstests/core/**/*.js
   exclude_files:
+  # Transactions are not supported on MongoDB standalone nodes.
+  - jstests/core/txns/**/*.js
   # Skip any tests that run with auth explicitly.
   - jstests/core/**/*[aA]uth*.js
   # Commands using UUIDs are not compatible with name-based auth
   - jstests/core/commands_with_uuid.js
 
 executor:
+  archive:
+    hooks:
+      - ValidateCollections
   config:
     shell_options:
       global_vars:

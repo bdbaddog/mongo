@@ -30,6 +30,7 @@
 #include "mongo/bson/mutable/document.h"
 #include "mongo/bson/mutable/element.h"
 #include "mongo/db/catalog/database_holder.h"
+#include "mongo/db/catalog/document_validation.h"
 #include "mongo/db/client.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/commands/write_commands/write_commands_common.h"
@@ -46,8 +47,9 @@
 #include "mongo/db/query/explain.h"
 #include "mongo/db/query/get_executor.h"
 #include "mongo/db/repl/repl_client_info.h"
-#include "mongo/db/repl/replication_coordinator_global.h"
+#include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/server_parameters.h"
+#include "mongo/db/session_catalog.h"
 #include "mongo/db/stats/counters.h"
 #include "mongo/db/write_concern.h"
 #include "mongo/s/stale_exception.h"
@@ -71,17 +73,6 @@ void redactTooLongLog(mutablebson::Document* cmdObj, StringData fieldName) {
     }
 }
 
-Status checkAuthForWriteCommand(Client* client,
-                                BatchedCommandRequest::BatchType batchType,
-                                const OpMsgRequest& request) {
-    Status status =
-        auth::checkAuthForWriteCommand(AuthorizationSession::get(client), batchType, request);
-    if (!status.isOK()) {
-        LastError::get(client).setLastError(status.code(), status.reason());
-    }
-    return status;
-}
-
 bool shouldSkipOutput(OperationContext* opCtx) {
     const WriteConcernOptions& writeConcern = opCtx->getWriteConcern();
     return writeConcern.wMode.empty() && writeConcern.wNumNodes == 0 &&
@@ -94,10 +85,23 @@ void serializeReply(OperationContext* opCtx,
                     ReplyStyle replyStyle,
                     bool continueOnError,
                     size_t opsInBatch,
-                    const WriteResult& result,
+                    WriteResult result,
                     BSONObjBuilder* out) {
     if (shouldSkipOutput(opCtx))
         return;
+
+    if (continueOnError && !result.results.empty()) {
+        const auto& lastResult = result.results.back();
+        if (lastResult == ErrorCodes::StaleConfig ||
+            lastResult == ErrorCodes::CannotImplicitlyCreateCollection) {
+            // For ordered:false commands we need to duplicate these error results for all ops
+            // after we stopped. See handleError() in write_ops_exec.cpp for more info.
+            auto err = result.results.back();
+            while (result.results.size() < opsInBatch) {
+                result.results.emplace_back(err);
+            }
+        }
+    }
 
     long long n = 0;
     long long nModified = 0;
@@ -137,27 +141,17 @@ void serializeReply(OperationContext* opCtx,
         const auto& status = result.results[i].getStatus();
         BSONObjBuilder error(errorsSizeTracker);
         error.append("index", int(i));
-        error.append("code", int(status.code()));
-        error.append("errmsg", errorMessage(status.reason()));
-        errors.push_back(error.obj());
-    }
-
-    if (result.staleConfigException) {
-        // For ordered:false commands we need to duplicate the StaleConfig result for all ops
-        // after we stopped. result.results doesn't include the staleConfigException.
-        // See the comment on WriteResult::staleConfigException for more info.
-        int endIndex = continueOnError ? opsInBatch : result.results.size() + 1;
-        for (int i = result.results.size(); i < endIndex; i++) {
-            BSONObjBuilder error(errorsSizeTracker);
-            error.append("index", i);
+        if (auto staleInfo = status.extraInfo<StaleConfigInfo>()) {
             error.append("code", int(ErrorCodes::StaleShardVersion));  // Different from exception!
-            error.append("errmsg", errorMessage(result.staleConfigException->reason()));
             {
                 BSONObjBuilder errInfo(error.subobjStart("errInfo"));
-                result.staleConfigException->getVersionWanted().addToBSON(errInfo, "vWanted");
+                staleInfo->getVersionWanted().addToBSON(errInfo, "vWanted");
             }
-            errors.push_back(error.obj());
+        } else {
+            error.append("code", int(status.code()));
         }
+        error.append("errmsg", errorMessage(status.reason()));
+        errors.push_back(error.obj());
     }
 
     out->appendNumber("n", n);
@@ -198,67 +192,136 @@ class WriteCommand : public Command {
 public:
     explicit WriteCommand(StringData name) : Command(name) {}
 
-    bool slaveOk() const final {
-        return false;
+protected:
+    class InvocationBase;
+
+private:
+    AllowedOnSecondary secondaryAllowed(ServiceContext*) const final {
+        return AllowedOnSecondary::kNever;
     }
 
     bool shouldAffectCommandCounter() const final {
         return false;
     }
 
-    bool supportsWriteConcern(const BSONObj& cmd) const {
-        return true;
-    }
-
-    ReadWriteType getReadWriteType() const {
+    ReadWriteType getReadWriteType() const final {
         return ReadWriteType::kWrite;
     }
+};
 
-    bool enhancedRun(OperationContext* opCtx,
-                     const OpMsgRequest& request,
-                     BSONObjBuilder& result) final {
+class WriteCommand::InvocationBase : public CommandInvocation {
+public:
+    InvocationBase(const WriteCommand* writeCommand, const OpMsgRequest& request)
+        : CommandInvocation(writeCommand), _request(&request) {}
+
+    bool getBypass() const {
+        return shouldBypassDocumentValidationForCommand(_request->body);
+    }
+
+private:
+    // Customization point for 'doCheckAuthorization'.
+    virtual void doCheckAuthorizationImpl(AuthorizationSession* authzSession) const = 0;
+
+    // Customization point for 'run'.
+    virtual void runImpl(OperationContext* opCtx, BSONObjBuilder& result) const = 0;
+
+    void run(OperationContext* opCtx, CommandReplyBuilder* result) final {
         try {
-            runImpl(opCtx, request, result);
-            return true;
-        } catch (const DBException& ex) {
-            LastError::get(opCtx->getClient()).setLastError(ex.code(), ex.reason());
+            try {
+                _transactionChecks(opCtx);
+                BSONObjBuilder bob = result->getBodyBuilder();
+                runImpl(opCtx, bob);
+                CommandHelpers::extractOrAppendOk(bob);
+            } catch (const DBException& ex) {
+                LastError::get(opCtx->getClient()).setLastError(ex.code(), ex.reason());
+                throw;
+            }
+        } catch (const ExceptionFor<ErrorCodes::Unauthorized>&) {
+            CommandHelpers::logAuthViolation(
+                opCtx, definition(), *_request, ErrorCodes::Unauthorized);
             throw;
         }
     }
 
-    virtual void runImpl(OperationContext* opCtx,
-                         const OpMsgRequest& request,
-                         BSONObjBuilder& result) = 0;
+    bool supportsReadConcern(repl::ReadConcernLevel level) const final {
+        return level == repl::ReadConcernLevel::kLocalReadConcern ||
+            level == repl::ReadConcernLevel::kSnapshotReadConcern;
+    }
+
+    bool supportsWriteConcern() const final {
+        return true;
+    }
+
+    void doCheckAuthorization(OperationContext* opCtx) const final {
+        try {
+            doCheckAuthorizationImpl(AuthorizationSession::get(opCtx->getClient()));
+        } catch (const DBException& e) {
+            LastError::get(opCtx->getClient()).setLastError(e.code(), e.reason());
+            throw;
+        }
+    }
+
+    void _transactionChecks(OperationContext* opCtx) const {
+        auto session = OperationContextSession::get(opCtx);
+        if (!session || !session->inSnapshotReadOrMultiDocumentTransaction())
+            return;
+        uassert(50791,
+                str::stream() << "Cannot write to system collection " << ns().toString()
+                              << " within a transaction.",
+                !ns().isSystem());
+        auto replCoord = repl::ReplicationCoordinator::get(opCtx);
+        uassert(50790,
+                str::stream() << "Cannot write to unreplicated collection " << ns().toString()
+                              << " within a transaction.",
+                !replCoord->isOplogDisabledFor(opCtx, ns()));
+    }
+
+    const OpMsgRequest* _request;
 };
 
 class CmdInsert final : public WriteCommand {
 public:
     CmdInsert() : WriteCommand("insert") {}
 
-    void redactForLogging(mutablebson::Document* cmdObj) final {
+private:
+    class Invocation final : public InvocationBase {
+    public:
+        Invocation(const WriteCommand* cmd, const OpMsgRequest& request)
+            : InvocationBase(cmd, request), _batch(InsertOp::parse(request)) {}
+
+    private:
+        NamespaceString ns() const override {
+            return _batch.getNamespace();
+        }
+
+        void doCheckAuthorizationImpl(AuthorizationSession* authzSession) const override {
+            auth::checkAuthForInsertCommand(authzSession, getBypass(), _batch);
+        }
+
+        void runImpl(OperationContext* opCtx, BSONObjBuilder& result) const override {
+            auto reply = performInserts(opCtx, _batch);
+            serializeReply(opCtx,
+                           ReplyStyle::kNotUpdate,
+                           !_batch.getWriteCommandBase().getOrdered(),
+                           _batch.getDocuments().size(),
+                           std::move(reply),
+                           &result);
+        }
+
+        write_ops::Insert _batch;
+    };
+
+    std::unique_ptr<CommandInvocation> parse(OperationContext*,
+                                             const OpMsgRequest& request) override {
+        return stdx::make_unique<Invocation>(this, request);
+    }
+
+    void redactForLogging(mutablebson::Document* cmdObj) const final {
         redactTooLongLog(cmdObj, "documents");
     }
 
-    void help(std::stringstream& help) const final {
-        help << "insert documents";
-    }
-
-    Status checkAuthForRequest(OperationContext* opCtx, const OpMsgRequest& request) final {
-        return checkAuthForWriteCommand(
-            opCtx->getClient(), BatchedCommandRequest::BatchType_Insert, request);
-    }
-
-    void runImpl(OperationContext* opCtx,
-                 const OpMsgRequest& request,
-                 BSONObjBuilder& result) final {
-        const auto batch = InsertOp::parse(request);
-        const auto reply = performInserts(opCtx, batch);
-        serializeReply(opCtx,
-                       ReplyStyle::kNotUpdate,
-                       !batch.getWriteCommandBase().getOrdered(),
-                       batch.getDocuments().size(),
-                       reply,
-                       &result);
+    std::string help() const final {
+        return "insert documents";
     }
 } cmdInsert;
 
@@ -266,66 +329,75 @@ class CmdUpdate final : public WriteCommand {
 public:
     CmdUpdate() : WriteCommand("update") {}
 
-    void redactForLogging(mutablebson::Document* cmdObj) final {
+private:
+    class Invocation final : public InvocationBase {
+    public:
+        Invocation(const WriteCommand* cmd, const OpMsgRequest& request)
+            : InvocationBase(cmd, request), _batch(UpdateOp::parse(request)) {}
+
+    private:
+        NamespaceString ns() const override {
+            return _batch.getNamespace();
+        }
+
+        void doCheckAuthorizationImpl(AuthorizationSession* authzSession) const override {
+            auth::checkAuthForUpdateCommand(authzSession, getBypass(), _batch);
+        }
+
+        void runImpl(OperationContext* opCtx, BSONObjBuilder& result) const override {
+            auto reply = performUpdates(opCtx, _batch);
+            serializeReply(opCtx,
+                           ReplyStyle::kUpdate,
+                           !_batch.getWriteCommandBase().getOrdered(),
+                           _batch.getUpdates().size(),
+                           std::move(reply),
+                           &result);
+        }
+
+        void explain(OperationContext* opCtx,
+                     ExplainOptions::Verbosity verbosity,
+                     BSONObjBuilder* out) override {
+            uassert(ErrorCodes::InvalidLength,
+                    "explained write batches must be of size 1",
+                    _batch.getUpdates().size() == 1);
+
+            UpdateLifecycleImpl updateLifecycle(_batch.getNamespace());
+            UpdateRequest updateRequest(_batch.getNamespace());
+            updateRequest.setLifecycle(&updateLifecycle);
+            updateRequest.setQuery(_batch.getUpdates()[0].getQ());
+            updateRequest.setUpdates(_batch.getUpdates()[0].getU());
+            updateRequest.setCollation(write_ops::collationOf(_batch.getUpdates()[0]));
+            updateRequest.setArrayFilters(write_ops::arrayFiltersOf(_batch.getUpdates()[0]));
+            updateRequest.setMulti(_batch.getUpdates()[0].getMulti());
+            updateRequest.setUpsert(_batch.getUpdates()[0].getUpsert());
+            updateRequest.setYieldPolicy(PlanExecutor::YIELD_AUTO);
+            updateRequest.setExplain();
+
+            ParsedUpdate parsedUpdate(opCtx, &updateRequest);
+            uassertStatusOK(parsedUpdate.parseRequest());
+
+            // Explains of write commands are read-only, but we take write locks so that timing
+            // info is more accurate.
+            AutoGetCollection collection(opCtx, _batch.getNamespace(), MODE_IX);
+
+            auto exec = uassertStatusOK(getExecutorUpdate(
+                opCtx, &CurOp::get(opCtx)->debug(), collection.getCollection(), &parsedUpdate));
+            Explain::explainStages(exec.get(), collection.getCollection(), verbosity, out);
+        }
+
+        write_ops::Update _batch;
+    };
+
+    std::unique_ptr<CommandInvocation> parse(OperationContext*, const OpMsgRequest& request) {
+        return stdx::make_unique<Invocation>(this, request);
+    }
+
+    void redactForLogging(mutablebson::Document* cmdObj) const final {
         redactTooLongLog(cmdObj, "updates");
     }
 
-    void help(std::stringstream& help) const final {
-        help << "update documents";
-    }
-
-    Status checkAuthForRequest(OperationContext* opCtx, const OpMsgRequest& request) final {
-        return checkAuthForWriteCommand(
-            opCtx->getClient(), BatchedCommandRequest::BatchType_Update, request);
-    }
-
-    void runImpl(OperationContext* opCtx,
-                 const OpMsgRequest& request,
-                 BSONObjBuilder& result) final {
-        const auto batch = UpdateOp::parse(request);
-        const auto reply = performUpdates(opCtx, batch);
-        serializeReply(opCtx,
-                       ReplyStyle::kUpdate,
-                       !batch.getWriteCommandBase().getOrdered(),
-                       batch.getUpdates().size(),
-                       reply,
-                       &result);
-    }
-
-    Status explain(OperationContext* opCtx,
-                   const std::string& dbname,
-                   const BSONObj& cmdObj,
-                   ExplainOptions::Verbosity verbosity,
-                   BSONObjBuilder* out) const final {
-        const auto opMsgRequest(OpMsgRequest::fromDBAndBody(dbname, cmdObj));
-        const auto batch = UpdateOp::parse(opMsgRequest);
-        uassert(ErrorCodes::InvalidLength,
-                "explained write batches must be of size 1",
-                batch.getUpdates().size() == 1);
-
-        UpdateLifecycleImpl updateLifecycle(batch.getNamespace());
-        UpdateRequest updateRequest(batch.getNamespace());
-        updateRequest.setLifecycle(&updateLifecycle);
-        updateRequest.setQuery(batch.getUpdates()[0].getQ());
-        updateRequest.setUpdates(batch.getUpdates()[0].getU());
-        updateRequest.setCollation(write_ops::collationOf(batch.getUpdates()[0]));
-        updateRequest.setArrayFilters(write_ops::arrayFiltersOf(batch.getUpdates()[0]));
-        updateRequest.setMulti(batch.getUpdates()[0].getMulti());
-        updateRequest.setUpsert(batch.getUpdates()[0].getUpsert());
-        updateRequest.setYieldPolicy(PlanExecutor::YIELD_AUTO);
-        updateRequest.setExplain();
-
-        ParsedUpdate parsedUpdate(opCtx, &updateRequest);
-        uassertStatusOK(parsedUpdate.parseRequest());
-
-        // Explains of write commands are read-only, but we take write locks so that timing
-        // info is more accurate.
-        AutoGetCollection collection(opCtx, batch.getNamespace(), MODE_IX);
-
-        auto exec = uassertStatusOK(getExecutorUpdate(
-            opCtx, &CurOp::get(opCtx)->debug(), collection.getCollection(), &parsedUpdate));
-        Explain::explainStages(exec.get(), collection.getCollection(), verbosity, out);
-        return Status::OK();
+    std::string help() const final {
+        return "update documents";
     }
 } cmdUpdate;
 
@@ -333,62 +405,72 @@ class CmdDelete final : public WriteCommand {
 public:
     CmdDelete() : WriteCommand("delete") {}
 
-    void redactForLogging(mutablebson::Document* cmdObj) final {
+private:
+    class Invocation final : public InvocationBase {
+    public:
+        Invocation(const WriteCommand* cmd, const OpMsgRequest& request)
+            : InvocationBase(cmd, request), _batch(DeleteOp::parse(request)) {}
+
+    private:
+        NamespaceString ns() const override {
+            return _batch.getNamespace();
+        }
+
+        void doCheckAuthorizationImpl(AuthorizationSession* authzSession) const override {
+            auth::checkAuthForDeleteCommand(authzSession, getBypass(), _batch);
+        }
+
+        void runImpl(OperationContext* opCtx, BSONObjBuilder& result) const override {
+            auto reply = performDeletes(opCtx, _batch);
+            serializeReply(opCtx,
+                           ReplyStyle::kNotUpdate,
+                           !_batch.getWriteCommandBase().getOrdered(),
+                           _batch.getDeletes().size(),
+                           std::move(reply),
+                           &result);
+        }
+
+        void explain(OperationContext* opCtx,
+                     ExplainOptions::Verbosity verbosity,
+                     BSONObjBuilder* out) override {
+            uassert(ErrorCodes::InvalidLength,
+                    "explained write batches must be of size 1",
+                    _batch.getDeletes().size() == 1);
+
+            DeleteRequest deleteRequest(_batch.getNamespace());
+            deleteRequest.setQuery(_batch.getDeletes()[0].getQ());
+            deleteRequest.setCollation(write_ops::collationOf(_batch.getDeletes()[0]));
+            deleteRequest.setMulti(_batch.getDeletes()[0].getMulti());
+            deleteRequest.setYieldPolicy(PlanExecutor::YIELD_AUTO);
+            deleteRequest.setExplain();
+
+            ParsedDelete parsedDelete(opCtx, &deleteRequest);
+            uassertStatusOK(parsedDelete.parseRequest());
+
+            // Explains of write commands are read-only, but we take write locks so that timing
+            // info is more accurate.
+            AutoGetCollection collection(opCtx, _batch.getNamespace(), MODE_IX);
+
+            // Explain the plan tree.
+            auto exec = uassertStatusOK(getExecutorDelete(
+                opCtx, &CurOp::get(opCtx)->debug(), collection.getCollection(), &parsedDelete));
+            Explain::explainStages(exec.get(), collection.getCollection(), verbosity, out);
+        }
+
+        write_ops::Delete _batch;
+    };
+
+    std::unique_ptr<CommandInvocation> parse(OperationContext*,
+                                             const OpMsgRequest& request) override {
+        return stdx::make_unique<Invocation>(this, request);
+    }
+
+    void redactForLogging(mutablebson::Document* cmdObj) const final {
         redactTooLongLog(cmdObj, "deletes");
     }
 
-    void help(std::stringstream& help) const final {
-        help << "delete documents";
-    }
-
-    Status checkAuthForRequest(OperationContext* opCtx, const OpMsgRequest& request) final {
-        return checkAuthForWriteCommand(
-            opCtx->getClient(), BatchedCommandRequest::BatchType_Delete, request);
-    }
-
-    void runImpl(OperationContext* opCtx,
-                 const OpMsgRequest& request,
-                 BSONObjBuilder& result) final {
-        const auto batch = DeleteOp::parse(request);
-        const auto reply = performDeletes(opCtx, batch);
-        serializeReply(opCtx,
-                       ReplyStyle::kNotUpdate,
-                       !batch.getWriteCommandBase().getOrdered(),
-                       batch.getDeletes().size(),
-                       reply,
-                       &result);
-    }
-
-    Status explain(OperationContext* opCtx,
-                   const std::string& dbname,
-                   const BSONObj& cmdObj,
-                   ExplainOptions::Verbosity verbosity,
-                   BSONObjBuilder* out) const final {
-        const auto opMsgRequest(OpMsgRequest::fromDBAndBody(dbname, cmdObj));
-        const auto batch = DeleteOp::parse(opMsgRequest);
-        uassert(ErrorCodes::InvalidLength,
-                "explained write batches must be of size 1",
-                batch.getDeletes().size() == 1);
-
-        DeleteRequest deleteRequest(batch.getNamespace());
-        deleteRequest.setQuery(batch.getDeletes()[0].getQ());
-        deleteRequest.setCollation(write_ops::collationOf(batch.getDeletes()[0]));
-        deleteRequest.setMulti(batch.getDeletes()[0].getMulti());
-        deleteRequest.setYieldPolicy(PlanExecutor::YIELD_AUTO);
-        deleteRequest.setExplain();
-
-        ParsedDelete parsedDelete(opCtx, &deleteRequest);
-        uassertStatusOK(parsedDelete.parseRequest());
-
-        // Explains of write commands are read-only, but we take write locks so that timing
-        // info is more accurate.
-        AutoGetCollection collection(opCtx, batch.getNamespace(), MODE_IX);
-
-        // Explain the plan tree.
-        auto exec = uassertStatusOK(getExecutorDelete(
-            opCtx, &CurOp::get(opCtx)->debug(), collection.getCollection(), &parsedDelete));
-        Explain::explainStages(exec.get(), collection.getCollection(), verbosity, out);
-        return Status::OK();
+    std::string help() const final {
+        return "delete documents";
     }
 } cmdDelete;
 

@@ -34,7 +34,9 @@
 #include <boost/filesystem/operations.hpp>
 
 #include "mongo/base/status.h"
+#include "mongo/config.h"
 #include "mongo/db/server_options.h"
+#include "mongo/util/hex.h"
 #include "mongo/util/log.h"
 #include "mongo/util/options_parser/startup_options.h"
 #include "mongo/util/text.h"
@@ -42,9 +44,123 @@
 namespace mongo {
 
 namespace moe = mongo::optionenvironment;
-
-
 using std::string;
+
+namespace {
+StatusWith<std::vector<uint8_t>> hexToVector(StringData hex) {
+    if (std::any_of(hex.begin(), hex.end(), [](char c) { return !isxdigit(c); })) {
+        return {ErrorCodes::BadValue, "Not a valid hex string"};
+    }
+    if (hex.size() % 2) {
+        return {ErrorCodes::BadValue, "Not an even number of hexits"};
+    }
+
+    std::vector<uint8_t> ret;
+    ret.resize(hex.size() >> 1);
+    int idx = -2;
+    std::generate(ret.begin(), ret.end(), [&hex, &idx] {
+        idx += 2;
+        return (fromHex(hex[idx]) << 4) | fromHex(hex[idx + 1]);
+    });
+    return ret;
+}
+
+/**
+ * Older versions of mongod/mongos accepted --sslDisabledProtocols values
+ * in the form 'noTLS1_0,noTLS1_1'.  kAcceptNegativePrefix allows us to
+ * continue accepting this format on mongod/mongos while only supporting
+ * the "standard" TLS1_X format in the shell.
+ */
+enum DisabledProtocolsMode {
+    kStandardFormat,
+    kAcceptNegativePrefix,
+};
+
+Status storeDisabledProtocols(const std::string& disabledProtocols,
+                              DisabledProtocolsMode mode = kStandardFormat) {
+    if (disabledProtocols == "none") {
+        // Allow overriding the default behavior below of implicitly disabling TLS 1.0.
+        return Status::OK();
+    }
+
+    // The disabledProtocols field is composed of a comma separated list of protocols to
+    // disable. First, tokenize the field.
+    const auto tokens = StringSplitter::split(disabledProtocols, ",");
+
+    // All universally accepted tokens, and their corresponding enum representation.
+    const std::map<std::string, SSLParams::Protocols> validConfigs{
+        {"TLS1_0", SSLParams::Protocols::TLS1_0},
+        {"TLS1_1", SSLParams::Protocols::TLS1_1},
+        {"TLS1_2", SSLParams::Protocols::TLS1_2},
+    };
+
+    // These noTLS* tokens exist for backwards compatibility.
+    const std::map<std::string, SSLParams::Protocols> validNoConfigs{
+        {"noTLS1_0", SSLParams::Protocols::TLS1_0},
+        {"noTLS1_1", SSLParams::Protocols::TLS1_1},
+        {"noTLS1_2", SSLParams::Protocols::TLS1_2},
+    };
+
+    // Map the tokens to their enum values, and push them onto the list of disabled protocols.
+    for (const std::string& token : tokens) {
+        auto mappedToken = validConfigs.find(token);
+        if (mappedToken != validConfigs.end()) {
+            sslGlobalParams.sslDisabledProtocols.push_back(mappedToken->second);
+            continue;
+        }
+
+        if (mode == DisabledProtocolsMode::kAcceptNegativePrefix) {
+            auto mappedNoToken = validNoConfigs.find(token);
+            if (mappedNoToken != validNoConfigs.end()) {
+                sslGlobalParams.sslDisabledProtocols.push_back(mappedNoToken->second);
+                continue;
+            }
+        }
+
+        return Status(ErrorCodes::BadValue, "Unrecognized disabledProtocols '" + token + "'");
+    }
+
+    return Status::OK();
+}
+}  // nameapace
+
+Status parseCertificateSelector(SSLParams::CertificateSelector* selector,
+                                StringData name,
+                                StringData value) {
+    selector->subject.clear();
+    selector->thumbprint.clear();
+
+    const auto delim = value.find('=');
+    if (delim == std::string::npos) {
+        return {ErrorCodes::BadValue,
+                str::stream() << "Certificate selector for '" << name
+                              << "' must be a key=value pair"};
+    }
+
+    auto key = value.substr(0, delim);
+    if (key == "subject") {
+        selector->subject = value.substr(delim + 1).toString();
+        return Status::OK();
+    }
+
+    if (key != "thumbprint") {
+        return {ErrorCodes::BadValue,
+                str::stream() << "Unknown certificate selector property for '" << name << "': '"
+                              << key
+                              << "'"};
+    }
+
+    auto swHex = hexToVector(value.substr(delim + 1));
+    if (!swHex.isOK()) {
+        return {ErrorCodes::BadValue,
+                str::stream() << "Invalid certificate selector value for '" << name << "': "
+                              << swHex.getStatus().reason()};
+    }
+
+    selector->thumbprint = std::move(swHex.getValue());
+
+    return Status::OK();
+}
 
 Status addSSLServerOptions(moe::OptionSection* options) {
     options
@@ -125,6 +241,23 @@ Status addSSLServerOptions(moe::OptionSection* options) {
     options->addOptionChaining(
         "net.ssl.FIPSMode", "sslFIPSMode", moe::Switch, "activate FIPS 140-2 mode at startup");
 
+#ifdef MONGO_CONFIG_SSL_CERTIFICATE_SELECTORS
+    options
+        ->addOptionChaining("net.ssl.certificateSelector",
+                            "sslCertificateSelector",
+                            moe::String,
+                            "SSL Certificate in system store")
+        .incompatibleWith("net.ssl.PEMKeyFile")
+        .incompatibleWith("net.ssl.PEMKeyPassword");
+    options
+        ->addOptionChaining("net.ssl.clusterCertificateSelector",
+                            "sslClusterCertificateSelector",
+                            moe::String,
+                            "SSL Certificate in system store for internal SSL authentication")
+        .incompatibleWith("net.ssl.clusterFile")
+        .incompatibleWith("net.ssl.clusterFilePassword");
+#endif
+
     return Status::OK();
 }
 
@@ -170,6 +303,22 @@ Status addSSLClientOptions(moe::OptionSection* options) {
 
     options->addOptionChaining(
         "ssl.FIPSMode", "sslFIPSMode", moe::Switch, "activate FIPS 140-2 mode at startup");
+
+#ifdef MONGO_CONFIG_SSL_CERTIFICATE_SELECTORS
+    options
+        ->addOptionChaining("ssl.certificateSelector",
+                            "sslCertificateSelector",
+                            moe::String,
+                            "SSL Certificate in system store")
+        .incompatibleWith("ssl.PEMKeyFile")
+        .incompatibleWith("ssl.PEMKeyPassword");
+#endif
+
+    options->addOptionChaining(
+        "ssl.disabledProtocols",
+        "sslDisabledProtocols",
+        moe::String,
+        "Comma separated list of TLS protocols to disable [TLS1_0,TLS1_1,TLS1_2]");
 
     return Status::OK();
 }
@@ -281,31 +430,23 @@ Status storeSSLServerOptions(const moe::Environment& params) {
     }
 
     if (params.count("net.ssl.disabledProtocols")) {
-        // The disabledProtocols field is composed of a comma separated list of protocols to
-        // disable. First, tokenize the field.
-        std::vector<std::string> tokens =
-            StringSplitter::split(params["net.ssl.disabledProtocols"].as<string>(), ",");
-
-        // All accepted tokens, and their corresponding enum representation. The noTLS* tokens
-        // exist for backwards compatibility.
-        const std::map<std::string, SSLParams::Protocols> validConfigs{
-            {"TLS1_0", SSLParams::Protocols::TLS1_0},
-            {"noTLS1_0", SSLParams::Protocols::TLS1_0},
-            {"TLS1_1", SSLParams::Protocols::TLS1_1},
-            {"noTLS1_1", SSLParams::Protocols::TLS1_1},
-            {"TLS1_2", SSLParams::Protocols::TLS1_2},
-            {"noTLS1_2", SSLParams::Protocols::TLS1_2}};
-
-        // Map the tokens to their enum values, and push them onto the list of disabled protocols.
-        for (const std::string& token : tokens) {
-            auto mappedToken = validConfigs.find(token);
-            if (mappedToken != validConfigs.end()) {
-                sslGlobalParams.sslDisabledProtocols.push_back(mappedToken->second);
-            } else {
-                return Status(ErrorCodes::BadValue,
-                              "Unrecognized disabledProtocols '" + token + "'");
-            }
+        const auto status = storeDisabledProtocols(params["net.ssl.disabledProtocols"].as<string>(),
+                                                   DisabledProtocolsMode::kAcceptNegativePrefix);
+        if (!status.isOK()) {
+            return status;
         }
+#if (MONGO_CONFIG_SSL_PROVIDER != SSL_PROVIDER_OPENSSL) || \
+    (OPENSSL_VERSION_NUMBER >= 0x100000cf) /* 1.0.0l */
+    } else {
+        /* Disable TLS 1.0 by default on all platforms
+         * except on mongod/mongos which were built with an
+         * old version of OpenSSL (pre 1.0.0l)
+         * which does not support TLS 1.1 or later.
+         */
+        log() << "Automatically disabling TLS 1.0, to force-enable TLS 1.0 "
+                 "specify --sslDisabledProtocols 'none'";
+        sslGlobalParams.sslDisabledProtocols.push_back(SSLParams::Protocols::TLS1_0);
+#endif
     }
 
     if (params.count("net.ssl.weakCertificateValidation")) {
@@ -327,20 +468,46 @@ Status storeSSLServerOptions(const moe::Environment& params) {
         sslGlobalParams.sslFIPSMode = params["net.ssl.FIPSMode"].as<bool>();
     }
 
+#ifdef MONGO_CONFIG_SSL_CERTIFICATE_SELECTORS
+    if (params.count("net.ssl.certificateSelector")) {
+        const auto status =
+            parseCertificateSelector(&sslGlobalParams.sslCertificateSelector,
+                                     "net.ssl.certificateSelector",
+                                     params["net.ssl.certificateSelector"].as<std::string>());
+        if (!status.isOK()) {
+            return status;
+        }
+    }
+    if (params.count("net.ssl.clusterCertificateSelector")) {
+        const auto status = parseCertificateSelector(
+            &sslGlobalParams.sslClusterCertificateSelector,
+            "net.ssl.clusterCertificateSelector",
+            params["net.ssl.clusterCertificateSelector"].as<std::string>());
+        if (!status.isOK()) {
+            return status;
+        }
+    }
+#endif
+
     int clusterAuthMode = serverGlobalParams.clusterAuthMode.load();
     if (sslGlobalParams.sslMode.load() != SSLParams::SSLMode_disabled) {
-        if (sslGlobalParams.sslPEMKeyFile.size() == 0) {
-            return Status(ErrorCodes::BadValue, "need sslPEMKeyFile when SSL is enabled");
+        bool usingCertifiateSelectors = params.count("net.ssl.certificateSelector");
+        if (sslGlobalParams.sslPEMKeyFile.size() == 0 && !usingCertifiateSelectors) {
+            return Status(ErrorCodes::BadValue,
+                          "need sslPEMKeyFile or certificateSelector when SSL is enabled");
         }
         if (!sslGlobalParams.sslCRLFile.empty() && sslGlobalParams.sslCAFile.empty()) {
             return Status(ErrorCodes::BadValue, "need sslCAFile with sslCRLFile");
         }
+
         std::string sslCANotFoundError(
             "No SSL certificate validation can be performed since"
             " no CA file has been provided; please specify an"
             " sslCAFile parameter");
 
-        if (sslGlobalParams.sslCAFile.empty() &&
+        // When using cetificate selectors, we use the local system certificate store for verifying
+        // X.509 certificates for auth instead of relying on a CA file.
+        if (sslGlobalParams.sslCAFile.empty() && !usingCertifiateSelectors &&
             clusterAuthMode == ServerGlobalParams::ClusterAuthMode_x509) {
             return Status(ErrorCodes::BadValue, sslCANotFoundError);
         }
@@ -348,7 +515,11 @@ Status storeSSLServerOptions(const moe::Environment& params) {
                sslGlobalParams.sslClusterFile.size() || sslGlobalParams.sslClusterPassword.size() ||
                sslGlobalParams.sslCAFile.size() || sslGlobalParams.sslCRLFile.size() ||
                sslGlobalParams.sslCipherConfig.size() ||
-               sslGlobalParams.sslDisabledProtocols.size() ||
+               params.count("net.ssl.disabledProtocols") ||
+#ifdef MONGO_CONFIG_SSL_CERTIFICATE_SELECTORS
+               params.count("net.ssl.certificateSelector") ||
+               params.count("net.ssl.clusterCertificateSelector") ||
+#endif
                sslGlobalParams.sslWeakCertificateValidation) {
         return Status(ErrorCodes::BadValue,
                       "need to enable SSL via the sslMode flag when "
@@ -399,6 +570,38 @@ Status storeSSLClientOptions(const moe::Environment& params) {
     if (params.count("ssl.FIPSMode")) {
         sslGlobalParams.sslFIPSMode = true;
     }
+
+    if (params.count("ssl.disabledProtocols")) {
+        const auto status =
+            storeDisabledProtocols(params["ssl.disabledProtocols"].as<std::string>());
+        if (!status.isOK()) {
+            return status;
+        }
+#if ((MONGO_CONFIG_SSL_PROVIDER != SSL_PROVIDER_OPENSSL) || \
+     (OPENSSL_VERSION_NUMBER >= 0x100000cf)) /* 1.0.0l */
+    } else {
+        /* Similar to the server setting above, we auto-disable TLS 1.0
+         * for shell clients which support TLS 1.1 and later.
+         * Unlike above, we don't have a blanket exception for Apple,
+         * since the reason for supporting external tooling does not apply.
+         *
+         * We also skip logging to keep the spam away from the interactive client op.
+         */
+        sslGlobalParams.sslDisabledProtocols.push_back(SSLParams::Protocols::TLS1_0);
+#endif
+    }
+
+#ifdef MONGO_CONFIG_SSL_CERTIFICATE_SELECTORS
+    if (params.count("ssl.certificateSelector")) {
+        const auto status =
+            parseCertificateSelector(&sslGlobalParams.sslCertificateSelector,
+                                     "ssl.certificateSelector",
+                                     params["ssl.certificateSelector"].as<std::string>());
+        if (!status.isOK()) {
+            return status;
+        }
+    }
+#endif
     return Status::OK();
 }
 

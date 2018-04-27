@@ -37,8 +37,8 @@
 #include "mongo/db/concurrency/locker.h"
 #include "mongo/db/logical_session_id.h"
 #include "mongo/db/storage/recovery_unit.h"
-#include "mongo/db/storage/recovery_unit.h"
 #include "mongo/db/storage/storage_options.h"
+#include "mongo/db/storage/write_unit_of_work.h"
 #include "mongo/db/write_concern_options.h"
 #include "mongo/platform/atomic_word.h"
 #include "mongo/stdx/condition_variable.h"
@@ -54,7 +54,6 @@ class CurOp;
 class ProgressMeter;
 class ServiceContext;
 class StringData;
-class WriteUnitOfWork;
 
 namespace repl {
 class UnreplicatedWritesBlock;
@@ -75,37 +74,6 @@ class OperationContext : public Decorable<OperationContext> {
     MONGO_DISALLOW_COPYING(OperationContext);
 
 public:
-    /**
-     * The RecoveryUnitState is used by WriteUnitOfWork to ensure valid state transitions.
-     */
-    enum RecoveryUnitState {
-        kNotInUnitOfWork,   // not in a unit of work, no writes allowed
-        kActiveUnitOfWork,  // in a unit of work that still may either commit or abort
-        kFailedUnitOfWork   // in a unit of work that has failed and must be aborted
-    };
-
-    /**
-     * An RAII type that will temporarily suspend any deadline on this operation. Resets the
-     * deadline to the previous value upon destruction.
-     */
-    class DeadlineStash {
-    public:
-        /**
-         * Clears any deadline set on this operation.
-         */
-        DeadlineStash(OperationContext* opCtx);
-
-        /**
-         * Resets the deadline on '_opCtx' to the original deadline present at the time this
-         * DeadlineStash was constructed.
-         */
-        ~DeadlineStash();
-
-    private:
-        OperationContext* _opCtx;
-        Date_t _originalDeadline;
-    };
-
     OperationContext(Client* client, unsigned int opId);
 
     virtual ~OperationContext() = default;
@@ -137,7 +105,8 @@ public:
      * returned separately even though the state logically belongs to the RecoveryUnit,
      * as it is managed by the OperationContext.
      */
-    RecoveryUnitState setRecoveryUnit(RecoveryUnit* unit, RecoveryUnitState state);
+    WriteUnitOfWork::RecoveryUnitState setRecoveryUnit(RecoveryUnit* unit,
+                                                       WriteUnitOfWork::RecoveryUnitState state);
 
     /**
      * Interface for locking.  Caller DOES NOT own pointer.
@@ -153,10 +122,9 @@ public:
     void setLockState(std::unique_ptr<Locker> locker);
 
     /**
-     * Releases the locker to the caller. Call during OperationContext cleanup or initialization,
-     * only.
+     * Swaps the locker, releasing the old locker to the caller.
      */
-    std::unique_ptr<Locker> releaseLockState();
+    std::unique_ptr<Locker> swapLockState(std::unique_ptr<Locker> locker);
 
     /**
      * Raises a AssertionException if this operation is in a killed state.
@@ -315,6 +283,24 @@ public:
     void setTxnNumber(TxnNumber txnNumber);
 
     /**
+     * Returns the top-level WriteUnitOfWork associated with this operation context, if any.
+     */
+    WriteUnitOfWork* getWriteUnitOfWork() {
+        return _writeUnitOfWork.get();
+    }
+
+    /**
+     * Sets a top-level WriteUnitOfWork for this operation context, to be held for the duration
+     * of the given network operation.
+     */
+    void setWriteUnitOfWork(std::unique_ptr<WriteUnitOfWork> writeUnitOfWork) {
+        invariant(writeUnitOfWork || _writeUnitOfWork);
+        invariant(!(writeUnitOfWork && _writeUnitOfWork));
+
+        _writeUnitOfWork = std::move(writeUnitOfWork);
+    }
+
+    /**
      * Returns WriteConcernOptions of the current operation
      */
     const WriteConcernOptions& getWriteConcern() const {
@@ -411,14 +397,6 @@ public:
     }
 
     /**
-     * Reset the deadline for this operation.
-     */
-    void clearDeadline() {
-        _deadline = Date_t::max();
-        _maxTime = computeMaxTimeFromDeadline(_deadline);
-    }
-
-    /**
      * Returns the number of milliseconds remaining for this operation's time limit or
      * Milliseconds::max() if the operation has no time limit.
      */
@@ -464,7 +442,6 @@ private:
         _writesAreReplicated = writesAreReplicated;
     }
 
-    friend class DeadlineStash;
     friend class WriteUnitOfWork;
     friend class repl::UnreplicatedWritesBlock;
     Client* const _client;
@@ -476,7 +453,12 @@ private:
     std::unique_ptr<Locker> _locker;
 
     std::unique_ptr<RecoveryUnit> _recoveryUnit;
-    RecoveryUnitState _ruState = kNotInUnitOfWork;
+    WriteUnitOfWork::RecoveryUnitState _ruState =
+        WriteUnitOfWork::RecoveryUnitState::kNotInUnitOfWork;
+
+    // Operations run within a transaction will hold a WriteUnitOfWork for the duration in order
+    // to maintain two-phase locking.
+    std::unique_ptr<WriteUnitOfWork> _writeUnitOfWork;
 
     // Follows the values of ErrorCodes::Error. The default value is 0 (OK), which means the
     // operation is not killed. If killed, it will contain a specific code. This value changes only
@@ -513,56 +495,6 @@ private:
     Timer _elapsedTime;
 
     bool _writesAreReplicated = true;
-};
-
-class WriteUnitOfWork {
-    MONGO_DISALLOW_COPYING(WriteUnitOfWork);
-
-public:
-    WriteUnitOfWork(OperationContext* opCtx)
-        : _opCtx(opCtx),
-          _committed(false),
-          _toplevel(opCtx->_ruState == OperationContext::kNotInUnitOfWork) {
-        uassert(ErrorCodes::IllegalOperation,
-                "Cannot execute a write operation in read-only mode",
-                !storageGlobalParams.readOnly);
-        _opCtx->lockState()->beginWriteUnitOfWork();
-        if (_toplevel) {
-            _opCtx->recoveryUnit()->beginUnitOfWork(_opCtx);
-            _opCtx->_ruState = OperationContext::kActiveUnitOfWork;
-        }
-    }
-
-    ~WriteUnitOfWork() {
-        dassert(!storageGlobalParams.readOnly);
-        if (!_committed) {
-            invariant(_opCtx->_ruState != OperationContext::kNotInUnitOfWork);
-            if (_toplevel) {
-                _opCtx->recoveryUnit()->abortUnitOfWork();
-                _opCtx->_ruState = OperationContext::kNotInUnitOfWork;
-            } else {
-                _opCtx->_ruState = OperationContext::kFailedUnitOfWork;
-            }
-            _opCtx->lockState()->endWriteUnitOfWork();
-        }
-    }
-
-    void commit() {
-        invariant(!_committed);
-        invariant(_opCtx->_ruState == OperationContext::kActiveUnitOfWork);
-        if (_toplevel) {
-            _opCtx->recoveryUnit()->commitUnitOfWork();
-            _opCtx->_ruState = OperationContext::kNotInUnitOfWork;
-        }
-        _opCtx->lockState()->endWriteUnitOfWork();
-        _committed = true;
-    }
-
-private:
-    OperationContext* const _opCtx;
-
-    bool _committed;
-    bool _toplevel;
 };
 
 namespace repl {

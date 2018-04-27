@@ -39,12 +39,14 @@
 #include "mongo/db/client.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/commands/server_status_metric.h"
+#include "mongo/db/concurrency/locker.h"
 #include "mongo/db/json.h"
 #include "mongo/db/query/getmore_request.h"
 #include "mongo/db/query/plan_summary_stats.h"
 #include "mongo/rpc/metadata/client_metadata.h"
 #include "mongo/rpc/metadata/client_metadata_ismaster.h"
 #include "mongo/util/log.h"
+#include "mongo/util/net/sock.h"
 #include "mongo/util/stringutils.h"
 
 namespace mongo {
@@ -84,12 +86,12 @@ BSONObj upconvertQueryEntry(const BSONObj& query,
 
     // Extract the query predicate.
     BSONObj filter;
-    if (auto elem = query["query"]) {
+    if (query["query"].isABSONObj()) {
         predicateIsWrapped = true;
-        bob.appendAs(elem, "filter");
-    } else if (auto elem = query["$query"]) {
+        bob.appendAs(query["query"], "filter");
+    } else if (query["$query"].isABSONObj()) {
         predicateIsWrapped = true;
-        bob.appendAs(elem, "filter");
+        bob.appendAs(query["$query"], "filter");
     } else if (!query.isEmpty()) {
         bob.append("filter", query);
     }
@@ -224,6 +226,53 @@ CurOp* CurOp::get(const OperationContext& opCtx) {
     return _curopStack(opCtx).top();
 }
 
+void CurOp::reportCurrentOpForClient(OperationContext* opCtx,
+                                     Client* client,
+                                     bool truncateOps,
+                                     BSONObjBuilder* infoBuilder) {
+    invariant(client);
+    OperationContext* clientOpCtx = client->getOperationContext();
+
+    const std::string hostName = getHostNameCachedAndPort();
+    infoBuilder->append("host", hostName);
+
+    client->reportState(*infoBuilder);
+    const auto& clientMetadata = ClientMetadataIsMasterState::get(client).getClientMetadata();
+
+    if (clientMetadata) {
+        auto appName = clientMetadata.get().getApplicationName();
+        if (!appName.empty()) {
+            infoBuilder->append("appName", appName);
+        }
+
+        auto clientMetadataDocument = clientMetadata.get().getDocument();
+        infoBuilder->append("clientMetadata", clientMetadataDocument);
+    }
+
+    // Fill out the rest of the BSONObj with opCtx specific details.
+    infoBuilder->appendBool("active", static_cast<bool>(clientOpCtx));
+    infoBuilder->append("currentOpTime",
+                        opCtx->getServiceContext()->getPreciseClockSource()->now().toString());
+
+    if (clientOpCtx) {
+        infoBuilder->append("opid", clientOpCtx->getOpID());
+        if (clientOpCtx->isKillPending()) {
+            infoBuilder->append("killPending", true);
+        }
+
+        if (auto lsid = clientOpCtx->getLogicalSessionId()) {
+            BSONObjBuilder bob(infoBuilder->subobjStart("lsid"));
+            lsid->serialize(&bob);
+        }
+
+        if (auto txnNumber = clientOpCtx->getTxnNumber()) {
+            infoBuilder->append("txnNumber", *txnNumber);
+        }
+
+        CurOp::get(clientOpCtx)->reportState(infoBuilder, truncateOps);
+    }
+}
+
 CurOp::CurOp(OperationContext* opCtx) : CurOp(opCtx, &_curopStack(opCtx)) {}
 
 CurOp::CurOp(OperationContext* opCtx, CurOpStack* stack) : _stack(stack) {
@@ -232,6 +281,30 @@ CurOp::CurOp(OperationContext* opCtx, CurOpStack* stack) : _stack(stack) {
     } else {
         _stack->push_nolock(this);
     }
+}
+
+CurOp::~CurOp() {
+    invariant(this == _stack->pop());
+}
+
+void CurOp::setGenericOpRequestDetails(OperationContext* opCtx,
+                                       const NamespaceString& nss,
+                                       const Command* command,
+                                       BSONObj cmdObj,
+                                       NetworkOp op) {
+    // Set the _isCommand flags based on network op only. For legacy writes on mongoS, we resolve
+    // them to OpMsgRequests and then pass them into the Commands path, so having a valid Command*
+    // here does not guarantee that the op was issued from the client using a command protocol.
+    const bool isCommand = (op == dbMsg || op == dbCommand || (op == dbQuery && nss.isCommand()));
+    auto logicalOp = (command ? command->getLogicalOp() : networkOpToLogicalOp(op));
+
+    stdx::lock_guard<Client> clientLock(*opCtx->getClient());
+    _isCommand = _debug.iscommand = isCommand;
+    _logicalOp = _debug.logicalOp = logicalOp;
+    _networkOp = _debug.networkOp = op;
+    _opDescription = cmdObj;
+    _command = command;
+    _ns = nss.ns();
 }
 
 ProgressMeter& CurOp::setMessage_inlock(const char* msg,
@@ -250,10 +323,6 @@ ProgressMeter& CurOp::setMessage_inlock(const char* msg,
     }
     _message = msg;
     return _progressMeter;
-}
-
-CurOp::~CurOp() {
-    invariant(this == _stack->pop());
 }
 
 void CurOp::setNS_inlock(StringData ns) {
@@ -276,6 +345,38 @@ void CurOp::enter_inlock(const char* ns, boost::optional<int> dbProfileLevel) {
 
 void CurOp::raiseDbProfileLevel(int dbProfileLevel) {
     _dbprofile = std::max(dbProfileLevel, _dbprofile);
+}
+
+bool CurOp::completeAndLogOperation(OperationContext* opCtx,
+                                    logger::LogComponent component,
+                                    boost::optional<size_t> responseLength,
+                                    boost::optional<long long> slowMsOverride,
+                                    bool forceLog) {
+    // Log the operation if it is eligible according to the current slowMS and sampleRate settings.
+    const bool shouldLogOp = (forceLog || shouldLog(component, logger::LogSeverity::Debug(1)));
+    const long long slowMs = slowMsOverride.value_or(serverGlobalParams.slowMS);
+
+    const auto client = opCtx->getClient();
+
+    // Record the size of the response returned to the client, if applicable.
+    if (responseLength) {
+        _debug.responseLength = *responseLength;
+    }
+
+    // Obtain the total execution time of this operation.
+    _end = curTimeMicros64();
+    _debug.executionTimeMicros = durationCount<Microseconds>(elapsedTimeExcludingPauses());
+
+    const bool shouldSample =
+        client->getPrng().nextCanonicalDouble() < serverGlobalParams.sampleRate;
+
+    if (shouldLogOp || (shouldSample && _debug.executionTimeMicros > slowMs * 1000LL)) {
+        const auto lockerInfo = opCtx->lockState()->getLockerInfo();
+        log(component) << _debug.report(client, *this, (lockerInfo ? &lockerInfo->stats : nullptr));
+    }
+
+    // Return 'true' if this operation should also be added to the profiler.
+    return shouldDBProfile(shouldSample);
 }
 
 Command::ReadWriteType CurOp::getReadWriteType() const {
@@ -354,23 +455,7 @@ void CurOp::reportState(BSONObjBuilder* builder, bool truncateOps) {
     // is true, limit the size of each op to 1000 bytes. Otherwise, do not truncate.
     const boost::optional<size_t> maxQuerySize{truncateOps, 1000};
 
-    if (!_command && _networkOp == dbQuery) {
-        // This is a legacy OP_QUERY. We upconvert the "query" field of the currentOp output to look
-        // similar to a find command.
-        //
-        // CurOp doesn't have access to the ntoreturn or ntoskip values. By setting them to zero, we
-        // will omit mention of them in the currentOp output.
-        const int ntoreturn = 0;
-        const int ntoskip = 0;
-
-        appendAsObjOrString(
-            "command",
-            upconvertQueryEntry(_opDescription, NamespaceString(_ns), ntoreturn, ntoskip),
-            maxQuerySize,
-            builder);
-    } else {
-        appendAsObjOrString("command", _opDescription, maxQuerySize, builder);
-    }
+    appendAsObjOrString("command", _opDescription, maxQuerySize, builder);
 
     if (!_originatingCommand.isEmpty()) {
         appendAsObjOrString("originatingCommand", _originatingCommand, maxQuerySize, builder);
@@ -419,7 +504,7 @@ StringData getProtoString(int op) {
 
 string OpDebug::report(Client* client,
                        const CurOp& curop,
-                       const SingleThreadedLockStats& lockStats) const {
+                       const SingleThreadedLockStats* lockStats) const {
     StringBuilder s;
     if (iscommand)
         s << "command ";
@@ -436,21 +521,11 @@ string OpDebug::report(Client* client,
         }
     }
 
-    BSONObj query;
-
-    // If necessary, upconvert legacy find operations so that their log lines resemble their find
-    // command counterpart.
-    if (!iscommand && networkOp == dbQuery) {
-        query = upconvertQueryEntry(
-            curop.opDescription(), NamespaceString(curop.getNS()), ntoreturn, ntoskip);
-    } else {
-        query = curop.opDescription();
-    }
-
+    auto query = curop.opDescription();
     if (!query.isEmpty()) {
         s << " command: ";
         if (iscommand) {
-            Command* curCommand = curop.getCommand();
+            const Command* curCommand = curop.getCommand();
             if (curCommand) {
                 mutablebson::Document cmdToLog(query, mutablebson::Document::kInPlaceDisabled);
                 curCommand->redactForLogging(&cmdToLog);
@@ -473,6 +548,7 @@ string OpDebug::report(Client* client,
         s << " planSummary: " << redact(curop.getPlanSummary().toString());
     }
 
+    OPDEBUG_TOSTRING_HELP(nShards);
     OPDEBUG_TOSTRING_HELP(cursorid);
     OPDEBUG_TOSTRING_HELP(ntoreturn);
     OPDEBUG_TOSTRING_HELP(ntoskip);
@@ -503,25 +579,33 @@ string OpDebug::report(Client* client,
         s << " keysDeleted:" << keysDeleted;
     }
 
+    if (prepareReadConflicts > 0) {
+        s << " prepareReadConflicts:" << prepareReadConflicts;
+    }
+
     if (writeConflicts > 0) {
         s << " writeConflicts:" << writeConflicts;
     }
 
-    if (!exceptionInfo.isOK()) {
-        s << " exception: " << redact(exceptionInfo.reason());
-        s << " code:" << exceptionInfo.code();
+    s << " numYields:" << curop.numYields();
+    OPDEBUG_TOSTRING_HELP(nreturned);
+
+    if (!errInfo.isOK()) {
+        s << " ok:" << 0;
+        if (!errInfo.reason().empty()) {
+            s << " errMsg:\"" << escape(redact(errInfo.reason())) << "\"";
+        }
+        s << " errName:" << errInfo.code();
+        s << " errCode:" << static_cast<int>(errInfo.code());
     }
 
-    s << " numYields:" << curop.numYields();
-
-    OPDEBUG_TOSTRING_HELP(nreturned);
     if (responseLength > 0) {
         s << " reslen:" << responseLength;
     }
 
-    {
+    if (lockStats) {
         BSONObjBuilder locks;
-        lockStats.report(&locks);
+        lockStats->report(&locks);
         s << " locks:" << locks.obj().toString();
     }
 
@@ -551,20 +635,14 @@ void OpDebug::append(const CurOp& curop,
     NamespaceString nss = NamespaceString(curop.getNS());
     b.append("ns", nss.ns());
 
-    if (!iscommand && networkOp == dbQuery) {
-        appendAsObjOrString("command",
-                            upconvertQueryEntry(curop.opDescription(), nss, ntoreturn, ntoskip),
-                            maxElementSize,
-                            &b);
-    } else if (curop.haveOpDescription()) {
-        appendAsObjOrString("command", curop.opDescription(), maxElementSize, &b);
-    }
+    appendAsObjOrString("command", curop.opDescription(), maxElementSize, &b);
 
     auto originatingCommand = curop.originatingCommand();
     if (!originatingCommand.isEmpty()) {
         appendAsObjOrString("originatingCommand", originatingCommand, maxElementSize, &b);
     }
 
+    OPDEBUG_APPEND_NUMBER(nShards);
     OPDEBUG_APPEND_NUMBER(cursorid);
     OPDEBUG_APPEND_BOOL(exhaust);
 
@@ -593,23 +671,31 @@ void OpDebug::append(const CurOp& curop,
         b.appendNumber("keysDeleted", keysDeleted);
     }
 
+    if (prepareReadConflicts > 0) {
+        b.appendNumber("prepareReadConflicts", prepareReadConflicts);
+    }
+
     if (writeConflicts > 0) {
         b.appendNumber("writeConflicts", writeConflicts);
     }
 
     b.appendNumber("numYield", curop.numYields());
+    OPDEBUG_APPEND_NUMBER(nreturned);
 
     {
         BSONObjBuilder locks(b.subobjStart("locks"));
         lockStats.report(&locks);
     }
 
-    if (!exceptionInfo.isOK()) {
-        b.append("exception", exceptionInfo.reason());
-        b.append("exceptionCode", exceptionInfo.code());
+    if (!errInfo.isOK()) {
+        b.appendNumber("ok", 0.0);
+        if (!errInfo.reason().empty()) {
+            b.append("errMsg", errInfo.reason());
+        }
+        b.append("errName", ErrorCodes::errorString(errInfo.code()));
+        b.append("errCode", errInfo.code());
     }
 
-    OPDEBUG_APPEND_NUMBER(nreturned);
     OPDEBUG_APPEND_NUMBER(responseLength);
     if (iscommand) {
         b.append("protocol", getProtoString(networkOp));

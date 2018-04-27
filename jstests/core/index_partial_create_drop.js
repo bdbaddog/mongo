@@ -1,6 +1,11 @@
-// Cannot implicitly shard accessed collections because of extra shard key index in sharded
-// collection.
-// @tags: [assumes_no_implicit_index_creation]
+// @tags: [
+//     # Cannot implicitly shard accessed collections because of extra shard key index in sharded
+//     # collection.
+//     assumes_no_implicit_index_creation,
+//
+//     # Builds index in the background
+//     requires_background_index,
+// ]
 
 // Test partial index creation and drops.
 
@@ -32,8 +37,11 @@
         partialFilterExpression:
             {$and: [{$and: [{x: {$lt: 2}}, {x: {$gt: 0}}]}, {x: {$exists: true}}]}
     }));
+    // Use of $expr is banned in a partial index filter.
     assert.commandFailed(
         coll.createIndex({x: 1}, {partialFilterExpression: {$expr: {$eq: ["$x", 5]}}}));
+    assert.commandFailed(coll.createIndex(
+        {x: 1}, {partialFilterExpression: {$expr: {$eq: [{$trim: {input: "$x"}}, "hi"]}}}));
 
     for (var i = 0; i < 10; i++) {
         assert.writeOK(coll.insert({x: i, a: i}));

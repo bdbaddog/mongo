@@ -71,17 +71,18 @@ void MockReplCoordServerFixture::setUp() {
     repl::ReplSettings replSettings;
     replSettings.setReplSetString(
         ConnectionString::forReplicaSet("sessionTxnStateTest", {HostAndPort("a:1")}).toString());
-    replSettings.setMaster(true);
 
     repl::ReplicationCoordinator::set(
         service, stdx::make_unique<repl::ReplicationCoordinatorMock>(service, replSettings));
+    ASSERT_OK(
+        repl::ReplicationCoordinator::get(service)->setFollowerMode(repl::MemberState::RS_PRIMARY));
 
     // Note: internal code does not allow implicit creation of non-capped oplog collection.
     DBDirectClient client(opCtx());
     ASSERT_TRUE(
         client.createCollection(NamespaceString::kRsOplogNamespace.ns(), 1024 * 1024, true));
 
-    repl::setOplogCollectionName();
+    repl::setOplogCollectionName(service);
     repl::acquireOplogCollectionForLogging(opCtx());
 }
 

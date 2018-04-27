@@ -35,6 +35,7 @@
 #include "mongo/db/auth/action_type.h"
 #include "mongo/db/auth/privilege.h"
 #include "mongo/db/commands.h"
+#include "mongo/db/commands/test_commands_enabled.h"
 #include "mongo/util/fail_point_service.h"
 #include "mongo/util/log.h"
 
@@ -68,10 +69,9 @@ class FaultInjectCmd : public ErrmsgCommandDeprecated {
 public:
     FaultInjectCmd() : ErrmsgCommandDeprecated("configureFailPoint") {}
 
-    virtual bool slaveOk() const {
-        return true;
+    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
+        return AllowedOnSecondary::kAlways;
     }
-
 
     virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
         return false;
@@ -84,10 +84,10 @@ public:
     // No auth needed because it only works when enabled via command line.
     virtual void addRequiredPrivileges(const std::string& dbname,
                                        const BSONObj& cmdObj,
-                                       std::vector<Privilege>* out) {}
+                                       std::vector<Privilege>* out) const {}
 
-    virtual void help(stringstream& h) const {
-        h << "modifies the settings of a fail point";
+    std::string help() const override {
+        return "modifies the settings of a fail point";
     }
 
     bool errmsgRun(OperationContext* opCtx,
@@ -116,7 +116,7 @@ public:
     }
 };
 MONGO_INITIALIZER(RegisterFaultInjectCmd)(InitializerContext* context) {
-    if (Command::testCommandsEnabled) {
+    if (getTestCommandsEnabled()) {
         // Leaked intentionally: a Command registers itself when constructed.
         new FaultInjectCmd();
     }

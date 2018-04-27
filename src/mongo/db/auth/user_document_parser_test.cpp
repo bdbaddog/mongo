@@ -39,7 +39,6 @@
 #include "mongo/db/auth/sasl_options.h"
 #include "mongo/db/auth/user_document_parser.h"
 #include "mongo/db/jsobj.h"
-#include "mongo/db/server_options.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/net/sock.h"
 
@@ -59,15 +58,17 @@ public:
     unique_ptr<User> adminUser;
     V2UserDocumentParser v2parser;
     BSONObj credentials;
+    BSONObj sha1_creds, sha256_creds;
 
     void setUp() {
-        serverGlobalParams.featureCompatibility.setVersion(
-            ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo36);
         user.reset(new User(UserName("spencer", "test")));
         adminUser.reset(new User(UserName("admin", "admin")));
 
-        credentials = BSON("SCRAM-SHA-1" << scram::generateCredentials(
-                               "a", saslGlobalParams.scramIterationCount.load()));
+        sha1_creds = scram::Secrets<SHA1Block>::generateCredentials(
+            "a", saslGlobalParams.scramSHA1IterationCount.load());
+        sha256_creds = scram::Secrets<SHA256Block>::generateCredentials(
+            "a", saslGlobalParams.scramSHA256IterationCount.load());
+        credentials = BSON("SCRAM-SHA-1" << sha1_creds << "SCRAM-SHA-256" << sha256_creds);
     }
 };
 
@@ -288,7 +289,33 @@ TEST_F(V2UserDocumentParsing, V2CredentialExtraction) {
                                                                           << BSON("foo"
                                                                                   << "bar"))));
 
-    // Make sure extracting valid credentials works
+    // May specify only SCRAM-SHA-1 credentials
+    ASSERT_OK(v2parser.initializeUserCredentialsFromUserDocument(user.get(),
+                                                                 BSON("user"
+                                                                      << "spencer"
+                                                                      << "db"
+                                                                      << "test"
+                                                                      << "credentials"
+                                                                      << BSON("SCRAM-SHA-1"
+                                                                              << sha1_creds))));
+    ASSERT(user->getCredentials().scram_sha1.isValid());
+    ASSERT(!user->getCredentials().scram_sha256.isValid());
+    ASSERT(!user->getCredentials().isExternal);
+
+    // May specify only SCRAM-SHA-256 credentials
+    ASSERT_OK(v2parser.initializeUserCredentialsFromUserDocument(user.get(),
+                                                                 BSON("user"
+                                                                      << "spencer"
+                                                                      << "db"
+                                                                      << "test"
+                                                                      << "credentials"
+                                                                      << BSON("SCRAM-SHA-256"
+                                                                              << sha256_creds))));
+    ASSERT(!user->getCredentials().scram_sha1.isValid());
+    ASSERT(user->getCredentials().scram_sha256.isValid());
+    ASSERT(!user->getCredentials().isExternal);
+
+    // Make sure extracting valid combined credentials works
     ASSERT_OK(v2parser.initializeUserCredentialsFromUserDocument(user.get(),
                                                                  BSON("user"
                                                                       << "spencer"
@@ -296,7 +323,8 @@ TEST_F(V2UserDocumentParsing, V2CredentialExtraction) {
                                                                       << "test"
                                                                       << "credentials"
                                                                       << credentials)));
-    ASSERT(user->getCredentials().scram.isValid());
+    ASSERT(user->getCredentials().scram_sha1.isValid());
+    ASSERT(user->getCredentials().scram_sha256.isValid());
     ASSERT(!user->getCredentials().isExternal);
 
     // Credentials are {external:true if users's db is $external
@@ -308,7 +336,8 @@ TEST_F(V2UserDocumentParsing, V2CredentialExtraction) {
                                                                 << "$external"
                                                                 << "credentials"
                                                                 << BSON("external" << true))));
-    ASSERT(!user->getCredentials().scram.isValid());
+    ASSERT(!user->getCredentials().scram_sha1.isValid());
+    ASSERT(!user->getCredentials().scram_sha256.isValid());
     ASSERT(user->getCredentials().isExternal);
 }
 
@@ -464,8 +493,6 @@ TEST_F(V2UserDocumentParsing, V2AuthenticationRestrictionsExtraction) {
 }
 
 TEST_F(V2UserDocumentParsing, V2AuthenticationRestrictionsExtractionAndRetreival) {
-    serverGlobalParams.featureCompatibility.setVersion(
-        ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo36);
     enableIPv6(true);
     ASSERT_OK(v2parser.initializeAuthenticationRestrictionsFromUserDocument(
         BSON("user"

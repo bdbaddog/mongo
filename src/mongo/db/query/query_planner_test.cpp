@@ -1141,8 +1141,7 @@ TEST_F(QueryPlannerTest, MaxMinSort) {
                  0,
                  BSONObj(),
                  fromjson("{a: 2}"),
-                 fromjson("{a: 8}"),
-                 false);
+                 fromjson("{a: 8}"));
 
     assertNumSolutions(1);
     assertSolutionExists("{fetch: {node: {ixscan: {filter: null, pattern: {a: 1}}}}}");
@@ -1159,8 +1158,7 @@ TEST_F(QueryPlannerTest, MaxMinSortEqualityFirstSortSecond) {
                  0,
                  BSONObj(),
                  fromjson("{a: 1, b: 1}"),
-                 fromjson("{a: 1, b: 2}"),
-                 false);
+                 fromjson("{a: 1, b: 2}"));
 
     assertNumSolutions(1);
     assertSolutionExists("{fetch: {node: {ixscan: {filter: null, pattern: {a: 1, b: 1}}}}}");
@@ -1177,8 +1175,7 @@ TEST_F(QueryPlannerTest, MaxMinSortInequalityFirstSortSecond) {
                  0,
                  BSONObj(),
                  fromjson("{a: 1, b: 1}"),
-                 fromjson("{a: 2, b: 2}"),
-                 false);
+                 fromjson("{a: 2, b: 2}"));
 
     assertNumSolutions(1);
     assertSolutionExists(
@@ -1198,8 +1195,7 @@ TEST_F(QueryPlannerTest, MaxMinReverseSort) {
                  0,
                  BSONObj(),
                  fromjson("{a: 2}"),
-                 fromjson("{a: 8}"),
-                 false);
+                 fromjson("{a: 8}"));
 
     assertNumSolutions(1);
     assertSolutionExists("{fetch: {node: {ixscan: {filter: null, dir: -1, pattern: {a: 1}}}}}");
@@ -1216,8 +1212,7 @@ TEST_F(QueryPlannerTest, MaxMinReverseIndexDir) {
                  0,
                  BSONObj(),
                  fromjson("{a: 8}"),
-                 fromjson("{a: 2}"),
-                 false);
+                 fromjson("{a: 2}"));
 
     assertNumSolutions(1);
     assertSolutionExists("{fetch: {node: {ixscan: {filter: null, dir: 1, pattern: {a: -1}}}}}");
@@ -1235,8 +1230,7 @@ TEST_F(QueryPlannerTest, MaxMinReverseIndexDirSort) {
                  0,
                  BSONObj(),
                  fromjson("{a: 8}"),
-                 fromjson("{a: 2}"),
-                 false);
+                 fromjson("{a: 2}"));
 
     assertNumSolutions(1);
     assertSolutionExists(
@@ -1255,30 +1249,16 @@ TEST_F(QueryPlannerTest, MaxMinSelectCorrectlyOrderedIndex) {
     addIndex(BSON("a" << -1));
 
     // The ordering of min and max means that we *must* use the descending index.
-    runQueryFull(BSONObj(),
-                 BSONObj(),
-                 BSONObj(),
-                 0,
-                 0,
-                 BSONObj(),
-                 fromjson("{a: 8}"),
-                 fromjson("{a: 2}"),
-                 false);
+    runQueryFull(
+        BSONObj(), BSONObj(), BSONObj(), 0, 0, BSONObj(), fromjson("{a: 8}"), fromjson("{a: 2}"));
 
     assertNumSolutions(1);
     assertSolutionExists("{fetch: {node: {ixscan: {filter: null, dir: 1, pattern: {a: -1}}}}}");
 
     // If we switch the ordering, then we use the ascending index.
     // The ordering of min and max means that we *must* use the descending index.
-    runQueryFull(BSONObj(),
-                 BSONObj(),
-                 BSONObj(),
-                 0,
-                 0,
-                 BSONObj(),
-                 fromjson("{a: 2}"),
-                 fromjson("{a: 8}"),
-                 false);
+    runQueryFull(
+        BSONObj(), BSONObj(), BSONObj(), 0, 0, BSONObj(), fromjson("{a: 2}"), fromjson("{a: 8}"));
 
     assertNumSolutions(1);
     assertSolutionExists("{fetch: {node: {ixscan: {filter: null, dir: 1, pattern: {a: 1}}}}}");
@@ -1298,43 +1278,7 @@ TEST_F(QueryPlannerTest, MaxMinBadHintSelectsReverseIndex) {
                         0,
                         fromjson("{a: 1}"),
                         fromjson("{a: 8}"),
-                        fromjson("{a: 2}"),
-                        false);
-}
-
-
-//
-// snapshot
-//
-
-TEST_F(QueryPlannerTest, Snapshot) {
-    addIndex(BSON("a" << 1));
-    runQuerySnapshot(fromjson("{a: {$gt: 0}}"));
-
-    assertNumSolutions(1U);
-    assertSolutionExists("{cscan: {filter: {a: {$gt: 0}}, dir: 1}}");
-}
-
-TEST_F(QueryPlannerTest, SnapshotUseId) {
-    params.options = QueryPlannerParams::SNAPSHOT_USE_ID;
-
-    addIndex(BSON("a" << 1));
-    runQuerySnapshot(fromjson("{a: {$gt: 0}}"));
-
-    assertNumSolutions(1U);
-    assertSolutionExists(
-        "{fetch: {filter: {a:{$gt:0}}, node: "
-        "{ixscan: {filter: null, pattern: {_id: 1}}}}}");
-}
-
-TEST_F(QueryPlannerTest, CannotSnapshotWithGeoNear) {
-    // Snapshot is skipped with geonear queries.
-    addIndex(BSON("a"
-                  << "2d"));
-    runQuerySnapshot(fromjson("{a: {$near: [0,0]}}"));
-
-    ASSERT_EQUALS(getNumSolutions(), 1U);
-    assertSolutionExists("{geoNear2d: {a: '2d'}}");
+                        fromjson("{a: 2}"));
 }
 
 //
@@ -4322,13 +4266,9 @@ TEST_F(QueryPlannerTest, KeyPatternOverflowsInt) {
 //
 
 TEST_F(QueryPlannerTest, CacheDataFromTaggedTreeFailsOnBadInput) {
-    PlanCacheIndexTree* indexTree;
-
     // Null match expression.
     std::vector<IndexEntry> relevantIndices;
-    Status s = QueryPlanner::cacheDataFromTaggedTree(NULL, relevantIndices, &indexTree);
-    ASSERT_NOT_OK(s);
-    ASSERT(NULL == indexTree);
+    ASSERT_NOT_OK(QueryPlanner::cacheDataFromTaggedTree(NULL, relevantIndices).getStatus());
 
     // No relevant index matching the index tag.
     relevantIndices.push_back(IndexEntry(BSON("a" << 1)));
@@ -4340,9 +4280,8 @@ TEST_F(QueryPlannerTest, CacheDataFromTaggedTreeFailsOnBadInput) {
     std::unique_ptr<CanonicalQuery> scopedCq = std::move(statusWithCQ.getValue());
     scopedCq->root()->setTag(new IndexTag(1));
 
-    s = QueryPlanner::cacheDataFromTaggedTree(scopedCq->root(), relevantIndices, &indexTree);
-    ASSERT_NOT_OK(s);
-    ASSERT(NULL == indexTree);
+    ASSERT_NOT_OK(
+        QueryPlanner::cacheDataFromTaggedTree(scopedCq->root(), relevantIndices).getStatus());
 }
 
 TEST_F(QueryPlannerTest, TagAccordingToCacheFailsOnBadInput) {

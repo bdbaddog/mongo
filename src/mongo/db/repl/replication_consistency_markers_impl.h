@@ -52,14 +52,11 @@ public:
     static constexpr StringData kDefaultMinValidNamespace = "local.replset.minvalid"_sd;
     static constexpr StringData kDefaultOplogTruncateAfterPointNamespace =
         "local.replset.oplogTruncateAfterPoint"_sd;
-    static constexpr StringData kDefaultCheckpointTimestampNamespace =
-        "local.replset.checkpointTimestamp"_sd;
 
     explicit ReplicationConsistencyMarkersImpl(StorageInterface* storageInterface);
     ReplicationConsistencyMarkersImpl(StorageInterface* storageInterface,
                                       NamespaceString minValidNss,
-                                      NamespaceString oplogTruncateAfterNss,
-                                      NamespaceString checkpointTimestampNss);
+                                      NamespaceString oplogTruncateAfterNss);
 
     void initializeMinValidDocument(OperationContext* opCtx) override;
 
@@ -80,8 +77,7 @@ public:
     void clearAppliedThrough(OperationContext* opCtx, const Timestamp& writeTimestamp) override;
     OpTime getAppliedThrough(OperationContext* opCtx) const override;
 
-    void writeCheckpointTimestamp(OperationContext* opCtx, const Timestamp& timestamp);
-    Timestamp getCheckpointTimestamp(OperationContext* opCtx);
+    Status createInternalCollections(OperationContext* opCtx);
 
 private:
     /**
@@ -91,8 +87,8 @@ private:
     boost::optional<MinValidDocument> _getMinValidDocument(OperationContext* opCtx) const;
 
     /**
-     * Updates the MinValid document according to the provided update spec. If the collection does
-     * not exist, it is created. If the document does not exist, it is upserted.
+     * Updates the MinValid document according to the provided update spec. The collection must
+     * exist, see `createInternalCollections`. If the document does not exist, it is upserted.
      *
      * This fasserts on failure.
      */
@@ -113,35 +109,16 @@ private:
     Timestamp _getOldOplogDeleteFromPoint(OperationContext* opCtx) const;
 
     /**
-     * Reads the CheckpointTimestamp document from disk.
-     * Returns boost::none if not present.
-     */
-    boost::optional<CheckpointTimestampDocument> _getCheckpointTimestampDocument(
-        OperationContext* opCtx) const;
-
-    /**
-     * Upserts the OplogTruncateAfterPoint document according to the provided update spec.
-     * If the collection does not exist, it is created. If the document does not exist,
-     * it is upserted.
+     * Upserts the OplogTruncateAfterPoint document according to the provided update spec. The
+     * collection must already exist. See `createInternalCollections`.
      *
      * This fasserts on failure.
      */
     void _upsertOplogTruncateAfterPointDocument(OperationContext* opCtx, const BSONObj& updateSpec);
 
-    /**
-     * Upserts the CheckpointTimestamp document according to the provided update spec.
-     * If the collection does not exist, it is created. If the document does not exist,
-     * it is upserted.
-     *
-     * This fasserts on failure.
-     */
-    void _upsertCheckpointTimestampDocument(OperationContext* opCtx, const BSONObj& updateSpec);
-
-
     StorageInterface* _storageInterface;
     const NamespaceString _minValidNss;
     const NamespaceString _oplogTruncateAfterPointNss;
-    const NamespaceString _checkpointTimestampNss;
 };
 
 }  // namespace repl

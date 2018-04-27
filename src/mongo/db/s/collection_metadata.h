@@ -54,7 +54,6 @@ public:
      * "does this key belong to this shard"?
      */
     CollectionMetadata(std::shared_ptr<ChunkManager> cm, const ShardId& thisShardId);
-    ~CollectionMetadata();
 
     /**
      * Returns true if 'key' contains exactly the same fields as the shard key pattern.
@@ -64,11 +63,12 @@ public:
     }
 
     /**
-     * Returns true if the document key 'key' belongs to this chunkset. Recall that documents of
-     * an in-flight chunk migration may be present and should not be considered part of the
-     * collection / chunkset yet. Key must be the full shard key.
+     * Returns true if the document with the given key belongs to this chunkset. If the key is empty
+     * returns false. If key is not a valid shard key, the behaviour is undefined.
      */
-    bool keyBelongsToMe(const BSONObj& key) const;
+    bool keyBelongsToMe(const BSONObj& key) const {
+        return _cm->keyBelongsToShard(key, _thisShardId);
+    }
 
     /**
      * Given a key 'lookupKey' in the shard key range, get the next chunk which overlaps or is
@@ -86,12 +86,14 @@ public:
     /**
      * Validates that the passed-in chunk's bounds exactly match a chunk in the metadata cache.
      */
-    Status checkChunkIsValid(const ChunkType& chunk);
+    Status checkChunkIsValid(const ChunkType& chunk) const;
 
     /**
      * Returns true if the argument range overlaps any chunk.
      */
-    bool rangeOverlapsChunk(ChunkRange const& range);
+    bool rangeOverlapsChunk(ChunkRange const& range) const {
+        return _cm->rangeOverlapsShard(range, _thisShardId);
+    }
 
     /**
      * Given a key in the shard key range, get the next range which overlaps or is greater than
@@ -119,12 +121,10 @@ public:
     }
 
     ChunkVersion getShardVersion() const {
-        return _shardVersion;
+        return _cm->getVersion(_thisShardId);
     }
 
-    const RangeMap& getChunks() const {
-        return _chunksMap;
-    }
+    RangeMap getChunks() const;
 
     const BSONObj& getKeyPattern() const {
         return _cm->getShardKeyPattern().toBSON();
@@ -140,10 +140,6 @@ public:
 
     BSONObj getMaxKey() const {
         return _cm->getShardKeyPattern().getKeyPattern().globalMax();
-    }
-
-    std::size_t getNumChunks() const {
-        return _chunksMap.size();
     }
 
     /**
@@ -170,27 +166,11 @@ public:
     }
 
 private:
-    /**
-     * Builds _rangesMap from the contents of _chunksMap.
-     */
-    void _buildRangesMap();
-
     // The full routing table for the collection.
     std::shared_ptr<ChunkManager> _cm;
 
     // The identity of this shard, for the purpose of answering "key belongs to me" queries.
     ShardId _thisShardId;
-
-    // highest ChunkVersion for which this metadata's information is accurate
-    ChunkVersion _shardVersion;
-
-    // Map of chunks tracked by this shard
-    RangeMap _chunksMap;
-
-    // A second map from a min key into a range of contiguous chunks. This map is redundant with
-    // respect to the contents of _chunkMap but we expect high chunk contiguity, especially in small
-    // clusters.
-    RangeMap _rangesMap;
 };
 
 }  // namespace mongo

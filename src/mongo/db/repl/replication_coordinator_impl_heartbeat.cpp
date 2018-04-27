@@ -35,11 +35,12 @@
 #include <algorithm>
 
 #include "mongo/base/status.h"
+#include "mongo/db/logical_clock.h"
+#include "mongo/db/logical_time_validator.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/repl/elect_cmd_runner.h"
 #include "mongo/db/repl/freshness_checker.h"
 #include "mongo/db/repl/heartbeat_response_action.h"
-#include "mongo/db/repl/member_data.h"
 #include "mongo/db/repl/repl_set_config_checks.h"
 #include "mongo/db/repl/repl_set_heartbeat_args.h"
 #include "mongo/db/repl/repl_set_heartbeat_args_v1.h"
@@ -394,15 +395,27 @@ void ReplicationCoordinatorImpl::_stepDownFinish(
 
     auto opCtx = cc().makeOperationContext();
     Lock::GlobalLock globalExclusiveLock{
-        opCtx.get(), MODE_X, UINT_MAX, Lock::GlobalLock::EnqueueOnly()};
+        opCtx.get(), MODE_X, Date_t::max(), Lock::GlobalLock::EnqueueOnly()};
     _externalState->killAllUserOperations(opCtx.get());
-    globalExclusiveLock.waitForLock(UINT_MAX);
+    globalExclusiveLock.waitForLockUntil(Date_t::max());
     invariant(globalExclusiveLock.isLocked());
+
+    // TODO SERVER-34395: Remove this method and kill cursors as part of killAllUserOperations call
+    // when the CursorManager no longer requires collection locks to kill cursors.
+    _externalState->killAllTransactionCursors(opCtx.get());
 
     stdx::unique_lock<stdx::mutex> lk(_mutex);
 
     _topCoord->finishUnconditionalStepDown();
     const auto action = _updateMemberStateFromTopologyCoordinator_inlock(opCtx.get());
+    if (_pendingTermUpdateDuringStepDown) {
+        TopologyCoordinator::UpdateTermResult result;
+        _updateTerm_inlock(*_pendingTermUpdateDuringStepDown, &result);
+        // We've just stepped down due to the "term", so it's impossible to step down again
+        // for the same term.
+        invariant(result != TopologyCoordinator::UpdateTermResult::kTriggerStepDown);
+        _pendingTermUpdateDuringStepDown = boost::none;
+    }
     lk.unlock();
     _performPostMemberStateUpdateAction(action);
     _replExecutor->signalEvent(finishedEvent);
@@ -513,6 +526,14 @@ void ReplicationCoordinatorImpl::_heartbeatReconfigStore(
 
         bool isArbiter = myIndex.isOK() && myIndex.getValue() != -1 &&
             newConfig.getMemberAt(myIndex.getValue()).isArbiter();
+
+        if (isArbiter) {
+            LogicalClock::get(getGlobalServiceContext())->setEnabled(false);
+            if (auto validator = LogicalTimeValidator::get(getGlobalServiceContext())) {
+                validator->resetKeyManager();
+            }
+        }
+
         if (!isArbiter && isFirstConfig) {
             shouldStartDataReplication = true;
         }

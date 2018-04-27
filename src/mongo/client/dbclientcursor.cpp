@@ -137,7 +137,7 @@ Message DBClientCursor::_assembleInit() {
 Message DBClientCursor::_assembleGetMore() {
     invariant(cursorId);
     if (_useFindCommand) {
-        long long batchSize = nextBatchSize();
+        std::int64_t batchSize = nextBatchSize();
         auto gmr = GetMoreRequest(ns,
                                   cursorId,
                                   boost::make_optional(batchSize != 0, batchSize),
@@ -259,8 +259,8 @@ BSONObj DBClientCursor::commandDataReceived(const Message& reply) {
     auto commandStatus = getStatusFromCommandResult(commandReply->getCommandReply());
 
     if (ErrorCodes::StaleConfig == commandStatus) {
-        throw StaleConfigException("stale config in DBClientCursor::dataReceived()",
-                                   commandReply->getCommandReply());
+        uassertStatusOK(
+            commandStatus.withContext("stale config in DBClientCursor::dataReceived()"));
     } else if (!commandStatus.isOK()) {
         wasError = true;
     }
@@ -305,7 +305,7 @@ void DBClientCursor::dataReceived(const Message& reply, bool& retry, string& hos
         invariant(qr.getCursorId() == 0);
 
         if (!(opts & QueryOption_CursorTailable)) {
-            uasserted(13127,
+            uasserted(ErrorCodes::CursorNotFound,
                       str::stream() << "cursor id " << cursorId << " didn't exist on server.");
         }
 
@@ -346,8 +346,7 @@ void DBClientCursor::dataReceived(const Message& reply, bool& retry, string& hos
     if (qr.getResultFlags() & ResultFlag_ShardConfigStale) {
         BSONObj error;
         verify(peekError(&error));
-        throw StaleConfigException(
-            (string) "stale config on lazy receive" + causedBy(getErrField(error)), error);
+        uasserted(StaleConfigInfo(error), "stale config on lazy receive");
     }
 
     /* this assert would fire the way we currently work:
@@ -393,11 +392,7 @@ BSONObj DBClientCursor::nextSafe() {
     // Only convert legacy errors ($err) to exceptions. Otherwise, just return the response and the
     // caller will interpret it as a command error.
     if (wasError && strcmp(o.firstElementFieldName(), "$err") == 0) {
-        auto code = o["code"].numberInt();
-        if (!code) {
-            code = ErrorCodes::UnknownError;
-        }
-        uasserted(code, o.firstElement().str());
+        uassertStatusOK(getStatusFromCommandResult(o));
     }
 
     return o;

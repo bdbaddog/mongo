@@ -72,6 +72,7 @@ repl::OplogEntry makeOplogEntry(repl::OpTime opTime,
         object,                           // o
         object2,                          // o2
         {},                               // sessionInfo
+        boost::none,                      // upsert
         wallClockTime,                    // wall clock time
         stmtId,                           // statement id
         prevWriteOpTimeInTransaction,     // optime of previous write within same transaction
@@ -595,6 +596,8 @@ TEST_F(SessionCatalogMigrationSourceTest, ReturnsDeadEndSentinelForIncompleteHis
         ASSERT_BSONOBJ_EQ(Session::kDeadEndSentinel, *oplog.getObject2());
         ASSERT_TRUE(oplog.getStatementId());
         ASSERT_EQ(kIncompleteHistoryStmtId, *oplog.getStatementId());
+        ASSERT_TRUE(oplog.getWallClockTime());
+        ASSERT_NE(Date_t{}, *oplog.getWallClockTime());
 
         auto sessionInfo = oplog.getOperationSessionInfo();
         ASSERT_TRUE(sessionInfo.getSessionId());

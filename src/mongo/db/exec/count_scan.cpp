@@ -157,7 +157,6 @@ void CountScan::doRestoreState() {
         _cursor->restore();
 
     // This can change during yielding.
-    // TODO this isn't sufficient. See SERVER-17678.
     _shouldDedup = _descriptor->isMultikey(getOpCtx());
 }
 
@@ -180,7 +179,7 @@ void CountScan::doInvalidate(OperationContext* opCtx, const RecordId& dl, Invali
 
     // If we see this RecordId again, it may not be the same document it was before, so we want
     // to return it if we see it again.
-    unordered_set<RecordId, RecordId::Hasher>::iterator it = _returned.find(dl);
+    stdx::unordered_set<RecordId, RecordId::Hasher>::iterator it = _returned.find(dl);
     if (it != _returned.end()) {
         _returned.erase(it);
     }

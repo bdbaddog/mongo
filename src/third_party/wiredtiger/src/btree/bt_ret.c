@@ -100,16 +100,8 @@ __value_return(WT_SESSION_IMPL *session, WT_CURSOR_BTREE *cbt)
 		if (__wt_row_leaf_value(page, rip, &cursor->value))
 			return (0);
 
-		/*
-		 * Take the value from the original page cell (which may be
-		 * empty).
-		 */
-		if ((cell =
-		    __wt_row_leaf_value_cell(page, rip, NULL)) == NULL) {
-			cursor->value.size = 0;
-			return (0);
-		}
-		__wt_cell_unpack(cell, &unpack);
+		/* Take the value from the original page cell. */
+		__wt_row_leaf_value_cell(page, rip, NULL, &unpack);
 		return (__wt_page_cell_data_ref(
 		    session, page, &unpack, &cursor->value));
 
@@ -213,27 +205,43 @@ __wt_value_return_upd(WT_SESSION_IMPL *session,
 	}
 
 	/*
-	 * If we hit the end of the chain, roll forward from the update item we
-	 * found, otherwise, from the original page's value.
+	 * If there's no visible update and we skipped a birthmark, the base
+	 * item is an empty item (in other words, birthmarks we can't read act
+	 * as tombstones).
+	 * If there's no visible update and we didn't skip a birthmark, the base
+	 * item is the on-page item, which must be globally visible.
+	 * If there's a visible update and it's a tombstone, the base item is an
+	 * empty item.
+	 * If there's a visible update and it's not a tombstone, the base item
+	 * is the on-page item.
 	 */
-	if (upd == NULL && !skipped_birthmark) {
-		/*
-		 * Callers of this function set the cursor slot to an impossible
-		 * value to check we're not trying to return on-page values when
-		 * the update list should have been sufficient (which happens,
-		 * for example, if an update list was truncated, deleting some
-		 * standard update required by a previous modify update). Assert
-		 * the case.
-		 */
-		WT_ASSERT(session, cbt->slot != UINT32_MAX);
+	if (upd == NULL) {
+		if (skipped_birthmark)
+			WT_ERR(__wt_buf_set(session, &cursor->value, "", 0));
+		else {
+			/*
+			 * Callers of this function set the cursor slot to an
+			 * impossible value to check we don't try and return
+			 * on-page values when the update list should have been
+			 * sufficient (which happens, for example, if an update
+			 * list was truncated, deleting some standard update
+			 * required by a previous modify update). Assert the
+			 * case.
+			 */
+			WT_ASSERT(session, cbt->slot != UINT32_MAX);
 
-		WT_ERR(__value_return(session, cbt));
-	} else if (upd->type == WT_UPDATE_TOMBSTONE || skipped_birthmark)
+			WT_ERR(__value_return(session, cbt));
+		}
+	} else if (upd->type == WT_UPDATE_TOMBSTONE)
 		WT_ERR(__wt_buf_set(session, &cursor->value, "", 0));
 	else
 		WT_ERR(__wt_buf_set(session,
 		    &cursor->value, upd->data, upd->size));
 
+	/*
+	 * Once we have a base item, roll forward through any visible modify
+	 * updates.
+	 */
 	while (i > 0)
 		WT_ERR(__wt_modify_apply(session, cursor, listp[--i]->data));
 

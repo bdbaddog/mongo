@@ -31,18 +31,18 @@
 #include "mongo/base/disallow_copying.h"
 #include "mongo/base/status_with.h"
 #include "mongo/db/repl/multiapplier.h"
+#include "mongo/db/repl/oplog_applier.h"
 #include "mongo/db/repl/oplog_buffer.h"
 #include "mongo/db/repl/optime.h"
 #include "mongo/db/repl/optime_with.h"
 #include "mongo/db/repl/repl_set_config.h"
 #include "mongo/rpc/metadata/oplog_query_metadata.h"
 #include "mongo/rpc/metadata/repl_set_metadata.h"
+#include "mongo/util/concurrency/thread_pool.h"
 #include "mongo/util/net/hostandport.h"
 #include "mongo/util/time_support.h"
 
 namespace mongo {
-
-class OldThreadPool;
 
 namespace executor {
 class TaskExecutor;
@@ -77,11 +77,6 @@ public:
     virtual executor::TaskExecutor* getTaskExecutor() const = 0;
 
     /**
-     * Returns shared db worker thread pool for collection cloning.
-     */
-    virtual OldThreadPool* getDbWorkThreadPool() const = 0;
-
-    /**
      * Returns the current term and last committed optime.
      * Returns (OpTime::kUninitializedTerm, OpTime()) if not available.
      */
@@ -113,43 +108,21 @@ public:
         OperationContext* opCtx) const = 0;
 
     /**
-     * Creates an oplog buffer suitable for steady state replication.
-     */
-    virtual std::unique_ptr<OplogBuffer> makeSteadyStateOplogBuffer(
-        OperationContext* opCtx) const = 0;
-
-    /**
      * Returns the current replica set config if there is one, or an error why there isn't.
      */
     virtual StatusWith<ReplSetConfig> getCurrentConfig() const = 0;
 
 private:
     /**
-     * Applies the operations described in the oplog entries contained in "ops" using the
-     * "applyOperation" function.
+     * Applies the operations described in the oplog entries contained in "ops".
      *
      * Used exclusively by the InitialSyncer to construct a MultiApplier.
      */
     virtual StatusWith<OpTime> _multiApply(OperationContext* opCtx,
                                            MultiApplier::Operations ops,
-                                           MultiApplier::ApplyOperationFn applyOperation) = 0;
-
-    /**
-     * Used by _multiApply() to write operations to database during steady state replication.
-     *
-     * Used exclusively by the InitialSyncer to construct a MultiApplier.
-     */
-    virtual Status _multiSyncApply(MultiApplier::OperationPtrs* ops) = 0;
-
-    /**
-     * Used by _multiApply() to write operations to database during initial sync. `fetchCount` is a
-     * pointer to a counter that is incremented every time we fetch a missing document.
-     *
-     * Used exclusively by the InitialSyncer to construct a MultiApplier.
-     */
-    virtual Status _multiInitialSyncApply(MultiApplier::OperationPtrs* ops,
-                                          const HostAndPort& source,
-                                          AtomicUInt32* fetchCount) = 0;
+                                           OplogApplier::Observer* observer,
+                                           const HostAndPort& source,
+                                           ThreadPool* writerPool) = 0;
 
     // Provides InitialSyncer with access to _multiApply, _multiSyncApply and
     // _multiInitialSyncApply.

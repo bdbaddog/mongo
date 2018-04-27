@@ -30,7 +30,6 @@
 
 #include "mongo/db/ops/parsed_update.h"
 
-#include "mongo/db/commands/feature_compatibility_version_command_parser.h"
 #include "mongo/db/matcher/extensions_callback_real.h"
 #include "mongo/db/ops/update_request.h"
 #include "mongo/db/query/canonical_query.h"
@@ -149,16 +148,6 @@ Status ParsedUpdate::parseUpdate() {
 }
 
 Status ParsedUpdate::parseArrayFilters() {
-    if (!_request->getArrayFilters().empty() &&
-        (serverGlobalParams.featureCompatibility.getVersion() !=
-         ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo36)) {
-        return Status(ErrorCodes::InvalidOptions,
-                      str::stream()
-                          << "The featureCompatibilityVersion must be 3.6 to use arrayFilters. See "
-                          << feature_compatibility_version::kDochubLink
-                          << ".");
-    }
-
     for (auto rawArrayFilter : _request->getArrayFilters()) {
         boost::intrusive_ptr<ExpressionContext> expCtx(
             new ExpressionContext(_opCtx, _collator.get()));
@@ -168,16 +157,13 @@ Status ParsedUpdate::parseArrayFilters() {
                                          ExtensionsCallbackNoop(),
                                          MatchExpressionParser::kBanAllSpecialFeatures);
         if (!parsedArrayFilter.isOK()) {
-            return Status(parsedArrayFilter.getStatus().code(),
-                          str::stream() << "Error parsing array filter: "
-                                        << parsedArrayFilter.getStatus().reason());
+            return parsedArrayFilter.getStatus().withContext("Error parsing array filter");
         }
         auto parsedArrayFilterWithPlaceholder =
             ExpressionWithPlaceholder::make(std::move(parsedArrayFilter.getValue()));
         if (!parsedArrayFilterWithPlaceholder.isOK()) {
-            return Status(parsedArrayFilterWithPlaceholder.getStatus().code(),
-                          str::stream() << "Error parsing array filter: "
-                                        << parsedArrayFilterWithPlaceholder.getStatus().reason());
+            return parsedArrayFilterWithPlaceholder.getStatus().withContext(
+                "Error parsing array filter");
         }
         auto finalArrayFilter = std::move(parsedArrayFilterWithPlaceholder.getValue());
         auto fieldName = finalArrayFilter->getPlaceholder();
@@ -200,18 +186,7 @@ Status ParsedUpdate::parseArrayFilters() {
 }
 
 PlanExecutor::YieldPolicy ParsedUpdate::yieldPolicy() const {
-    if (_request->isGod()) {
-        return PlanExecutor::NO_YIELD;
-    }
-    if (_request->getYieldPolicy() == PlanExecutor::YIELD_AUTO && isIsolated()) {
-        return PlanExecutor::WRITE_CONFLICT_RETRY_ONLY;  // Don't yield locks.
-    }
-    return _request->getYieldPolicy();
-}
-
-bool ParsedUpdate::isIsolated() const {
-    return _canonicalQuery.get() ? _canonicalQuery->isIsolated()
-                                 : QueryRequest::isQueryIsolated(_request->getQuery());
+    return _request->isGod() ? PlanExecutor::NO_YIELD : _request->getYieldPolicy();
 }
 
 bool ParsedUpdate::hasParsedQuery() const {

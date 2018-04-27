@@ -73,7 +73,7 @@
 #include "mongo/db/query/query_settings.h"
 #include "mongo/db/query/stage_builder.h"
 #include "mongo/db/repl/optime.h"
-#include "mongo/db/repl/replication_coordinator_global.h"
+#include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/s/collection_metadata.h"
 #include "mongo/db/s/collection_sharding_state.h"
 #include "mongo/db/s/sharding_state.h"
@@ -177,7 +177,7 @@ void fillOutPlannerParams(OperationContext* opCtx,
     // If the caller wants a shard filter, make sure we're actually sharded.
     if (plannerParams->options & QueryPlannerParams::INCLUDE_SHARD_FILTER) {
         auto collMetadata =
-            CollectionShardingState::get(opCtx, canonicalQuery->nss())->getMetadata();
+            CollectionShardingState::get(opCtx, canonicalQuery->nss())->getMetadata(opCtx);
         if (collMetadata) {
             plannerParams->shardKey = collMetadata->getKeyPattern();
         } else {
@@ -208,12 +208,38 @@ void fillOutPlannerParams(OperationContext* opCtx,
         plannerParams->options |= QueryPlannerParams::KEEP_MUTATIONS;
     }
 
-    // MMAPv1 storage engine should have snapshot() perform an index scan on _id rather than a
-    // collection scan since a collection scan on the MMAP storage engine can return duplicates
-    // or miss documents.
-    if (isMMAPV1()) {
-        plannerParams->options |= QueryPlannerParams::SNAPSHOT_USE_ID;
+    if (shouldWaitForOplogVisibility(
+            opCtx, collection, canonicalQuery->getQueryRequest().isTailable())) {
+        plannerParams->options |= QueryPlannerParams::OPLOG_SCAN_WAIT_FOR_VISIBLE;
     }
+}
+
+bool shouldWaitForOplogVisibility(OperationContext* opCtx,
+                                  const Collection* collection,
+                                  bool tailable) {
+
+    // Only non-tailable cursors on the oplog are affected. Only forward cursors, not reverse
+    // cursors, are affected, but this is checked when the cursor is opened.
+    if (!collection->ns().isOplog() || tailable) {
+        return false;
+    }
+
+    // Only primaries should require readers to wait for oplog visibility. In any other replication
+    // state, readers read at the most visible oplog timestamp. The reason why readers on primaries
+    // need to wait is because multiple optimes can be allocated for operations before their entries
+    // are written to the storage engine. "Holes" will appear when an operation with a later optime
+    // commits before an operation with an earlier optime, and readers should wait so that all data
+    // is consistent.
+    //
+    // Secondaries can't wait for oplog visibility without the PBWM lock because it can introduce a
+    // hang while a batch application is in progress. The wait is done while holding a global lock,
+    // and the oplog visibility timestamp is updated at the end of every batch on a secondary,
+    // signalling the wait to complete. If a replication worker had a global lock and temporarily
+    // released it, a reader could acquire the lock to read the oplog. If the secondary reader were
+    // to wait for the oplog visibility timestamp to be updated, it would wait for a replication
+    // batch that would never complete because it couldn't reacquire its own lock, the global lock
+    // held by the waiting reader.
+    return repl::ReplicationCoordinator::get(opCtx)->canAcceptWritesForDatabase(opCtx, "admin");
 }
 
 namespace {
@@ -251,7 +277,6 @@ StatusWith<PrepareExecutionResult> prepareExecution(OperationContext* opCtx,
     invariant(canonicalQuery);
 
     unique_ptr<PlanStage> root;
-    unique_ptr<QuerySolution> querySolution;
 
     // This can happen as we're called by internal clients as well.
     if (NULL == collection) {
@@ -259,8 +284,7 @@ StatusWith<PrepareExecutionResult> prepareExecution(OperationContext* opCtx,
         LOG(2) << "Collection " << ns << " does not exist."
                << " Using EOF plan: " << redact(canonicalQuery->toStringShort());
         root = make_unique<EOFStage>(opCtx);
-        return PrepareExecutionResult(
-            std::move(canonicalQuery), std::move(querySolution), std::move(root));
+        return PrepareExecutionResult(std::move(canonicalQuery), nullptr, std::move(root));
     }
 
     // Fill out the planning params.  We use these for both cached solutions and non-cached.
@@ -287,7 +311,7 @@ StatusWith<PrepareExecutionResult> prepareExecution(OperationContext* opCtx,
         if (plannerParams.options & QueryPlannerParams::INCLUDE_SHARD_FILTER) {
             root = make_unique<ShardFilterStage>(
                 opCtx,
-                CollectionShardingState::get(opCtx, canonicalQuery->nss())->getMetadata(),
+                CollectionShardingState::get(opCtx, canonicalQuery->nss())->getMetadata(opCtx),
                 ws,
                 root.release());
         }
@@ -324,8 +348,7 @@ StatusWith<PrepareExecutionResult> prepareExecution(OperationContext* opCtx,
             root = make_unique<ProjectionStage>(opCtx, params, ws, root.release());
         }
 
-        return PrepareExecutionResult(
-            std::move(canonicalQuery), std::move(querySolution), std::move(root));
+        return PrepareExecutionResult(std::move(canonicalQuery), nullptr, std::move(root));
     }
 
     // Tailable: If the query requests tailable the collection must be capped.
@@ -343,16 +366,18 @@ StatusWith<PrepareExecutionResult> prepareExecution(OperationContext* opCtx,
         collection->infoCache()->getPlanCache()->get(*canonicalQuery, &rawCS).isOK()) {
         // We have a CachedSolution.  Have the planner turn it into a QuerySolution.
         unique_ptr<CachedSolution> cs(rawCS);
-        QuerySolution* qs;
-        Status status = QueryPlanner::planFromCache(*canonicalQuery, plannerParams, *cs, &qs);
+        auto statusWithQs = QueryPlanner::planFromCache(*canonicalQuery, plannerParams, *cs);
 
-        if (status.isOK()) {
-            if ((plannerParams.options & QueryPlannerParams::IS_COUNT) && turnIxscanIntoCount(qs)) {
+        if (statusWithQs.isOK()) {
+            auto querySolution = std::move(statusWithQs.getValue());
+            if ((plannerParams.options & QueryPlannerParams::IS_COUNT) &&
+                turnIxscanIntoCount(querySolution.get())) {
                 LOG(2) << "Using fast count: " << redact(canonicalQuery->toStringShort());
             }
 
             PlanStage* rawRoot;
-            verify(StageBuilder::build(opCtx, collection, *canonicalQuery, *qs, ws, &rawRoot));
+            verify(StageBuilder::build(
+                opCtx, collection, *canonicalQuery, *querySolution, ws, &rawRoot));
 
             // Add a CachedPlanStage on top of the previous root.
             //
@@ -365,7 +390,6 @@ StatusWith<PrepareExecutionResult> prepareExecution(OperationContext* opCtx,
                                                 plannerParams,
                                                 cs->decisionWorks,
                                                 rawRoot);
-            querySolution.reset(qs);
             return PrepareExecutionResult(
                 std::move(canonicalQuery), std::move(querySolution), std::move(root));
         }
@@ -377,17 +401,16 @@ StatusWith<PrepareExecutionResult> prepareExecution(OperationContext* opCtx,
 
         root =
             make_unique<SubplanStage>(opCtx, collection, ws, plannerParams, canonicalQuery.get());
-        return PrepareExecutionResult(
-            std::move(canonicalQuery), std::move(querySolution), std::move(root));
+        return PrepareExecutionResult(std::move(canonicalQuery), nullptr, std::move(root));
     }
 
-    vector<QuerySolution*> solutions;
-    Status status = QueryPlanner::plan(*canonicalQuery, plannerParams, &solutions);
-    if (!status.isOK()) {
+    auto statusWithSolutions = QueryPlanner::plan(*canonicalQuery, plannerParams);
+    if (!statusWithSolutions.isOK()) {
         return Status(ErrorCodes::BadValue,
                       "error processing query: " + canonicalQuery->toString() +
-                          " planner returned error: " + status.reason());
+                          " planner returned error: " + statusWithSolutions.getStatus().reason());
     }
+    auto solutions = std::move(statusWithSolutions.getValue());
 
     // We cannot figure out how to answer the query.  Perhaps it requires an index
     // we do not have?
@@ -400,14 +423,7 @@ StatusWith<PrepareExecutionResult> prepareExecution(OperationContext* opCtx,
     // See if one of our solutions is a fast count hack in disguise.
     if (plannerParams.options & QueryPlannerParams::IS_COUNT) {
         for (size_t i = 0; i < solutions.size(); ++i) {
-            if (turnIxscanIntoCount(solutions[i])) {
-                // Great, we can use solutions[i].  Clean up the other QuerySolution(s).
-                for (size_t j = 0; j < solutions.size(); ++j) {
-                    if (j != i) {
-                        delete solutions[j];
-                    }
-                }
-
+            if (turnIxscanIntoCount(solutions[i].get())) {
                 // We're not going to cache anything that's fast count.
                 PlanStage* rawRoot;
                 verify(StageBuilder::build(
@@ -417,9 +433,8 @@ StatusWith<PrepareExecutionResult> prepareExecution(OperationContext* opCtx,
                 LOG(2) << "Using fast count: " << redact(canonicalQuery->toStringShort())
                        << ", planSummary: " << redact(Explain::getPlanSummary(root.get()));
 
-                querySolution.reset(solutions[i]);
                 return PrepareExecutionResult(
-                    std::move(canonicalQuery), std::move(querySolution), std::move(root));
+                    std::move(canonicalQuery), std::move(solutions[i]), std::move(root));
             }
         }
     }
@@ -435,9 +450,8 @@ StatusWith<PrepareExecutionResult> prepareExecution(OperationContext* opCtx,
                << redact(canonicalQuery->toStringShort())
                << ", planSummary: " << redact(Explain::getPlanSummary(root.get()));
 
-        querySolution.reset(solutions[0]);
         return PrepareExecutionResult(
-            std::move(canonicalQuery), std::move(querySolution), std::move(root));
+            std::move(canonicalQuery), std::move(solutions[0]), std::move(root));
     } else {
         // Many solutions. Create a MultiPlanStage to pick the best, update the cache,
         // and so on. The working set will be shared by all candidate plans.
@@ -453,13 +467,12 @@ StatusWith<PrepareExecutionResult> prepareExecution(OperationContext* opCtx,
             verify(StageBuilder::build(
                 opCtx, collection, *canonicalQuery, *solutions[ix], ws, &nextPlanRoot));
 
-            // Owns none of the arguments
-            multiPlanStage->addPlan(solutions[ix], nextPlanRoot, ws);
+            // Takes ownership of 'nextPlanRoot'.
+            multiPlanStage->addPlan(std::move(solutions[ix]), nextPlanRoot, ws);
         }
 
         root = std::move(multiPlanStage);
-        return PrepareExecutionResult(
-            std::move(canonicalQuery), std::move(querySolution), std::move(root));
+        return PrepareExecutionResult(std::move(canonicalQuery), nullptr, std::move(root));
     }
 }
 
@@ -637,6 +650,8 @@ StatusWith<unique_ptr<PlanExecutor, PlanExecutor::Deleter>> getOplogStartHack(
     params.tailable = cq->getQueryRequest().isTailable();
     params.shouldTrackLatestOplogTimestamp =
         plannerOptions & QueryPlannerParams::TRACK_LATEST_OPLOG_TS;
+    params.shouldWaitForOplogVisibility =
+        shouldWaitForOplogVisibility(opCtx, collection, params.tailable);
 
     // If the query is just a lower bound on "ts", we know that every document in the collection
     // after the first matching one must also match. To avoid wasting time running the match
@@ -654,15 +669,18 @@ StatusWith<unique_ptr<PlanExecutor, PlanExecutor::Deleter>> getOplogStartHack(
         opCtx, std::move(ws), std::move(cs), std::move(cq), collection, PlanExecutor::YIELD_AUTO);
 }
 
-}  // namespace
-
-StatusWith<unique_ptr<PlanExecutor, PlanExecutor::Deleter>> getExecutorFind(
+StatusWith<unique_ptr<PlanExecutor, PlanExecutor::Deleter>> _getExecutorFind(
     OperationContext* opCtx,
     Collection* collection,
     const NamespaceString& nss,
     unique_ptr<CanonicalQuery> canonicalQuery,
     PlanExecutor::YieldPolicy yieldPolicy,
     size_t plannerOptions) {
+    if (canonicalQuery->getQueryRequest().getMaxScan()) {
+        RARELY log() << "Support for the maxScan option has been deprecated. Instead, use "
+                        "maxTimeMS. See http://dochub.mongodb.org/core/4.0-deprecate-maxScan.";
+    }
+
     if (NULL != collection && canonicalQuery->getQueryRequest().isOplogReplay()) {
         return getOplogStartHack(opCtx, collection, std::move(canonicalQuery), plannerOptions);
     }
@@ -670,8 +688,36 @@ StatusWith<unique_ptr<PlanExecutor, PlanExecutor::Deleter>> getExecutorFind(
     if (ShardingState::get(opCtx)->needCollectionMetadata(opCtx, nss.ns())) {
         plannerOptions |= QueryPlannerParams::INCLUDE_SHARD_FILTER;
     }
-    return getExecutor(
-        opCtx, collection, std::move(canonicalQuery), PlanExecutor::YIELD_AUTO, plannerOptions);
+    return getExecutor(opCtx, collection, std::move(canonicalQuery), yieldPolicy, plannerOptions);
+}
+
+}  // namespace
+
+StatusWith<unique_ptr<PlanExecutor, PlanExecutor::Deleter>> getExecutorFind(
+    OperationContext* opCtx,
+    Collection* collection,
+    const NamespaceString& nss,
+    unique_ptr<CanonicalQuery> canonicalQuery,
+    size_t plannerOptions) {
+    auto readConcernArgs = repl::ReadConcernArgs::get(opCtx);
+    auto yieldPolicy = readConcernArgs.getLevel() == repl::ReadConcernLevel::kSnapshotReadConcern
+        ? PlanExecutor::INTERRUPT_ONLY
+        : PlanExecutor::YIELD_AUTO;
+    return _getExecutorFind(
+        opCtx, collection, nss, std::move(canonicalQuery), yieldPolicy, plannerOptions);
+}
+
+StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> getExecutorLegacyFind(
+    OperationContext* opCtx,
+    Collection* collection,
+    const NamespaceString& nss,
+    std::unique_ptr<CanonicalQuery> canonicalQuery) {
+    return _getExecutorFind(opCtx,
+                            collection,
+                            nss,
+                            std::move(canonicalQuery),
+                            PlanExecutor::YIELD_AUTO,
+                            QueryPlannerParams::DEFAULT);
 }
 
 namespace {
@@ -747,7 +793,7 @@ StatusWith<unique_ptr<PlanExecutor, PlanExecutor::Deleter>> getExecutorDelete(
     }
 
     bool userInitiatedWritesAndNotPrimary = opCtx->writesAreReplicated() &&
-        !repl::getGlobalReplicationCoordinator()->canAcceptWritesFor(opCtx, nss);
+        !repl::ReplicationCoordinator::get(opCtx)->canAcceptWritesFor(opCtx, nss);
 
     if (userInitiatedWritesAndNotPrimary) {
         return Status(ErrorCodes::PrimarySteppedDown,
@@ -897,7 +943,7 @@ StatusWith<unique_ptr<PlanExecutor, PlanExecutor::Deleter>> getExecutorUpdate(
     // writes on a secondary. If this is an update to a secondary from the replication system,
     // however, then we make an exception and let the write proceed.
     bool userInitiatedWritesAndNotPrimary = opCtx->writesAreReplicated() &&
-        !repl::getGlobalReplicationCoordinator()->canAcceptWritesFor(opCtx, nss);
+        !repl::ReplicationCoordinator::get(opCtx)->canAcceptWritesFor(opCtx, nss);
 
     if (userInitiatedWritesAndNotPrimary) {
         return Status(ErrorCodes::PrimarySteppedDown,
@@ -1007,15 +1053,17 @@ StatusWith<unique_ptr<PlanExecutor, PlanExecutor::Deleter>> getExecutorUpdate(
 //
 
 StatusWith<unique_ptr<PlanExecutor, PlanExecutor::Deleter>> getExecutorGroup(
-    OperationContext* opCtx,
-    Collection* collection,
-    const GroupRequest& request,
-    PlanExecutor::YieldPolicy yieldPolicy) {
+    OperationContext* opCtx, Collection* collection, const GroupRequest& request) {
     if (!getGlobalScriptEngine()) {
         return Status(ErrorCodes::BadValue, "server-side JavaScript execution is disabled");
     }
 
     unique_ptr<WorkingSet> ws = make_unique<WorkingSet>();
+    const auto readConcernArgs = repl::ReadConcernArgs::get(opCtx);
+    const auto yieldPolicy =
+        readConcernArgs.getLevel() == repl::ReadConcernLevel::kSnapshotReadConcern
+        ? PlanExecutor::INTERRUPT_ONLY
+        : PlanExecutor::YIELD_AUTO;
 
     if (!collection) {
         // Treat collections that do not exist as empty collections.  Note that the explain
@@ -1258,11 +1306,7 @@ BSONObj getDistinctProjection(const std::string& field) {
 }  // namespace
 
 StatusWith<unique_ptr<PlanExecutor, PlanExecutor::Deleter>> getExecutorCount(
-    OperationContext* opCtx,
-    Collection* collection,
-    const CountRequest& request,
-    bool explain,
-    PlanExecutor::YieldPolicy yieldPolicy) {
+    OperationContext* opCtx, Collection* collection, const CountRequest& request, bool explain) {
     unique_ptr<WorkingSet> ws = make_unique<WorkingSet>();
 
     auto qr = stdx::make_unique<QueryRequest>(request.getNs());
@@ -1279,13 +1323,19 @@ StatusWith<unique_ptr<PlanExecutor, PlanExecutor::Deleter>> getExecutorCount(
         collection ? static_cast<const ExtensionsCallback&>(
                          ExtensionsCallbackReal(opCtx, &collection->ns()))
                    : static_cast<const ExtensionsCallback&>(ExtensionsCallbackNoop()),
-        MatchExpressionParser::kAllowAllSpecialFeatures &
-            ~MatchExpressionParser::AllowedFeatures::kIsolated);
+        MatchExpressionParser::kAllowAllSpecialFeatures);
 
     if (!statusWithCQ.isOK()) {
         return statusWithCQ.getStatus();
     }
     unique_ptr<CanonicalQuery> cq = std::move(statusWithCQ.getValue());
+
+    const auto readConcernArgs = repl::ReadConcernArgs::get(opCtx);
+    const auto yieldPolicy =
+        readConcernArgs.getLevel() == repl::ReadConcernLevel::kSnapshotReadConcern
+        ? PlanExecutor::INTERRUPT_ONLY
+        : PlanExecutor::YIELD_AUTO;
+
     if (!collection) {
         // Treat collections that do not exist as empty collections. Note that the explain
         // reporting machinery always assumes that the root stage for a count operation is
@@ -1315,7 +1365,11 @@ StatusWith<unique_ptr<PlanExecutor, PlanExecutor::Deleter>> getExecutorCount(
             opCtx, std::move(ws), std::move(root), request.getNs(), yieldPolicy);
     }
 
-    const size_t plannerOptions = QueryPlannerParams::IS_COUNT;
+    size_t plannerOptions = QueryPlannerParams::IS_COUNT;
+    if (ShardingState::get(opCtx)->needCollectionMetadata(opCtx, request.getNs().ns())) {
+        plannerOptions |= QueryPlannerParams::INCLUDE_SHARD_FILTER;
+    }
+
     StatusWith<PrepareExecutionResult> executionResult =
         prepareExecution(opCtx, collection, ws.get(), std::move(cq), plannerOptions);
     if (!executionResult.isOK()) {
@@ -1467,8 +1521,13 @@ StatusWith<unique_ptr<PlanExecutor, PlanExecutor::Deleter>> getExecutorDistinct(
     OperationContext* opCtx,
     Collection* collection,
     const std::string& ns,
-    ParsedDistinct* parsedDistinct,
-    PlanExecutor::YieldPolicy yieldPolicy) {
+    ParsedDistinct* parsedDistinct) {
+    const auto readConcernArgs = repl::ReadConcernArgs::get(opCtx);
+    const auto yieldPolicy =
+        readConcernArgs.getLevel() == repl::ReadConcernLevel::kSnapshotReadConcern
+        ? PlanExecutor::INTERRUPT_ONLY
+        : PlanExecutor::YIELD_AUTO;
+
     if (!collection) {
         // Treat collections that do not exist as empty collections.
         return PlanExecutor::make(opCtx,
@@ -1537,8 +1596,7 @@ StatusWith<unique_ptr<PlanExecutor, PlanExecutor::Deleter>> getExecutorDistinct(
                                      std::move(qr),
                                      expCtx,
                                      extensionsCallback,
-                                     MatchExpressionParser::kAllowAllSpecialFeatures &
-                                         ~MatchExpressionParser::AllowedFeatures::kIsolated);
+                                     MatchExpressionParser::kAllowAllSpecialFeatures);
     if (!statusWithCQ.isOK()) {
         return statusWithCQ.getStatus();
     }
@@ -1577,8 +1635,7 @@ StatusWith<unique_ptr<PlanExecutor, PlanExecutor::Deleter>> getExecutorDistinct(
 
         QueryPlannerParams params;
 
-        unique_ptr<QuerySolution> soln(
-            QueryPlannerAnalysis::analyzeDataAccess(*cq, params, std::move(solnRoot)));
+        auto soln = QueryPlannerAnalysis::analyzeDataAccess(*cq, params, std::move(solnRoot));
         invariant(soln);
 
         unique_ptr<WorkingSet> ws = make_unique<WorkingSet>();
@@ -1599,25 +1656,18 @@ StatusWith<unique_ptr<PlanExecutor, PlanExecutor::Deleter>> getExecutorDistinct(
     }
 
     // See if we can answer the query in a fast-distinct compatible fashion.
-    vector<QuerySolution*> solutions;
-    Status status = QueryPlanner::plan(*cq, plannerParams, &solutions);
-    if (!status.isOK()) {
+    auto statusWithSolutions = QueryPlanner::plan(*cq, plannerParams);
+    if (!statusWithSolutions.isOK()) {
         return getExecutor(opCtx, collection, std::move(cq), yieldPolicy);
     }
+    auto solutions = std::move(statusWithSolutions.getValue());
 
     // We look for a solution that has an ixscan we can turn into a distinctixscan
     for (size_t i = 0; i < solutions.size(); ++i) {
-        if (turnIxscanIntoDistinctIxscan(solutions[i], parsedDistinct->getKey())) {
-            // Great, we can use solutions[i].  Clean up the other QuerySolution(s).
-            for (size_t j = 0; j < solutions.size(); ++j) {
-                if (j != i) {
-                    delete solutions[j];
-                }
-            }
-
+        if (turnIxscanIntoDistinctIxscan(solutions[i].get(), parsedDistinct->getKey())) {
             // Build and return the SSR over solutions[i].
             unique_ptr<WorkingSet> ws = make_unique<WorkingSet>();
-            unique_ptr<QuerySolution> currentSolution(solutions[i]);
+            unique_ptr<QuerySolution> currentSolution = std::move(solutions[i]);
             PlanStage* rawRoot;
             verify(
                 StageBuilder::build(opCtx, collection, *cq, *currentSolution, ws.get(), &rawRoot));
@@ -1637,12 +1687,7 @@ StatusWith<unique_ptr<PlanExecutor, PlanExecutor::Deleter>> getExecutorDistinct(
     }
 
     // If we're here, the planner made a soln with the restricted index set but we couldn't
-    // translate any of them into a distinct-compatible soln.  So, delete the solutions and just
-    // go through normal planning.
-    for (size_t i = 0; i < solutions.size(); ++i) {
-        delete solutions[i];
-    }
-
+    // translate any of them into a distinct-compatible soln. Just go through normal planning.
     return getExecutor(opCtx, collection, parsedDistinct->releaseQuery(), yieldPolicy);
 }
 

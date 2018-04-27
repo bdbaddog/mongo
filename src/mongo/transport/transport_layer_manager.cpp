@@ -49,26 +49,6 @@ namespace transport {
 
 TransportLayerManager::TransportLayerManager() = default;
 
-Ticket TransportLayerManager::sourceMessage(const SessionHandle& session,
-                                            Message* message,
-                                            Date_t expiration) {
-    return session->getTransportLayer()->sourceMessage(session, message, expiration);
-}
-
-Ticket TransportLayerManager::sinkMessage(const SessionHandle& session,
-                                          const Message& message,
-                                          Date_t expiration) {
-    return session->getTransportLayer()->sinkMessage(session, message, expiration);
-}
-
-Status TransportLayerManager::wait(Ticket&& ticket) {
-    return getTicketTransportLayer(ticket)->wait(std::move(ticket));
-}
-
-void TransportLayerManager::asyncWait(Ticket&& ticket, TicketCallback callback) {
-    return getTicketTransportLayer(ticket)->asyncWait(std::move(ticket), std::move(callback));
-}
-
 template <typename Callable>
 void TransportLayerManager::_foreach(Callable&& cb) const {
     {
@@ -79,8 +59,20 @@ void TransportLayerManager::_foreach(Callable&& cb) const {
     }
 }
 
-void TransportLayerManager::end(const SessionHandle& session) {
-    session->getTransportLayer()->end(session);
+StatusWith<SessionHandle> TransportLayerManager::connect(HostAndPort peer,
+                                                         ConnectSSLMode sslMode,
+                                                         Milliseconds timeout) {
+    return _tls.front()->connect(peer, sslMode, timeout);
+}
+
+Future<SessionHandle> TransportLayerManager::asyncConnect(HostAndPort peer,
+                                                          ConnectSSLMode sslMode,
+                                                          const ReactorHandle& reactor) {
+    return _tls.front()->asyncConnect(peer, sslMode, reactor);
+}
+
+ReactorHandle TransportLayerManager::getReactor(WhichReactor which) {
+    return _tls.front()->getReactor(which);
 }
 
 // TODO Right now this and setup() leave TLs started if there's an error. In practice the server
@@ -123,6 +115,16 @@ Status TransportLayerManager::addAndStartTransportLayer(std::unique_ptr<Transpor
     return ptr->start();
 }
 
+std::unique_ptr<TransportLayer> TransportLayerManager::makeAndStartDefaultEgressTransportLayer() {
+    transport::TransportLayerASIO::Options opts(&serverGlobalParams);
+    opts.mode = transport::TransportLayerASIO::Options::kEgress;
+
+    auto ret = stdx::make_unique<transport::TransportLayerASIO>(opts, nullptr);
+    uassertStatusOK(ret->setup());
+    uassertStatusOK(ret->start());
+    return std::unique_ptr<TransportLayer>(std::move(ret));
+}
+
 std::unique_ptr<TransportLayer> TransportLayerManager::createWithConfig(
     const ServerGlobalParams* config, ServiceContext* ctx) {
     std::unique_ptr<TransportLayer> transportLayer;
@@ -140,8 +142,9 @@ std::unique_ptr<TransportLayer> TransportLayerManager::createWithConfig(
     auto transportLayerASIO = stdx::make_unique<transport::TransportLayerASIO>(opts, sep);
 
     if (config->serviceExecutor == "adaptive") {
+        auto reactor = transportLayerASIO->getReactor(TransportLayer::kIngress);
         ctx->setServiceExecutor(
-            stdx::make_unique<ServiceExecutorAdaptive>(ctx, transportLayerASIO->getIOContext()));
+            stdx::make_unique<ServiceExecutorAdaptive>(ctx, std::move(reactor)));
     } else if (config->serviceExecutor == "synchronous") {
         ctx->setServiceExecutor(stdx::make_unique<ServiceExecutorSynchronous>(ctx));
     }

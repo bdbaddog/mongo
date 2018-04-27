@@ -35,13 +35,8 @@
 #include <string>
 #include <vector>
 
-#include "mongo/bson/util/bson_extract.h"
-#include "mongo/db/auth/action_set.h"
-#include "mongo/db/auth/action_type.h"
-#include "mongo/db/auth/privilege.h"
+#include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/bson/dotted_path_support.h"
-#include "mongo/db/catalog/collection.h"
-#include "mongo/db/catalog/database.h"
 #include "mongo/db/client.h"
 #include "mongo/db/clientcursor.h"
 #include "mongo/db/commands.h"
@@ -64,34 +59,33 @@
 #include "mongo/util/log.h"
 
 namespace mongo {
+namespace {
 
-using std::unique_ptr;
-using std::string;
-using std::stringstream;
-
-namespace dps = ::mongo::dotted_path_support;
+namespace dps = dotted_path_support;
 
 class DistinctCommand : public BasicCommand {
 public:
     DistinctCommand() : BasicCommand("distinct") {}
 
-    virtual bool slaveOk() const {
+    std::string help() const override {
+        return "{ distinct : 'collection name' , key : 'a.b' , query : {} }";
+    }
+
+    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
+        return AllowedOnSecondary::kOptIn;
+    }
+
+    bool supportsWriteConcern(const BSONObj& cmd) const override {
         return false;
     }
 
-    virtual bool slaveOverrideOk() const {
+    bool supportsReadConcern(const std::string& dbName,
+                             const BSONObj& cmdObj,
+                             repl::ReadConcernLevel level) const override {
         return true;
     }
 
-    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
-        return false;
-    }
-
-    bool supportsNonLocalReadConcern(const std::string& dbName, const BSONObj& cmdObj) const final {
-        return true;
-    }
-
-    ReadWriteType getReadWriteType() const {
+    ReadWriteType getReadWriteType() const override {
         return ReadWriteType::kRead;
     }
 
@@ -99,38 +93,45 @@ public:
         return FindCommon::kInitReplyBufferSize;
     }
 
-    virtual void addRequiredPrivileges(const std::string& dbname,
-                                       const BSONObj& cmdObj,
-                                       std::vector<Privilege>* out) {
-        ActionSet actions;
-        actions.addAction(ActionType::find);
-        out->push_back(Privilege(parseResourcePattern(dbname, cmdObj), actions));
-    }
+    Status checkAuthForOperation(OperationContext* opCtx,
+                                 const std::string& dbname,
+                                 const BSONObj& cmdObj) const override {
+        AuthorizationSession* authSession = AuthorizationSession::get(opCtx->getClient());
 
-    virtual void help(stringstream& help) const {
-        help << "{ distinct : 'collection name' , key : 'a.b' , query : {} }";
-    }
-
-    virtual Status explain(OperationContext* opCtx,
-                           const std::string& dbname,
-                           const BSONObj& cmdObj,
-                           ExplainOptions::Verbosity verbosity,
-                           BSONObjBuilder* out) const {
-        const NamespaceString nss(parseNsCollectionRequired(dbname, cmdObj));
-
-        const ExtensionsCallbackReal extensionsCallback(opCtx, &nss);
-        auto parsedDistinct = ParsedDistinct::parse(opCtx, nss, cmdObj, extensionsCallback, true);
-        if (!parsedDistinct.isOK()) {
-            return parsedDistinct.getStatus();
+        if (!authSession->isAuthorizedToParseNamespaceElement(cmdObj.firstElement())) {
+            return Status(ErrorCodes::Unauthorized, "Unauthorized");
         }
 
-        AutoGetCollectionOrViewForReadCommand ctx(opCtx, nss);
-        Collection* collection = ctx.getCollection();
+        const auto hasTerm = false;
+        return authSession->checkAuthForFind(
+            AutoGetCollection::resolveNamespaceStringOrUUID(
+                opCtx, CommandHelpers::parseNsOrUUID(dbname, cmdObj)),
+            hasTerm);
+    }
 
-        if (ctx.getView()) {
-            ctx.releaseLocksForView();
+    Status explain(OperationContext* opCtx,
+                   const OpMsgRequest& request,
+                   ExplainOptions::Verbosity verbosity,
+                   BSONObjBuilder* out) const override {
+        std::string dbname = request.getDatabase().toString();
+        const BSONObj& cmdObj = request.body;
+        // Acquire locks and resolve possible UUID. The RAII object is optional, because in the case
+        // of a view, the locks need to be released.
+        boost::optional<AutoGetCollectionForReadCommand> ctx;
+        ctx.emplace(opCtx,
+                    CommandHelpers::parseNsOrUUID(dbname, cmdObj),
+                    AutoGetCollection::ViewMode::kViewsPermitted);
+        const auto nss = ctx->getNss();
 
-            auto viewAggregation = parsedDistinct.getValue().asAggregationCommand();
+        const ExtensionsCallbackReal extensionsCallback(opCtx, &nss);
+        auto parsedDistinct =
+            uassertStatusOK(ParsedDistinct::parse(opCtx, nss, cmdObj, extensionsCallback, true));
+
+        if (ctx->getView()) {
+            // Relinquish locks. The aggregation command will re-acquire them.
+            ctx.reset();
+
+            auto viewAggregation = parsedDistinct.asAggregationCommand();
             if (!viewAggregation.isOK()) {
                 return viewAggregation.getStatus();
             }
@@ -145,59 +146,51 @@ public:
                 opCtx, nss, viewAggRequest.getValue(), viewAggregation.getValue(), *out);
         }
 
-        auto executor = getExecutorDistinct(
-            opCtx, collection, nss.ns(), &parsedDistinct.getValue(), PlanExecutor::YIELD_AUTO);
-        if (!executor.isOK()) {
-            return executor.getStatus();
-        }
+        Collection* const collection = ctx->getCollection();
 
-        Explain::explainStages(executor.getValue().get(), collection, verbosity, out);
+        auto executor =
+            uassertStatusOK(getExecutorDistinct(opCtx, collection, nss.ns(), &parsedDistinct));
+
+        Explain::explainStages(executor.get(), collection, verbosity, out);
         return Status::OK();
     }
 
     bool run(OperationContext* opCtx,
-             const string& dbname,
+             const std::string& dbname,
              const BSONObj& cmdObj,
-             BSONObjBuilder& result) {
-        const NamespaceString nss(parseNsCollectionRequired(dbname, cmdObj));
+             BSONObjBuilder& result) override {
+        // Acquire locks and resolve possible UUID. The RAII object is optional, because in the case
+        // of a view, the locks need to be released.
+        boost::optional<AutoGetCollectionForReadCommand> ctx;
+        ctx.emplace(opCtx,
+                    CommandHelpers::parseNsOrUUID(dbname, cmdObj),
+                    AutoGetCollection::ViewMode::kViewsPermitted);
+        const auto& nss = ctx->getNss();
 
         const ExtensionsCallbackReal extensionsCallback(opCtx, &nss);
-        auto parsedDistinct = ParsedDistinct::parse(opCtx, nss, cmdObj, extensionsCallback, false);
-        if (!parsedDistinct.isOK()) {
-            return appendCommandStatus(result, parsedDistinct.getStatus());
-        }
+        auto parsedDistinct =
+            uassertStatusOK(ParsedDistinct::parse(opCtx, nss, cmdObj, extensionsCallback, false));
 
-        AutoGetCollectionOrViewForReadCommand ctx(opCtx, nss);
-        Collection* collection = ctx.getCollection();
+        if (ctx->getView()) {
+            // Relinquish locks. The aggregation command will re-acquire them.
+            ctx.reset();
 
-        if (ctx.getView()) {
-            ctx.releaseLocksForView();
-
-            auto viewAggregation = parsedDistinct.getValue().asAggregationCommand();
+            auto viewAggregation = parsedDistinct.asAggregationCommand();
             if (!viewAggregation.isOK()) {
-                return appendCommandStatus(result, viewAggregation.getStatus());
+                return CommandHelpers::appendCommandStatus(result, viewAggregation.getStatus());
             }
 
-            BSONObj aggResult = Command::runCommandDirectly(
+            BSONObj aggResult = CommandHelpers::runCommandDirectly(
                 opCtx, OpMsgRequest::fromDBAndBody(dbname, std::move(viewAggregation.getValue())));
-
-            if (ResolvedView::isResolvedViewErrorResponse(aggResult)) {
-                result.appendElements(aggResult);
-                return false;
-            }
-
-            ViewResponseFormatter formatter(aggResult);
-            Status formatStatus = formatter.appendAsDistinctResponse(&result);
-            if (!formatStatus.isOK()) {
-                return appendCommandStatus(result, formatStatus);
-            }
+            uassertStatusOK(ViewResponseFormatter(aggResult).appendAsDistinctResponse(&result));
             return true;
         }
 
-        auto executor = getExecutorDistinct(
-            opCtx, collection, nss.ns(), &parsedDistinct.getValue(), PlanExecutor::YIELD_AUTO);
+        Collection* const collection = ctx->getCollection();
+
+        auto executor = getExecutorDistinct(opCtx, collection, nss.ns(), &parsedDistinct);
         if (!executor.isOK()) {
-            return appendCommandStatus(result, executor.getStatus());
+            return CommandHelpers::appendCommandStatus(result, executor.getStatus());
         }
 
         {
@@ -206,7 +199,7 @@ public:
                 Explain::getPlanSummary(executor.getValue().get()));
         }
 
-        string key = cmdObj[ParsedDistinct::kKeyField].valuestrsafe();
+        const auto key = cmdObj[ParsedDistinct::kKeyField].valuestrsafe();
 
         int bufSize = BSONObjMaxUserSize - 4096;
         BufBuilder bb(bufSize);
@@ -249,11 +242,10 @@ public:
                   << redact(PlanExecutor::statestr(state))
                   << ", stats: " << redact(Explain::getWinningPlanStats(executor.getValue().get()));
 
-            return appendCommandStatus(result,
-                                       Status(ErrorCodes::OperationFailed,
-                                              str::stream()
-                                                  << "Executor error during distinct command: "
-                                                  << WorkingSetCommon::toStatusString(obj)));
+            return CommandHelpers::appendCommandStatus(
+                result,
+                WorkingSetCommon::getMemberObjectStatus(obj).withContext(
+                    "Executor error during distinct command"));
         }
 
 
@@ -279,6 +271,8 @@ public:
 
         return true;
     }
+
 } distinctCmd;
 
+}  // namespace
 }  // namespace mongo

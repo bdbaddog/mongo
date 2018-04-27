@@ -46,8 +46,8 @@ class RefreshSessionsCommand final : public BasicCommand {
 public:
     RefreshSessionsCommand() : BasicCommand("refreshSessions") {}
 
-    bool slaveOk() const override {
-        return true;
+    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
+        return AllowedOnSecondary::kAlways;
     }
     bool adminOnly() const override {
         return false;
@@ -55,18 +55,12 @@ public:
     bool supportsWriteConcern(const BSONObj& cmd) const override {
         return false;
     }
-    void help(std::stringstream& help) const override {
-        help << "renew a set of logical sessions";
+    std::string help() const override {
+        return "renew a set of logical sessions";
     }
     Status checkAuthForOperation(OperationContext* opCtx,
                                  const std::string& dbname,
-                                 const BSONObj& cmdObj) override {
-
-        if (serverGlobalParams.featureCompatibility.getVersion() !=
-            ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo36) {
-            return SessionsCommandFCV34Status(getName());
-        }
-
+                                 const BSONObj& cmdObj) const override {
         // It is always ok to run this command, as long as you are authenticated
         // as some user, if auth is enabled.
         AuthorizationSession* authSession = AuthorizationSession::get(opCtx->getClient());
@@ -83,18 +77,12 @@ public:
                      const std::string& db,
                      const BSONObj& cmdObj,
                      BSONObjBuilder& result) override {
-
-        if (serverGlobalParams.featureCompatibility.getVersion() !=
-            ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo36) {
-            return appendCommandStatus(result, SessionsCommandFCV34Status(getName()));
-        }
-
         IDLParserErrorContext ctx("RefreshSessionsCmdFromClient");
         auto cmd = RefreshSessionsCmdFromClient::parse(ctx, cmdObj);
         auto res =
             LogicalSessionCache::get(opCtx->getServiceContext())->refreshSessions(opCtx, cmd);
         if (!res.isOK()) {
-            return appendCommandStatus(result, res);
+            return CommandHelpers::appendCommandStatus(result, res);
         }
 
         return true;

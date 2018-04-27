@@ -58,6 +58,8 @@
  *       rs: same as above
  *       chunkSize: same as above
  *       keyFile {string}: the location of the keyFile
+ *       shardAsReplicaSet {boolean}: if true, start shards as 2 node replica sets. default
+ *          is true.
  *
  *       shardOptions {Object}: same as the shards property above.
  *          Can be used to specify options that are common all shards.
@@ -376,12 +378,16 @@ var ShardingTest = function(params) {
         }
     };
 
-    this.stop = function(opts) {
-        this.checkUUIDsConsistentAcrossCluster();
-
+    this.stopAllMongos = function(opts) {
         for (var i = 0; i < this._mongos.length; i++) {
             this.stopMongos(i, opts);
         }
+    };
+
+    this.stop = function(opts) {
+        this.checkUUIDsConsistentAcrossCluster();
+
+        this.stopAllMongos(opts);
 
         for (var i = 0; i < this._connections.length; i++) {
             if (this._rs[i]) {
@@ -400,8 +406,11 @@ var ShardingTest = function(params) {
             }
         }
 
-        for (var i = 0; i < _alldbpaths.length; i++) {
-            resetDbpath(MongoRunner.dataPath + _alldbpaths[i]);
+        if (!opts || !opts.noCleanData) {
+            print("ShardingTest stop deleting all dbpaths");
+            for (var i = 0; i < _alldbpaths.length; i++) {
+                resetDbpath(MongoRunner.dataPath + _alldbpaths[i]);
+            }
         }
 
         var timeMillis = new Date().getTime() - _startTime.getTime();
@@ -667,7 +676,7 @@ var ShardingTest = function(params) {
         }
 
         if (!_isSharded(dbName)) {
-            this.s.adminCommand({enableSharding: dbName});
+            assert.commandWorked(this.s.adminCommand({enableSharding: dbName}));
         }
 
         var result = assert.commandWorked(this.s.adminCommand({shardcollection: c, key: key}));
@@ -814,7 +823,6 @@ var ShardingTest = function(params) {
      */
     this.restartMongod = function(n, opts, beforeRestartCallback) {
         var mongod;
-
         if (otherParams.useBridge) {
             mongod = unbridgedConnections[n];
         } else {
@@ -868,9 +876,31 @@ var ShardingTest = function(params) {
     };
 
     /**
+     * Restarts each node in a particular shard replica set using the shard's original startup
+     * options by default.
+     *
+     * Option { startClean : true } forces clearing the data directory.
+     * Option { auth : Object } object that contains the auth details for admin credentials.
+     *   Should contain the fields 'user' and 'pwd'
+     *
+     *
+     * @param {int} shard server number (0, 1, 2, ...) to be restarted
+     */
+    this.restartShardRS = function(n, options, signal, wait) {
+        for (let i = 0; i < this["rs" + n].nodeList().length; i++) {
+            this["rs" + n].restart(i);
+        }
+
+        this["rs" + n].awaitSecondaryNodes();
+        this._connections[n] = new Mongo(this["rs" + n].getURL());
+        this["shard" + n] = this._connections[n];
+    };
+
+    /**
      * Stops and restarts a config server mongod process.
      *
-     * If opts is specified, the new mongod is started using those options. Otherwise, it is started
+     * If opts is specified, the new mongod is started using those options. Otherwise, it is
+     * started
      * with its previous parameters.
      *
      * Warning: Overwrites the old cn/confign member variables.
@@ -1019,6 +1049,8 @@ var ShardingTest = function(params) {
     var mongosVerboseLevel = otherParams.hasOwnProperty('verbose') ? otherParams.verbose : 1;
     var numMongos = otherParams.hasOwnProperty('mongos') ? otherParams.mongos : 1;
     var numConfigs = otherParams.hasOwnProperty('config') ? otherParams.config : 3;
+    var startShardsAsRS =
+        otherParams.hasOwnProperty('shardAsReplicaSet') ? otherParams.shardAsReplicaSet : true;
 
     // Default enableBalancer to false.
     otherParams.enableBalancer =
@@ -1043,6 +1075,7 @@ var ShardingTest = function(params) {
         var tempCount = 0;
         for (var i in numShards) {
             otherParams[i] = numShards[i];
+
             tempCount++;
         }
 
@@ -1111,7 +1144,7 @@ var ShardingTest = function(params) {
 
     // Start the MongoD servers (shards)
     for (var i = 0; i < numShards; i++) {
-        if (otherParams.rs || otherParams["rs" + i]) {
+        if (otherParams.rs || otherParams["rs" + i] || startShardsAsRS) {
             var setName = testName + "-rs" + i;
 
             var rsDefaults = {
@@ -1122,14 +1155,52 @@ var ShardingTest = function(params) {
                 pathOpts: Object.merge(pathOpts, {shard: i}),
             };
 
-            rsDefaults = Object.merge(rsDefaults, otherParams.rs);
-            rsDefaults = Object.merge(rsDefaults, otherParams.rsOptions);
-            rsDefaults = Object.merge(rsDefaults, otherParams["rs" + i]);
-            rsDefaults.nodes = rsDefaults.nodes || otherParams.numReplicas;
+            if (otherParams.rs || otherParams["rs" + i]) {
+                if (otherParams.rs) {
+                    rsDefaults = Object.merge(rsDefaults, otherParams.rs);
+                }
+                if (otherParams["rs" + i]) {
+                    rsDefaults = Object.merge(rsDefaults, otherParams["rs" + i]);
+                }
+                rsDefaults = Object.merge(rsDefaults, otherParams.rsOptions);
+                rsDefaults.nodes = rsDefaults.nodes || otherParams.numReplicas;
+            }
+
+            if (startShardsAsRS && !(otherParams.rs || otherParams["rs" + i])) {
+                if (jsTestOptions().shardMixedBinVersions) {
+                    if (!otherParams.shardOptions) {
+                        otherParams.shardOptions = {};
+                    }
+                    // If the test doesn't depend on specific shard binVersions, create a mixed
+                    // version
+                    // shard cluster that randomly assigns shard binVersions, half "latest" and half
+                    // "last-stable".
+                    if (!otherParams.shardOptions.binVersion) {
+                        Random.setRandomSeed();
+                        otherParams.shardOptions.binVersion =
+                            MongoRunner.versionIterator(["latest", "last-stable"], true);
+                    }
+                }
+
+                if (otherParams.shardOptions && otherParams.shardOptions.binVersion) {
+                    otherParams.shardOptions.binVersion =
+                        MongoRunner.versionIterator(otherParams.shardOptions.binVersion);
+                }
+
+                rsDefaults = Object.merge(rsDefaults, otherParams["d" + i]);
+                rsDefaults = Object.merge(rsDefaults, otherParams.shardOptions);
+            }
+
             var rsSettings = rsDefaults.settings;
             delete rsDefaults.settings;
 
-            var numReplicas = rsDefaults.nodes || 3;
+            // If both rs and startShardsAsRS are specfied, the number of nodes
+            // in the rs field should take priority.
+            if (otherParams.rs || otherParams["rs" + i]) {
+                var numReplicas = rsDefaults.nodes || 3;
+            } else if (startShardsAsRS) {
+                var numReplicas = 1;
+            }
             delete rsDefaults.nodes;
 
             var protocolVersion = rsDefaults.protocolVersion;
@@ -1235,7 +1306,7 @@ var ShardingTest = function(params) {
 
     // Do replication on replica sets if required
     for (var i = 0; i < numShards; i++) {
-        if (!otherParams.rs && !otherParams["rs" + i]) {
+        if (!otherParams.rs && !otherParams["rs" + i] && !startShardsAsRS) {
             continue;
         }
 
@@ -1337,7 +1408,7 @@ var ShardingTest = function(params) {
     const configRS = this.configRS;
     if (_hasNewFeatureCompatibilityVersion() && _isMixedVersionCluster()) {
         function setFeatureCompatibilityVersion() {
-            assert.commandWorked(csrsPrimary.adminCommand({setFeatureCompatibilityVersion: '3.4'}));
+            assert.commandWorked(csrsPrimary.adminCommand({setFeatureCompatibilityVersion: '3.6'}));
 
             // Wait for the new featureCompatibilityVersion to propagate to all nodes in the CSRS
             // to ensure that older versions of mongos can successfully connect.

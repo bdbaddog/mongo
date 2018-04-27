@@ -33,7 +33,7 @@
     const mongosDB = st.s0.getDB(jsTestName());
     const mongosColl = mongosDB[jsTestName()];
 
-    // Enable sharding on the test DB and ensure its primary is shard0000.
+    // Enable sharding on the test DB and ensure its primary is st.shard0.shardName.
     assert.commandWorked(mongosDB.adminCommand({enableSharding: mongosDB.getName()}));
     st.ensurePrimaryShard(mongosDB.getName(), st.rs0.getURL());
 
@@ -45,14 +45,15 @@
     assert.commandWorked(
         mongosDB.adminCommand({split: mongosColl.getFullName(), middle: {_id: 0}}));
 
-    // Move the [0, MaxKey) chunk to shard0001.
+    // Move the [0, MaxKey) chunk to st.shard1.shardName.
     assert.commandWorked(mongosDB.adminCommand(
         {moveChunk: mongosColl.getFullName(), find: {_id: 1}, to: st.rs1.getURL()}));
 
     function checkStream() {
         db = db.getSiblingDB(jsTestName());
         let coll = db[jsTestName()];
-        let changeStream = coll.aggregate([{$changeStream: {}}, {$project: {_id: 0}}]);
+        let changeStream =
+            coll.aggregate([{$changeStream: {}}, {$project: {_id: 0, clusterTime: 0}}]);
 
         assert.soon(() => changeStream.hasNext());
         assert.docEq(changeStream.next(), {
@@ -109,4 +110,5 @@
 
     assert.writeOK(mongosColl.insert({_id: -1002}, {writeConcern: {w: "majority"}}));
     waitForShell();
+    st.stop();
 })();

@@ -33,11 +33,13 @@
 #include "mongo/db/auth/action_type.h"
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/auth/privilege.h"
-#include "mongo/db/catalog/catalog_raii.h"
+#include "mongo/db/catalog_raii.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/field_parser.h"
+#include "mongo/db/logical_clock.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/s/collection_sharding_state.h"
+#include "mongo/db/s/shard_filtering_metadata_refresh.h"
 #include "mongo/db/s/sharding_state.h"
 #include "mongo/s/catalog/type_chunk.h"
 #include "mongo/s/client/shard_registry.h"
@@ -60,7 +62,7 @@ bool checkMetadataForSuccess(OperationContext* opCtx,
                              const BSONObj& maxKey) {
     const auto metadataAfterMerge = [&] {
         AutoGetCollection autoColl(opCtx, nss, MODE_IS);
-        return CollectionShardingState::get(opCtx, nss.ns())->getMetadata();
+        return CollectionShardingState::get(opCtx, nss)->getMetadata(opCtx);
     }();
 
     uassert(ErrorCodes::StaleEpoch,
@@ -89,35 +91,23 @@ Status mergeChunks(OperationContext* opCtx,
         opCtx, nss.ns(), whyMessage, DistLockManager::kSingleLockAttemptTimeout);
 
     if (!scopedDistLock.isOK()) {
-        std::string errmsg = stream() << "could not acquire collection lock for " << nss.ns()
-                                      << " to merge chunks in [" << redact(minKey) << ", "
-                                      << redact(maxKey) << ")"
-                                      << causedBy(scopedDistLock.getStatus());
+        std::string context = stream() << "could not acquire collection lock for " << nss.ns()
+                                       << " to merge chunks in [" << redact(minKey) << ", "
+                                       << redact(maxKey) << ")";
 
-        warning() << errmsg;
-        return Status(scopedDistLock.getStatus().code(), errmsg);
+        warning() << context << causedBy(scopedDistLock.getStatus());
+        return scopedDistLock.getStatus().withContext(context);
     }
 
     auto const shardingState = ShardingState::get(opCtx);
 
-    //
-    // We now have the collection lock, refresh metadata to latest version and sanity check
-    //
-
-    ChunkVersion unusedShardVersion;
-    Status refreshStatus = shardingState->refreshMetadataNow(opCtx, nss, &unusedShardVersion);
-    if (!refreshStatus.isOK()) {
-        std::string errmsg = str::stream()
-            << "could not merge chunks, failed to refresh metadata for " << nss.ns()
-            << causedBy(redact(refreshStatus));
-
-        warning() << errmsg;
-        return Status(refreshStatus.code(), errmsg);
-    }
+    // We now have the collection distributed lock, refresh metadata to latest version and sanity
+    // check
+    forceShardFilteringMetadataRefresh(opCtx, nss);
 
     const auto metadata = [&] {
         AutoGetCollection autoColl(opCtx, nss, MODE_IS);
-        return CollectionShardingState::get(opCtx, nss.ns())->getMetadata();
+        return CollectionShardingState::get(opCtx, nss)->getMetadata(opCtx);
     }();
 
     if (!metadata) {
@@ -161,15 +151,12 @@ Status mergeChunks(OperationContext* opCtx,
     ChunkType itChunk;
     itChunk.setMin(minKey);
     itChunk.setMax(minKey);
-    itChunk.setNS(nss.ns());
-    itChunk.setShard(shardingState->getShardName());
 
     while (itChunk.getMax().woCompare(maxKey) < 0 &&
            metadata->getNextChunk(itChunk.getMax(), &itChunk)) {
         chunkBoundaries.push_back(itChunk.getMax());
         chunksToMerge.push_back(itChunk);
     }
-
 
     if (chunksToMerge.empty()) {
         std::string errmsg = stream()
@@ -254,8 +241,11 @@ Status mergeChunks(OperationContext* opCtx,
     //
     // Run _configsvrCommitChunkMerge.
     //
-    MergeChunkRequest request{
-        nss, shardingState->getShardName(), shardVersion.epoch(), chunkBoundaries};
+    MergeChunkRequest request{nss,
+                              shardingState->getShardName(),
+                              shardVersion.epoch(),
+                              chunkBoundaries,
+                              LogicalClock::get(opCtx)->getClusterTime().asTimestamp()};
 
     auto configCmdObj =
         request.toConfigCommandBSON(ShardingCatalogClient::kMajorityWriteConcern.toBSON());
@@ -266,23 +256,9 @@ Status mergeChunks(OperationContext* opCtx,
         configCmdObj,
         Shard::RetryPolicy::kIdempotent);
 
-    //
     // Refresh metadata to pick up new chunk definitions (regardless of the results returned from
     // running _configsvrCommitChunkMerge).
-    //
-    {
-        ChunkVersion unusedShardVersion;
-        refreshStatus = shardingState->refreshMetadataNow(opCtx, nss, &unusedShardVersion);
-
-        if (!refreshStatus.isOK()) {
-            std::string errmsg = str::stream() << "failed to refresh metadata for merge chunk ["
-                                               << redact(minKey) << "," << redact(maxKey) << ") "
-                                               << redact(refreshStatus);
-
-            warning() << errmsg;
-            return Status(refreshStatus.code(), errmsg);
-        }
-    }
+    forceShardFilteringMetadataRefresh(opCtx, nss);
 
     // If we failed to get any response from the config server at all, despite retries, then we
     // should just go ahead and fail the whole operation.
@@ -303,13 +279,9 @@ Status mergeChunks(OperationContext* opCtx,
         LOG(1) << "mergeChunk [" << redact(minKey) << "," << redact(maxKey)
                << ") has already been committed.";
     } else if (!commandStatus.isOK()) {
-        std::string errmsg = str::stream() << "Failed to commit chunk merge"
-                                           << causedBy(redact(commandStatus));
-        return Status(commandStatus.code(), errmsg);
+        return commandStatus.withContext("Failed to commit chunk merge");
     } else if (!writeConcernStatus.isOK()) {
-        std::string errmsg = str::stream() << "Failed to commit chunk merge"
-                                           << causedBy(redact(writeConcernStatus));
-        return Status(writeConcernStatus.code(), errmsg);
+        return writeConcernStatus.withContext("Failed to commit chunk merge");
     }
 
     return Status::OK();
@@ -319,15 +291,14 @@ class MergeChunksCommand : public ErrmsgCommandDeprecated {
 public:
     MergeChunksCommand() : ErrmsgCommandDeprecated("mergeChunks") {}
 
-    void help(std::stringstream& h) const override {
-        h << "Merge Chunks command\n"
-          << "usage: { mergeChunks : <ns>, bounds : [ <min key>, <max key> ],"
-          << " (opt) epoch : <epoch> }";
+    std::string help() const override {
+        return "Internal command to merge a contiguous range of chunks.\n"
+               "Usage: { mergeChunks: <ns>, epoch: <epoch>, bounds: [<min key>, <max key>] }";
     }
 
     Status checkAuthForCommand(Client* client,
                                const std::string& dbname,
-                               const BSONObj& cmdObj) override {
+                               const BSONObj& cmdObj) const override {
         if (!AuthorizationSession::get(client)->isAuthorizedForActionsOnResource(
                 ResourcePattern::forClusterResource(), ActionType::internal)) {
             return Status(ErrorCodes::Unauthorized, "Unauthorized");
@@ -336,15 +307,15 @@ public:
     }
 
     std::string parseNs(const std::string& dbname, const BSONObj& cmdObj) const override {
-        return parseNsFullyQualified(dbname, cmdObj);
+        return CommandHelpers::parseNsFullyQualified(cmdObj);
     }
 
     bool adminOnly() const override {
         return true;
     }
 
-    bool slaveOk() const override {
-        return false;
+    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
+        return AllowedOnSecondary::kNever;
     }
 
     bool supportsWriteConcern(const BSONObj& cmd) const override {
@@ -365,12 +336,7 @@ public:
                    BSONObjBuilder& result) override {
         uassertStatusOK(ShardingState::get(opCtx)->canAcceptShardedCommands());
 
-        string ns = parseNs(dbname, cmdObj);
-
-        if (ns.size() == 0) {
-            errmsg = "no namespace specified";
-            return false;
-        }
+        const NamespaceString nss(parseNs(dbname, cmdObj));
 
         vector<BSONObj> bounds;
         if (!FieldParser::extract(cmdObj, boundsField, &bounds, &errmsg)) {
@@ -406,9 +372,10 @@ public:
             return false;
         }
 
-        auto mergeStatus = mergeChunks(opCtx, NamespaceString(ns), minKey, maxKey, epoch);
-        return appendCommandStatus(result, mergeStatus);
+        auto mergeStatus = mergeChunks(opCtx, nss, minKey, maxKey, epoch);
+        return CommandHelpers::appendCommandStatus(result, mergeStatus);
     }
+
 } mergeChunksCmd;
 
 BSONField<string> MergeChunksCommand::nsField("mergeChunks");

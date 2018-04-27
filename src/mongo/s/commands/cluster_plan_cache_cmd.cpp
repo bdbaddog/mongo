@@ -54,27 +54,25 @@ class ClusterPlanCacheCmd : public BasicCommand {
 public:
     virtual ~ClusterPlanCacheCmd() {}
 
-    bool slaveOk() const {
-        return false;
-    }
-
-    bool slaveOverrideOk() const {
-        return true;
+    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
+        return AllowedOnSecondary::kOptIn;
     }
 
     bool supportsWriteConcern(const BSONObj& cmd) const override {
         return false;
     }
 
-    void help(stringstream& ss) const {
-        ss << _helpText;
+    std::string help() const override {
+        return _helpText;
     }
 
     std::string parseNs(const std::string& dbname, const BSONObj& cmdObj) const override {
-        return parseNsCollectionRequired(dbname, cmdObj).ns();
+        return CommandHelpers::parseNsCollectionRequired(dbname, cmdObj).ns();
     }
 
-    Status checkAuthForCommand(Client* client, const std::string& dbname, const BSONObj& cmdObj) {
+    Status checkAuthForCommand(Client* client,
+                               const std::string& dbname,
+                               const BSONObj& cmdObj) const {
         AuthorizationSession* authzSession = AuthorizationSession::get(client);
         ResourcePattern pattern = parseResourcePattern(dbname, cmdObj);
 
@@ -112,7 +110,7 @@ bool ClusterPlanCacheCmd::run(OperationContext* opCtx,
                               const std::string& dbName,
                               const BSONObj& cmdObj,
                               BSONObjBuilder& result) {
-    const NamespaceString nss(parseNsCollectionRequired(dbName, cmdObj));
+    const NamespaceString nss(CommandHelpers::parseNsCollectionRequired(dbName, cmdObj));
 
     // Dispatch command to all the shards.
     // Targeted shard commands are generally data-dependent but plan cache
@@ -121,7 +119,7 @@ bool ClusterPlanCacheCmd::run(OperationContext* opCtx,
     const BSONObj query;
     Strategy::commandOp(opCtx,
                         dbName,
-                        filterCommandRequestForPassthrough(cmdObj),
+                        CommandHelpers::filterCommandRequestForPassthrough(cmdObj),
                         nss.ns(),
                         query,
                         CollationSpec::kSimpleSpec,
@@ -137,7 +135,7 @@ bool ClusterPlanCacheCmd::run(OperationContext* opCtx,
         // XXX: In absence of sensible aggregation strategy,
         //      promote first shard's result to top level.
         if (i == results.begin()) {
-            filterCommandReplyForPassthrough(cmdResult.result, &result);
+            CommandHelpers::filterCommandReplyForPassthrough(cmdResult.result, &result);
             clusterCmdResult = cmdResult.result["ok"].trueValue();
         }
 

@@ -269,6 +269,39 @@ public:
     }
 
     /**
+     * See `StorageEngine::recoverToStableTimestamp`
+     */
+    virtual StatusWith<Timestamp> recoverToStableTimestamp(OperationContext* opCtx) {
+        fassertFailed(50664);
+    }
+
+    /**
+     * See `StorageEngine::getRecoveryTimestamp`
+     */
+    virtual boost::optional<Timestamp> getRecoveryTimestamp() const {
+        MONGO_UNREACHABLE;
+    }
+
+    /**
+     * See `StorageEngine::getLastStableCheckpointTimestamp`
+     */
+    virtual boost::optional<Timestamp> getLastStableCheckpointTimestamp() const {
+        MONGO_UNREACHABLE;
+    }
+
+    /**
+     * See `StorageEngine::getAllCommittedTimestamp`
+     */
+    virtual Timestamp getAllCommittedTimestamp(OperationContext* opCtx) const = 0;
+
+    /**
+     * See `StorageEngine::supportsReadConcernSnapshot`
+     */
+    virtual bool supportsReadConcernSnapshot() const {
+        return false;
+    }
+
+    /**
      * See `StorageEngine::replicationBatchIsComplete()`
      */
     virtual void replicationBatchIsComplete() const {};

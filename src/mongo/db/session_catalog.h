@@ -31,6 +31,7 @@
 #include "mongo/base/disallow_copying.h"
 #include "mongo/db/logical_session_id.h"
 #include "mongo/db/session.h"
+#include "mongo/db/session_killer.h"
 #include "mongo/stdx/condition_variable.h"
 #include "mongo/stdx/mutex.h"
 #include "mongo/stdx/unordered_map.h"
@@ -52,24 +53,11 @@ class SessionCatalog {
     friend class ScopedCheckedOutSession;
 
 public:
-    explicit SessionCatalog(ServiceContext* serviceContext);
+    SessionCatalog() = default;
     ~SessionCatalog();
 
     /**
-     * Instantiates a transaction table on the specified service context. Must be called only once
-     * and is not thread-safe.
-     */
-    static void create(ServiceContext* service);
-
-    /**
-     * Resets the transaction table on the specified service context to an uninitialized state.
-     * Meant only for testing.
-     */
-    static void reset_forTest(ServiceContext* service);
-
-    /**
      * Retrieves the session transaction table associated with the service or operation context.
-     * Must only be called after 'create' has been called.
      */
     static SessionCatalog* get(OperationContext* opCtx);
     static SessionCatalog* get(ServiceContext* service);
@@ -79,6 +67,12 @@ public:
      * exist or has no UUID. Acquires a lock on the collection. Required for rollback via refetch.
      */
     static boost::optional<UUID> getTransactionTableUUID(OperationContext* opCtx);
+
+    /**
+     * Resets the transaction table to an uninitialized state.
+     * Meant only for testing.
+     */
+    void reset_forTest();
 
     /**
      * Invoked when the node enters the primary state. Ensures that the transactions collection is
@@ -123,6 +117,15 @@ public:
      */
     void invalidateSessions(OperationContext* opCtx, boost::optional<BSONObj> singleSessionDoc);
 
+    /**
+     * Iterates through the SessionCatalog and applies 'workerFn' to each Session. This locks the
+     * SessionCatalog.
+     * TODO SERVER-33850: Take Matcher out of the SessionKiller namespace.
+     */
+    void scanSessions(OperationContext* opCtx,
+                      const SessionKiller::Matcher& matcher,
+                      stdx::function<void(OperationContext*, Session*)> workerFn);
+
 private:
     struct SessionRuntimeInfo {
         SessionRuntimeInfo(LogicalSessionId lsid) : txnState(std::move(lsid)) {}
@@ -146,19 +149,17 @@ private:
                                                       LogicalSessionIdHash>;
 
     /**
-     * Must be called with _mutex locked and returns it locked. May release and re-acquire it zero
-     * or more times before returning. The returned 'SessionRuntimeInfo' is guaranteed to be linked
-     * on the catalog's _txnTable as long as the lock is held.
+     * May release and re-acquire it zero or more times before returning. The returned
+     * 'SessionRuntimeInfo' is guaranteed to be linked on the catalog's _txnTable as long as the
+     * lock is held.
      */
     std::shared_ptr<SessionRuntimeInfo> _getOrCreateSessionRuntimeInfo(
-        OperationContext* opCtx, const LogicalSessionId& lsid, stdx::unique_lock<stdx::mutex>& ul);
+        WithLock, OperationContext* opCtx, const LogicalSessionId& lsid);
 
     /**
      * Makes a session, previously checked out through 'checkoutSession', available again.
      */
     void _releaseSession(const LogicalSessionId& lsid);
-
-    ServiceContext* const _serviceContext;
 
     stdx::mutex _mutex;
     SessionRuntimeInfoMap _txnTable;
@@ -246,9 +247,16 @@ class OperationContextSession {
     MONGO_DISALLOW_COPYING(OperationContextSession);
 
 public:
-    OperationContextSession(OperationContext* opCtx, bool checkOutSession);
+    OperationContextSession(OperationContext* opCtx,
+                            bool checkOutSession,
+                            boost::optional<bool> autocommit,
+                            boost::optional<bool> startTransaction);
+
     ~OperationContextSession();
 
+    /**
+     * Returns the session checked out in the constructor.
+     */
     static Session* get(OperationContext* opCtx);
 
 private:

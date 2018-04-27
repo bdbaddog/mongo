@@ -37,9 +37,7 @@
 #include "mongo/db/namespace_string.h"
 #include "mongo/s/catalog/sharding_catalog_client.h"
 #include "mongo/s/catalog_cache.h"
-#include "mongo/s/client/shard_connection.h"
 #include "mongo/s/client/shard_registry.h"
-#include "mongo/s/commands/cluster_commands_helpers.h"
 #include "mongo/s/grid.h"
 
 namespace mongo {
@@ -56,14 +54,14 @@ class ClusterMergeChunksCommand : public ErrmsgCommandDeprecated {
 public:
     ClusterMergeChunksCommand() : ErrmsgCommandDeprecated("mergeChunks") {}
 
-    void help(std::stringstream& h) const override {
-        h << "Merge Chunks command\n"
-          << "usage: { mergeChunks : <ns>, bounds : [ <min key>, <max key> ] }";
+    std::string help() const override {
+        return "Merge Chunks command\n"
+               "usage: { mergeChunks : <ns>, bounds : [ <min key>, <max key> ] }";
     }
 
     Status checkAuthForCommand(Client* client,
                                const std::string& dbname,
-                               const BSONObj& cmdObj) override {
+                               const BSONObj& cmdObj) const override {
         if (!AuthorizationSession::get(client)->isAuthorizedForActionsOnResource(
                 ResourcePattern::forExactNamespace(NamespaceString(parseNs(dbname, cmdObj))),
                 ActionType::splitChunk)) {
@@ -73,15 +71,15 @@ public:
     }
 
     std::string parseNs(const std::string& dbname, const BSONObj& cmdObj) const override {
-        return parseNsFullyQualified(dbname, cmdObj);
+        return CommandHelpers::parseNsFullyQualified(cmdObj);
     }
 
     bool adminOnly() const override {
         return true;
     }
 
-    bool slaveOk() const override {
-        return false;
+    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
+        return AllowedOnSecondary::kNever;
     }
 
     bool supportsWriteConcern(const BSONObj& cmd) const override {
@@ -158,29 +156,28 @@ public:
             ClusterMergeChunksCommand::configField(),
             Grid::get(opCtx)->shardRegistry()->getConfigServerConnectionString().toString());
         remoteCmdObjB.append(ClusterMergeChunksCommand::shardNameField(),
-                             firstChunk->getShardId().toString());
+                             firstChunk.getShardId().toString());
+        remoteCmdObjB.append("epoch", cm->getVersion().epoch());
 
         BSONObj remoteResult;
 
         // Throws, but handled at level above.  Don't want to rewrap to preserve exception
         // formatting.
-        const auto shardStatus =
-            Grid::get(opCtx)->shardRegistry()->getShard(opCtx, firstChunk->getShardId());
-        if (!shardStatus.isOK()) {
-            return appendCommandStatus(
-                result,
-                Status(ErrorCodes::ShardNotFound,
-                       str::stream() << "Can't find shard for chunk: " << firstChunk->toString()));
-        }
+        auto shard = uassertStatusOK(
+            Grid::get(opCtx)->shardRegistry()->getShard(opCtx, firstChunk.getShardId()));
 
-        ShardConnection conn(shardStatus.getValue()->getConnString(), "");
-        bool ok = conn->runCommand("admin", remoteCmdObjB.obj(), remoteResult);
-        conn.done();
+        auto response = uassertStatusOK(shard->runCommandWithFixedRetryAttempts(
+            opCtx,
+            ReadPreferenceSetting{ReadPreference::PrimaryOnly},
+            "admin",
+            remoteCmdObjB.obj(),
+            Shard::RetryPolicy::kNotIdempotent));
+        uassertStatusOK(response.commandStatus);
 
-        Grid::get(opCtx)->catalogCache()->onStaleConfigError(std::move(routingInfo));
+        Grid::get(opCtx)->catalogCache()->onStaleShardVersion(std::move(routingInfo));
+        CommandHelpers::filterCommandReplyForPassthrough(response.response, &result);
 
-        filterCommandReplyForPassthrough(remoteResult, &result);
-        return ok;
+        return true;
     }
 
 } clusterMergeChunksCommand;

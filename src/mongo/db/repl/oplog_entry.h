@@ -61,6 +61,21 @@ public:
     // Current oplog version, should be the value of the v field in all oplog entries.
     static const int kOplogVersion;
 
+    // Helpers to generate ReplOperation.
+    static ReplOperation makeInsertOperation(const NamespaceString& nss,
+                                             boost::optional<UUID> uuid,
+                                             const BSONObj& docToInsert);
+    static ReplOperation makeUpdateOperation(const NamespaceString nss,
+                                             boost::optional<UUID> uuid,
+                                             const BSONObj& update,
+                                             const BSONObj& criteria);
+    static ReplOperation makeDeleteOperation(const NamespaceString& nss,
+                                             boost::optional<UUID> uuid,
+                                             const BSONObj& docToDelete);
+
+    // Get the in-memory size in bytes of a ReplOperation.
+    static size_t getReplOperationSize(const ReplOperation& op);
+
     static StatusWith<OplogEntry> parse(const BSONObj& object);
 
     OplogEntry(OpTime opTime,
@@ -73,6 +88,7 @@ public:
                const BSONObj& oField,
                const boost::optional<BSONObj>& o2Field,
                const OperationSessionInfo& sessionInfo,
+               const boost::optional<bool>& isUpsert,
                const boost::optional<mongo::Date_t>& wallClockTime,
                const boost::optional<StmtId>& statementId,
                const boost::optional<OpTime>& prevWriteOpTimeInTransaction,
@@ -95,6 +111,7 @@ public:
     /**
      * Returns if the oplog entry is for a CRUD operation.
      */
+    static bool isCrudOpType(OpTypeEnum opType);
     bool isCrudOpType() const;
 
     /**
@@ -103,9 +120,22 @@ public:
     BSONElement getIdElement() const;
 
     /**
+     * Returns the document representing the operation to apply.
+     * For commands and insert/delete operations, this will be the document in the 'o' field.
+     * For update operations, this will be the document in the 'o2' field.
+     * An empty document returned by this function indicates that we have a malformed OplogEntry.
+     */
+    BSONObj getOperationToApply() const;
+
+    /**
      * Returns the type of command of the oplog entry. Must be called on a command op.
      */
     CommandType getCommandType() const;
+
+    /**
+     * Returns the size of the original document used to create this OplogEntry.
+     */
+    int getRawObjSizeBytes() const;
 
     /**
      * Returns the OpTime of the oplog entry.
@@ -129,6 +159,8 @@ std::ostream& operator<<(std::ostream& s, const OplogEntry& o);
 inline bool operator==(const OplogEntry& lhs, const OplogEntry& rhs) {
     return SimpleBSONObjComparator::kInstance.evaluate(lhs.raw == rhs.raw);
 }
+
+std::ostream& operator<<(std::ostream& s, const ReplOperation& o);
 
 }  // namespace repl
 }  // namespace mongo

@@ -42,10 +42,11 @@ namespace {
 
 const BSONField<bool> kNoBalance("noBalance");
 const BSONField<bool> kDropped("dropped");
+const auto kIsAssignedShardKey = "isAssignedShardKey"_sd;
 
 }  // namespace
 
-const std::string CollectionType::ConfigNS = "config.collections";
+const NamespaceString CollectionType::ConfigNS("config.collections");
 
 const BSONField<std::string> CollectionType::fullNs("_id");
 const BSONField<OID> CollectionType::epoch("lastmodEpoch");
@@ -110,7 +111,7 @@ StatusWith<CollectionType> CollectionType::fromBSON(const BSONObj& source) {
         } else if (status == ErrorCodes::NoSuchKey) {
             // Sharding key can only be missing if the collection is dropped
             if (!coll.getDropped()) {
-                return {status.code(),
+                return {ErrorCodes::NoSuchKey,
                         str::stream() << "Shard key for collection " << coll._fullNs->ns()
                                       << " is missing, but the collection is not marked as "
                                          "dropped. This is an indication of corrupted sharding "
@@ -173,6 +174,18 @@ StatusWith<CollectionType> CollectionType::fromBSON(const BSONObj& source) {
             coll._allowBalance = !collNoBalance;
         } else if (status == ErrorCodes::NoSuchKey) {
             // No balance can be missing in which case it is presumed as false
+        } else {
+            return status;
+        }
+    }
+
+    {
+        bool isAssignedShardKey;
+        Status status = bsonExtractBooleanField(source, kIsAssignedShardKey, &isAssignedShardKey);
+        if (status.isOK()) {
+            coll._isAssignedShardKey = isAssignedShardKey;
+        } else if (status == ErrorCodes::NoSuchKey) {
+            // isAssignedShardKey can be missing in which case it is presumed as true.
         } else {
             return status;
         }
@@ -249,6 +262,10 @@ BSONObj CollectionType::toBSON() const {
 
     if (_allowBalance.is_initialized()) {
         builder.append(kNoBalance.name(), !_allowBalance.get());
+    }
+
+    if (_isAssignedShardKey) {
+        builder.append(kIsAssignedShardKey, !_isAssignedShardKey.get());
     }
 
     return builder.obj();

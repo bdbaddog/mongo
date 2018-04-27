@@ -43,6 +43,10 @@ class stream;
 
 namespace mongo {
 
+// Including builder.h here would cause a cycle.
+template <typename Allocator>
+class StringBuilderImpl;
+
 /**
  * Status represents an error state or the absence thereof.
  *
@@ -98,6 +102,15 @@ public:
     inline Status& operator=(Status&& other) noexcept;
 
     inline ~Status();
+
+    /**
+     * Returns a new Status with the same data as this, but with the reason string replaced with
+     * newReason.  The new reason is not visible to any other Statuses that share the same ErrorInfo
+     * object.
+     *
+     * No-op when called on an OK status.
+     */
+    Status withReason(StringData newReason) const;
 
     /**
      * Returns a new Status with the same data as this, but with the reason string prefixed with
@@ -249,6 +262,10 @@ inline bool operator==(const ErrorCodes::Error lhs, const Status& rhs);
 inline bool operator!=(const ErrorCodes::Error lhs, const Status& rhs);
 
 std::ostream& operator<<(std::ostream& os, const Status& status);
+
+// This is only implemented for StringBuilder, not StackStringBuilder.
+template <typename Allocator>
+StringBuilderImpl<Allocator>& operator<<(StringBuilderImpl<Allocator>& os, const Status& status);
 
 }  // namespace mongo
 

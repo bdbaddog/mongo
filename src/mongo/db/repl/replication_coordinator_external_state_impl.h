@@ -33,15 +33,14 @@
 #include "mongo/base/disallow_copying.h"
 #include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/repl/bgsync.h"
+#include "mongo/db/repl/oplog_applier.h"
 #include "mongo/db/repl/replication_coordinator_external_state.h"
-#include "mongo/db/repl/rs_sync.h"
 #include "mongo/db/repl/sync_source_feedback.h"
-#include "mongo/db/repl/sync_tail.h"
 #include "mongo/db/repl/task_runner.h"
 #include "mongo/db/storage/journal_listener.h"
 #include "mongo/db/storage/snapshot_manager.h"
 #include "mongo/stdx/mutex.h"
-#include "mongo/util/concurrency/old_thread_pool.h"
+#include "mongo/util/concurrency/thread_pool.h"
 
 namespace mongo {
 class ServiceContext;
@@ -74,17 +73,15 @@ public:
 
     virtual bool isInitialSyncFlagSet(OperationContext* opCtx) override;
 
-    virtual void startMasterSlave(OperationContext* opCtx);
     virtual void shutdown(OperationContext* opCtx);
     virtual executor::TaskExecutor* getTaskExecutor() const override;
-    virtual OldThreadPool* getDbWorkThreadPool() const override;
+    virtual ThreadPool* getDbWorkThreadPool() const override;
     virtual Status runRepairOnLocalDB(OperationContext* opCtx) override;
     virtual Status initializeReplSetStorage(OperationContext* opCtx, const BSONObj& config);
     virtual void waitForAllEarlierOplogWritesToBeVisible(OperationContext* opCtx);
     void onDrainComplete(OperationContext* opCtx) override;
     OpTime onTransitionToPrimary(OperationContext* opCtx, bool isV1ElectionProtocol) override;
     virtual void forwardSlaveProgress();
-    virtual OID ensureMe(OperationContext* opCtx);
     virtual bool isSelf(const HostAndPort& host, ServiceContext* service);
     virtual StatusWith<BSONObj> loadLocalConfigDocument(OperationContext* opCtx);
     virtual Status storeLocalConfigDocument(OperationContext* opCtx, const BSONObj& config);
@@ -95,27 +92,20 @@ public:
     virtual HostAndPort getClientHostAndPort(const OperationContext* opCtx);
     virtual void closeConnections();
     virtual void killAllUserOperations(OperationContext* opCtx);
+    virtual void killAllTransactionCursors(OperationContext* opCtx);
     virtual void shardingOnStepDownHook();
     virtual void signalApplierToChooseNewSyncSource();
     virtual void stopProducer();
     virtual void startProducerIfStopped();
     void dropAllSnapshots() final;
     void updateCommittedSnapshot(const OpTime& newCommitPoint) final;
+    void updateLocalSnapshot(const OpTime& optime) final;
     virtual bool snapshotsEnabled() const;
     virtual void notifyOplogMetadataWaiters(const OpTime& committedOpTime);
+    boost::optional<OpTime> getEarliestDropPendingOpTime() const final;
     virtual double getElectionTimeoutOffsetLimitFraction() const;
     virtual bool isReadCommittedSupportedByStorageEngine(OperationContext* opCtx) const;
-    virtual StatusWith<OpTime> multiApply(OperationContext* opCtx,
-                                          MultiApplier::Operations ops,
-                                          MultiApplier::ApplyOperationFn applyOperation) override;
-    virtual Status multiSyncApply(MultiApplier::OperationPtrs* ops) override;
-    virtual Status multiInitialSyncApply(MultiApplier::OperationPtrs* ops,
-                                         const HostAndPort& source,
-                                         AtomicUInt32* fetchCount) override;
-    virtual std::unique_ptr<OplogBuffer> makeInitialSyncOplogBuffer(
-        OperationContext* opCtx) const override;
-    virtual std::unique_ptr<OplogBuffer> makeSteadyStateOplogBuffer(
-        OperationContext* opCtx) const override;
+    virtual bool isReadConcernSnapshotSupportedByStorageEngine(OperationContext* opCtx) const;
     virtual std::size_t getOplogFetcherMaxFetcherRestarts() const override;
 
     // Methods from JournalListener.
@@ -176,6 +166,11 @@ private:
     // replication.
     SyncSourceFeedback _syncSourceFeedback;
 
+    // The OplogBuffer is used to hold operations read from the sync source.
+    // BackgroundSync adds operations to the OplogBuffer while the applier thread consumes these
+    // operations in batches during oplog application.
+    std::unique_ptr<OplogBuffer> _oplogBuffer;
+
     // The BackgroundSync class is responsible for pulling ops off the network from the sync source
     // and into a BlockingQueue.
     // We can't create it on construction because it needs a fully constructed
@@ -186,8 +181,10 @@ private:
     // Thread running SyncSourceFeedback::run().
     std::unique_ptr<stdx::thread> _syncSourceFeedbackThread;
 
-    // Thread running runSyncThread().
-    std::unique_ptr<RSDataSync> _applierThread;
+    // Thread running oplog application.
+    std::unique_ptr<executor::TaskExecutor> _oplogApplierTaskExecutor;
+    std::unique_ptr<OplogApplier> _oplogApplier;
+    Future<void> _oplogApplierShutdownFuture;
 
     // Mutex guarding the _nextThreadId value to prevent concurrent incrementing.
     stdx::mutex _nextThreadIdMutex;
@@ -198,7 +195,10 @@ private:
     std::unique_ptr<executor::TaskExecutor> _taskExecutor;
 
     // Used by repl::multiApply() to apply the sync source's operations in parallel.
-    std::unique_ptr<OldThreadPool> _writerPool;
+    // Also used by database and collection cloners to perform storage operations.
+    // Cloners and oplog application run in separate phases of initial sync so it is fine to share
+    // this thread pool.
+    std::unique_ptr<ThreadPool> _writerPool;
 
     // Writes a noop every 10 seconds.
     std::unique_ptr<NoopWriter> _noopWriter;

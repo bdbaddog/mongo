@@ -153,10 +153,6 @@ if (typeof _threadInject != "undefined") {
 
         // some tests can't run in parallel with most others
         var skipTests = makeKeys([
-            "repair.js",
-            "cursor8.js",
-            "recstore.js",
-            "extent.js",
             "indexb.js",
 
             // Tests that set a parameter that causes the server to ignore
@@ -164,26 +160,32 @@ if (typeof _threadInject != "undefined") {
             "index_bigkeys_nofail.js",
             "index_bigkeys_validation.js",
 
-            "mr_drop.js",
             "mr3.js",
-            "indexh.js",
             "evald.js",
-            "evalf.js",
             "run_program1.js",
             "notablescan.js",
-            "dropdb_race.js",
             "bench_test1.js",
-            "padding.js",
+
+            // These tests use the getLastError command, which is unsafe to use in this environment,
+            // since a previous test's cursors could be garbage collected in the middle of the next
+            // test, which would reset the last error associated with the shell's client.
+            "dropdb_race.js",
+            "bulk_legacy_enforce_gle.js",
+
+            // These tests use getLog to examine the logs. Tests which do so shouldn't be run in
+            // this suite because any test being run at the same time could conceivably spam the
+            // logs so much that the line they are looking for has been rotated off the server's
+            // in-memory buffer of log messages, which only stores the 1024 most recent operations.
+            "getlog2.js",
+            "logprocessdetails.js",
             "queryoptimizera.js",
-            "loglong.js",  // log might overflow before
-            // this has a chance to see the message
+
             "connections_opened.js",  // counts connections, globally
             "opcounters_write_cmd.js",
-            "set_param1.js",                  // changes global state
-            "geo_update_btree2.js",           // SERVER-11132 test disables table scans
-            "update_setOnInsert.js",          // SERVER-9982
-            "max_time_ms.js",                 // Sensitive to query execution time, by design
-            "collection_info_cache_race.js",  // Requires collection exists
+            "set_param1.js",          // changes global state
+            "geo_update_btree2.js",   // SERVER-11132 test disables table scans
+            "update_setOnInsert.js",  // SERVER-9982
+            "max_time_ms.js",         // Sensitive to query execution time, by design
 
             // This overwrites MinKey/MaxKey's singleton which breaks
             // any other test that uses MinKey/MaxKey
@@ -195,6 +197,9 @@ if (typeof _threadInject != "undefined") {
             // Views tests
             "views/invalid_system_views.js",  // Creates invalid view definitions in system.views.
             "views/views_all_commands.js",    // Drops test DB.
+
+            // Destroys and recreates the catalog, which will interfere with other tests.
+            "restart_catalog.js",
         ]);
 
         // The following tests cannot run when shell readMode is legacy.
@@ -221,6 +226,10 @@ if (typeof _threadInject != "undefined") {
             });
             return fileList;
         };
+
+        // Transactions are not supported on standalone nodes so we do not run them here.
+        let txnsTestFiles = getFilesRecursive("jstests/core/txns").map(f => ("txns/" + f.baseName));
+        Object.assign(skipTests, makeKeys(txnsTestFiles));
 
         var parallelFilesDir = "jstests/core";
 
@@ -263,10 +272,12 @@ if (typeof _threadInject != "undefined") {
             parallelFilesDir + "/profile_sampling.js",
             parallelFilesDir + "/profile_update.js",
 
-            // These tests use getLog to examine the slow query logs. Tests which examine the slow
-            // query logs can't be run concurrently with tests that affect the profile sampling
-            // rate, since that also impacts which operations get logged.
-            parallelFilesDir + "/getlog2.js",
+            // These tests can't be run in parallel because they expect an awaitData cursor to
+            // return after maxTimeMS, however this doesn't work if a long running blocking
+            // operation is running in parallel.
+            // TODO: Remove this restriction as part of SERVER-33942.
+            parallelFilesDir + "/compact_keeps_indexes.js",
+            parallelFilesDir + "/awaitdata_getmore_cmd.js",
         ];
         var serialTests = makeKeys(serialTestsArr);
 

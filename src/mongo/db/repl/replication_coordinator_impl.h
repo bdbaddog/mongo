@@ -47,10 +47,9 @@
 #include "mongo/executor/task_executor.h"
 #include "mongo/platform/atomic_word.h"
 #include "mongo/platform/random.h"
-#include "mongo/platform/unordered_map.h"
-#include "mongo/platform/unordered_set.h"
 #include "mongo/stdx/condition_variable.h"
 #include "mongo/stdx/mutex.h"
+#include "mongo/stdx/unordered_set.h"
 #include "mongo/util/concurrency/with_lock.h"
 #include "mongo/util/net/hostandport.h"
 
@@ -73,7 +72,6 @@ namespace repl {
 
 class ElectCmdRunner;
 class FreshnessChecker;
-class HandshakeArgs;
 class HeartbeatResponseAction;
 class LastVote;
 class OplogReader;
@@ -123,9 +121,6 @@ public:
     virtual ReplicationCoordinator::StatusAndDuration awaitReplication(
         OperationContext* opCtx, const OpTime& opTime, const WriteConcernOptions& writeConcern);
 
-    virtual ReplicationCoordinator::StatusAndDuration awaitReplicationOfLastOpForClient(
-        OperationContext* opCtx, const WriteConcernOptions& writeConcern);
-
     virtual Status stepDown(OperationContext* opCtx,
                             bool force,
                             const Milliseconds& waitTime,
@@ -150,8 +145,6 @@ public:
 
     virtual bool shouldRelaxIndexConstraints(OperationContext* opCtx, const NamespaceString& ns);
 
-    virtual Status setLastOptimeForSlave(const OID& rid, const Timestamp& ts);
-
     virtual void setMyLastAppliedOpTime(const OpTime& opTime);
     virtual void setMyLastDurableOpTime(const OpTime& opTime);
 
@@ -173,8 +166,6 @@ public:
                                           const ReadConcernArgs& readConcern) override;
 
     virtual OID getElectionId() override;
-
-    virtual OID getMyRID() const override;
 
     virtual int getMyId() const override;
 
@@ -240,9 +231,6 @@ public:
     virtual Status processReplSetUpdatePosition(const UpdatePositionArgs& updates,
                                                 long long* configVersion) override;
 
-    virtual Status processHandshake(OperationContext* opCtx,
-                                    const HandshakeArgs& handshake) override;
-
     virtual bool buildsIndexes() override;
 
     virtual std::vector<HostAndPort> getHostsWrittenTo(const OpTime& op,
@@ -274,8 +262,7 @@ public:
                                               const ReplSetRequestVotesArgs& args,
                                               ReplSetRequestVotesResponse* response) override;
 
-    virtual void prepareReplMetadata(OperationContext* opCtx,
-                                     const BSONObj& metadataRequestObj,
+    virtual void prepareReplMetadata(const BSONObj& metadataRequestObj,
                                      const OpTime& lastOpTimeFromClient,
                                      BSONObjBuilder* builder) const override;
 
@@ -301,7 +288,7 @@ public:
 
     virtual Status updateTerm(OperationContext* opCtx, long long term) override;
 
-    virtual Timestamp reserveSnapshotName(OperationContext* opCtx) override;
+    virtual Timestamp getMinimumVisibleSnapshot(OperationContext* opCtx) override;
 
     virtual OpTime getCurrentCommittedSnapshotOpTime() const override;
 
@@ -323,6 +310,8 @@ public:
     virtual Status stepUpIfEligible() override;
 
     virtual Status abortCatchupIfNeeded() override;
+
+    void signalDropPendingCollectionsRemovedFromStorage() final;
 
     // ================== Test support API ===================
 
@@ -386,7 +375,6 @@ public:
      * Returns event handle that we can use to wait for the operation to complete.
      * When the operation is complete (waitForEvent() returns), 'updateResult' will be set
      * to a status telling if the term increased or a stepdown was triggered.
-
      */
     executor::TaskExecutor::EventHandle updateTerm_forTest(
         long long term, TopologyCoordinator::UpdateTermResult* updateResult);
@@ -618,7 +606,6 @@ private:
     Status _awaitReplication_inlock(stdx::unique_lock<stdx::mutex>* lock,
                                     OperationContext* opCtx,
                                     const OpTime& opTime,
-                                    Timestamp minSnapshot,
                                     const WriteConcernOptions& writeConcern);
 
     /**
@@ -628,7 +615,6 @@ private:
      * minSnapshot.
      */
     bool _doneWaitingForReplication_inlock(const OpTime& opTime,
-                                           Timestamp minSnapshot,
                                            const WriteConcernOptions& writeConcern);
 
     Status _checkIfWriteConcernCanBeSatisfied_inlock(const WriteConcernOptions& writeConcern) const;
@@ -641,8 +627,6 @@ private:
     void _signalStepDownWaiterIfReady_inlock();
 
     bool _canAcceptWritesFor_inlock(const NamespaceString& ns);
-
-    OID _getMyRID_inlock() const;
 
     int _getMyId_inlock() const;
 
@@ -977,8 +961,10 @@ private:
 
     /**
      * Blesses a snapshot to be used for new committed reads.
+     *
+     * Returns true if the value was updated to `newCommittedSnapshot`.
      */
-    void _updateCommittedSnapshot_inlock(const OpTime& newCommittedSnapshot);
+    bool _updateCommittedSnapshot_inlock(const OpTime& newCommittedSnapshot);
 
     /**
      * A helper method that returns the current stable optime based on the current commit point and
@@ -1151,7 +1137,7 @@ private:
     // every host that sends it a heartbeat request to this set, and also starts
     // sending heartbeat requests to that host.  This set is cleared whenever
     // a node discovers that it is a member of a config.
-    unordered_set<HostAndPort> _seedList;  // (M)
+    stdx::unordered_set<HostAndPort> _seedList;  // (M)
 
     // Back pointer to the ServiceContext that has started the instance.
     ServiceContext* const _service;  // (S)
@@ -1170,10 +1156,6 @@ private:
 
     // Pointer to the ReplicationCoordinatorExternalState owned by this ReplicationCoordinator.
     std::unique_ptr<ReplicationCoordinatorExternalState> _externalState;  // (PS)
-
-    // Our RID, used to identify us to our sync source when sending replication progress
-    // updates upstream.  Set once in startReplication() and then never modified again.
-    OID _myRID;  // (M)
 
     // list of information about clients waiting on replication.  Does *not* own the WaiterInfos.
     WaiterList _replicationWaiterList;  // (M)
@@ -1241,7 +1223,7 @@ private:
 
     // Flag that indicates whether writes to databases other than "local" are allowed.  Used to
     // answer canAcceptWritesForDatabase() and canAcceptWritesFor() questions.
-    // Always true for standalone nodes and masters in master-slave relationships.
+    // Always true for standalone nodes.
     bool _canAcceptNonLocalWrites;  // (GM)
 
     // Flag that indicates whether reads from databases other than "local" are allowed.  Unlike
@@ -1342,6 +1324,10 @@ private:
     // This variable must be written immediately after _term, and thus its value can lag.
     // Reading this value does not require the replication coordinator mutex to be locked.
     AtomicInt64 _termShadow;  // (S)
+
+    // When we decide to step down due to hearing about a higher term, we remember the term we heard
+    // here so we can update our term to match as part of finishing stepdown.
+    boost::optional<long long> _pendingTermUpdateDuringStepDown;  // (M)
 };
 
 }  // namespace repl

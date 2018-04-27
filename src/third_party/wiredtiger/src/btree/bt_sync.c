@@ -132,13 +132,26 @@ __sync_file(WT_SESSION_IMPL *session, WT_CACHE_OP syncop)
 	tried_eviction = false;
 	time_start = time_stop = 0;
 
+	/* Only visit pages in cache and don't bump page read generations. */
 	flags = WT_READ_CACHE | WT_READ_NO_GEN;
+
+	/*
+	 * Skip all deleted pages.  For a page to be marked deleted, it must
+	 * have been evicted from cache and marked clean.  Checkpoint should
+	 * never instantiate deleted pages: if a truncate is not visible to the
+	 * checkpoint, the on-disk version is correct.  If the truncate is
+	 * visible, we skip over the child page when writing its parent.  We
+	 * check whether a truncate is visible in the checkpoint as part of
+	 * reconciling internal pages (specifically in __rec_child_modify).
+	 */
+	LF_SET(WT_READ_DELETED_SKIP);
+
 	internal_bytes = leaf_bytes = 0;
 	internal_pages = leaf_pages = 0;
 	saved_pinned_id = WT_SESSION_TXN_STATE(session)->pinned_id;
 	timer = WT_VERBOSE_ISSET(session, WT_VERB_CHECKPOINT);
 	if (timer)
-		time_start = __wt_rdtsc(session);
+		time_start = __wt_clock(session);
 
 	switch (syncop) {
 	case WT_SYNC_WRITE_LEAVES:
@@ -330,7 +343,7 @@ __sync_file(WT_SESSION_IMPL *session, WT_CACHE_OP syncop)
 	}
 
 	if (timer) {
-		time_stop = __wt_rdtsc(session);
+		time_stop = __wt_clock(session);
 		__wt_verbose(session, WT_VERB_CHECKPOINT,
 		    "__sync_file WT_SYNC_%s wrote: %" PRIu64
 		    " leaf pages (%" PRIu64 "B), %" PRIu64
@@ -338,7 +351,7 @@ __sync_file(WT_SESSION_IMPL *session, WT_CACHE_OP syncop)
 		    syncop == WT_SYNC_WRITE_LEAVES ?
 		    "WRITE_LEAVES" : "CHECKPOINT",
 		    leaf_pages, leaf_bytes, internal_pages, internal_bytes,
-		    WT_TSCDIFF_MS(time_stop, time_start));
+		    WT_CLOCKDIFF_MS(time_stop, time_start));
 	}
 
 err:	/* On error, clear any left-over tree walk. */

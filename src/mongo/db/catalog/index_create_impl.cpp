@@ -43,9 +43,12 @@
 #include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/curop.h"
 #include "mongo/db/exec/working_set_common.h"
+#include "mongo/db/index/multikey_paths.h"
+#include "mongo/db/logical_clock.h"
+#include "mongo/db/multi_key_path_tracker.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/query/internal_plans.h"
-#include "mongo/db/repl/replication_coordinator_global.h"
+#include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/server_parameters.h"
 #include "mongo/stdx/memory.h"
 #include "mongo/stdx/mutex.h"
@@ -55,17 +58,39 @@
 #include "mongo/util/processinfo.h"
 #include "mongo/util/progress_meter.h"
 #include "mongo/util/quick_exit.h"
+#include "mongo/util/scopeguard.h"
+
+#include "mongo/db/op_observer.h"
 
 namespace mongo {
 
 namespace {
-MONGO_INITIALIZER(InitializeMultiIndexBlockFactory)(InitializerContext* const) {
-    MultiIndexBlock::registerFactory(
-        [](OperationContext* const opCtx, Collection* const collection) {
-            return stdx::make_unique<MultiIndexBlockImpl>(opCtx, collection);
-        });
-    return Status::OK();
+
+/**
+ * Returns true if writes to the catalog entry for the input namespace require being
+ * timestamped. A ghost write is when the operation is not committed with an oplog entry and
+ * implies the caller will look at the logical clock to choose a time to use.
+ */
+bool requiresGhostCommitTimestamp(OperationContext* opCtx, NamespaceString nss) {
+    if (!nss.isReplicated() || nss.coll().startsWith("tmp.mr")) {
+        return false;
+    }
+
+    auto replCoord = repl::ReplicationCoordinator::get(opCtx);
+    if (!replCoord->getSettings().usingReplSets()) {
+        return false;
+    }
+
+    // Nodes in `startup` may not have yet initialized the `LogicalClock`. Primaries do not need
+    // ghost writes.
+    const auto memberState = replCoord->getMemberState();
+    if (memberState.primary() || memberState.startup()) {
+        return false;
+    }
+
+    return opCtx->recoveryUnit()->getCommitTimestamp().isNull();
 }
+
 }  // namespace
 
 using std::unique_ptr;
@@ -75,6 +100,7 @@ using std::endl;
 MONGO_FP_DECLARE(crashAfterStartingIndexBuild);
 MONGO_FP_DECLARE(hangAfterStartingIndexBuild);
 MONGO_FP_DECLARE(hangAfterStartingIndexBuildUnlocked);
+MONGO_FP_DECLARE(slowBackgroundIndexBuild);
 
 AtomicInt32 maxIndexBuildMemoryUsageMegabytes(500);
 
@@ -145,6 +171,7 @@ MultiIndexBlockImpl::MultiIndexBlockImpl(OperationContext* opCtx, Collection* co
 MultiIndexBlockImpl::~MultiIndexBlockImpl() {
     if (!_needToCleanup || _indexes.empty())
         return;
+
     while (true) {
         try {
             WriteUnitOfWork wunit(_opCtx);
@@ -153,6 +180,16 @@ MultiIndexBlockImpl::~MultiIndexBlockImpl() {
             // of a WUOW. Nothing inside this block can fail, and it is made fatal if it does.
             for (size_t i = 0; i < _indexes.size(); i++) {
                 _indexes[i].block->fail();
+            }
+
+            auto replCoord = repl::ReplicationCoordinator::get(_opCtx);
+            if (replCoord->canAcceptWritesForDatabase(_opCtx, "admin")) {
+                // Primaries must timestamp the failure of an index build (via an op
+                // message). Secondaries may not fail index builds.
+                _opCtx->getServiceContext()->getOpObserver()->onOpMessage(
+                    _opCtx,
+                    BSON("msg" << std::string(str::stream() << "Failing index builds. Coll: "
+                                                            << _collection->ns().ns())));
             }
             wunit.commit();
             return;
@@ -215,7 +252,7 @@ StatusWith<std::vector<BSONObj>> MultiIndexBlockImpl::init(const std::vector<BSO
         }
 
         // Any foreground indexes make all indexes be built in the foreground.
-        _buildInBackground = (_buildInBackground && info["background"].trueValue());
+        _buildInBackground = (_buildInBackground && initBackgroundIndexFromSpec(info));
     }
 
     std::vector<BSONObj> indexInfoObjs;
@@ -278,6 +315,14 @@ StatusWith<std::vector<BSONObj>> MultiIndexBlockImpl::init(const std::vector<BSO
     if (_buildInBackground)
         _backgroundOperation.reset(new BackgroundOperation(ns));
 
+    auto replCoord = repl::ReplicationCoordinator::get(_opCtx);
+    if (replCoord->canAcceptWritesForDatabase(_opCtx, "admin")) {
+        // Only primaries must timestamp this write. Secondaries run this from within a
+        // `TimestampBlock`
+        _opCtx->getServiceContext()->getOpObserver()->onOpMessage(
+            _opCtx, BSON("msg" << std::string(str::stream() << "Creating indexes. Coll: " << ns)));
+    }
+
     wunit.commit();
 
     if (MONGO_FAIL_POINT(crashAfterStartingIndexBuild)) {
@@ -294,6 +339,18 @@ StatusWith<std::vector<BSONObj>> MultiIndexBlockImpl::init(const std::vector<BSO
 }
 
 Status MultiIndexBlockImpl::insertAllDocumentsInCollection(std::set<RecordId>* dupsOut) {
+    invariant(!_opCtx->lockState()->inAWriteUnitOfWork());
+
+    // Refrain from persisting any multikey updates as a result from building the index. Instead,
+    // accumulate them in the `MultikeyPathTracker` and do the write as part of the update that
+    // commits the index.
+    auto stopTracker =
+        MakeGuard([this] { MultikeyPathTracker::get(_opCtx).stopTrackingMultikeyPathInfo(); });
+    if (MultikeyPathTracker::get(_opCtx).isTrackingMultikeyPathInfo()) {
+        stopTracker.Dismiss();
+    }
+    MultikeyPathTracker::get(_opCtx).startTrackingMultikeyPathInfo();
+
     const char* curopMessage = _buildInBackground ? "Index Build (background)" : "Index Build";
     const auto numRecords = _collection->numRecords(_opCtx);
     stdx::unique_lock<Client> lk(*_opCtx->getClient());
@@ -326,9 +383,9 @@ Status MultiIndexBlockImpl::insertAllDocumentsInCollection(std::set<RecordId>* d
             if (_allowInterruption)
                 _opCtx->checkForInterrupt();
 
-            if (!(retries || (PlanExecutor::ADVANCED == state))) {
-                // The only reason we are still in the loop is hangAfterStartingIndexBuild.
-                log() << "Hanging index build due to 'hangAfterStartingIndexBuild' failpoint";
+            if (!(retries || PlanExecutor::ADVANCED == state) ||
+                MONGO_FAIL_POINT(slowBackgroundIndexBuild)) {
+                log() << "Hanging index build due to failpoint";
                 invariant(_allowInterruption);
                 sleepmillis(1000);
                 continue;
@@ -387,10 +444,9 @@ Status MultiIndexBlockImpl::insertAllDocumentsInCollection(std::set<RecordId>* d
         }
     }
 
-    uassert(28550,
-            "Unable to complete index build due to collection scan failure: " +
-                WorkingSetCommon::toStatusString(objToIndex.value()),
-            state == PlanExecutor::IS_EOF);
+    if (state != PlanExecutor::IS_EOF) {
+        return WorkingSetCommon::getMemberObjectStatus(objToIndex.value());
+    }
 
     if (MONGO_FAIL_POINT(hangAfterStartingIndexBuildUnlocked)) {
         // Unlock before hanging so replication recognizes we've completed.
@@ -401,9 +457,16 @@ Status MultiIndexBlockImpl::insertAllDocumentsInCollection(std::set<RecordId>* d
                      "'hangAfterStartingIndexBuildUnlocked' failpoint";
             sleepmillis(1000);
         }
-        // If we want to support this, we'd need to regrab the lock and be sure that all callers are
-        // ok with us yielding. They should be for BG indexes, but not for foreground.
-        invariant(!"the hangAfterStartingIndexBuildUnlocked failpoint can't be turned off");
+
+        if (_buildInBackground) {
+            _opCtx->lockState()->restoreLockState(_opCtx, lockInfo);
+            _opCtx->recoveryUnit()->abandonSnapshot();
+            return Status(ErrorCodes::OperationFailed,
+                          "background index build aborted due to failpoint");
+        } else {
+            invariant(
+                !"the hangAfterStartingIndexBuildUnlocked failpoint can't be turned off for foreground index builds");
+        }
     }
 
     progress->finished();
@@ -438,13 +501,14 @@ Status MultiIndexBlockImpl::insert(const BSONObj& doc, const RecordId& loc) {
 }
 
 Status MultiIndexBlockImpl::doneInserting(std::set<RecordId>* dupsOut) {
+    invariant(!_opCtx->lockState()->inAWriteUnitOfWork());
     for (size_t i = 0; i < _indexes.size(); i++) {
         if (_indexes[i].bulk == NULL)
             continue;
         LOG(1) << "\t bulk commit starting for index: "
                << _indexes[i].block->getEntry()->descriptor()->indexName();
         Status status = _indexes[i].real->commitBulk(_opCtx,
-                                                     std::move(_indexes[i].bulk),
+                                                     _indexes[i].bulk.get(),
                                                      _allowInterruption,
                                                      _indexes[i].options.dupsAllowed,
                                                      dupsOut);
@@ -462,12 +526,44 @@ void MultiIndexBlockImpl::abortWithoutCleanup() {
 }
 
 void MultiIndexBlockImpl::commit() {
+    // Do not interfere with writing multikey information when committing index builds.
+    auto restartTracker =
+        MakeGuard([this] { MultikeyPathTracker::get(_opCtx).startTrackingMultikeyPathInfo(); });
+    if (!MultikeyPathTracker::get(_opCtx).isTrackingMultikeyPathInfo()) {
+        restartTracker.Dismiss();
+    }
+    MultikeyPathTracker::get(_opCtx).stopTrackingMultikeyPathInfo();
+
     for (size_t i = 0; i < _indexes.size(); i++) {
         _indexes[i].block->success();
+
+        // The bulk builder will track multikey information itself. Non-bulk builders re-use the
+        // code path that a typical insert/update uses. State is altered on the non-bulk build
+        // path to accumulate the multikey information on the `MultikeyPathTracker`.
+        if (_indexes[i].bulk) {
+            const auto& bulkBuilder = _indexes[i].bulk;
+            if (bulkBuilder->isMultikey()) {
+                _indexes[i].block->getEntry()->setMultikey(_opCtx, bulkBuilder->getMultikeyPaths());
+            }
+        } else {
+            auto multikeyPaths =
+                boost::optional<MultikeyPaths>(MultikeyPathTracker::get(_opCtx).getMultikeyPathInfo(
+                    _collection->ns(), _indexes[i].block->getIndexName()));
+            if (multikeyPaths) {
+                _indexes[i].block->getEntry()->setMultikey(_opCtx, *multikeyPaths);
+            }
+        }
+    }
+
+    if (requiresGhostCommitTimestamp(_opCtx, _collection->ns())) {
+        // Only secondaries must explicitly timestamp index completion. Primaries perform this
+        // write along with an oplog entry.
+        fassert(50701,
+                _opCtx->recoveryUnit()->setTimestamp(
+                    LogicalClock::get(_opCtx)->getClusterTime().asTimestamp()));
     }
 
     _opCtx->recoveryUnit()->registerChange(new SetNeedToCleanupOnRollback(this));
     _needToCleanup = false;
 }
-
 }  // namespace mongo

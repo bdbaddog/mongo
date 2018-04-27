@@ -42,7 +42,7 @@
                     cursorTimeoutMillis: mongosCursorTimeoutMs,
                     clientCursorMonitorFrequencySecs: cursorMonitorFrequencySecs
                 }
-            }
+            },
         },
         enableBalancer: false
     });
@@ -50,19 +50,20 @@
     const adminDB = st.admin;
     const routerColl = st.s.getDB('test').user;
 
-    const shardHost = st.config.shards.findOne({_id: "shard0001"}).host;
+    const shardHost = st.config.shards.findOne({_id: st.shard1.shardName}).host;
     const mongod = new Mongo(shardHost);
     const shardColl = mongod.getCollection(routerColl.getFullName());
 
     assert.commandWorked(adminDB.runCommand({enableSharding: routerColl.getDB().getName()}));
-    st.ensurePrimaryShard(routerColl.getDB().getName(), 'shard0000');
+    st.ensurePrimaryShard(routerColl.getDB().getName(), st.shard0.shardName);
+
     assert.commandWorked(
         adminDB.runCommand({shardCollection: routerColl.getFullName(), key: {x: 1}}));
     assert.commandWorked(adminDB.runCommand({split: routerColl.getFullName(), middle: {x: 10}}));
     assert.commandWorked(adminDB.runCommand({
         moveChunk: routerColl.getFullName(),
         find: {x: 11},
-        to: "shard0001",
+        to: st.shard1.shardName,
         _waitForDelete: true
     }));
 

@@ -75,11 +75,15 @@ selector:
   - jstests/core/profile_insert.js
   - jstests/core/profile_sampling.js
   - jstests/core/profile_update.js
+  - jstests/core/txns/transactions_profiling.js
   # The downstream syncing node affects the top output.
   - jstests/core/top.js
 
 run_hook_interval: &run_hook_interval 20
 executor:
+  archive:
+    hooks:
+      - BackgroundInitialSync
   config:
     shell_options:
       eval: "testingReplication = true;"
@@ -93,8 +97,10 @@ executor:
   fixture:
     class: ReplicaSetFixture
     mongod_options:
-      oplogSize: 511
       set_parameters:
         enableTestCommands: 1
+        # TODO SERVER-33063: Use numInitialSyncAttempts=1 once the idempotency issues in initial
+        # sync have been addressed.
+        numInitialSyncAttempts: 10
     num_nodes: 2
     start_initial_sync_node: True

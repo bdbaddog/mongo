@@ -34,15 +34,12 @@
 
 #include "mongo/client/dbclient_rs.h"
 #include "mongo/db/namespace_string.h"
-#include "mongo/s/catalog/sharding_catalog_client.h"
 #include "mongo/s/catalog_cache.h"
-#include "mongo/s/catalog_cache.h"
-#include "mongo/s/chunk_version.h"
 #include "mongo/s/client/shard_connection.h"
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/is_mongos.h"
-#include "mongo/s/set_shard_version_request.h"
+#include "mongo/s/request_types/set_shard_version_request.h"
 #include "mongo/s/stale_exception.h"
 #include "mongo/util/log.h"
 
@@ -271,7 +268,7 @@ bool checkShardVersion(OperationContext* opCtx,
     auto& routingInfo = routingInfoStatus.getValue();
 
     const auto manager = routingInfo.cm();
-    const auto primary = routingInfo.primary();
+    const auto primary = routingInfo.db().primary();
 
     unsigned long long officialSequenceNumber = 0;
 
@@ -311,7 +308,7 @@ bool checkShardVersion(OperationContext* opCtx,
                                      << shard->getConnString().toString()
                                      << ")");
 
-            throw StaleConfigException(ns, msg, refVersion, currentVersion);
+            uasserted(StaleConfigInfo(ns, refVersion, currentVersion), msg);
         }
     } else if (refManager) {
         string msg(str::stream() << "not sharded (" << (!manager ? string("<none>") : str::stream()
@@ -325,8 +322,9 @@ bool checkShardVersion(OperationContext* opCtx,
                                  << conn_in->getServerAddress()
                                  << ")");
 
-        throw StaleConfigException(
-            ns, msg, refManager->getVersion(shard->getId()), ChunkVersion::UNSHARDED());
+        uasserted(
+            StaleConfigInfo(ns, refManager->getVersion(shard->getId()), ChunkVersion::UNSHARDED()),
+            msg);
     }
 
     // Has the ChunkManager been reloaded since the last time we updated the shard version over
@@ -379,7 +377,7 @@ bool checkShardVersion(OperationContext* opCtx,
         return true;
     }
 
-    Grid::get(opCtx)->catalogCache()->onStaleConfigError(std::move(routingInfo));
+    Grid::get(opCtx)->catalogCache()->onStaleShardVersion(std::move(routingInfo));
 
     const int maxNumTries = 7;
     if (tryNumber < maxNumTries) {

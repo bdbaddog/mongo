@@ -42,10 +42,10 @@
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/commands/cluster_commands_helpers.h"
 #include "mongo/s/commands/cluster_explain.h"
-#include "mongo/s/commands/cluster_write.h"
 #include "mongo/s/commands/strategy.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/stale_exception.h"
+#include "mongo/s/write_ops/cluster_write.h"
 #include "mongo/util/timer.h"
 
 namespace mongo {
@@ -78,8 +78,8 @@ class FindAndModifyCmd : public BasicCommand {
 public:
     FindAndModifyCmd() : BasicCommand("findAndModify", "findandmodify") {}
 
-    bool slaveOk() const override {
-        return true;
+    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
+        return AllowedOnSecondary::kAlways;
     }
 
     bool adminOnly() const override {
@@ -92,16 +92,17 @@ public:
 
     void addRequiredPrivileges(const std::string& dbname,
                                const BSONObj& cmdObj,
-                               std::vector<Privilege>* out) override {
+                               std::vector<Privilege>* out) const override {
         find_and_modify::addPrivilegesRequiredForFindAndModify(this, dbname, cmdObj, out);
     }
 
     Status explain(OperationContext* opCtx,
-                   const std::string& dbName,
-                   const BSONObj& cmdObj,
+                   const OpMsgRequest& request,
                    ExplainOptions::Verbosity verbosity,
                    BSONObjBuilder* out) const override {
-        const NamespaceString nss(parseNsCollectionRequired(dbName, cmdObj));
+        std::string dbName = request.getDatabase().toString();
+        const BSONObj& cmdObj = request.body;
+        const NamespaceString nss(CommandHelpers::parseNsCollectionRequired(dbName, cmdObj));
 
         auto routingInfo =
             uassertStatusOK(Grid::get(opCtx)->catalogCache()->getCollectionRoutingInfo(opCtx, nss));
@@ -110,7 +111,7 @@ public:
         std::shared_ptr<Shard> shard;
 
         if (!routingInfo.cm()) {
-            shard = routingInfo.primary();
+            shard = routingInfo.db().primary();
         } else {
             chunkMgr = routingInfo.cm();
 
@@ -120,7 +121,7 @@ public:
             const auto chunk = chunkMgr->findIntersectingChunk(shardKey, collation);
 
             shard = uassertStatusOK(
-                Grid::get(opCtx)->shardRegistry()->getShard(opCtx, chunk->getShardId()));
+                Grid::get(opCtx)->shardRegistry()->getShard(opCtx, chunk.getShardId()));
         }
 
         const auto explainCmd = ClusterExplain::wrapAsExplain(cmdObj, verbosity);
@@ -152,7 +153,7 @@ public:
              const std::string& dbName,
              const BSONObj& cmdObj,
              BSONObjBuilder& result) override {
-        const NamespaceString nss(parseNsCollectionRequired(dbName, cmdObj));
+        const NamespaceString nss(CommandHelpers::parseNsCollectionRequired(dbName, cmdObj));
 
         // findAndModify should only be creating database if upsert is true, but this would require
         // that the parsing be pulled into this function.
@@ -161,8 +162,12 @@ public:
         const auto routingInfo =
             uassertStatusOK(Grid::get(opCtx)->catalogCache()->getCollectionRoutingInfo(opCtx, nss));
         if (!routingInfo.cm()) {
-            _runCommand(
-                opCtx, routingInfo.primaryId(), ChunkVersion::UNSHARDED(), nss, cmdObj, &result);
+            _runCommand(opCtx,
+                        routingInfo.db().primaryId(),
+                        ChunkVersion::UNSHARDED(),
+                        nss,
+                        cmdObj,
+                        &result);
             return true;
         }
 
@@ -174,13 +179,13 @@ public:
         auto chunk = chunkMgr->findIntersectingChunk(shardKey, collation);
 
         _runCommand(opCtx,
-                    chunk->getShardId(),
-                    chunkMgr->getVersion(chunk->getShardId()),
+                    chunk.getShardId(),
+                    chunkMgr->getVersion(chunk.getShardId()),
                     nss,
                     cmdObj,
                     &result);
         updateChunkWriteStatsAndSplitIfNeeded(
-            opCtx, chunkMgr.get(), chunk.get(), cmdObj.getObjectField("update").objsize());
+            opCtx, chunkMgr.get(), chunk, cmdObj.getObjectField("update").objsize());
 
         return true;
     }
@@ -196,7 +201,8 @@ private:
             std::vector<AsyncRequestsSender::Request> requests;
             requests.emplace_back(
                 shardId,
-                appendShardVersion(filterCommandRequestForPassthrough(cmdObj), shardVersion));
+                appendShardVersion(CommandHelpers::filterCommandRequestForPassthrough(cmdObj),
+                                   shardVersion));
 
             AsyncRequestsSender ars(opCtx,
                                     Grid::get(opCtx)->getExecutorPool()->getArbitraryExecutor(),
@@ -215,9 +221,9 @@ private:
         uassertStatusOK(response.status);
 
         const auto responseStatus = getStatusFromCommandResult(response.data);
-        if (ErrorCodes::isStaleShardingError(responseStatus.code())) {
+        if (ErrorCodes::isNeedRetargettingError(responseStatus.code())) {
             // Command code traps this exception and re-runs
-            throw StaleConfigException("findAndModify", response.data);
+            uassertStatusOK(responseStatus.withContext("findAndModify"));
         }
 
         // First append the properly constructed writeConcernError. It will then be skipped in
@@ -226,7 +232,8 @@ private:
             appendWriteConcernErrorToCmdResponse(shardId, wcErrorElem, *result);
         }
 
-        result->appendElementsUnique(filterCommandReplyForPassthrough(response.data));
+        result->appendElementsUnique(
+            CommandHelpers::filterCommandReplyForPassthrough(response.data));
     }
 
 } findAndModifyCmd;

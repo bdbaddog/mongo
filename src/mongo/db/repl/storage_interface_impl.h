@@ -66,12 +66,12 @@ public:
         const std::vector<BSONObj>& secondaryIndexSpecs) override;
 
     Status insertDocument(OperationContext* opCtx,
-                          const NamespaceString& nss,
+                          const NamespaceStringOrUUID& nsOrUUID,
                           const TimestampedBSONObj& doc,
                           long long term) override;
 
     Status insertDocuments(OperationContext* opCtx,
-                           const NamespaceString& nss,
+                           const NamespaceStringOrUUID& nsOrUUID,
                            const std::vector<InsertStatement>& docs) override;
 
     Status dropReplicatedDatabases(OperationContext* opCtx) override;
@@ -92,6 +92,12 @@ public:
                             const NamespaceString& fromNS,
                             const NamespaceString& toNS,
                             bool stayTemp) override;
+
+    Status setIndexIsMultikey(OperationContext* opCtx,
+                              const NamespaceString& nss,
+                              const std::string& indexName,
+                              const MultikeyPaths& paths,
+                              Timestamp ts) override;
 
     StatusWith<std::vector<BSONObj>> findDocuments(OperationContext* opCtx,
                                                    const NamespaceString& nss,
@@ -121,15 +127,15 @@ public:
                            const TimestampedBSONObj& update) override;
 
     StatusWith<BSONObj> findById(OperationContext* opCtx,
-                                 const NamespaceString& nss,
+                                 const NamespaceStringOrUUID& nsOrUUID,
                                  const BSONElement& idKey) override;
 
     StatusWith<BSONObj> deleteById(OperationContext* opCtx,
-                                   const NamespaceString& nss,
+                                   const NamespaceStringOrUUID& nsOrUUID,
                                    const BSONElement& idKey) override;
 
     Status upsertById(OperationContext* opCtx,
-                      const NamespaceString& nss,
+                      const NamespaceStringOrUUID& nsOrUUID,
                       const BSONElement& idKey,
                       const BSONObj& update) override;
 
@@ -141,18 +147,24 @@ public:
         OperationContext* opCtx, const NamespaceString& nss) override;
 
     StatusWith<StorageInterface::CollectionCount> getCollectionCount(
-        OperationContext* opCtx, const NamespaceString& nss) override;
+        OperationContext* opCtx, const NamespaceStringOrUUID& nsOrUUID) override;
+
+    Status setCollectionCount(OperationContext* opCtx,
+                              const NamespaceStringOrUUID& nsOrUUID,
+                              long long newCount) override;
 
     StatusWith<OptionalCollectionUUID> getCollectionUUID(OperationContext* opCtx,
                                                          const NamespaceString& nss) override;
-
-    Status upgradeUUIDSchemaVersionNonReplicated(OperationContext* opCtx) override;
 
     void setStableTimestamp(ServiceContext* serviceCtx, Timestamp snapshotName) override;
 
     void setInitialDataTimestamp(ServiceContext* serviceCtx, Timestamp snapshotName) override;
 
-    Status recoverToStableTimestamp(ServiceContext* serviceCtx) override;
+    StatusWith<Timestamp> recoverToStableTimestamp(OperationContext* opCtx) override;
+
+    bool supportsRecoverToStableTimestamp(ServiceContext* serviceCtx) const override;
+
+    boost::optional<Timestamp> getRecoveryTimestamp(ServiceContext* serviceCtx) const override;
 
     /**
      * Checks that the "admin" database contains a supported version of the auth data schema.
@@ -160,6 +172,12 @@ public:
     Status isAdminDbValid(OperationContext* opCtx) override;
 
     void waitForAllEarlierOplogWritesToBeVisible(OperationContext* opCtx) override;
+    void oplogDiskLocRegister(OperationContext* opCtx,
+                              const Timestamp& ts,
+                              bool orderedCommit) override;
+
+    boost::optional<Timestamp> getLastStableCheckpointTimestamp(
+        ServiceContext* serviceCtx) const override;
 
 private:
     const NamespaceString _rollbackIdNss;

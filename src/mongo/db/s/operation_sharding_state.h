@@ -33,7 +33,9 @@
 #include "mongo/base/disallow_copying.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/s/chunk_version.h"
+#include "mongo/s/database_version_gen.h"
 #include "mongo/util/concurrency/notification.h"
+#include "mongo/util/string_map.h"
 
 namespace mongo {
 
@@ -72,16 +74,20 @@ public:
     bool allowImplicitCollectionCreation() const;
 
     /**
-     * Parses shard version from the command parameters 'cmdObj' and stores the results in this
-     * object along with the give namespace that is associated with the version. Does nothing
-     * if no shard version is attached to the command.
+     * Parses shardVersion and databaseVersion from 'cmdObj' and stores the results in this object
+     * along with the given namespace that is associated with the versions. Does nothing if no
+     * shardVersion or databaseVersion is attached to the command.
      *
-     * Expects the format { ..., shardVersion: [<version>, <epoch>] }.
+     * Expects 'cmdObj' to have format
+     * { ...,
+     *   shardVersion: [<version>, <epoch>],
+     *   databaseVersion: { uuid: <UUID>, version: <int> },
+     * ...}
      *
      * This initialization may only be performed once for the lifetime of the object, which
-     * coincides with the lifetime of the request.
+     * coincides with the lifetime of the client's request.
      */
-    void initializeShardVersion(NamespaceString nss, const BSONElement& shardVersionElement);
+    void initializeClientRoutingVersions(NamespaceString nss, const BSONObj& cmdObj);
 
     /**
      * Returns whether or not there is a shard version associated with this operation.
@@ -99,14 +105,21 @@ public:
     ChunkVersion getShardVersion(const NamespaceString& nss) const;
 
     /**
-     * Stores the given chunk version of a namespace into this object.
+     * Returns true if the client sent a databaseVersion for any namespace.
      */
-    void setShardVersion(NamespaceString nss, ChunkVersion newVersion);
+    bool hasDbVersion() const;
 
     /**
-     * Undoes setting the shard version for the given namespace. Needed for views.
+     * If 'db' matches the 'db' in the namespace the client sent versions for, returns the database
+     * version sent by the client (if any), else returns boost::none.
      */
-    void unsetShardVersion(NamespaceString nss);
+    boost::optional<DatabaseVersion> getDbVersion(const StringData dbName) const;
+
+    /**
+     * Makes the OperationShardingState behave as if an UNSHARDED shardVersion was sent for every
+     * possible namespace.
+     */
+    void setGlobalUnshardedShardVersion();
 
     /**
      * This call is a no op if there isn't a currently active migration critical section. Otherwise
@@ -124,23 +137,44 @@ public:
      */
     void setMigrationCriticalSectionSignal(std::shared_ptr<Notification<void>> critSecSignal);
 
-private:
     /**
-     * Resets this object back as if it was default constructed (ie _hasVersion is false,
-     * _shardVersion is UNSHARDED, _ns is empty).
+     * This call is a no op if there isn't a currently active movePrimary critical section.
+     * Otherwise it will wait for the critical section to complete up to the remaining operation
+     * time.
+     *
+     * Returns true if the call actually waited because of movePrimary critical section (regardless
+     * whether it timed out or not), false if there was no active movePrimary critical section.
      */
-    void _clear();
+    bool waitForMovePrimaryCriticalSectionSignal(OperationContext* opCtx);
 
+    /**
+     * Setting this value indicates that when the version check failed, there was an active
+     * movePrimary for the namespace and that it would be prudent to wait for the critical section
+     * to complete before retrying so the router doesn't make wasteful requests.
+     */
+    void setMovePrimaryCriticalSectionSignal(std::shared_ptr<Notification<void>> critSecSignal);
+
+private:
     // Specifies whether the request is allowed to create database/collection implicitly
     bool _allowImplicitCollectionCreation{true};
 
-    bool _hasVersion = false;
-    ChunkVersion _shardVersion{ChunkVersion::UNSHARDED()};
-    NamespaceString _ns;
+    // Should be set to true if all collections accessed are expected to be unsharded.
+    bool _globalUnshardedShardVersion = false;
+
+    // The OperationShardingState class supports storing shardVersions for multiple namespaces (and
+    // databaseVersions for multiple databases), even though client code has not been written yet to
+    // *send* multiple shardVersions or databaseVersions.
+    StringMap<ChunkVersion> _shardVersions;
+    StringMap<DatabaseVersion> _databaseVersions;
 
     // This value will only be non-null if version check during the operation execution failed due
     // to stale version and there was a migration for that namespace, which was in critical section.
     std::shared_ptr<Notification<void>> _migrationCriticalSectionSignal;
+
+    // This value will only be non-null if version check during the operation execution failed due
+    // to stale version and there was a movePrimary for that namespace, which was in critical
+    // section.
+    std::shared_ptr<Notification<void>> _movePrimaryCriticalSectionSignal;
 };
 
 }  // namespace mongo

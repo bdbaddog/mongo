@@ -48,26 +48,30 @@ class PipelineCommand : public BasicCommand {
 public:
     PipelineCommand() : BasicCommand("aggregate") {}
 
-    void help(std::stringstream& help) const override {
-        help << "Runs the aggregation command. See http://dochub.mongodb.org/core/aggregation for "
-                "more details.";
+    std::string help() const override {
+        return "Runs the aggregation command. See http://dochub.mongodb.org/core/aggregation for "
+               "more details.";
     }
 
     bool supportsWriteConcern(const BSONObj& cmd) const override {
         return Pipeline::aggSupportsWriteConcern(cmd);
     }
 
-    bool slaveOk() const override {
-        return false;
+    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
+        return AllowedOnSecondary::kOptIn;
     }
 
-    bool slaveOverrideOk() const override {
-        return true;
-    }
-
-    bool supportsNonLocalReadConcern(const std::string& dbName,
-                                     const BSONObj& cmdObj) const override {
-        return !AggregationRequest::parseNs(dbName, cmdObj).isCollectionlessAggregateNS();
+    bool supportsReadConcern(const std::string& dbName,
+                             const BSONObj& cmdObj,
+                             repl::ReadConcernLevel level) const override {
+        // Aggregations that are run directly against a collection allow any read concern.
+        // Otherwise, if the aggregate is collectionless then the read concern must be 'local' (e.g.
+        // $currentOp). The exception to this is a $changeStream on a whole database, which is
+        // considered collectionless but must be read concern 'majority'. Further read concern
+        // validation is done one the pipeline is parsed.
+        return level == repl::ReadConcernLevel::kLocalReadConcern ||
+            level == repl::ReadConcernLevel::kMajorityReadConcern ||
+            !AggregationRequest::parseNs(dbName, cmdObj).isCollectionlessAggregateNS();
     }
 
     ReadWriteType getReadWriteType() const {
@@ -76,7 +80,7 @@ public:
 
     Status checkAuthForCommand(Client* client,
                                const std::string& dbname,
-                               const BSONObj& cmdObj) override {
+                               const BSONObj& cmdObj) const override {
         const NamespaceString nss(AggregationRequest::parseNs(dbname, cmdObj));
         return AuthorizationSession::get(client)->checkAuthForAggregate(nss, cmdObj, false);
     }
@@ -88,19 +92,21 @@ public:
         const auto aggregationRequest =
             uassertStatusOK(AggregationRequest::parseFromBSON(dbname, cmdObj, boost::none));
 
-        return appendCommandStatus(result,
-                                   runAggregate(opCtx,
-                                                aggregationRequest.getNamespaceString(),
-                                                aggregationRequest,
-                                                cmdObj,
-                                                result));
+        return CommandHelpers::appendCommandStatus(
+            result,
+            runAggregate(opCtx,
+                         aggregationRequest.getNamespaceString(),
+                         aggregationRequest,
+                         cmdObj,
+                         result));
     }
 
     Status explain(OperationContext* opCtx,
-                   const std::string& dbname,
-                   const BSONObj& cmdObj,
+                   const OpMsgRequest& request,
                    ExplainOptions::Verbosity verbosity,
                    BSONObjBuilder* out) const override {
+        std::string dbname = request.getDatabase().toString();
+        const BSONObj& cmdObj = request.body;
         const auto aggregationRequest =
             uassertStatusOK(AggregationRequest::parseFromBSON(dbname, cmdObj, verbosity));
 

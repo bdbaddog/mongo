@@ -96,6 +96,14 @@ add_option('prefix',
     help='installation prefix',
 )
 
+add_option('install-mode',
+    choices=['legacy', 'hygienic'],
+    default='legacy',
+    help='select type of installation',
+    nargs=1,
+    type='choice',
+)
+
 add_option('nostrip',
     help='do not strip installed binaries',
     nargs=0,
@@ -139,8 +147,17 @@ add_option('ssl',
     nargs=0
 )
 
+add_option('ssl-provider',
+    choices=['auto', 'openssl', 'native'],
+    default='auto',
+    help='Select the SSL engine to use',
+    nargs=1,
+    type='choice',
+)
+
 add_option('mmapv1',
     choices=['auto', 'on', 'off'],
+    const='on',
     default='auto',
     help='Enable MMapV1',
     nargs='?',
@@ -156,6 +173,15 @@ add_option('wiredtiger',
     type='choice',
 )
 
+add_option('mobile-se',
+    choices=['on', 'off'],
+    const='on',
+    default='off',
+    help='Enable Mobile Storage Engine',
+    nargs='?',
+    type='choice',
+)
+
 js_engine_choices = ['mozjs', 'none']
 add_option('js-engine',
     choices=js_engine_choices,
@@ -166,7 +192,6 @@ add_option('js-engine',
 
 add_option('server-js',
     choices=['on', 'off'],
-    const='on',
     default='on',
     help='Build mongod without JavaScript support',
     type='choice',
@@ -211,7 +236,7 @@ add_option('spider-monkey-dbg',
 )
 
 add_option('opt',
-    choices=['on', 'off'],
+    choices=['on', 'size', 'off'],
     const='on',
     help='Enable compile-time optimization',
     nargs='?',
@@ -250,13 +275,11 @@ add_option('gcov',
     nargs=0,
 )
 
-add_option('smokedbprefix',
-    help='prefix to dbpath et al. for smoke tests',
-)
-
-add_option('smokeauth',
-    help='run smoke tests with --auth',
-    nargs=0,
+add_option('enable-free-mon',
+    choices=["auto", "on", "off"],
+    default="auto",
+    help='Disable support for Free Monitoring to avoid HTTP client library dependencies',
+    type='choice',
 )
 
 add_option('use-sasl-client',
@@ -298,8 +321,18 @@ add_option('use-system-valgrind',
     nargs=0,
 )
 
+add_option('use-system-google-benchmark',
+    help='use system version of Google benchmark library',
+    nargs=0,
+)
+
 add_option('use-system-zlib',
     help='use system version of zlib library',
+    nargs=0,
+)
+
+add_option('use-system-sqlite',
+    help='use system version of sqlite library',
     nargs=0,
 )
 
@@ -468,6 +501,13 @@ add_option('android-toolchain-path',
     help="Android NDK standalone toolchain path. Required when using --variables-files=etc/scons/android_ndk.vars",
 )
 
+add_option('msvc-debugging-format',
+    choices=["codeview", "pdb"],
+    default="codeview",
+    help='Debugging format in debug builds using msvc. Codeview (/Z7) or Program database (/Zi). Default is codeview.',
+    type='choice',
+)
+
 try:
     with open("version.json", "r") as version_fp:
         version_data = json.load(version_fp)
@@ -476,7 +516,7 @@ try:
         print("version.json does not contain a version string")
         Exit(1)
     if 'githash' not in version_data:
-        version_data['githash'] = utils.getGitVersion()
+        version_data['githash'] = utils.get_git_version()
 
 except IOError as e:
     # If the file error wasn't because the file is missing, error out
@@ -485,8 +525,8 @@ except IOError as e:
         Exit(1)
 
     version_data = {
-        'version': utils.getGitDescribe()[1:],
-        'githash': utils.getGitVersion(),
+        'version': utils.get_git_describe()[1:],
+        'githash': utils.get_git_version(),
     }
 
 except ValueError as e:
@@ -549,6 +589,7 @@ def variable_tools_converter(val):
         'idl_tool',
         "jsheader",
         "mergelib",
+        "mongo_benchmark",
         "mongo_integrationtest",
         "mongo_unittest",
         "textfile",
@@ -850,8 +891,11 @@ dbg_opt_mapping = {
     ( "off", None  ) : ( False, True ),
     ( "off", "on"  ) : ( False, True ),
     ( "off", "off" ) : ( False, False ),
+    ( "on",  "size"  ) : ( True,  True ),
+    ( "off", "size"  ) : ( False, True ),
 }
 debugBuild, optBuild = dbg_opt_mapping[(get_option('dbg'), get_option('opt'))]
+optBuildForSize = True if optBuild and get_option('opt') == "size" else False
 
 if releaseBuild and (debugBuild or not optBuild):
     print("Error: A --release build may not have debugging, and must have optimization")
@@ -893,6 +937,8 @@ envDict = dict(BUILD_ROOT=buildDir,
                UNITTEST_LIST='$BUILD_ROOT/unittests.txt',
                INTEGRATION_TEST_ALIAS='integration_tests',
                INTEGRATION_TEST_LIST='$BUILD_ROOT/integration_tests.txt',
+               BENCHMARK_ALIAS='benchmarks',
+               BENCHMARK_LIST='$BUILD_ROOT/benchmarks.txt',
                CONFIGUREDIR='$BUILD_ROOT/scons/$VARIANT_DIR/sconf_temp',
                CONFIGURELOG='$BUILD_ROOT/scons/config.log',
                INSTALL_DIR=installDir,
@@ -1045,6 +1091,7 @@ os_macros = {
     # the above declarations since we will never target them with anything other than XCode 8.
     "macOS": "defined(__APPLE__) && (TARGET_OS_OSX || (TARGET_OS_MAC && !TARGET_OS_IPHONE))",
     "linux": "defined(__linux__)",
+    "android": "defined(__ANDROID__)",
 }
 
 def CheckForOS(context, which_os):
@@ -1164,8 +1211,10 @@ env['TARGET_OS_FAMILY'] = 'posix' if env.TargetOSIs('posix') else env.GetTargetO
 # options for some strange reason in SCons. Instead, we store this
 # option as a new variable in the environment.
 if get_option('allocator') == "auto":
+    # using an allocator besides system on android would require either fixing or disabling
+    # gperftools on android
     if env.TargetOSIs('windows') or \
-       env.TargetOSIs('linux'):
+       env.TargetOSIs('linux') and not env.TargetOSIs('android'):
         env['MONGO_ALLOCATOR'] = "tcmalloc"
     else:
         env['MONGO_ALLOCATOR'] = "system"
@@ -1434,7 +1483,9 @@ else:
     env.AppendUnique( CPPDEFINES=[ 'NDEBUG' ] )
 
 if env.TargetOSIs('linux'):
-    env.Append( LIBS=['m',"resolv"] )
+    env.Append( LIBS=["m"] )
+    if not env.TargetOSIs('android'):
+        env.Append( LIBS=["resolv"] )
 
 elif env.TargetOSIs('solaris'):
      env.Append( LIBS=["socket","resolv","lgrp"] )
@@ -1535,10 +1586,14 @@ elif env.TargetOSIs('windows'):
     # this would be for pre-compiled headers, could play with it later
     #env.Append( CCFLAGS=['/Yu"pch.h"'] )
 
-    # docs say don't use /FD from command line (minimal rebuild)
-    # /Gy function level linking (implicit when using /Z7)
-    # /Z7 debug info goes into each individual .obj file -- no .pdb created
-    env.Append( CCFLAGS= ["/Z7", "/errorReport:none"] )
+    # Don't send error reports in case of internal compiler error
+    env.Append( CCFLAGS= ["/errorReport:none"] ) 
+
+    # Select debugging format. /Zi gives faster links but seem to use more memory
+    if get_option('msvc-debugging-format') == "codeview":
+        env['CCPDBFLAGS'] = "/Z7"
+    elif get_option('msvc-debugging-format') == "pdb":
+        env['CCPDBFLAGS'] = '/Zi /Fd${TARGET}.pdb'
 
     # /DEBUG will tell the linker to create a .pdb file
     # which WinDbg and Visual Studio will use to resolve
@@ -1565,11 +1620,14 @@ elif env.TargetOSIs('windows'):
     env.Append(CCFLAGS=[winRuntimeLibMap[(dynamicCRT, debugBuild)]])
 
     if optBuild:
+        # /O1:  optimize for size
         # /O2:  optimize for speed (as opposed to size)
         # /Oy-: disable frame pointer optimization (overrides /O2, only affects 32-bit)
         # /INCREMENTAL: NO - disable incremental link - avoid the level of indirection for function
         # calls
-        env.Append( CCFLAGS=["/O2", "/Oy-"] )
+
+        optStr = "/O2" if not optBuildForSize else "/O1"
+        env.Append( CCFLAGS=[optStr, "/Oy-"] )
         env.Append( LINKFLAGS=["/INCREMENTAL:NO"])
     else:
         env.Append( CCFLAGS=["/Od"] )
@@ -1613,6 +1671,7 @@ elif env.TargetOSIs('windows'):
             'version.lib',
             'winmm.lib',
             'ws2_32.lib',
+            'secur32.lib',
         ],
     )
 
@@ -1677,8 +1736,10 @@ if env.TargetOSIs('posix'):
         env.Append( CCFLAGS=["-fprofile-arcs", "-ftest-coverage"] )
         env.Append( LINKFLAGS=["-fprofile-arcs", "-ftest-coverage"] )
 
-    if optBuild:
+    if optBuild and not optBuildForSize:
         env.Append( CCFLAGS=["-O2"] )
+    elif optBuild and optBuildForSize: 
+        env.Append( CCFLAGS=["-Os"] )
     else:
         env.Append( CCFLAGS=["-O0"] )
 
@@ -1710,6 +1771,10 @@ if get_option('wiredtiger') == 'on':
     else:
         wiredtiger = True
         env.SetConfigHeaderDefine("MONGO_CONFIG_WIREDTIGER_ENABLED")
+
+mobile_se = False
+if get_option('mobile-se') == 'on':
+    mobile_se = True
 
 if env['TARGET_ARCH'] == 'i386':
     # If we are using GCC or clang to target 32 bit, set the ISA minimum to 'nocona',
@@ -1750,9 +1815,13 @@ mongo_modules = moduleconfig.discover_modules('src/mongo/db/modules', get_option
 env['MONGO_MODULES'] = [m.name for m in mongo_modules]
 
 # --- check system ---
+ssl_provider = None
+free_monitoring = get_option("enable-free-mon")
 
 def doConfigure(myenv):
     global wiredtiger
+    global ssl_provider
+    global free_monitoring
 
     # Check that the compilers work.
     #
@@ -2415,14 +2484,36 @@ def doConfigure(myenv):
             "undefined" : myenv.File("#etc/ubsan.blacklist"),
         }
 
-        blackfiles = set([v for (k, v) in blackfiles_map.iteritems() if k in sanitizer_list])
-        blacklist_options=["-fsanitize-blacklist=%s" % blackfile
-                           for blackfile in blackfiles
-                           if os.stat(blackfile.path).st_size != 0]
+        # Select those unique black files that are associated with the
+        # currently enabled sanitizers, but filter out those that are
+        # zero length.
+        blackfiles = {v for (k, v) in blackfiles_map.iteritems() if k in sanitizer_list}
+        blackfiles = [f for f in blackfiles if os.stat(f.path).st_size != 0]
 
-        for blacklist_option in blacklist_options:
-            if AddToCCFLAGSIfSupported(myenv, blacklist_option):
-                myenv.Append(LINKFLAGS=[blacklist_option])
+        # Filter out any blacklist options that the toolchain doesn't support.
+        supportedBlackfiles = []
+        blackfilesTestEnv = myenv.Clone()
+        for blackfile in blackfiles:
+            if AddToCCFLAGSIfSupported(blackfilesTestEnv, "-fsanitize-blacklist=%s" % blackfile):
+                supportedBlackfiles.append(blackfile)
+        blackfilesTestEnv = None
+        blackfiles = sorted(supportedBlackfiles)
+
+        # If we ended up with any blackfiles after the above filters,
+        # then expand them into compiler flag arguments, and use a
+        # generator to return at command line expansion time so that
+        # we can change the signature if the file contents change.
+        if blackfiles:
+            blacklist_options=["-fsanitize-blacklist=%s" % blackfile for blackfile in blackfiles]
+            def SanitizerBlacklistGenerator(source, target, env, for_signature):
+                if for_signature:
+                    return [f.get_csig() for f in blackfiles]
+                return blacklist_options
+            myenv.AppendUnique(
+                SANITIZER_BLACKLIST_GENERATOR=SanitizerBlacklistGenerator,
+                CCFLAGS="${SANITIZER_BLACKLIST_GENERATOR}",
+                LINKFLAGS="${SANITIZER_BLACKLIST_GENERATOR}",
+            )
 
         llvm_symbolizer = get_option('llvm-symbolizer')
         if os.path.isabs(llvm_symbolizer):
@@ -2690,26 +2781,31 @@ def doConfigure(myenv):
 
     libdeps.setup_conftests(conf)
 
-    def addOpenSslLibraryToDistArchive(file_name):
-        openssl_bin_path = os.path.normpath(env['WINDOWS_OPENSSL_BIN'].lower())
-        full_file_name = os.path.join(openssl_bin_path, file_name)
-        if os.path.exists(full_file_name):
-            env.Append(ARCHIVE_ADDITIONS=[full_file_name])
-            env.Append(ARCHIVE_ADDITION_DIR_MAP={
-                    openssl_bin_path: "bin"
-                    })
-            return True
-        else:
-            return False
-
-    if has_option( "ssl" ):
+    ### --ssl and --ssl-provider checks
+    def checkOpenSSL(conf):
         sslLibName = "ssl"
         cryptoLibName = "crypto"
+        sslLinkDependencies = ["crypto", "dl"]
+        if conf.env.TargetOSIs('freebsd'):
+            sslLinkDependencies = ["crypto"]
         if conf.env.TargetOSIs('windows'):
             sslLibName = "ssleay32"
             cryptoLibName = "libeay32"
+            sslLinkDependencies = ["libeay32"]
 
             # Add the SSL binaries to the zip file distribution
+            def addOpenSslLibraryToDistArchive(file_name):
+                openssl_bin_path = os.path.normpath(env['WINDOWS_OPENSSL_BIN'].lower())
+                full_file_name = os.path.join(openssl_bin_path, file_name)
+                if os.path.exists(full_file_name):
+                    env.Append(ARCHIVE_ADDITIONS=[full_file_name])
+                    env.Append(ARCHIVE_ADDITION_DIR_MAP={
+                            openssl_bin_path: "bin"
+                            })
+                    return True
+                else:
+                    return False
+
             files = ['ssleay32.dll', 'libeay32.dll']
             for extra_file in files:
                 if not addOpenSslLibraryToDistArchive(extra_file):
@@ -2753,15 +2849,6 @@ def doConfigure(myenv):
                         pass
 
         if not conf.CheckLibWithHeader(
-                sslLibName,
-                ["openssl/ssl.h"],
-                "C",
-                "SSL_version(NULL);",
-                autoadd=True):
-            maybeIssueDarwinSSLAdvice(conf.env)
-            conf.env.ConfError("Couldn't find OpenSSL ssl.h header and library")
-
-        if not conf.CheckLibWithHeader(
                 cryptoLibName,
                 ["openssl/crypto.h"],
                 "C",
@@ -2769,6 +2856,23 @@ def doConfigure(myenv):
                 autoadd=True):
             maybeIssueDarwinSSLAdvice(conf.env)
             conf.env.ConfError("Couldn't find OpenSSL crypto.h header and library")
+
+        def CheckLibSSL(context):
+            res = SCons.Conftest.CheckLib(context,
+                     libs=[sslLibName],
+                     extra_libs=sslLinkDependencies,
+                     header='#include "openssl/ssl.h"',
+                     language="C",
+                     call="SSL_version(NULL);",
+                     autoadd=True)
+            context.did_show_result = 1
+            return not res
+
+        conf.AddTest("CheckLibSSL", CheckLibSSL)
+
+        if not conf.CheckLibSSL():
+           maybeIssueDarwinSSLAdvice(conf.env)
+           conf.env.ConfError("Couldn't find OpenSSL ssl.h header and library")
 
         def CheckLinkSSL(context):
             test_body = """
@@ -2798,9 +2902,6 @@ def doConfigure(myenv):
             maybeIssueDarwinSSLAdvice(conf.env)
             conf.env.ConfError("SSL is enabled, but is unavailable")
 
-        env.SetConfigHeaderDefine("MONGO_CONFIG_SSL")
-        env.Append( MONGO_CRYPTO=["openssl"] )
-
         if conf.CheckDeclaration(
             "FIPS_mode_set",
             includes="""
@@ -2815,7 +2916,6 @@ def doConfigure(myenv):
                 #include <openssl/asn1.h>
             """):
             conf.env.SetConfigHeaderDefine('MONGO_CONFIG_HAVE_ASN1_ANY_DEFINITIONS')
-
 
         def CheckOpenSSL_EC_DH(context):
             compile_test_body = textwrap.dedent("""
@@ -2837,8 +2937,61 @@ def doConfigure(myenv):
         if conf.CheckOpenSSL_EC_DH():
             conf.env.SetConfigHeaderDefine('MONGO_CONFIG_HAS_SSL_SET_ECDH_AUTO')
 
+    ssl_provider = get_option("ssl-provider")
+    if ssl_provider == 'auto':
+        if conf.env.TargetOSIs('windows', 'darwin', 'macOS'):
+            ssl_provider = 'native'
+        else:
+            ssl_provider = 'openssl'
+
+    if ssl_provider == 'native':
+        if conf.env.TargetOSIs('windows'):
+            ssl_provider = 'windows'
+            env.SetConfigHeaderDefine("MONGO_CONFIG_SSL_PROVIDER", "SSL_PROVIDER_WINDOWS")
+            conf.env.Append( MONGO_CRYPTO=["windows"] )
+
+        elif conf.env.TargetOSIs('darwin', 'macOS'):
+            ssl_provider = 'apple'
+            env.SetConfigHeaderDefine("MONGO_CONFIG_SSL_PROVIDER", "SSL_PROVIDER_APPLE")
+            conf.env.Append( MONGO_CRYPTO=["apple"] )
+            conf.env.AppendUnique(FRAMEWORKS=[
+                'CoreFoundation',
+                'Security',
+            ])
+
+    if ssl_provider == 'openssl':
+        if has_option("ssl"):
+            checkOpenSSL(conf)
+            # Working OpenSSL available, use it.
+            env.SetConfigHeaderDefine("MONGO_CONFIG_SSL_PROVIDER", "SSL_PROVIDER_OPENSSL")
+
+            conf.env.Append( MONGO_CRYPTO=["openssl"] )
+        else:
+            # If we don't need an SSL build, we can get by with TomCrypt.
+            conf.env.Append( MONGO_CRYPTO=["tom"] )
+
+    if has_option( "ssl" ):
+        # Either crypto engine is native,
+        # or it's OpenSSL and has been checked to be working.
+        conf.env.SetConfigHeaderDefine("MONGO_CONFIG_SSL")
+        print("Using SSL Provider: {0}".format(ssl_provider))
     else:
-        env.Append( MONGO_CRYPTO=["tom"] )
+        ssl_provider = "none"
+
+    if free_monitoring == "auto":
+        if "enterprise" not in env['MONGO_MODULES']:
+            free_monitoring = "on"
+        else:
+            free_monitoring = "off"
+
+    if not env.TargetOSIs("windows") \
+        and free_monitoring == "on" \
+        and not conf.CheckLibWithHeader(
+        "curl",
+        ["curl/curl.h"], "C",
+        "curl_global_init(0);",
+        autoadd=False):
+        env.ConfError("Could not find <curl/curl.h> and curl lib")
 
     if use_system_version_of_library("pcre"):
         conf.FindSysLibDep("pcre", ["pcre"])
@@ -2876,6 +3029,11 @@ def doConfigure(myenv):
         if not conf.CheckCXXHeader( "wiredtiger.h" ):
             myenv.ConfError("Cannot find wiredtiger headers")
         conf.FindSysLibDep("wiredtiger", ["wiredtiger"])
+
+    if use_system_version_of_library("sqlite"):
+        if not conf.CheckCXXHeader( "sqlite3.h" ):
+            myenv.ConfError("Cannot find sqlite headers")
+        conf.FindSysLibDep("sqlite", ["sqlite3"])
 
     conf.env.Append(
         CPPDEFINES=[
@@ -3060,6 +3218,37 @@ def doConfigure(myenv):
 
 env = doConfigure( env )
 
+# TODO: Later, this should live somewhere more graceful.
+if get_option('install-mode') == 'hygienic':
+    env.Tool('auto_install_binaries')
+    if env['PLATFORM'] == 'posix':
+        env.AppendUnique(
+            RPATH=[
+                env.Literal('\\$$ORIGIN/../lib')
+            ],
+            LINKFLAGS=[
+                # Most systems *require* -z,origin to make origin work, but android
+                # blows up at runtime if it finds DF_ORIGIN_1 in DT_FLAGS_1.
+                # https://android.googlesource.com/platform/bionic/+/cbc80ba9d839675a0c4891e2ab33f39ba51b04b2/linker/linker.h#68
+                # https://android.googlesource.com/platform/bionic/+/cbc80ba9d839675a0c4891e2ab33f39ba51b04b2/libc/include/elf.h#215
+                '-Wl,-z,origin' if not env.TargetOSIs('android') else [],
+                '-Wl,--enable-new-dtags',
+            ],
+            SHLINKFLAGS=[
+                # -h works for both the sun linker and the gnu linker.
+                "-Wl,-h,${TARGET.file}",
+            ]
+        )
+    elif env['PLATFORM'] == 'darwin':
+        env.AppendUnique(
+            PROGLINKFLAGS=[
+                '-Wl,-rpath,@loader_path/../lib'
+            ],
+            SHLINKFLAGS=[
+                "-Wl,-install_name,@rpath/${TARGET.file}",
+            ],
+        )
+
 # Now that we are done with configure checks, enable icecream, if available.
 env.Tool('icecream')
 
@@ -3086,8 +3275,8 @@ if incremental_link.exists(env):
 
 def checkErrorCodes():
     import buildscripts.errorcodes as x
-    if x.checkErrorCodes() == False:
-        env.FatalError("next id to use: {0}", x.getNextCode())
+    if x.check_error_codes() == False:
+        env.FatalError("next id to use: {0}", x.get_next_code())
 
 checkErrorCodes()
 
@@ -3190,7 +3379,10 @@ Export('module_sconscripts')
 Export("debugBuild optBuild")
 Export("wiredtiger")
 Export("mmapv1")
+Export("mobile_se")
 Export("endian")
+Export("ssl_provider")
+Export("free_monitoring")
 
 def injectMongoIncludePaths(thisEnv):
     thisEnv.AppendUnique(CPPPATH=['$BUILD_DIR'])
@@ -3232,7 +3424,7 @@ env.SConscript(
     variant_dir='$BUILD_DIR',
 )
 
-all = env.Alias('all', ['core', 'tools', 'dbtest', 'unittests', 'integration_tests'])
+all = env.Alias('all', ['core', 'tools', 'dbtest', 'unittests', 'integration_tests', 'benchmarks'])
 
 # run the Dagger tool if it's installed
 if should_dagger:

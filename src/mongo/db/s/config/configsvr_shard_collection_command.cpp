@@ -38,7 +38,7 @@
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/auth/privilege.h"
 #include "mongo/db/commands.h"
-#include "mongo/db/commands/feature_compatibility_version.h"
+#include "mongo/db/commands/test_commands_enabled.h"
 #include "mongo/db/hasher.h"
 #include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/namespace_string.h"
@@ -46,17 +46,18 @@
 #include "mongo/db/repl/repl_client_info.h"
 #include "mongo/db/repl/repl_set_config.h"
 #include "mongo/db/repl/replication_coordinator.h"
+#include "mongo/db/s/config/sharding_catalog_manager.h"
 #include "mongo/db/sessions_collection.h"
 #include "mongo/s/balancer_configuration.h"
-#include "mongo/s/catalog/sharding_catalog_manager.h"
 #include "mongo/s/catalog/type_database.h"
 #include "mongo/s/catalog/type_shard.h"
 #include "mongo/s/catalog_cache.h"
 #include "mongo/s/catalog_cache.h"
 #include "mongo/s/client/shard_registry.h"
+#include "mongo/s/commands/cluster_commands_helpers.h"
 #include "mongo/s/config_server_client.h"
 #include "mongo/s/grid.h"
-#include "mongo/s/migration_secondary_throttle_options.h"
+#include "mongo/s/request_types/migration_secondary_throttle_options.h"
 #include "mongo/s/request_types/shard_collection_gen.h"
 #include "mongo/s/shard_util.h"
 #include "mongo/util/log.h"
@@ -121,7 +122,7 @@ BSONObj makeCreateIndexesCmd(const NamespaceString& nss,
     createIndexes.append("createIndexes", nss.coll());
     createIndexes.append("indexes", BSON_ARRAY(index.obj()));
     createIndexes.append("writeConcern", WriteConcernOptions::Majority);
-    return createIndexes.obj();
+    return appendAllowImplicitCreate(createIndexes.obj(), true);
 }
 
 /**
@@ -138,14 +139,6 @@ void validateAndDeduceFullRequestOptions(OperationContext* opCtx,
                                          ConfigsvrShardCollectionRequest* request) {
     uassert(
         ErrorCodes::InvalidOptions, "cannot have empty shard key", !request->getKey().isEmpty());
-
-    // Ensure the proposed shard key is valid.
-    uassert(ErrorCodes::InvalidOptions,
-            str::stream()
-                << "Unsupported shard key pattern "
-                << shardKeyPattern.toString()
-                << ". Pattern must either be a single hashed field, or a list of ascending fields",
-            shardKeyPattern.isValid());
 
     // Ensure that hashed and unique are not both set.
     uassert(ErrorCodes::InvalidOptions,
@@ -261,7 +254,7 @@ boost::optional<CollectionType> checkIfAlreadyShardedWithSameOptions(
                             opCtx,
                             ReadPreferenceSetting{ReadPreference::PrimaryOnly},
                             repl::ReadConcernLevel::kLocalReadConcern,
-                            NamespaceString(CollectionType::ConfigNS),
+                            CollectionType::ConfigNS,
                             BSON("_id" << nss.ns() << "dropped" << false),
                             BSONObj(),
                             1))
@@ -564,15 +557,15 @@ void migrateAndFurtherSplitInitialChunks(OperationContext* opCtx,
         const auto to = toStatus.getValue();
 
         // Can't move chunk to shard it's already on
-        if (to->getId() == chunk->getShardId()) {
+        if (to->getId() == chunk.getShardId()) {
             continue;
         }
 
         ChunkType chunkType;
-        chunkType.setNS(nss.ns());
-        chunkType.setMin(chunk->getMin());
-        chunkType.setMax(chunk->getMax());
-        chunkType.setShard(chunk->getShardId());
+        chunkType.setNS(nss);
+        chunkType.setMin(chunk.getMin());
+        chunkType.setMax(chunk.getMax());
+        chunkType.setShard(chunk.getShardId());
         chunkType.setVersion(chunkManager->getVersion());
 
         Status moveStatus = configsvr_client::moveChunk(
@@ -583,7 +576,7 @@ void migrateAndFurtherSplitInitialChunks(OperationContext* opCtx,
             MigrationSecondaryThrottleOptions::create(MigrationSecondaryThrottleOptions::kOff),
             true);
         if (!moveStatus.isOK()) {
-            warning() << "couldn't move chunk " << redact(chunk->toString()) << " to shard " << *to
+            warning() << "couldn't move chunk " << redact(chunk.toString()) << " to shard " << *to
                       << " while sharding collection " << nss.ns() << causedBy(redact(moveStatus));
         }
     }
@@ -602,7 +595,8 @@ void migrateAndFurtherSplitInitialChunks(OperationContext* opCtx,
 
     // Subdivide the big chunks by splitting at each of the points in "allSplits"
     // that we haven't already split by.
-    auto currentChunk = chunkManager->findIntersectingChunkWithSimpleCollation(allSplits[0]);
+    boost::optional<Chunk> currentChunk(
+        chunkManager->findIntersectingChunkWithSimpleCollation(allSplits[0]));
 
     std::vector<BSONObj> subSplits;
     for (unsigned i = 0; i <= allSplits.size(); i++) {
@@ -626,7 +620,8 @@ void migrateAndFurtherSplitInitialChunks(OperationContext* opCtx,
             }
 
             if (i < allSplits.size()) {
-                currentChunk = chunkManager->findIntersectingChunkWithSimpleCollation(allSplits[i]);
+                currentChunk.emplace(
+                    chunkManager->findIntersectingChunkWithSimpleCollation(allSplits[i]));
             }
         } else {
             BSONObj splitPoint(allSplits[i]);
@@ -643,11 +638,6 @@ void migrateAndFurtherSplitInitialChunks(OperationContext* opCtx,
 
 boost::optional<UUID> getUUIDFromPrimaryShard(const NamespaceString& nss,
                                               ScopedDbConnection& conn) {
-    // UUIDs were introduced in featureCompatibilityVersion 3.6.
-    if (!serverGlobalParams.featureCompatibility.isSchemaVersion36()) {
-        return boost::none;
-    }
-
     // Obtain the collection's UUID from the primary shard's listCollections response.
     BSONObj res;
     {
@@ -698,7 +688,7 @@ public:
 
     Status checkAuthForCommand(Client* client,
                                const std::string& dbname,
-                               const BSONObj& cmdObj) override {
+                               const BSONObj& cmdObj) const override {
         if (!AuthorizationSession::get(client)->isAuthorizedForActionsOnResource(
                 ResourcePattern::forClusterResource(), ActionType::internal)) {
             return Status(ErrorCodes::Unauthorized, "Unauthorized");
@@ -706,8 +696,8 @@ public:
         return Status::OK();
     }
 
-    bool slaveOk() const override {
-        return false;
+    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
+        return AllowedOnSecondary::kNever;
     }
 
     bool adminOnly() const override {
@@ -718,14 +708,14 @@ public:
         return true;
     }
 
-    void help(std::stringstream& help) const override {
-        help << "Internal command, which is exported by the sharding config server. Do not call "
-             << "directly. Shards a collection. Requires key. Optional unique. Sharding must "
-                "already be enabled for the database";
+    std::string help() const override {
+        return "Internal command, which is exported by the sharding config server. Do not call "
+               "directly. Shards a collection. Requires key. Optional unique. Sharding must "
+               "already be enabled for the database";
     }
 
     std::string parseNs(const std::string& dbname, const BSONObj& cmdObj) const override {
-        return parseNsFullyQualified(dbname, cmdObj);
+        return CommandHelpers::parseNsFullyQualified(cmdObj);
     }
 
     bool run(OperationContext* opCtx,
@@ -742,10 +732,6 @@ public:
                               << cmdObj,
                 opCtx->getWriteConcern().wMode == WriteConcernOptions::kMajority);
 
-        // Do not allow sharding collections while a featureCompatibilityVersion upgrade or
-        // downgrade is in progress (see SERVER-31231 for details).
-        Lock::ExclusiveLock lk(opCtx->lockState(), FeatureCompatibilityVersion::fcvLock);
-
         const NamespaceString nss(parseNs(dbname, cmdObj));
         auto request = ConfigsvrShardCollectionRequest::parse(
             IDLParserErrorContext("ConfigsvrShardCollectionRequest"), cmdObj);
@@ -753,15 +739,9 @@ public:
         auto const catalogManager = ShardingCatalogManager::get(opCtx);
         auto const catalogCache = Grid::get(opCtx)->catalogCache();
         auto const catalogClient = Grid::get(opCtx)->catalogClient();
+        auto shardRegistry = Grid::get(opCtx)->shardRegistry();
 
         // Make the distlocks boost::optional so that they can be released by being reset below.
-        // Remove the backwards compatible lock after 3.6 ships.
-        boost::optional<DistLockManager::ScopedDistLock> backwardsCompatibleDbDistLock(
-            uassertStatusOK(
-                catalogClient->getDistLockManager()->lock(opCtx,
-                                                          nss.db() + "-movePrimary",
-                                                          "shardCollection",
-                                                          DistLockManager::kDefaultLockTimeout)));
         boost::optional<DistLockManager::ScopedDistLock> dbDistLock(
             uassertStatusOK(catalogClient->getDistLockManager()->lock(
                 opCtx, nss.db(), "shardCollection", DistLockManager::kDefaultLockTimeout)));
@@ -788,7 +768,7 @@ public:
         ShardKeyPattern shardKeyPattern(proposedKey);
 
         std::vector<ShardId> shardIds;
-        Grid::get(opCtx)->shardRegistry()->getAllShardIds(&shardIds);
+        shardRegistry->getAllShardIds(opCtx, &shardIds);
         const int numShards = shardIds.size();
 
         uassert(ErrorCodes::IllegalOperation,
@@ -801,11 +781,9 @@ public:
             // (unless we are in test mode)
             uassert(ErrorCodes::IllegalOperation,
                     "only special collections in the config db may be sharded",
-                    nss.ns() == SessionsCollection::kSessionsFullNS ||
-                        Command::testCommandsEnabled);
+                    nss.ns() == SessionsCollection::kSessionsFullNS || getTestCommandsEnabled());
 
-            auto configShard = uassertStatusOK(
-                Grid::get(opCtx)->shardRegistry()->getShard(opCtx, dbType.getPrimary()));
+            auto configShard = uassertStatusOK(shardRegistry->getShard(opCtx, dbType.getPrimary()));
             ScopedDbConnection configConn(configShard->getConnString());
             ON_BLOCK_EXIT([&configConn] { configConn.done(); });
 
@@ -826,8 +804,7 @@ public:
             }
         }();
 
-        auto primaryShard =
-            uassertStatusOK(Grid::get(opCtx)->shardRegistry()->getShard(opCtx, primaryShardId));
+        auto primaryShard = uassertStatusOK(shardRegistry->getShard(opCtx, primaryShardId));
         ScopedDbConnection conn(primaryShard->getConnString());
         ON_BLOCK_EXIT([&conn] { conn.done(); });
 
@@ -881,7 +858,7 @@ public:
 
         // Step 6. Actually shard the collection.
         catalogManager->shardCollection(opCtx,
-                                        nss.ns(),
+                                        nss,
                                         uuid,
                                         shardKeyPattern,
                                         *request.getCollation(),
@@ -900,7 +877,6 @@ public:
         // Free the distlocks to allow the splits and migrations below to proceed.
         collDistLock.reset();
         dbDistLock.reset();
-        backwardsCompatibleDbDistLock.reset();
 
         // Step 7. Migrate initial chunks to distribute them across shards.
         migrateAndFurtherSplitInitialChunks(

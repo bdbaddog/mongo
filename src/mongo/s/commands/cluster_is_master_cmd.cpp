@@ -28,12 +28,12 @@
 
 #include "mongo/platform/basic.h"
 
+#include "mongo/db/auth/sasl_mechanism_registry.h"
 #include "mongo/db/client.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/logical_session_id.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/ops/write_ops.h"
-#include "mongo/db/server_options.h"
 #include "mongo/db/server_parameters.h"
 #include "mongo/db/wire_version.h"
 #include "mongo/rpc/metadata/client_metadata.h"
@@ -54,18 +54,22 @@ public:
         return false;
     }
 
-    bool slaveOk() const override {
-        return true;
+    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
+        return AllowedOnSecondary::kAlways;
     }
 
-    void help(std::stringstream& help) const override {
-        help << "test if this is master half of a replica pair";
+    std::string help() const override {
+        return "test if this is master half of a replica pair";
     }
 
     void addRequiredPrivileges(const std::string& dbname,
                                const BSONObj& cmdObj,
-                               std::vector<Privilege>* out) override {
+                               std::vector<Privilege>* out) const override {
         // No auth required
+    }
+
+    bool requiresAuth() const override {
+        return false;
     }
 
     bool run(OperationContext* opCtx,
@@ -81,7 +85,7 @@ public:
         BSONElement element = cmdObj[kMetadataDocumentName];
         if (!element.eoo()) {
             if (seenIsMaster) {
-                return Command::appendCommandStatus(
+                return CommandHelpers::appendCommandStatus(
                     result,
                     Status(ErrorCodes::ClientMetadataCannotBeMutated,
                            "The client metadata document may only be sent in the first isMaster"));
@@ -90,7 +94,8 @@ public:
             auto swParseClientMetadata = ClientMetadata::parse(element);
 
             if (!swParseClientMetadata.getStatus().isOK()) {
-                return Command::appendCommandStatus(result, swParseClientMetadata.getStatus());
+                return CommandHelpers::appendCommandStatus(result,
+                                                           swParseClientMetadata.getStatus());
             }
 
             invariant(swParseClientMetadata.getValue());
@@ -112,10 +117,7 @@ public:
         result.appendNumber("maxMessageSizeBytes", MaxMessageSizeBytes);
         result.appendNumber("maxWriteBatchSize", write_ops::kMaxWriteBatchSize);
         result.appendDate("localTime", jsTime());
-        if (serverGlobalParams.featureCompatibility.getVersion() ==
-            ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo36) {
-            result.append("logicalSessionTimeoutMinutes", localLogicalSessionTimeoutMinutes);
-        }
+        result.append("logicalSessionTimeoutMinutes", localLogicalSessionTimeoutMinutes);
 
         // Mongos tries to keep exactly the same version range of the server for which
         // it is compiled.
@@ -130,6 +132,9 @@ public:
 
         MessageCompressorManager::forSession(opCtx->getClient()->session())
             .serverNegotiate(cmdObj, &result);
+
+        auto& saslMechanismRegistry = SASLServerMechanismRegistry::get(opCtx->getServiceContext());
+        saslMechanismRegistry.advertiseMechanismNamesForUser(opCtx, cmdObj, &result);
 
         return true;
     }

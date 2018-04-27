@@ -1,5 +1,6 @@
 /**
  * This test checks that authentication restrictions can be set and respected.
+ * @tags: [requires_sharding, requires_replication]
  */
 
 (function() {
@@ -27,24 +28,6 @@
         var externalMongo = new Mongo(get_ipaddr() + ":" + conn.port);
         var externalDb = externalMongo.getDB("admin");
 
-        print("=== Feature compatibility tests");
-        assert.commandWorked(admin.runCommand({setFeatureCompatibilityVersion: "3.4"}));
-
-        print(
-            "Given a server with 3.4 featureCompatibilityVersions, it is not possible to make a user with authenticationRestrictions");
-        assert.commandFailed(admin.runCommand({
-            createUser: "user",
-            pwd: "user",
-            roles: [],
-            authenticationRestrictions: [{clientSource: ["127.0.0.1"]}]
-        }));
-        assert.commandWorked(admin.runCommand({createUser: "user", pwd: "user", roles: []}));
-        assert.commandFailed(admin.runCommand(
-            {updateUser: "user", authenticationRestrictions: [{serverAddress: ["127.0.0.1"]}]}));
-
-        print(
-            "When the server is upgraded to 3.6 featureCompatibilityVersion, users may be created with authenticationRestrictions");
-        assert.commandWorked(admin.runCommand({setFeatureCompatibilityVersion: "3.6"}));
         assert.commandWorked(admin.runCommand({
             createUser: "user2",
             pwd: "user",
@@ -192,32 +175,6 @@
         sleepUntilUserDataRefreshed();
         assert.commandFailed(
             eventualDb.getSiblingDB("test").runCommand({find: "foo", batchSize: 0}));
-
-        print(
-            "When a client downgrades featureCompatibilityVersion, authenticationRestrictions are still enforced");
-        assert.commandWorked(admin.runCommand({
-            createUser: "user13",
-            pwd: "user",
-            roles: [{role: "readWrite", db: "test"}],
-            authenticationRestrictions: [{clientSource: ["127.0.0.1"]}]
-        }));
-        assert(db.auth("user13", "user"));
-        assert.commandWorked(db.getSiblingDB("test").runCommand({find: "foo", batchSize: 0}));
-
-        sleepUntilUserDataPropagated();
-        assert(eventualDb.auth("user13", "user"));
-        assert.commandWorked(
-            eventualDb.getSiblingDB("test").runCommand({find: "foo", batchSize: 0}));
-
-        assert.commandWorked(admin.runCommand({setFeatureCompatibilityVersion: "3.4"}));
-
-        sleepUntilUserDataRefreshed();
-        assert(db.auth("user13", "user"));
-        assert.commandWorked(db.getSiblingDB("test").runCommand({find: "foo", batchSize: 0}));
-        assert(eventualDb.auth("user13", "user"));
-        assert.commandWorked(
-            eventualDb.getSiblingDB("test").runCommand({find: "foo", batchSize: 0}));
-        assert(!externalDb.auth("user13", "user"));
     }
 
     print("Testing standalone");
@@ -243,6 +200,7 @@
     rst.stopSet();
 
     print("Testing sharded cluster");
+    // TODO: Remove 'shardAsReplicaSet: false' when SERVER-32672 is fixed.
     var st = new ShardingTest({
         mongos: 2,
         config: 3,
@@ -251,7 +209,8 @@
         other: {
             mongosOptions: {bind_ip_all: "", auth: null},
             configOptions: {auth: null},
-            shardOptions: {auth: null}
+            shardOptions: {auth: null},
+            shardAsReplicaSet: false
         }
     });
     testConnection(st.s0,

@@ -39,14 +39,16 @@
 #include "mongo/db/dbmessage.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/write_concern_options.h"
+#include "mongo/logger/log_severity.h"
 #include "mongo/platform/atomic_word.h"
 #include "mongo/rpc/metadata.h"
 #include "mongo/rpc/protocol.h"
 #include "mongo/rpc/unique_message.h"
 #include "mongo/stdx/functional.h"
 #include "mongo/transport/message_compressor_manager.h"
+#include "mongo/transport/session.h"
+#include "mongo/transport/transport_layer.h"
 #include "mongo/util/mongoutils/str.h"
-#include "mongo/util/net/abstract_message_port.h"
 #include "mongo/util/net/message.h"
 #include "mongo/util/net/op_msg.h"
 
@@ -969,9 +971,11 @@ public:
         return _failed;
     }
 
-    bool isStillConnected() {
-        return _port ? _port->isStillConnected() : true;
-    }
+    bool isStillConnected();
+
+    void setTags(transport::Session::TagMask tag);
+
+    void shutdown();
 
     void setWireVersions(int minWireVersion, int maxWireVersion) {
         _minWireVersion = minWireVersion;
@@ -984,11 +988,6 @@ public:
 
     int getMaxWireVersion() final {
         return _maxWireVersion;
-    }
-
-    AbstractMessagingPort& port() {
-        verify(_port);
-        return *_port;
     }
 
     std::string toString() const {
@@ -1020,7 +1019,7 @@ public:
     }
     void setSoTimeout(double timeout);
     double getSoTimeout() const {
-        return _so_timeout;
+        return _socketTimeout.value_or(Milliseconds{0}).count() / 1000.0;
     }
 
     virtual bool lazySupported() const {
@@ -1037,13 +1036,13 @@ public:
      */
     void setParentReplSetName(const std::string& replSetName);
 
-    uint64_t getSockCreationMicroSec() const;
+    uint64_t getSockCreationMicroSec() const override;
 
     MessageCompressorManager& getCompressorManager() {
         return _compressorManager;
     }
 
-    // throws SocketException if in failed state and not reconnecting or if waiting to reconnect
+    // throws a NetworkException if in failed state and not reconnecting or if waiting to reconnect
     void checkConnection() override {
         if (_failed)
             _checkConnection();
@@ -1065,9 +1064,13 @@ protected:
 
     virtual void _auth(const BSONObj& params);
 
-    std::unique_ptr<AbstractMessagingPort> _port;
+    transport::SessionHandle _session;
+    boost::optional<Milliseconds> _socketTimeout;
+    transport::Session::TagMask _tagMask = transport::Session::kEmptyTagMask;
+    uint64_t _sessionCreationMicros = INVALID_SOCK_CREATION_TIME;
+    Date_t _lastConnectivityCheck;
 
-    bool _failed;
+    bool _failed = false;
     const bool autoReconnect;
     Backoff autoReconnectBackoff;
 
@@ -1078,7 +1081,6 @@ protected:
     void _checkConnection();
 
     std::map<std::string, BSONObj> authCache;
-    double _so_timeout;
 
     static AtomicInt32 _numConnections;
 
@@ -1089,6 +1091,8 @@ private:
      * returned.
      */
     void handleNotMasterResponse(const BSONObj& replyBody, StringData errorMsgFieldName);
+    enum FailAction { kSetFlag, kEndSession, kReleaseSession };
+    void _markFailed(FailAction action);
 
     // Contains the string for the replica set name of the host this is connected to.
     // Should be empty if this connection is not pointing to a replica set member.

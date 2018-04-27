@@ -213,7 +213,9 @@ public:
     virtual boost::optional<RecordId> oplogStartHack(OperationContext* opCtx,
                                                      const RecordId& startingPosition) const;
 
-    virtual Status oplogDiskLocRegister(OperationContext* opCtx, const Timestamp& opTime);
+    virtual Status oplogDiskLocRegister(OperationContext* opCtx,
+                                        const Timestamp& opTime,
+                                        bool orderedCommit);
 
     virtual void updateStatsAfterRepair(OperationContext* opCtx,
                                         long long numRecords,
@@ -249,16 +251,20 @@ public:
 
     void reclaimOplog(OperationContext* opCtx);
 
+    /**
+     * The `persistedTimestamp` is when replication recovery would need to replay from on a
+     * restart. `reclaimOplog` will not truncate oplog entries in front of this time.
+     */
+    void reclaimOplog(OperationContext* opCtx, Timestamp persistedTimestamp);
+
     int64_t cappedDeleteAsNeeded(OperationContext* opCtx, const RecordId& justInserted);
 
     int64_t cappedDeleteAsNeeded_inlock(OperationContext* opCtx, const RecordId& justInserted);
 
-    stdx::timed_mutex& cappedDeleterMutex() {
-        return _cappedDeleterMutex;
-    }
-
     // Returns false if the oplog was dropped while waiting for a deletion request.
     bool yieldAndAwaitOplogDeletionRequest(OperationContext* opCtx);
+
+    bool haveCappedWaiters();
 
     void notifyCappedWaitersIfNeeded();
 
@@ -290,9 +296,27 @@ private:
     RecordId _nextId();
     void _setId(RecordId id);
     bool cappedAndNeedDelete() const;
+    RecordData _getData(const WiredTigerCursor& cursor) const;
+
+    /**
+     * Adjusts the record count and data size metadata for this record store, respectively. These
+     * functions consult the SizeRecoveryState to determine whether or not to actually change the
+     * size metadata if the server is undergoing recovery.
+     *
+     * For most record stores, we will not update the size metadata during recovery, as we trust
+     * that the values in the SizeStorer are accurate with respect to the end state of recovery.
+     * However, there are two exceptions:
+     *
+     *   1. When a record store is created as part of the recovery process. The SizeStorer will have
+     *      no information about that newly-created ident.
+     *   2. When a record store is created at startup but constains no records as of the stable
+     *      checkpoint timestamp. In this scenario, we will assume that the record store has a size
+     *      of zero and will discard all cached size metadata. This assumption is incorrect if there
+     *      are pending writes to this ident as part of the recovery process, and so we must
+     *      always adjust size metadata for these idents.
+     */
     void _changeNumRecords(OperationContext* opCtx, int64_t diff);
     void _increaseDataSize(OperationContext* opCtx, int64_t amount);
-    RecordData _getData(const WiredTigerCursor& cursor) const;
 
 
     const std::string _uri;
@@ -314,7 +338,7 @@ private:
     AtomicInt64 _cappedSleepMS;
     CappedCallback* _cappedCallback;
     bool _shuttingDown;
-    stdx::mutex _cappedCallbackMutex;  // guards _cappedCallback and _shuttingDown
+    mutable stdx::mutex _cappedCallbackMutex;  // guards _cappedCallback and _shuttingDown
 
     // See comment in ::cappedDeleteAsNeeded
     int _cappedDeleteCheckCount;

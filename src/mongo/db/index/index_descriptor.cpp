@@ -127,8 +127,7 @@ Status IndexDescriptor::isIndexVersionAllowedForCreation(
                           << static_cast<int>(indexVersion)};
 }
 
-IndexVersion IndexDescriptor::getDefaultIndexVersion(
-    ServerGlobalParams::FeatureCompatibility::Version featureCompatibilityVersion) {
+IndexVersion IndexDescriptor::getDefaultIndexVersion() {
     return IndexVersion::kV2;
 }
 

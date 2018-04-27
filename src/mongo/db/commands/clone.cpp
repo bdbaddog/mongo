@@ -56,23 +56,22 @@ class CmdClone : public BasicCommand {
 public:
     CmdClone() : BasicCommand("clone") {}
 
-    virtual bool slaveOk() const {
-        return false;
+    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
+        return AllowedOnSecondary::kNever;
     }
-
 
     virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
         return true;
     }
 
-    virtual void help(stringstream& help) const {
-        help << "clone this database from an instance of the db on another host\n";
-        help << "{clone: \"host13\"[, slaveOk: <bool>]}";
+    std::string help() const override {
+        return "clone this database from an instance of the db on another host\n"
+               "{clone: \"host13\"[, slaveOk: <bool>]}";
     }
 
     virtual Status checkAuthForCommand(Client* client,
                                        const std::string& dbname,
-                                       const BSONObj& cmdObj) {
+                                       const BSONObj& cmdObj) const {
         ActionSet actions;
         actions.addAction(ActionType::insert);
         actions.addAction(ActionType::createIndex);
@@ -104,20 +103,21 @@ public:
         opts.fromDB = dbname;
         opts.slaveOk = cmdObj["slaveOk"].trueValue();
 
-        // See if there's any collections we should ignore
+        // collsToIgnore is only used by movePrimary and contains a list of the
+        // sharded collections.
         if (cmdObj["collsToIgnore"].type() == Array) {
             BSONObjIterator it(cmdObj["collsToIgnore"].Obj());
 
             while (it.more()) {
                 BSONElement e = it.next();
                 if (e.type() == String) {
-                    opts.collsToIgnore.insert(e.String());
+                    opts.shardedColls.insert(e.String());
                 }
             }
         }
 
+        // Clone the non-ignored collections.
         set<string> clonedColls;
-
         Lock::DBLock dbXLock(opCtx, dbname, MODE_X);
 
         Cloner cloner;
@@ -125,10 +125,9 @@ public:
 
         BSONArrayBuilder barr;
         barr.append(clonedColls);
-
         result.append("clonedColls", barr.arr());
 
-        return appendCommandStatus(result, status);
+        return CommandHelpers::appendCommandStatus(result, status);
     }
 
 } cmdClone;

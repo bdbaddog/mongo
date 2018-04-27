@@ -40,10 +40,10 @@ namespace {
 
 class FsyncCommand : public ErrmsgCommandDeprecated {
 public:
-    FsyncCommand() : ErrmsgCommandDeprecated("fsync", "fsync") {}
+    FsyncCommand() : ErrmsgCommandDeprecated("fsync") {}
 
-    virtual bool slaveOk() const {
-        return true;
+    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
+        return AllowedOnSecondary::kAlways;
     }
 
     virtual bool adminOnly() const {
@@ -55,13 +55,13 @@ public:
         return false;
     }
 
-    virtual void help(std::stringstream& help) const {
-        help << "invoke fsync on all shards belonging to the cluster";
+    std::string help() const override {
+        return "invoke fsync on all shards belonging to the cluster";
     }
 
     virtual void addRequiredPrivileges(const std::string& dbname,
                                        const BSONObj& cmdObj,
-                                       std::vector<Privilege>* out) {
+                                       std::vector<Privilege>* out) const {
         ActionSet actions;
         actions.addAction(ActionType::fsync);
         out->push_back(Privilege(ResourcePattern::forClusterResource(), actions));
@@ -83,7 +83,7 @@ public:
         int numFiles = 0;
 
         std::vector<ShardId> shardIds;
-        grid.shardRegistry()->getAllShardIds(&shardIds);
+        grid.shardRegistry()->getAllShardIdsNoReload(&shardIds);
 
         for (const ShardId& shardId : shardIds) {
             auto shardStatus = grid.shardRegistry()->getShard(opCtx, shardId);

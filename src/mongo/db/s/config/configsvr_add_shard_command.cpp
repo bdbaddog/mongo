@@ -39,7 +39,7 @@
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/repl/repl_set_config.h"
 #include "mongo/db/repl/replication_coordinator.h"
-#include "mongo/s/catalog/sharding_catalog_manager.h"
+#include "mongo/db/s/config/sharding_catalog_manager.h"
 #include "mongo/s/catalog/type_shard.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/request_types/add_shard_request_type.h"
@@ -60,13 +60,13 @@ class ConfigSvrAddShardCommand : public BasicCommand {
 public:
     ConfigSvrAddShardCommand() : BasicCommand("_configsvrAddShard") {}
 
-    void help(std::stringstream& help) const override {
-        help << "Internal command, which is exported by the sharding config server. Do not call "
-                "directly. Validates and adds a new shard to the cluster.";
+    std::string help() const override {
+        return "Internal command, which is exported by the sharding config server. Do not call "
+               "directly. Validates and adds a new shard to the cluster.";
     }
 
-    bool slaveOk() const override {
-        return false;
+    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
+        return AllowedOnSecondary::kNever;
     }
 
     bool adminOnly() const override {
@@ -79,7 +79,7 @@ public:
 
     Status checkAuthForCommand(Client* client,
                                const std::string& dbname,
-                               const BSONObj& cmdObj) override {
+                               const BSONObj& cmdObj) const override {
         if (!AuthorizationSession::get(client)->isAuthorizedForActionsOnResource(
                 ResourcePattern::forClusterResource(), ActionType::internal)) {
             return Status(ErrorCodes::Unauthorized, "Unauthorized");
@@ -92,7 +92,7 @@ public:
              const BSONObj& cmdObj,
              BSONObjBuilder& result) override {
         if (serverGlobalParams.clusterRole != ClusterRole::ConfigServer) {
-            return appendCommandStatus(
+            return CommandHelpers::appendCommandStatus(
                 result,
                 Status(ErrorCodes::IllegalOperation,
                        "_configsvrAddShard can only be run on config servers"));
@@ -100,11 +100,12 @@ public:
 
         // Do not allow adding shards while a featureCompatibilityVersion upgrade or downgrade is in
         // progress (see SERVER-31231 for details).
-        Lock::ExclusiveLock lk(opCtx->lockState(), FeatureCompatibilityVersion::fcvLock);
+        invariant(!opCtx->lockState()->isLocked());
+        Lock::SharedLock lk(opCtx->lockState(), FeatureCompatibilityVersion::fcvLock);
 
         auto swParsedRequest = AddShardRequest::parseFromConfigCommand(cmdObj);
         if (!swParsedRequest.isOK()) {
-            return appendCommandStatus(result, swParsedRequest.getStatus());
+            return CommandHelpers::appendCommandStatus(result, swParsedRequest.getStatus());
         }
         auto parsedRequest = std::move(swParsedRequest.getValue());
 
@@ -113,7 +114,7 @@ public:
 
         auto validationStatus = parsedRequest.validate(rsConfig.isLocalHostAllowed());
         if (!validationStatus.isOK()) {
-            return appendCommandStatus(result, validationStatus);
+            return CommandHelpers::appendCommandStatus(result, validationStatus);
         }
 
         uassert(ErrorCodes::InvalidOptions,
@@ -136,7 +137,7 @@ public:
         if (!addShardResult.isOK()) {
             log() << "addShard request '" << parsedRequest << "'"
                   << "failed" << causedBy(addShardResult.getStatus());
-            return appendCommandStatus(result, addShardResult.getStatus());
+            return CommandHelpers::appendCommandStatus(result, addShardResult.getStatus());
         }
 
         result << "shardAdded" << addShardResult.getValue();

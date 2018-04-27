@@ -131,9 +131,17 @@ public:
         repl::ReadConcernLevel readConcernLevel) = 0;
 
     /**
+     * Retrieves all databases in a cluster.
+     *
+     * Returns a !OK status if an error occurs.
+     */
+    virtual StatusWith<repl::OpTimeWith<std::vector<DatabaseType>>> getAllDBs(
+        OperationContext* opCtx, repl::ReadConcernLevel readConcern) = 0;
+
+    /**
      * Retrieves the metadata for a given collection, if it exists.
      *
-     * @param collectionNs fully qualified name of the collection (case sensitive)
+     * @param nss fully qualified name of the collection (case sensitive)
      *
      * Returns Status::OK along with the collection information and the OpTime of the config server
      * which the collection information was based upon. Otherwise, returns an error code indicating
@@ -142,7 +150,7 @@ public:
      */
     virtual StatusWith<repl::OpTimeWith<CollectionType>> getCollection(
         OperationContext* opCtx,
-        const std::string& collNs,
+        const NamespaceString& nss,
         repl::ReadConcernLevel readConcernLevel = repl::ReadConcernLevel::kMajorityReadConcern) = 0;
 
     /**
@@ -156,21 +164,21 @@ public:
      *
      * Returns the set of collections, or a !OK status if an error occurs.
      */
-    virtual StatusWith<std::vector<CollectionType>> getCollections(OperationContext* opCtx,
-                                                                   const std::string* dbName,
-                                                                   repl::OpTime* optime) = 0;
+    virtual StatusWith<std::vector<CollectionType>> getCollections(
+        OperationContext* opCtx,
+        const std::string* dbName,
+        repl::OpTime* optime,
+        repl::ReadConcernLevel readConcernLevel = repl::ReadConcernLevel::kMajorityReadConcern) = 0;
 
     /**
-     * Drops the specified collection from the collection metadata store.
+     * Returns the set of collections for the specified database, which have been marked as sharded.
+     * Goes directly to the config server's metadata, without checking the local cache so it should
+     * not be used in frequently called code paths.
      *
-     * Returns Status::OK if successful or any error code indicating the failure. These are
-     * some of the known failures:
-     *  - NamespaceNotFound - collection does not exist
+     * Throws exception on errors.
      */
-    virtual Status dropCollection(
-        OperationContext* opCtx,
-        const NamespaceString& ns,
-        repl::ReadConcernLevel readConcernLevel = repl::ReadConcernLevel::kMajorityReadConcern) = 0;
+    virtual std::vector<NamespaceString> getAllShardedCollectionsForDb(
+        OperationContext* opCtx, StringData dbName, repl::ReadConcernLevel readConcern) = 0;
 
     /**
      * Retrieves all databases for a shard.
@@ -205,8 +213,8 @@ public:
      *
      * Returns a !OK status if an error occurs.
      */
-    virtual StatusWith<std::vector<TagsType>> getTagsForCollection(
-        OperationContext* opCtx, const std::string& collectionNs) = 0;
+    virtual StatusWith<std::vector<TagsType>> getTagsForCollection(OperationContext* opCtx,
+                                                                   const NamespaceString& nss) = 0;
 
     /**
      * Retrieves all shards in this sharded cluster.
@@ -260,7 +268,7 @@ public:
     virtual Status applyChunkOpsDeprecated(OperationContext* opCtx,
                                            const BSONArray& updateOps,
                                            const BSONArray& preCondition,
-                                           const std::string& nss,
+                                           const NamespaceString& nss,
                                            const ChunkVersion& lastChunkVersion,
                                            const WriteConcernOptions& writeConcern,
                                            repl::ReadConcernLevel readConcern) = 0;
@@ -331,7 +339,7 @@ public:
      * NOTE: Should not be used in new code outside the ShardingCatalogManager.
      */
     virtual Status insertConfigDocument(OperationContext* opCtx,
-                                        const std::string& ns,
+                                        const NamespaceString& nss,
                                         const BSONObj& doc,
                                         const WriteConcernOptions& writeConcern) = 0;
 
@@ -350,7 +358,7 @@ public:
      * NOTE: Should not be used in new code outside the ShardingCatalogManager.
      */
     virtual StatusWith<bool> updateConfigDocument(OperationContext* opCtx,
-                                                  const std::string& ns,
+                                                  const NamespaceString& nss,
                                                   const BSONObj& query,
                                                   const BSONObj& update,
                                                   bool upsert,
@@ -363,7 +371,7 @@ public:
      * NOTE: Should not be used in new code outside the ShardingCatalogManager.
      */
     virtual Status removeConfigDocuments(OperationContext* opCtx,
-                                         const std::string& ns,
+                                         const NamespaceString& nss,
                                          const BSONObj& query,
                                          const WriteConcernOptions& writeConcern) = 0;
 

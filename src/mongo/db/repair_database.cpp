@@ -51,7 +51,7 @@
 #include "mongo/db/catalog/uuid_catalog.h"
 #include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/repl/replication_coordinator.h"
-#include "mongo/db/storage/mmap_v1/mmap_v1_engine.h"
+#include "mongo/db/storage/mmap_v1/repair_database_interface.h"
 #include "mongo/db/storage/storage_engine.h"
 #include "mongo/util/log.h"
 #include "mongo/util/scopeguard.h"
@@ -248,9 +248,10 @@ Status repairDatabase(OperationContext* opCtx,
     opCtx->checkForInterrupt();
 
     if (engine->isMmapV1()) {
-        // MMAPv1 is a layering violation so it implements its own repairDatabase.
-        auto status = static_cast<MMAPV1Engine*>(engine)->repairDatabase(
-            opCtx, dbName, preserveClonedFilesOnFailure, backupOriginalFiles);
+        // MMAPv1 is a layering violation so it implements its own repairDatabase. Call through a
+        // shimmed interface, so the symbol can exist independent of mmapv1.
+        auto status = repairDatabaseMmapv1(
+            engine, opCtx, dbName, preserveClonedFilesOnFailure, backupOriginalFiles);
         // Restore oplog Collection pointer cache.
         repl::acquireOplogCollectionForLogging(opCtx);
         return status;
@@ -268,6 +269,9 @@ Status repairDatabase(OperationContext* opCtx,
     dbHolder().close(opCtx, dbName, "database closed for repair");
     ON_BLOCK_EXIT([&dbName, &opCtx] {
         try {
+            // Ensure that we don't trigger an exception when attempting to take locks.
+            UninterruptibleLockGuard noInterrupt(opCtx->lockState());
+
             // Open the db after everything finishes.
             auto db = dbHolder().openDb(opCtx, dbName);
 
@@ -275,7 +279,7 @@ Status repairDatabase(OperationContext* opCtx,
             // using majority readConcern level can only use the collections after their repaired
             // versions are in the committed view.
             auto replCoord = repl::ReplicationCoordinator::get(opCtx);
-            auto snapshotName = replCoord->reserveSnapshotName(opCtx);
+            auto snapshotName = replCoord->getMinimumVisibleSnapshot(opCtx);
 
             for (auto&& collection : *db) {
                 collection->setMinimumVisibleSnapshot(snapshotName);

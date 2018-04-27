@@ -49,13 +49,13 @@ public:
         return false;
     }
 
-    virtual bool slaveOk() const {
-        return true;
+    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
+        return AllowedOnSecondary::kAlways;
     }
 
     virtual void addRequiredPrivileges(const std::string& dbname,
                                        const BSONObj& cmdObj,
-                                       std::vector<Privilege>* out) {
+                                       std::vector<Privilege>* out) const {
         // No auth required
     }
 
@@ -75,7 +75,8 @@ public:
             BSONObj res;
 
             // Don't care about result from shards.
-            conn->runCommand(dbname, filterCommandRequestForPassthrough(cmdObj), res);
+            conn->runCommand(
+                dbname, CommandHelpers::filterCommandRequestForPassthrough(cmdObj), res);
             conn.done();
         }
 

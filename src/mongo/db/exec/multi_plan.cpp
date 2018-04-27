@@ -77,8 +77,10 @@ MultiPlanStage::MultiPlanStage(OperationContext* opCtx,
     invariant(_collection);
 }
 
-void MultiPlanStage::addPlan(QuerySolution* solution, PlanStage* root, WorkingSet* ws) {
-    _candidates.push_back(CandidatePlan(solution, root, ws));
+void MultiPlanStage::addPlan(std::unique_ptr<QuerySolution> solution,
+                             PlanStage* root,
+                             WorkingSet* ws) {
+    _candidates.push_back(CandidatePlan(std::move(solution), root, ws));
     _children.emplace_back(root);
 }
 
@@ -149,8 +151,8 @@ Status MultiPlanStage::tryYield(PlanYieldPolicy* yieldPolicy) {
     //   2) some stage requested a yield due to a document fetch, or
     //   3) we need to yield and retry due to a WriteConflictException.
     // In all cases, the actual yielding happens here.
-    if (yieldPolicy->shouldYield()) {
-        auto yieldStatus = yieldPolicy->yield(_fetcher.get());
+    if (yieldPolicy->shouldYieldOrInterrupt()) {
+        auto yieldStatus = yieldPolicy->yieldOrInterrupt(_fetcher.get());
 
         if (!yieldStatus.isOK()) {
             _failure = true;

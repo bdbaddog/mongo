@@ -34,7 +34,6 @@
 #include "mongo/bson/mutable/algorithm.h"
 #include "mongo/bson/mutable/document.h"
 #include "mongo/db/bson/dotted_path_support.h"
-#include "mongo/db/commands/feature_compatibility_version_command_parser.h"
 #include "mongo/db/field_ref.h"
 #include "mongo/db/matcher/expression_leaf.h"
 #include "mongo/db/matcher/extensions_callback_noop.h"
@@ -69,7 +68,7 @@ StatusWith<UpdateSemantics> updateSemanticsFromElement(BSONElement element) {
 
     // As of 3.7, we only support one version of the update language.
     if (updateSemantics != static_cast<int>(UpdateSemantics::kUpdateNode)) {
-        return {ErrorCodes::Error(50659),
+        return {ErrorCodes::Error(40682),
                 str::stream() << "Unrecognized value for '$v' (UpdateSemantics) field: "
                               << updateSemantics};
     }
@@ -286,7 +285,7 @@ Status UpdateDriver::update(StringData matchedField,
         //
         // We also don't need to specify the semantics for a full document replacement (and there
         // would be no place to put a "$v" field in the update document).
-        invariantOK(logBuilder.setUpdateSemantics(UpdateSemantics::kUpdateNode));
+        invariant(logBuilder.setUpdateSemantics(UpdateSemantics::kUpdateNode));
     }
 
     if (_logOp && logOpRec)

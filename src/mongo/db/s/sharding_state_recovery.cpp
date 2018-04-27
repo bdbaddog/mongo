@@ -35,7 +35,8 @@
 #include "mongo/bson/bsonobj.h"
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/bson/util/bson_extract.h"
-#include "mongo/db/catalog/catalog_raii.h"
+#include "mongo/client/connection_string.h"
+#include "mongo/db/catalog_raii.h"
 #include "mongo/db/dbhelpers.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_context.h"
@@ -59,6 +60,8 @@ namespace {
 const char kRecoveryDocumentId[] = "minOpTimeRecovery";
 const char kMinOpTime[] = "minOpTime";
 const char kMinOpTimeUpdaters[] = "minOpTimeUpdaters";
+const char kConfigsvrConnString[] = "configsvrConnectionString";  // TODO SERVER-34166: Remove.
+const char kShardName[] = "shardName";                            // TODO SERVER-34166: Remove.
 
 const WriteConcernOptions kMajorityWriteConcern(WriteConcernOptions::kMajority,
                                                 WriteConcernOptions::SyncMode::UNSET,
@@ -89,11 +92,16 @@ public:
         return recDoc;
     }
 
-    static BSONObj createChangeObj(repl::OpTime minOpTime, ChangeType change) {
+    static BSONObj createChangeObj(ConnectionString configsvr,
+                                   std::string shardName,
+                                   repl::OpTime minOpTime,
+                                   ChangeType change) {
         BSONObjBuilder cmdBuilder;
 
         {
             BSONObjBuilder setBuilder(cmdBuilder.subobjStart("$set"));
+            setBuilder.append(kConfigsvrConnString, configsvr.toString());
+            setBuilder.append(kShardName, shardName);
             minOpTime.append(&setBuilder, kMinOpTime);
         }
 
@@ -147,7 +155,15 @@ Status modifyRecoveryDocument(OperationContext* opCtx,
         autoGetOrCreateDb.emplace(
             opCtx, NamespaceString::kServerConfigurationNamespace.db(), MODE_X);
 
-        BSONObj updateObj = RecoveryDocument::createChangeObj(grid.configOpTime(), change);
+        // The config server connection string and shard name are no longer parsed in 4.0, but 3.6
+        // nodes still expect to find them, so we must include them until after 4.0 ships.
+        //
+        // TODO SERVER-34166: Stop writing config server connection string and shard name.
+        BSONObj updateObj = RecoveryDocument::createChangeObj(
+            Grid::get(opCtx)->shardRegistry()->getConfigServerConnectionString(),
+            ShardingState::get(opCtx)->getShardName(),
+            Grid::get(opCtx)->configOpTime(),
+            change);
 
         LOG(1) << "Changing sharding recovery document " << redact(updateObj);
 
@@ -225,12 +241,13 @@ Status ShardingStateRecovery::recover(OperationContext* opCtx) {
 
     log() << "Sharding state recovery process found document " << redact(recoveryDoc.toBSON());
 
+    Grid* const grid = Grid::get(opCtx);
     ShardingState* const shardingState = ShardingState::get(opCtx);
     invariant(shardingState->enabled());
 
     if (!recoveryDoc.getMinOpTimeUpdaters()) {
         // Treat the minOpTime as up-to-date
-        grid.advanceConfigOpTime(recoveryDoc.getMinOpTime());
+        grid->advanceConfigOpTime(recoveryDoc.getMinOpTime());
         return Status::OK();
     }
 
@@ -240,16 +257,16 @@ Status ShardingStateRecovery::recover(OperationContext* opCtx) {
              "to retrieve the most recent opTime.";
 
     // Need to fetch the latest uptime from the config server, so do a logging write
-    Status status = Grid::get(opCtx)->catalogClient()->logChange(
-        opCtx,
-        "Sharding minOpTime recovery",
-        NamespaceString::kServerConfigurationNamespace.ns(),
-        recoveryDocBSON,
-        ShardingCatalogClient::kMajorityWriteConcern);
+    Status status =
+        grid->catalogClient()->logChange(opCtx,
+                                         "Sharding minOpTime recovery",
+                                         NamespaceString::kServerConfigurationNamespace.ns(),
+                                         recoveryDocBSON,
+                                         ShardingCatalogClient::kMajorityWriteConcern);
     if (!status.isOK())
         return status;
 
-    log() << "Sharding state recovered. New config server opTime is " << grid.configOpTime();
+    log() << "Sharding state recovered. New config server opTime is " << grid->configOpTime();
 
     // Finally, clear the recovery document so next time we don't need to recover
     status = modifyRecoveryDocument(opCtx, RecoveryDocument::Clear, kLocalWriteConcern);

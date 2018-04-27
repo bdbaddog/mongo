@@ -8,9 +8,18 @@
 // Checking UUID consistency involves talking to the shard primaries, but by the end of this test,
 // one shard does not have a primary.
 TestData.skipCheckingUUIDsConsistentAcrossCluster = true;
+TestData.skipCheckDBHashes = true;
 
 (function() {
-    'use strict';
+    "use strict";
+
+    // Skip this test if running with the "wiredTiger" storage engine, since it requires
+    // using 'nojournal' in a replica set, which is not supported when using WT.
+    if (!jsTest.options().storageEngine || jsTest.options().storageEngine === "wiredTiger") {
+        // WT is currently the default engine so it is used when 'storageEngine' is not set.
+        jsTest.log("Skipping test because it is not applicable for the wiredTiger storage engine");
+        return;
+    }
 
     // Options for a cluster with two replica set shards, the first with two nodes the second with
     // one
@@ -136,5 +145,4 @@ TestData.skipCheckingUUIDsConsistentAcrossCluster = true;
     assert.eq(coll.count({_id: 1}), 1);
 
     st.stop();
-
 })();

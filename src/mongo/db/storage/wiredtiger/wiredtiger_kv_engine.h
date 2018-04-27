@@ -56,6 +56,7 @@ class WiredTigerSizeStorer;
 
 class WiredTigerKVEngine final : public KVEngine {
 public:
+    static const int kDefaultJournalDelayMillis;
     WiredTigerKVEngine(const std::string& canonicalName,
                        const std::string& path,
                        ClockSource* cs,
@@ -169,11 +170,26 @@ public:
 
     /**
      * This method will force the oldest timestamp to the input value. Callers must be serialized
-     * along with `_advanceOldestTimestamp`
+     * along with `setStableTimestamp`
      */
     void setOldestTimestamp(Timestamp oldestTimestamp);
 
     virtual bool supportsRecoverToStableTimestamp() const override;
+
+    virtual StatusWith<Timestamp> recoverToStableTimestamp(OperationContext* opCtx) override;
+
+    virtual boost::optional<Timestamp> getRecoveryTimestamp() const override;
+
+    /**
+     * Returns a timestamp value that is at or before the last checkpoint. Everything before this
+     * value is guaranteed to be persisted on disk and replication recovery will not need to
+     * replay documents with an earlier time.
+     */
+    virtual boost::optional<Timestamp> getLastStableCheckpointTimestamp() const override;
+
+    virtual Timestamp getAllCommittedTimestamp(OperationContext* opCtx) const override;
+
+    bool supportsReadConcernSnapshot() const final;
 
     // wiredtiger specific
     // Calls WT_CONNECTION::reconfigure on the underlying WT_CONNECTION
@@ -234,7 +250,7 @@ public:
     /**
      * Initializes a background job to remove excess documents in the oplog collections.
      * This applies to the capped collections in the local.oplog.* namespaces (specifically
-     * local.oplog.rs for replica sets and local.oplog.$main for master/slave replication).
+     * local.oplog.rs for replica sets).
      * Returns true if a background job is running for the namespace.
      */
     static bool initRsOplogBackgroundThread(StringData ns);
@@ -252,22 +268,17 @@ private:
 
     std::string _uri(StringData ident) const;
 
-    // Not threadsafe; callers must be serialized along with `setOldestTimestamp`.
-    void _advanceOldestTimestamp(Timestamp oldestTimestamp);
-    Timestamp _previousSetOldestTimestamp;
+    void _setOldestTimestamp(Timestamp oldestTimestamp, bool force = false);
 
     WT_CONNECTION* _conn;
     WT_EVENT_HANDLER _eventHandler;
     std::unique_ptr<WiredTigerSessionCache> _sessionCache;
     ClockSource* const _clockSource;
 
-    // Mutex to protect use of _oplogManager and _oplogManagerCount by this instance of KV
-    // engine.
-    // Uses of _oplogManager by the oplog record stores themselves are safe without locking, since
-    // those record stores manage the oplogManager lifetime.
+    // Mutex to protect use of _oplogManagerCount by this instance of KV engine.
     mutable stdx::mutex _oplogManagerMutex;
-    std::unique_ptr<WiredTigerOplogManager> _oplogManager;
     std::size_t _oplogManagerCount = 0;
+    std::unique_ptr<WiredTigerOplogManager> _oplogManager;
 
     std::string _canonicalName;
     std::string _path;
@@ -293,5 +304,6 @@ private:
     mutable Date_t _previousCheckedDropsQueued;
 
     std::unique_ptr<WiredTigerSession> _backupSession;
+    Timestamp _recoveryTimestamp;
 };
 }

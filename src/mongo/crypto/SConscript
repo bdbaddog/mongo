@@ -23,7 +23,7 @@ env.Library('sha256_block',
     ])
 
 if "tom" in env["MONGO_CRYPTO"]:
-    tomEnv = env.Clone();
+    tomEnv = env.Clone()
     tomEnv.InjectThirdPartyIncludePaths(libraries=['tomcrypt'])
     tomEnv.Append(
         CPPDEFINES=[
@@ -46,23 +46,16 @@ if "tom" in env["MONGO_CRYPTO"]:
         ]
     )
 
-env.Library('sha_block_openssl',
-    source=[
-        'sha_block_openssl.cpp'
-    ],
-    LIBDEPS=[
-        '$BUILD_DIR/mongo/base',
-        'sha1_block',
-        'sha256_block',
-    ])
-
-env.Library('scramauth',
-            ['mechanism_scram.cpp'],
-            LIBDEPS=['$BUILD_DIR/mongo/base',
-                     '$BUILD_DIR/mongo/base/secure_allocator',
-                     '$BUILD_DIR/mongo/util/secure_compare_memory',
-                     '$BUILD_DIR/mongo/util/secure_zero_memory',
-                     'sha_block_${MONGO_CRYPTO}'])
+else:
+    env.Library('sha_block_${MONGO_CRYPTO}',
+        source=[
+            'sha_block_${MONGO_CRYPTO}.cpp'
+        ],
+        LIBDEPS=[
+            '$BUILD_DIR/mongo/base',
+            'sha1_block',
+            'sha256_block',
+        ])
 
 env.CppUnitTest('sha1_block_test',
                 ['sha1_block_test.cpp'],
@@ -71,3 +64,11 @@ env.CppUnitTest('sha1_block_test',
 env.CppUnitTest('sha256_block_test',
                 ['sha256_block_test.cpp'],
                 LIBDEPS=['sha_block_${MONGO_CRYPTO}'])
+
+env.CppUnitTest('mechanism_scram_test',
+                ['mechanism_scram_test.cpp'],
+                LIBDEPS_PRIVATE=[
+                    '$BUILD_DIR/mongo/base',
+                    '$BUILD_DIR/mongo/base/secure_allocator',
+                    'sha_block_${MONGO_CRYPTO}',
+                ])

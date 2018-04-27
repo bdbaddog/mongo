@@ -96,6 +96,9 @@ env.Library(
         'connection_pool_stats',
         'remote_command',
     ],
+    LIBDEPS_PRIVATE=[
+        'egress_tag_closer_manager',
+    ],
 )
 
 env.CppUnitTest(
@@ -106,6 +109,9 @@ env.CppUnitTest(
     ],
     LIBDEPS=[
         'connection_pool_executor',
+    ],
+    LIBDEPS_PRIVATE=[
+        'egress_tag_closer_manager',
     ],
 )
 
@@ -142,6 +148,32 @@ env.Library(target='network_test_env',
                 'task_executor_interface',
             ])
 
+env.Library(target='egress_tag_closer_manager',
+            source=[
+                'egress_tag_closer_manager.cpp',
+            ],
+            LIBDEPS_PRIVATE=[
+                '$BUILD_DIR/mongo/db/service_context',
+            ])
+
+env.Library(
+    target='network_interface_tl',
+    source=[
+        'connection_pool_tl.cpp',
+        'network_interface_tl.cpp',
+    ],
+    LIBDEPS=[
+        '$BUILD_DIR/mongo/client/async_client',
+        '$BUILD_DIR/mongo/transport/transport_layer',
+    ],
+    LIBDEPS_PRIVATE=[
+        '$BUILD_DIR/mongo/db/auth/authcommon',
+        '$BUILD_DIR/mongo/transport/transport_layer_manager',
+        'connection_pool_executor',
+        'network_interface',
+    ]
+)
+
 env.Library(
     target='network_interface_asio',
     source=[
@@ -157,17 +189,22 @@ env.Library(
         '$BUILD_DIR/mongo/base/system_error',
         '$BUILD_DIR/mongo/client/client_query',
         '$BUILD_DIR/mongo/db/auth/authcommon',
-        '$BUILD_DIR/mongo/db/commands/test_commands_enabled',
         '$BUILD_DIR/mongo/db/wire_version',
         '$BUILD_DIR/mongo/rpc/command_status',
         '$BUILD_DIR/mongo/rpc/rpc',
+        '$BUILD_DIR/mongo/transport/message_compressor',
         '$BUILD_DIR/third_party/shim_asio',
         'async_stream',
         'async_timer_asio',
         'connection_pool_executor',
+        'egress_tag_closer_manager',
         'network_interface',
         'task_executor_interface',
-    ])
+    ],
+    LIBDEPS_PRIVATE=[
+        '$BUILD_DIR/mongo/db/commands/test_commands_enabled',
+    ],
+)
 
 env.Library(
     target='async_stream',
@@ -181,6 +218,7 @@ env.Library(
     LIBDEPS=[
         '$BUILD_DIR/mongo/base/system_error',
         '$BUILD_DIR/mongo/client/authentication',
+        '$BUILD_DIR/mongo/util/net/ssl_stream',
         '$BUILD_DIR/third_party/shim_asio',
         'task_executor_interface',
     ]
@@ -264,6 +302,10 @@ env.Library(
     LIBDEPS=[
         'network_interface',
         'network_interface_asio',
+        'network_interface_tl',
+    ],
+    LIBDEPS_PRIVATE=[
+        'egress_tag_closer_manager',
     ])
 
 env.Library(

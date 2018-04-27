@@ -1,5 +1,3 @@
-// @file oplog.cpp
-
 /**
 *    Copyright (C) 2008-2014 MongoDB Inc.
 *
@@ -50,6 +48,7 @@
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/collection_catalog_entry.h"
 #include "mongo/db/catalog/create_collection.h"
+#include "mongo/db/catalog/database_holder.h"
 #include "mongo/db/catalog/drop_collection.h"
 #include "mongo/db/catalog/drop_database.h"
 #include "mongo/db/catalog/drop_indexes.h"
@@ -57,7 +56,7 @@
 #include "mongo/db/catalog/uuid_catalog.h"
 #include "mongo/db/client.h"
 #include "mongo/db/commands.h"
-#include "mongo/db/commands/feature_compatibility_version.h"
+#include "mongo/db/commands/feature_compatibility_version_parser.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/dbdirectclient.h"
@@ -79,10 +78,9 @@
 #include "mongo/db/repl/oplogreader.h"
 #include "mongo/db/repl/optime.h"
 #include "mongo/db/repl/repl_client_info.h"
-#include "mongo/db/repl/replication_coordinator_global.h"
+#include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/repl/sync_tail.h"
 #include "mongo/db/repl/timestamp_block.h"
-#include "mongo/db/server_options.h"
 #include "mongo/db/server_parameters.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/session_catalog.h"
@@ -112,8 +110,6 @@ using std::vector;
 using IndexVersion = IndexDescriptor::IndexVersion;
 
 namespace repl {
-std::string masterSlaveOplogName = "local.oplog.$main";
-
 namespace {
 /**
  * The `_localOplogCollection` pointer is always valid (or null) because an
@@ -121,11 +117,6 @@ namespace {
  * the Collection instance is destroyed. See `oplogCheckCloseDatabase`.
  */
 Collection* _localOplogCollection = nullptr;
-
-// Specifies whether we abort initial sync when attempting to apply a renameCollection operation.
-// If set to true, users risk corrupting their data. This should only be enabled by expert users
-// of the server who understand the risks this poses.
-MONGO_EXPORT_SERVER_PARAMETER(allowUnsafeRenamesDuringInitialSync, bool, false);
 
 PseudoRandom hashGenerator(std::unique_ptr<SecureRandom>(SecureRandom::create())->nextInt64());
 
@@ -148,7 +139,8 @@ void checkOplogInsert(Status result) {
 void _getNextOpTimes(OperationContext* opCtx,
                      Collection* oplog,
                      std::size_t count,
-                     OplogSlot* slotsOut) {
+                     OplogSlot* slotsOut,
+                     bool persist = true) {
     auto replCoord = ReplicationCoordinator::get(opCtx);
     long long term = OpTime::kUninitializedTerm;
 
@@ -160,22 +152,21 @@ void _getNextOpTimes(OperationContext* opCtx,
     }
 
     // Allow the storage engine to start the transaction outside the critical section.
-    opCtx->recoveryUnit()->prepareSnapshot();
+    opCtx->recoveryUnit()->preallocateSnapshot();
     stdx::lock_guard<stdx::mutex> lk(newOpMutex);
 
     auto ts = LogicalClock::get(opCtx)->reserveTicks(count).asTimestamp();
     lastSetTimestamp = ts;
     newTimestampNotifier.notify_all();
+    const bool orderedCommit = false;
 
-    fassert(28560, oplog->getRecordStore()->oplogDiskLocRegister(opCtx, ts));
+    if (persist) {
+        fassert(28560, oplog->getRecordStore()->oplogDiskLocRegister(opCtx, ts, orderedCommit));
+    }
 
-    // Set hash if we're in replset mode, otherwise it remains 0 in master/slave.
-    const bool needHash = (replCoord->getReplicationMode() == ReplicationCoordinator::modeReplSet);
     for (std::size_t i = 0; i < count; i++) {
         slotsOut[i].opTime = {Timestamp(ts.asULL() + i), term};
-        if (needHash) {
-            slotsOut[i].hash = hashGenerator.nextInt64();
-        }
+        slotsOut[i].hash = hashGenerator.nextInt64();
     }
 }
 
@@ -219,26 +210,22 @@ private:
 
 }  // namespace
 
-void setOplogCollectionName() {
-    switch (getGlobalReplicationCoordinator()->getReplicationMode()) {
+void setOplogCollectionName(ServiceContext* service) {
+    switch (ReplicationCoordinator::get(service)->getReplicationMode()) {
         case ReplicationCoordinator::modeReplSet:
             _oplogCollectionName = NamespaceString::kRsOplogNamespace.ns();
-            break;
-        case ReplicationCoordinator::modeMasterSlave:
-            _oplogCollectionName = masterSlaveOplogName;
             break;
         case ReplicationCoordinator::modeNone:
             // leave empty.
             break;
-        default:
-            MONGO_UNREACHABLE;
     }
 }
 
 void createIndexForApplyOps(OperationContext* opCtx,
                             const BSONObj& indexSpec,
                             const NamespaceString& indexNss,
-                            IncrementOpsAppliedStatsFn incrementOpsAppliedStats) {
+                            IncrementOpsAppliedStatsFn incrementOpsAppliedStats,
+                            OplogApplication::Mode mode) {
     // Check if collection exists.
     Database* db = dbHolder().get(opCtx, indexNss.ns());
     auto indexCollection = db ? db->getCollection(opCtx, indexNss) : nullptr;
@@ -252,21 +239,31 @@ void createIndexForApplyOps(OperationContext* opCtx,
     bool relaxIndexConstraints =
         ReplicationCoordinator::get(opCtx)->shouldRelaxIndexConstraints(opCtx, indexNss);
     if (indexSpec["background"].trueValue()) {
-        Lock::TempRelease release(opCtx->lockState());
-        if (opCtx->lockState()->isLocked()) {
-            // If TempRelease fails, background index build will deadlock.
+        if (mode == OplogApplication::Mode::kRecovering) {
             LOG(3) << "apply op: building background index " << indexSpec
-                   << " in the foreground because temp release failed";
+                   << " in the foreground because the node is in recovery";
             IndexBuilder builder(indexSpec, relaxIndexConstraints);
             Status status = builder.buildInForeground(opCtx, db);
             uassertStatusOK(status);
         } else {
-            IndexBuilder* builder = new IndexBuilder(indexSpec, relaxIndexConstraints);
-            // This spawns a new thread and returns immediately.
-            builder->go();
-            // Wait for thread to start and register itself
-            IndexBuilder::waitForBgIndexStarting();
+            Lock::TempRelease release(opCtx->lockState());
+            if (opCtx->lockState()->isLocked()) {
+                // If TempRelease fails, background index build will deadlock.
+                LOG(3) << "apply op: building background index " << indexSpec
+                       << " in the foreground because temp release failed";
+                IndexBuilder builder(indexSpec, relaxIndexConstraints);
+                Status status = builder.buildInForeground(opCtx, db);
+                uassertStatusOK(status);
+            } else {
+                IndexBuilder* builder = new IndexBuilder(
+                    indexSpec, relaxIndexConstraints, opCtx->recoveryUnit()->getCommitTimestamp());
+                // This spawns a new thread and returns immediately.
+                builder->go();
+                // Wait for thread to start and register itself
+                IndexBuilder::waitForBgIndexStarting();
+            }
         }
+
         opCtx->recoveryUnit()->abandonSnapshot();
     } else {
         IndexBuilder builder(indexSpec, relaxIndexConstraints);
@@ -338,9 +335,7 @@ OplogDocWriter _logOpWriter(OperationContext* opCtx,
     b.append("v", OplogEntry::kOplogVersion);
     b.append("op", opstr);
     b.append("ns", nss.ns());
-    if (uuid &&
-        ReplicationCoordinator::get(opCtx)->getReplicationMode() !=
-            ReplicationCoordinator::modeMasterSlave)
+    if (uuid)
         uuid->appendToBuilder(&b, "ui");
 
     if (fromMigrate)
@@ -367,7 +362,6 @@ OplogDocWriter _logOpWriter(OperationContext* opCtx,
     "u" update
     "d" delete
     "c" db cmd
-    "db" declares presence of a database (ns is set to the db name + '.') (master/slave only)
     "n" no op
 */
 
@@ -376,8 +370,7 @@ OplogDocWriter _logOpWriter(OperationContext* opCtx,
  * writers - an array with size nDocs of DocWriter objects.
  * timestamps - an array with size nDocs of respective Timestamp objects for each DocWriter.
  * oplogCollection - collection to be written to.
- * replicationMode - ReplSet or MasterSlave.
- * finalOpTime - the OpTime of the last DocWriter object.
+  * finalOpTime - the OpTime of the last DocWriter object.
  */
 void _logOpsInner(OperationContext* opCtx,
                   const NamespaceString& nss,
@@ -399,9 +392,29 @@ void _logOpsInner(OperationContext* opCtx,
 
     // Set replCoord last optime only after we're sure the WUOW didn't abort and roll back.
     opCtx->recoveryUnit()->onCommit([opCtx, replCoord, finalOpTime] {
+
+        auto lastAppliedTimestamp = finalOpTime.getTimestamp();
+        const auto storageEngine = opCtx->getServiceContext()->getGlobalStorageEngine();
+        if (storageEngine->supportsDocLocking()) {
+            // If the storage engine supports document level locking, then it is possible for
+            // oplog writes to commit out of order. In that case, we only want to set our last
+            // applied optime to the all committed timestamp to ensure that all operations earlier
+            // than the last applied optime have been storage-committed. We are guaranteed that
+            // whatever operation occurred at the all committed timestamp occurred during the same
+            // term as 'finalOpTime'. When a primary enters a new term, it first commits a
+            // 'new primary' oplog entry in the new term before accepting any new writes. This
+            // will ensure that the all committed timestamp is in the new term before any client
+            // writes are committed.
+            lastAppliedTimestamp = storageEngine->getAllCommittedTimestamp(opCtx);
+        }
+
         // Optimes on the primary should always represent consistent database states.
         replCoord->setMyLastAppliedOpTimeForward(
-            finalOpTime, ReplicationCoordinator::DataConsistency::Consistent);
+            OpTime(lastAppliedTimestamp, finalOpTime.getTerm()),
+            ReplicationCoordinator::DataConsistency::Consistent);
+
+        // We set the last op on the client to 'finalOpTime', because that contains the timestamp
+        // of the operation that the client actually performed.
         ReplClientInfo::forClient(opCtx->getClient()).setLastOp(finalOpTime);
     });
 }
@@ -421,7 +434,10 @@ OpTime logOp(OperationContext* opCtx,
     // For commands, the test below is on the command ns and therefore does not check for
     // specific namespaces such as system.profile. This is the caller's responsibility.
     if (replCoord->isOplogDisabledFor(opCtx, nss)) {
-        invariant(statementId == kUninitializedStmtId);
+        uassert(ErrorCodes::IllegalOperation,
+                str::stream() << "retryable writes is not supported for unreplicated ns: "
+                              << nss.ns(),
+                statementId == kUninitializedStmtId);
         return {};
     }
 
@@ -465,7 +481,10 @@ std::vector<OpTime> logInsertOps(OperationContext* opCtx,
 
     auto replCoord = ReplicationCoordinator::get(opCtx);
     if (replCoord->isOplogDisabledFor(opCtx, nss)) {
-        invariant(begin->stmtId == kUninitializedStmtId);
+        uassert(ErrorCodes::IllegalOperation,
+                str::stream() << "retryable writes is not supported for unreplicated ns: "
+                              << nss.ns(),
+                begin->stmtId == kUninitializedStmtId);
         return {};
     }
 
@@ -646,6 +665,14 @@ OplogSlot getNextOpTime(OperationContext* opCtx) {
     return os;
 }
 
+OplogSlot getNextOpTimeNoPersistForTesting(OperationContext* opCtx) {
+    invariant(_localOplogCollection);
+    OplogSlot os;
+    bool persist = false;  // Don't update the storage engine with the allocated OpTime.
+    _getNextOpTimes(opCtx, _localOplogCollection, 1, &os, persist);
+    return os;
+}
+
 std::vector<OplogSlot> getNextOpTimes(OperationContext* opCtx, std::size_t count) {
     // The local oplog collection pointer must already be established by this point.
     // We can't establish it here because that would require locking the local database, which would
@@ -778,7 +805,7 @@ std::map<std::string, ApplyOpMetadata> opsMap = {
           BSONObj nsObj = BSON("ns" << nss.ns());
           indexSpec = indexSpec.addField(nsObj.firstElement());
 
-          createIndexForApplyOps(opCtx, indexSpec, nss, {});
+          createIndexForApplyOps(opCtx, indexSpec, nss, {}, mode);
           return Status::OK();
       },
       {ErrorCodes::IndexAlreadyExists, ErrorCodes::NamespaceNotFound}}},
@@ -789,10 +816,10 @@ std::map<std::string, ApplyOpMetadata> opsMap = {
          BSONObj& cmd,
          const OpTime& opTime,
          OplogApplication::Mode mode) -> Status {
-          OptionalCollectionUUID uuid;
           NamespaceString nss;
-          std::tie(uuid, nss) = parseCollModUUIDAndNss(opCtx, ui, ns, cmd);
-          return collModForUUIDUpgrade(opCtx, nss, cmd, uuid);
+          BSONObjBuilder resultWeDontCareAbout;
+          std::tie(std::ignore, nss) = parseCollModUUIDAndNss(opCtx, ui, ns, cmd);
+          return collMod(opCtx, nss, cmd, &resultWeDontCareAbout);
       },
       {ErrorCodes::IndexNotFound, ErrorCodes::NamespaceNotFound}}},
     {"dbCheck", {dbCheckOplogCommand, {}}},
@@ -891,10 +918,9 @@ std::map<std::string, ApplyOpMetadata> opsMap = {
          BSONObj& cmd,
          const OpTime& opTime,
          OplogApplication::Mode mode) -> Status {
-          BSONObjBuilder resultWeDontCareAbout;
-          return applyOps(opCtx, nsToDatabase(ns), cmd, mode, &resultWeDontCareAbout);
-      },
-      {ErrorCodes::UnknownError}}},
+         BSONObjBuilder resultWeDontCareAbout;
+         return applyOps(opCtx, nsToDatabase(ns), cmd, mode, &resultWeDontCareAbout);
+     }}},
     {"convertToCapped",
      {[](OperationContext* opCtx,
          const char* ns,
@@ -918,7 +944,6 @@ std::map<std::string, ApplyOpMetadata> opsMap = {
 }  // namespace
 
 constexpr StringData OplogApplication::kInitialSyncOplogApplicationMode;
-constexpr StringData OplogApplication::kMasterSlaveOplogApplicationMode;
 constexpr StringData OplogApplication::kRecoveringOplogApplicationMode;
 constexpr StringData OplogApplication::kSecondaryOplogApplicationMode;
 constexpr StringData OplogApplication::kApplyOpsCmdOplogApplicationMode;
@@ -927,8 +952,6 @@ StringData OplogApplication::modeToString(OplogApplication::Mode mode) {
     switch (mode) {
         case OplogApplication::Mode::kInitialSync:
             return OplogApplication::kInitialSyncOplogApplicationMode;
-        case OplogApplication::Mode::kMasterSlave:
-            return OplogApplication::kMasterSlaveOplogApplicationMode;
         case OplogApplication::Mode::kRecovering:
             return OplogApplication::kRecoveringOplogApplicationMode;
         case OplogApplication::Mode::kSecondary:
@@ -942,8 +965,6 @@ StringData OplogApplication::modeToString(OplogApplication::Mode mode) {
 StatusWith<OplogApplication::Mode> OplogApplication::parseMode(const std::string& mode) {
     if (mode == OplogApplication::kInitialSyncOplogApplicationMode) {
         return OplogApplication::Mode::kInitialSync;
-    } else if (mode == OplogApplication::kMasterSlaveOplogApplicationMode) {
-        return OplogApplication::Mode::kMasterSlave;
     } else if (mode == OplogApplication::kRecoveringOplogApplicationMode) {
         return OplogApplication::Mode::kRecovering;
     } else if (mode == OplogApplication::kSecondaryOplogApplicationMode) {
@@ -1050,34 +1071,36 @@ Status applyOperation_inlock(OperationContext* opCtx,
                 collection);
         requestNss = collection->ns();
         dassert(opCtx->lockState()->isCollectionLockedForMode(
-            requestNss.ns(), supportsDocLocking() ? MODE_IX : MODE_X));
+                    requestNss.ns(), supportsDocLocking() ? MODE_IX : MODE_X),
+                requestNss.ns());
     } else {
         uassert(ErrorCodes::InvalidNamespace,
                 "'ns' must be of type String",
                 fieldNs.type() == BSONType::String);
-        const StringData ns = fieldNs.valueStringData();
+        const StringData ns = fieldNs.valuestrsafe();
         requestNss = NamespaceString(ns);
         if (nsIsFull(ns)) {
             if (supportsDocLocking()) {
                 // WiredTiger, and others requires MODE_IX since the applier threads driving
                 // this allow writes to the same collection on any thread.
-                dassert(opCtx->lockState()->isCollectionLockedForMode(ns, MODE_IX));
+                dassert(opCtx->lockState()->isCollectionLockedForMode(ns, MODE_IX),
+                        requestNss.ns());
             } else {
                 // mmapV1 ensures that all operations to the same collection are executed from
                 // the same worker thread, so it takes an exclusive lock (MODE_X)
-                dassert(opCtx->lockState()->isCollectionLockedForMode(ns, MODE_X));
+                dassert(opCtx->lockState()->isCollectionLockedForMode(ns, MODE_X), requestNss.ns());
             }
         }
         collection = db->getCollection(opCtx, requestNss);
     }
 
-    // During upgrade from 3.4 to 3.6, the feature compatibility version cannot change during
-    // initial sync because we cannot do some operations with UUIDs and others without.
+    // The feature compatibility version in the server configuration collection must not change
+    // during initial sync.
     if ((mode == OplogApplication::Mode::kInitialSync) &&
-        requestNss == FeatureCompatibilityVersion::kCollection) {
+        requestNss == NamespaceString::kServerConfigurationNamespace) {
         std::string oID;
         auto status = bsonExtractStringField(o, "_id", &oID);
-        if (status.isOK() && oID == FeatureCompatibilityVersion::kParameterName) {
+        if (status.isOK() && oID == FeatureCompatibilityVersionParser::kParameterName) {
             return Status(ErrorCodes::OplogOperationUnsupported,
                           str::stream() << "Applying operation on feature compatibility version "
                                            "document not supported in initial sync: "
@@ -1121,7 +1144,7 @@ Status applyOperation_inlock(OperationContext* opCtx,
     //    the individual operations will not contain a `ts` field. The caller is responsible for
     //    setting the timestamp before committing. Assigning a competing timestamp in this
     //    codepath would break that atomicity. Sharding is a consumer of this use-case.
-    const bool assignOperationTimestamp = [opCtx, haveWrappingWriteUnitOfWork] {
+    const bool assignOperationTimestamp = [opCtx, haveWrappingWriteUnitOfWork, mode] {
         const auto replMode = ReplicationCoordinator::get(opCtx)->getReplicationMode();
         if (opCtx->writesAreReplicated()) {
             // We do not assign timestamps on replicated writes since they will get their oplog
@@ -1140,12 +1163,9 @@ Status applyOperation_inlock(OperationContext* opCtx,
                     break;
                 }
                 case ReplicationCoordinator::modeNone: {
-                    // We do not assign timestamps on standalones.
-                    return false;
-                }
-                case ReplicationCoordinator::modeMasterSlave: {
-                    // Master-slave does not support timestamps so we do not assign a timestamp.
-                    return false;
+                    // Only assign timestamps on standalones during replication recovery when
+                    // started with 'recoverFromOplogAsStandalone'.
+                    return mode == OplogApplication::Mode::kRecovering;
                 }
             }
         }
@@ -1161,7 +1181,7 @@ Status applyOperation_inlock(OperationContext* opCtx,
             NamespaceString indexNss;
             std::tie(indexSpec, indexNss) =
                 repl::prepForApplyOpsIndexInsert(fieldO, op, requestNss);
-            createIndexForApplyOps(opCtx, indexSpec, indexNss, incrementOpsAppliedStats);
+            createIndexForApplyOps(opCtx, indexSpec, indexNss, incrementOpsAppliedStats, mode);
             return Status::OK();
         }
         uassert(ErrorCodes::NamespaceNotFound,
@@ -1310,7 +1330,7 @@ Status applyOperation_inlock(OperationContext* opCtx,
                 UpdateLifecycleImpl updateLifecycle(requestNss);
                 request.setLifecycle(&updateLifecycle);
 
-                const StringData ns = fieldNs.valueStringData();
+                const StringData ns = fieldNs.valuestrsafe();
                 writeConflictRetry(opCtx, "applyOps_upsert", ns, [&] {
                     WriteUnitOfWork wuow(opCtx);
                     // If this is an atomic applyOps (i.e: `haveWrappingWriteUnitOfWork` is true),
@@ -1360,7 +1380,7 @@ Status applyOperation_inlock(OperationContext* opCtx,
             timestamp = fieldTs.timestamp();
         }
 
-        const StringData ns = fieldNs.valueStringData();
+        const StringData ns = fieldNs.valuestrsafe();
         auto status = writeConflictRetry(opCtx, "applyOps_update", ns, [&] {
             WriteUnitOfWork wuow(opCtx);
             if (timestamp != Timestamp::min()) {
@@ -1435,7 +1455,7 @@ Status applyOperation_inlock(OperationContext* opCtx,
             timestamp = fieldTs.timestamp();
         }
 
-        const StringData ns = fieldNs.valueStringData();
+        const StringData ns = fieldNs.valuestrsafe();
         writeConflictRetry(opCtx, "applyOps_delete", ns, [&] {
             WriteUnitOfWork wuow(opCtx);
             if (timestamp != Timestamp::min()) {
@@ -1443,7 +1463,8 @@ Status applyOperation_inlock(OperationContext* opCtx,
             }
 
             if (opType[1] == 0) {
-                deleteObjects(opCtx, collection, requestNss, deleteCriteria, /*justOne*/ valueB);
+                const auto justOne = true;
+                deleteObjects(opCtx, collection, requestNss, deleteCriteria, justOne);
             } else
                 verify(opType[1] == 'b');  // "db" advertisement
             wuow.commit();
@@ -1502,23 +1523,8 @@ Status applyCommand_inlock(OperationContext* opCtx,
         }
     }
 
-    // Applying renameCollection during initial sync to a collection without UUID might lead to
-    // data corruption, so we restart the initial sync.
-    if (fieldUI.eoo() && (mode == OplogApplication::Mode::kInitialSync) &&
-        o.firstElementFieldName() == std::string("renameCollection")) {
-        if (!allowUnsafeRenamesDuringInitialSync.load()) {
-            return Status(ErrorCodes::OplogOperationUnsupported,
-                          str::stream()
-                              << "Applying renameCollection not supported in initial sync: "
-                              << redact(op));
-        }
-        warning() << "allowUnsafeRenamesDuringInitialSync set to true. Applying renameCollection "
-                     "operation during initial sync even though it may lead to data corruption: "
-                  << redact(op);
-    }
-
-    // During upgrade from 3.4 to 3.6, the feature compatibility version cannot change during
-    // initial sync because we cannot do some operations with UUIDs and others without.
+    // The feature compatibility version in the server configuration collection cannot change during
+    // initial sync.
     // We do not attempt to parse the whitelisted ops because they do not have a collection
     // namespace. If we drop the 'admin' database we will also log a 'drop' oplog entry for each
     // collection dropped. 'applyOps' will try to apply each individual operation, and those
@@ -1527,7 +1533,7 @@ Status applyCommand_inlock(OperationContext* opCtx,
     if ((mode == OplogApplication::Mode::kInitialSync) &&
         (std::find(whitelistedOps.begin(), whitelistedOps.end(), o.firstElementFieldName()) ==
          whitelistedOps.end()) &&
-        parseNs(nss.ns(), o) == FeatureCompatibilityVersion::kCollection) {
+        parseNs(nss.ns(), o) == NamespaceString::kServerConfigurationNamespace) {
         return Status(ErrorCodes::OplogOperationUnsupported,
                       str::stream() << "Applying command to feature compatibility version "
                                        "collection not supported in initial sync: "
@@ -1548,7 +1554,7 @@ Status applyCommand_inlock(OperationContext* opCtx,
         }
     }
 
-    const bool assignCommandTimestamp = [opCtx] {
+    const bool assignCommandTimestamp = [opCtx, mode] {
         const auto replMode = ReplicationCoordinator::get(opCtx)->getReplicationMode();
         if (opCtx->writesAreReplicated()) {
             // We do not assign timestamps on replicated writes since they will get their oplog
@@ -1565,12 +1571,9 @@ Status applyCommand_inlock(OperationContext* opCtx,
                     return true;
                 }
                 case ReplicationCoordinator::modeNone: {
-                    // We do not assign timestamps on standalones.
-                    return false;
-                }
-                case ReplicationCoordinator::modeMasterSlave: {
-                    // Master-slave does not support timestamps so we do not assign a timestamp.
-                    return false;
+                    // Only assign timestamps on standalones during replication recovery when
+                    // started with 'recoverFromOplogAsStandalone'.
+                    return mode == OplogApplication::Mode::kRecovering;
                 }
             }
             MONGO_UNREACHABLE;
@@ -1616,7 +1619,7 @@ Status applyCommand_inlock(OperationContext* opCtx,
             case ErrorCodes::BackgroundOperationInProgressForNamespace: {
                 Lock::TempRelease release(opCtx->lockState());
 
-                Command* cmd = Command::findCommand(o.firstElement().fieldName());
+                Command* cmd = CommandHelpers::findCommand(o.firstElement().fieldName());
                 invariant(cmd);
                 BackgroundOperation::awaitNoBgOpInProgForNs(cmd->parseNs(nss.db().toString(), o));
                 opCtx->recoveryUnit()->abandonSnapshot();
@@ -1624,11 +1627,7 @@ Status applyCommand_inlock(OperationContext* opCtx,
                 break;
             }
             default:
-                if (_oplogCollectionName == masterSlaveOplogName) {
-                    error() << "Failed command " << redact(o) << " on " << nss.db()
-                            << " with status " << status << " during oplog application";
-                } else if (curOpToApply.acceptableErrors.find(status.code()) ==
-                           curOpToApply.acceptableErrors.end()) {
+                if (!curOpToApply.acceptableErrors.count(status.code())) {
                     error() << "Failed command " << redact(o) << " on " << nss.db()
                             << " with status " << status << " during oplog application";
                     return status;
@@ -1662,7 +1661,7 @@ void initTimestampFromOplog(OperationContext* opCtx, const std::string& oplogNS)
 
     if (!lastOp.isEmpty()) {
         LOG(1) << "replSet setting last Timestamp";
-        const OpTime opTime = fassertStatusOK(28696, OpTime::parseFromOplogEntry(lastOp));
+        const OpTime opTime = fassert(28696, OpTime::parseFromOplogEntry(lastOp));
         setNewTimestamp(opCtx->getServiceContext(), opTime.getTimestamp());
     }
 }
@@ -1681,6 +1680,12 @@ void acquireOplogCollectionForLogging(OperationContext* opCtx) {
         _localOplogCollection = autoColl.getCollection();
         fassert(13347, _localOplogCollection);
     }
+}
+
+void establishOplogCollectionForLogging(OperationContext* opCtx, Collection* oplog) {
+    invariant(opCtx->lockState()->isW());
+    invariant(oplog);
+    _localOplogCollection = oplog;
 }
 
 void signalOplogWaiters() {

@@ -38,11 +38,11 @@
 #include "mongo/db/repl/repl_set_heartbeat_response.h"
 #include "mongo/executor/network_interface_mock.h"
 #include "mongo/executor/thread_pool_task_executor_test_fixture.h"
-#include "mongo/platform/unordered_set.h"
 #include "mongo/rpc/metadata/repl_set_metadata.h"
 #include "mongo/stdx/functional.h"
 #include "mongo/stdx/memory.h"
 #include "mongo/stdx/thread.h"
+#include "mongo/stdx/unordered_set.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/net/hostandport.h"
 
@@ -143,6 +143,8 @@ TEST_F(CheckQuorumForInitiate, ValidSingleNodeSet) {
                                                    << "rs0"
                                                    << "version"
                                                    << 1
+                                                   << "protocolVersion"
+                                                   << 1
                                                    << "members"
                                                    << BSON_ARRAY(BSON("_id" << 1 << "host"
                                                                             << "h1"))));
@@ -155,6 +157,8 @@ TEST_F(CheckQuorumForInitiate, QuorumCheckCanceledByShutdown) {
     ReplSetConfig config = assertMakeRSConfig(BSON("_id"
                                                    << "rs0"
                                                    << "version"
+                                                   << 1
+                                                   << "protocolVersion"
                                                    << 1
                                                    << "members"
                                                    << BSON_ARRAY(BSON("_id" << 1 << "host"
@@ -170,6 +174,8 @@ TEST_F(CheckQuorumForInitiate, QuorumCheckFailedDueToSeveralDownNodes) {
     ReplSetConfig config = assertMakeRSConfig(BSON("_id"
                                                    << "rs0"
                                                    << "version"
+                                                   << 1
+                                                   << "protocolVersion"
                                                    << 1
                                                    << "members"
                                                    << BSON_ARRAY(BSON("_id" << 1 << "host"
@@ -208,6 +214,7 @@ TEST_F(CheckQuorumForInitiate, QuorumCheckFailedDueToSeveralDownNodes) {
 const BSONObj makeHeartbeatRequest(const ReplSetConfig& rsConfig, int myConfigIndex) {
     const MemberConfig& myConfig = rsConfig.getMemberAt(myConfigIndex);
     ReplSetHeartbeatArgsV1 hbArgs;
+    hbArgs.setHeartbeatVersion(1);
     hbArgs.setSetName(rsConfig.getReplSetName());
     hbArgs.setConfigVersion(rsConfig.getConfigVersion());
     if (rsConfig.getConfigVersion() == 1) {
@@ -228,6 +235,8 @@ TEST_F(CheckQuorumForInitiate, QuorumCheckSuccessForFiveNodes) {
                                 << "rs0"
                                 << "version"
                                 << 1
+                                << "protocolVersion"
+                                << 1
                                 << "members"
                                 << BSON_ARRAY(BSON("_id" << 1 << "host"
                                                          << "h1:1")
@@ -245,7 +254,7 @@ TEST_F(CheckQuorumForInitiate, QuorumCheckSuccessForFiveNodes) {
     startQuorumCheck(rsConfig, myConfigIndex);
     const Date_t startDate = getNet()->now();
     const int numCommandsExpected = rsConfig.getNumMembers() - 1;
-    unordered_set<HostAndPort> seenHosts;
+    stdx::unordered_set<HostAndPort> seenHosts;
     getNet()->enterNetwork();
     for (int i = 0; i < numCommandsExpected; ++i) {
         const NetworkInterfaceMock::NetworkOperationIterator noi = getNet()->getNextReadyRequest();
@@ -275,6 +284,8 @@ TEST_F(CheckQuorumForInitiate, QuorumCheckFailedDueToOneDownNode) {
                                 << "rs0"
                                 << "version"
                                 << 1
+                                << "protocolVersion"
+                                << 1
                                 << "members"
                                 << BSON_ARRAY(BSON("_id" << 1 << "host"
                                                          << "h1:1")
@@ -298,7 +309,7 @@ TEST_F(CheckQuorumForInitiate, QuorumCheckFailedDueToOneDownNode) {
     startQuorumCheck(rsConfig, myConfigIndex);
     const Date_t startDate = getNet()->now();
     const int numCommandsExpected = rsConfig.getNumMembers() - 1;
-    unordered_set<HostAndPort> seenHosts;
+    stdx::unordered_set<HostAndPort> seenHosts;
     getNet()->enterNetwork();
     for (int i = 0; i < numCommandsExpected; ++i) {
         const NetworkInterfaceMock::NetworkOperationIterator noi = getNet()->getNextReadyRequest();
@@ -341,6 +352,8 @@ TEST_F(CheckQuorumForInitiate, QuorumCheckFailedDueToSetNameMismatch) {
                                 << "rs0"
                                 << "version"
                                 << 1
+                                << "protocolVersion"
+                                << 1
                                 << "members"
                                 << BSON_ARRAY(BSON("_id" << 1 << "host"
                                                          << "h1:1")
@@ -358,7 +371,7 @@ TEST_F(CheckQuorumForInitiate, QuorumCheckFailedDueToSetNameMismatch) {
     startQuorumCheck(rsConfig, myConfigIndex);
     const Date_t startDate = getNet()->now();
     const int numCommandsExpected = rsConfig.getNumMembers() - 1;
-    unordered_set<HostAndPort> seenHosts;
+    stdx::unordered_set<HostAndPort> seenHosts;
     getNet()->enterNetwork();
     for (int i = 0; i < numCommandsExpected; ++i) {
         const NetworkInterfaceMock::NetworkOperationIterator noi = getNet()->getNextReadyRequest();
@@ -403,6 +416,8 @@ TEST_F(CheckQuorumForInitiate, QuorumCheckFailedDueToSetIdMismatch) {
                                 << "rs0"
                                 << "version"
                                 << 1
+                                << "protocolVersion"
+                                << 1
                                 << "members"
                                 << BSON_ARRAY(BSON("_id" << 1 << "host"
                                                          << "h1:1")
@@ -422,7 +437,7 @@ TEST_F(CheckQuorumForInitiate, QuorumCheckFailedDueToSetIdMismatch) {
     startQuorumCheck(rsConfig, myConfigIndex);
     const Date_t startDate = getNet()->now();
     const int numCommandsExpected = rsConfig.getNumMembers() - 1;
-    unordered_set<HostAndPort> seenHosts;
+    stdx::unordered_set<HostAndPort> seenHosts;
     getNet()->enterNetwork();
     HostAndPort incompatibleHost("h4", 1);
     OID unexpectedId = OID::gen();
@@ -484,6 +499,8 @@ TEST_F(CheckQuorumForInitiate, QuorumCheckFailedDueToInitializedNode) {
                                 << "rs0"
                                 << "version"
                                 << 1
+                                << "protocolVersion"
+                                << 1
                                 << "members"
                                 << BSON_ARRAY(BSON("_id" << 1 << "host"
                                                          << "h1:1")
@@ -501,7 +518,7 @@ TEST_F(CheckQuorumForInitiate, QuorumCheckFailedDueToInitializedNode) {
     startQuorumCheck(rsConfig, myConfigIndex);
     const Date_t startDate = getNet()->now();
     const int numCommandsExpected = rsConfig.getNumMembers() - 1;
-    unordered_set<HostAndPort> seenHosts;
+    stdx::unordered_set<HostAndPort> seenHosts;
     getNet()->enterNetwork();
     for (int i = 0; i < numCommandsExpected; ++i) {
         const NetworkInterfaceMock::NetworkOperationIterator noi = getNet()->getNextReadyRequest();
@@ -550,6 +567,8 @@ TEST_F(CheckQuorumForInitiate, QuorumCheckFailedDueToInitializedNodeOnlyOneRespo
                                 << "rs0"
                                 << "version"
                                 << 1
+                                << "protocolVersion"
+                                << 1
                                 << "members"
                                 << BSON_ARRAY(BSON("_id" << 1 << "host"
                                                          << "h1:1")
@@ -567,7 +586,7 @@ TEST_F(CheckQuorumForInitiate, QuorumCheckFailedDueToInitializedNodeOnlyOneRespo
     startQuorumCheck(rsConfig, myConfigIndex);
     const Date_t startDate = getNet()->now();
     const int numCommandsExpected = rsConfig.getNumMembers() - 1;
-    unordered_set<HostAndPort> seenHosts;
+    stdx::unordered_set<HostAndPort> seenHosts;
     getNet()->enterNetwork();
     for (int i = 0; i < numCommandsExpected; ++i) {
         const NetworkInterfaceMock::NetworkOperationIterator noi = getNet()->getNextReadyRequest();
@@ -611,6 +630,8 @@ TEST_F(CheckQuorumForInitiate, QuorumCheckFailedDueToNodeWithData) {
                                 << "rs0"
                                 << "version"
                                 << 1
+                                << "protocolVersion"
+                                << 1
                                 << "members"
                                 << BSON_ARRAY(BSON("_id" << 1 << "host"
                                                          << "h1:1")
@@ -628,7 +649,7 @@ TEST_F(CheckQuorumForInitiate, QuorumCheckFailedDueToNodeWithData) {
     startQuorumCheck(rsConfig, myConfigIndex);
     const Date_t startDate = getNet()->now();
     const int numCommandsExpected = rsConfig.getNumMembers() - 1;
-    unordered_set<HostAndPort> seenHosts;
+    stdx::unordered_set<HostAndPort> seenHosts;
     getNet()->enterNetwork();
     for (int i = 0; i < numCommandsExpected; ++i) {
         const NetworkInterfaceMock::NetworkOperationIterator noi = getNet()->getNextReadyRequest();
@@ -669,6 +690,8 @@ TEST_F(CheckQuorumForReconfig, QuorumCheckVetoedDueToHigherConfigVersion) {
                                 << "rs0"
                                 << "version"
                                 << 2
+                                << "protocolVersion"
+                                << 1
                                 << "members"
                                 << BSON_ARRAY(BSON("_id" << 1 << "host"
                                                          << "h1:1")
@@ -682,7 +705,7 @@ TEST_F(CheckQuorumForReconfig, QuorumCheckVetoedDueToHigherConfigVersion) {
     startQuorumCheck(rsConfig, myConfigIndex);
     const Date_t startDate = getNet()->now();
     const int numCommandsExpected = rsConfig.getNumMembers() - 1;
-    unordered_set<HostAndPort> seenHosts;
+    stdx::unordered_set<HostAndPort> seenHosts;
     getNet()->enterNetwork();
     for (int i = 0; i < numCommandsExpected; ++i) {
         const NetworkInterfaceMock::NetworkOperationIterator noi = getNet()->getNextReadyRequest();
@@ -724,6 +747,8 @@ TEST_F(CheckQuorumForReconfig, QuorumCheckVetoedDueToIncompatibleSetName) {
                                 << "rs0"
                                 << "version"
                                 << 2
+                                << "protocolVersion"
+                                << 1
                                 << "members"
                                 << BSON_ARRAY(BSON("_id" << 1 << "host"
                                                          << "h1:1")
@@ -737,7 +762,7 @@ TEST_F(CheckQuorumForReconfig, QuorumCheckVetoedDueToIncompatibleSetName) {
     startQuorumCheck(rsConfig, myConfigIndex);
     const Date_t startDate = getNet()->now();
     const int numCommandsExpected = rsConfig.getNumMembers() - 1;
-    unordered_set<HostAndPort> seenHosts;
+    stdx::unordered_set<HostAndPort> seenHosts;
     getNet()->enterNetwork();
     for (int i = 0; i < numCommandsExpected; ++i) {
         const NetworkInterfaceMock::NetworkOperationIterator noi = getNet()->getNextReadyRequest();
@@ -778,6 +803,8 @@ TEST_F(CheckQuorumForReconfig, QuorumCheckFailsDueToInsufficientVoters) {
                                 << "rs0"
                                 << "version"
                                 << 2
+                                << "protocolVersion"
+                                << 1
                                 << "members"
                                 << BSON_ARRAY(BSON("_id" << 1 << "host"
                                                          << "h1:1")
@@ -803,7 +830,7 @@ TEST_F(CheckQuorumForReconfig, QuorumCheckFailsDueToInsufficientVoters) {
     startQuorumCheck(rsConfig, myConfigIndex);
     const Date_t startDate = getNet()->now();
     const int numCommandsExpected = rsConfig.getNumMembers() - 1;
-    unordered_set<HostAndPort> seenHosts;
+    stdx::unordered_set<HostAndPort> seenHosts;
     getNet()->enterNetwork();
     for (int i = 0; i < numCommandsExpected; ++i) {
         const NetworkInterfaceMock::NetworkOperationIterator noi = getNet()->getNextReadyRequest();
@@ -843,6 +870,8 @@ TEST_F(CheckQuorumForReconfig, QuorumCheckFailsDueToNoElectableNodeResponding) {
                                 << "rs0"
                                 << "version"
                                 << 2
+                                << "protocolVersion"
+                                << 1
                                 << "members"
                                 << BSON_ARRAY(BSON("_id" << 1 << "host"
                                                          << "h1:1")
@@ -864,7 +893,7 @@ TEST_F(CheckQuorumForReconfig, QuorumCheckFailsDueToNoElectableNodeResponding) {
     startQuorumCheck(rsConfig, myConfigIndex);
     const Date_t startDate = getNet()->now();
     const int numCommandsExpected = rsConfig.getNumMembers() - 1;
-    unordered_set<HostAndPort> seenHosts;
+    stdx::unordered_set<HostAndPort> seenHosts;
     getNet()->enterNetwork();
     for (int i = 0; i < numCommandsExpected; ++i) {
         const NetworkInterfaceMock::NetworkOperationIterator noi = getNet()->getNextReadyRequest();
@@ -900,6 +929,8 @@ TEST_F(CheckQuorumForReconfig, QuorumCheckSucceedsWithAsSoonAsPossible) {
                                 << "rs0"
                                 << "version"
                                 << 2
+                                << "protocolVersion"
+                                << 1
                                 << "members"
                                 << BSON_ARRAY(BSON("_id" << 1 << "host"
                                                          << "h1:1")
@@ -925,7 +956,7 @@ TEST_F(CheckQuorumForReconfig, QuorumCheckSucceedsWithAsSoonAsPossible) {
     startQuorumCheck(rsConfig, myConfigIndex);
     const Date_t startDate = getNet()->now();
     const int numCommandsExpected = rsConfig.getNumMembers() - 1;
-    unordered_set<HostAndPort> seenHosts;
+    stdx::unordered_set<HostAndPort> seenHosts;
     getNet()->enterNetwork();
     for (int i = 0; i < numCommandsExpected; ++i) {
         const NetworkInterfaceMock::NetworkOperationIterator noi = getNet()->getNextReadyRequest();

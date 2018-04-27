@@ -598,8 +598,7 @@ __log_file_server(void *arg)
 					continue;
 				WT_ERR(__wt_fsync(session, log->log_fh, true));
 				__wt_spin_lock(session, &log->log_sync_lock);
-				locked = true;
-				WT_NOT_READ(locked);
+				WT_NOT_READ(locked, true);
 				/*
 				 * The sync LSN could have advanced while we
 				 * were writing to disk.
@@ -870,7 +869,7 @@ __log_server(void *arg)
 	WT_DECL_RET;
 	WT_LOG *log;
 	WT_SESSION_IMPL *session;
-	uint64_t time_start, time_stop, timediff;
+	uint64_t retry, time_start, time_stop, timediff;
 	bool did_work, signalled;
 
 	session = arg;
@@ -896,6 +895,7 @@ __log_server(void *arg)
 	 * takes to sync out an earlier file.
 	 */
 	did_work = true;
+	retry = 0;
 	while (F_ISSET(conn, WT_CONN_SERVER_LOG)) {
 		/*
 		 * Slots depend on future activity.  Force out buffered
@@ -940,7 +940,24 @@ __log_server(void *arg)
 					ret = __log_archive_once(session, 0);
 					__wt_writeunlock(
 					    session, &log->log_archive_lock);
-					WT_ERR(ret);
+					/*
+					 * It is possible that an external
+					 * process on some systems may prevent
+					 * removal. If we get a permission
+					 * error, retry a few times.
+					 */
+					if (ret == EACCES &&
+					    retry < WT_RETRY_MAX) {
+						retry++;
+						WT_NOT_READ(ret, 0);
+					} else {
+						/*
+						 * Return the error if there is
+						 * one or reset on success.
+						 */
+						WT_ERR(ret);
+						retry = 0;
+					}
 				} else
 					__wt_verbose(session, WT_VERB_LOG, "%s",
 					    "log_archive: Blocked due to open "
@@ -949,11 +966,11 @@ __log_server(void *arg)
 		}
 
 		/* Wait until the next event. */
-		time_start = __wt_rdtsc(session);
+		time_start = __wt_clock(session);
 		__wt_cond_auto_wait_signal(
 		    session, conn->log_cond, did_work, NULL, &signalled);
-		time_stop = __wt_rdtsc(session);
-		timediff = WT_TSCDIFF_MS(time_stop, time_start);
+		time_stop = __wt_clock(session);
+		timediff = WT_CLOCKDIFF_MS(time_stop, time_start);
 	}
 
 	if (0) {

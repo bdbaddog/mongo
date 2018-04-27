@@ -39,10 +39,12 @@
 #include "mongo/base/parse_number.h"
 #include "mongo/db/client.h"
 #include "mongo/db/dbdirectclient.h"
+#include "mongo/db/hasher.h"
 #include "mongo/db/json.h"
 #include "mongo/dbtests/dbtests.h"
 #include "mongo/platform/decimal128.h"
 #include "mongo/scripting/engine.h"
+#include "mongo/shell/shell_utils.h"
 #include "mongo/util/concurrency/thread_name.h"
 #include "mongo/util/log.h"
 #include "mongo/util/timer.h"
@@ -161,8 +163,7 @@ public:
     LogRecordingScope()
         : _logged(false),
           _threadName(mongo::getThreadName().toString()),
-          _handle(mongo::logger::globalLogDomain()->attachAppender(
-              mongo::logger::MessageLogDomain::AppenderAutoPtr(new Tee(this)))) {}
+          _handle(mongo::logger::globalLogDomain()->attachAppender(std::make_unique<Tee>(this))) {}
     ~LogRecordingScope() {
         mongo::logger::globalLogDomain()->detachAppender(_handle);
     }
@@ -1119,39 +1120,46 @@ class TestRoundTrip {
 public:
     virtual ~TestRoundTrip() {}
     void run() {
-        // Insert in Javascript -> Find using DBDirectClient
+        {
+            // Insert in Javascript -> Find using DBDirectClient
 
-        // Drop the collection
-        const ServiceContext::UniqueOperationContext opCtxPtr = cc().makeOperationContext();
-        OperationContext& opCtx = *opCtxPtr;
-        DBDirectClient client(&opCtx);
+            // Drop the collection
+            const ServiceContext::UniqueOperationContext opCtxPtr = cc().makeOperationContext();
+            OperationContext& opCtx = *opCtxPtr;
+            DBDirectClient client(&opCtx);
 
-        client.dropCollection("unittest.testroundtrip");
+            client.dropCollection("unittest.testroundtrip");
 
-        // Insert in Javascript
-        stringstream jsInsert;
-        jsInsert << "db.testroundtrip.insert(" << jsonIn() << ")";
-        ASSERT_TRUE(client.eval("unittest", jsInsert.str()));
+            // Insert in Javascript
+            stringstream jsInsert;
+            jsInsert << "db.testroundtrip.insert(" << jsonIn() << ")";
+            ASSERT_TRUE(client.eval("unittest", jsInsert.str()));
 
-        // Find using DBDirectClient
-        BSONObj excludeIdProjection = BSON("_id" << 0);
-        BSONObj directFind = client.findOne("unittest.testroundtrip", "", &excludeIdProjection);
-        bsonEquals(bson(), directFind);
+            // Find using DBDirectClient
+            BSONObj excludeIdProjection = BSON("_id" << 0);
+            BSONObj directFind = client.findOne("unittest.testroundtrip", "", &excludeIdProjection);
+            bsonEquals(bson(), directFind);
+        }
 
+        {
+            // Insert using DBDirectClient -> Find in Javascript
 
-        // Insert using DBDirectClient -> Find in Javascript
+            const ServiceContext::UniqueOperationContext opCtxPtr = cc().makeOperationContext();
+            OperationContext& opCtx = *opCtxPtr;
+            DBDirectClient client(&opCtx);
 
-        // Drop the collection
-        client.dropCollection("unittest.testroundtrip");
+            // Drop the collection
+            client.dropCollection("unittest.testroundtrip");
 
-        // Insert using DBDirectClient
-        client.insert("unittest.testroundtrip", bson());
+            // Insert using DBDirectClient
+            client.insert("unittest.testroundtrip", bson());
 
-        // Find in Javascript
-        stringstream jsFind;
-        jsFind << "dbref = db.testroundtrip.findOne( { } , { _id : 0 } )\n"
-               << "assert.eq(dbref, " << jsonOut() << ")";
-        ASSERT_TRUE(client.eval("unittest", jsFind.str()));
+            // Find in Javascript
+            stringstream jsFind;
+            jsFind << "dbref = db.testroundtrip.findOne( { } , { _id : 0 } )\n"
+                   << "assert.eq(dbref, " << jsonOut() << ")";
+            ASSERT_TRUE(client.eval("unittest", jsFind.str()));
+        }
     }
 
 protected:
@@ -2230,18 +2238,29 @@ public:
         update.append("_id", "invalidstoredjs1");
         update.appendCode("value",
                           "function () { db.test.find().forEach(function(obj) { continue; }); }");
-
-        const ServiceContext::UniqueOperationContext opCtxPtr = cc().makeOperationContext();
-        OperationContext& opCtx = *opCtxPtr;
-        DBDirectClient client(&opCtx);
-        client.update("test.system.js", query.obj(), update.obj(), true /* upsert */);
+        {
+            const ServiceContext::UniqueOperationContext opCtxPtr = cc().makeOperationContext();
+            OperationContext& opCtx = *opCtxPtr;
+            DBDirectClient client(&opCtx);
+            client.update("test.system.js", query.obj(), update.obj(), true /* upsert */);
+        }
 
         unique_ptr<Scope> s(getGlobalScriptEngine()->newScope());
-        client.eval("test", "invalidstoredjs1()");
+        {
+            const ServiceContext::UniqueOperationContext opCtxPtr = cc().makeOperationContext();
+            OperationContext& opCtx = *opCtxPtr;
+            DBDirectClient client(&opCtx);
+            client.eval("test", "invalidstoredjs1()");
+        }
 
         BSONObj info;
         BSONElement ret;
-        ASSERT(client.eval("test", "return 5 + 12", info, ret));
+        {
+            const ServiceContext::UniqueOperationContext opCtxPtr = cc().makeOperationContext();
+            OperationContext& opCtx = *opCtxPtr;
+            DBDirectClient client(&opCtx);
+            ASSERT(client.eval("test", "return 5 + 12", info, ret));
+        }
         ASSERT_EQUALS(17, ret.number());
     }
 };
@@ -2368,6 +2387,25 @@ public:
     }
 };
 
+class ErrorWithSidecarFromInvoke {
+public:
+    void run() {
+        auto sidecarThrowingFunc = [](const BSONObj& args, void* data) -> BSONObj {
+            uassertStatusOK(Status(ErrorExtraInfoExample(123), "foo"));
+            return {};
+        };
+
+        unique_ptr<Scope> s(getGlobalScriptEngine()->newScope());
+
+        s->injectNative("foo", sidecarThrowingFunc);
+
+        ASSERT_THROWS_WITH_CHECK(
+            s->invoke("try { foo(); } catch (e) { throw e; } throw new Error(\"bar\");", 0, 0),
+            ExceptionFor<ErrorCodes::ForTestingErrorExtraInfo>,
+            [](const auto& ex) { ASSERT_EQ(ex->data, 123); });
+    }
+};
+
 class RequiresOwnedObjects {
 public:
     void run() {
@@ -2408,6 +2446,89 @@ public:
             s->reset();
             s->setObject("unowned", unowned, true);
         }
+    }
+};
+
+class ConvertShardKeyToHashed {
+public:
+    void check(shared_ptr<Scope> s, const mongo::BSONObj& o) {
+        s->setObject("o", o, true);
+        s->invoke("return convertShardKeyToHashed(o);", 0, 0);
+        const auto scopeShardKey = s->getNumber("__returnValue");
+
+        // Wrapping to form a proper element
+        const auto wrapO = BSON("" << o);
+        const auto e = wrapO[""];
+        const auto trueShardKey =
+            mongo::BSONElementHasher::hash64(e, mongo::BSONElementHasher::DEFAULT_HASH_SEED);
+
+        ASSERT_EQUALS(scopeShardKey, trueShardKey);
+    }
+
+    void checkWithSeed(shared_ptr<Scope> s, const mongo::BSONObj& o, int seed) {
+        s->setObject("o", o, true);
+        s->setNumber("seed", seed);
+        s->invoke("return convertShardKeyToHashed(o, seed);", 0, 0);
+        const auto scopeShardKey = s->getNumber("__returnValue");
+
+        // Wrapping to form a proper element
+        const auto wrapO = BSON("" << o);
+        const auto e = wrapO[""];
+        const auto trueShardKey = mongo::BSONElementHasher::hash64(e, seed);
+
+        ASSERT_EQUALS(scopeShardKey, trueShardKey);
+    }
+
+    void checkNoArgs(shared_ptr<Scope> s) {
+        s->invoke("return convertShardKeyToHashed();", 0, 0);
+    }
+
+    void checkWithExtraArg(shared_ptr<Scope> s, const mongo::BSONObj& o, int seed) {
+        s->setObject("o", o, true);
+        s->setNumber("seed", seed);
+        s->invoke("return convertShardKeyToHashed(o, seed, 1);", 0, 0);
+    }
+
+    void checkWithBadSeed(shared_ptr<Scope> s, const mongo::BSONObj& o) {
+        s->setObject("o", o, true);
+        s->setString("seed", "sunflower");
+        s->invoke("return convertShardKeyToHashed(o, seed);", 0, 0);
+    }
+
+    void run() {
+        shared_ptr<Scope> s(getGlobalScriptEngine()->newScope());
+        shell_utils::installShellUtils(*s);
+
+        // Check a few elementary objects
+        check(s, BSON("" << 1));
+        check(s, BSON("" << 10.0));
+        check(s,
+              BSON(""
+                   << "Shardy"));
+        check(s, BSON("" << BSON_ARRAY(1 << 2 << 3)));
+        check(s, BSON("" << mongo::jstNULL));
+        check(s, BSON("" << mongo::BSONObj()));
+        check(s,
+              BSON("A" << 1 << "B"
+                       << "Shardy"));
+
+        // Check a few different seeds
+        checkWithSeed(s,
+                      BSON(""
+                           << "Shardy"),
+                      mongo::BSONElementHasher::DEFAULT_HASH_SEED);
+        checkWithSeed(s,
+                      BSON(""
+                           << "Shardy"),
+                      0);
+        checkWithSeed(s,
+                      BSON(""
+                           << "Shardy"),
+                      -1);
+
+        ASSERT_THROWS(checkNoArgs(s), mongo::DBException);
+        ASSERT_THROWS(checkWithExtraArg(s, BSON("" << 10.0), 0), mongo::DBException);
+        ASSERT_THROWS(checkWithBadSeed(s, BSON("" << 1)), mongo::DBException);
     }
 };
 
@@ -2467,7 +2588,9 @@ public:
 
         add<RecursiveInvoke>();
         add<ErrorCodeFromInvoke>();
+        add<ErrorWithSidecarFromInvoke>();
         add<RequiresOwnedObjects>();
+        add<ConvertShardKeyToHashed>();
 
         add<RoundTripTests::DBRefTest>();
         add<RoundTripTests::DBPointerTest>();

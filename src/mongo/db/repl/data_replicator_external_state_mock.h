@@ -45,8 +45,6 @@ public:
 
     executor::TaskExecutor* getTaskExecutor() const override;
 
-    OldThreadPool* getDbWorkThreadPool() const override;
-
     OpTimeWithTerm getCurrentTermAndLastCommittedOpTime() override;
 
     void processMetadata(const rpc::ReplSetMetadata& metadata,
@@ -58,15 +56,10 @@ public:
 
     std::unique_ptr<OplogBuffer> makeInitialSyncOplogBuffer(OperationContext* opCtx) const override;
 
-    std::unique_ptr<OplogBuffer> makeSteadyStateOplogBuffer(OperationContext* opCtx) const override;
-
     StatusWith<ReplSetConfig> getCurrentConfig() const override;
 
     // Task executor. Not owned by us.
     executor::TaskExecutor* taskExecutor = nullptr;
-
-    // DB worker thread pool. Not owned by us.
-    OldThreadPool* dbWorkThreadPool = nullptr;
 
     // Returned by getCurrentTermAndLastCommittedOpTime.
     long long currentTerm = OpTime::kUninitializedTerm;
@@ -86,26 +79,18 @@ public:
     bool shouldStopFetchingResult = false;
 
     // Override to change multiApply behavior.
-    MultiApplier::MultiApplyFn multiApplyFn;
-
-    // Override to change _multiInitialSyncApply behavior.
-    using MultiInitialSyncApplyFn = stdx::function<Status(
-        MultiApplier::OperationPtrs* ops, const HostAndPort& source, AtomicUInt32* fetchCount)>;
-    MultiInitialSyncApplyFn multiInitialSyncApplyFn = [](
-        MultiApplier::OperationPtrs*, const HostAndPort&, AtomicUInt32*) { return Status::OK(); };
+    using MultiApplyFn = stdx::function<StatusWith<OpTime>(
+        OperationContext*, MultiApplier::Operations, OplogApplier::Observer*)>;
+    MultiApplyFn multiApplyFn;
 
     StatusWith<ReplSetConfig> replSetConfigResult = ReplSetConfig();
 
 private:
     StatusWith<OpTime> _multiApply(OperationContext* opCtx,
                                    MultiApplier::Operations ops,
-                                   MultiApplier::ApplyOperationFn applyOperation) override;
-
-    Status _multiSyncApply(MultiApplier::OperationPtrs* ops) override;
-
-    Status _multiInitialSyncApply(MultiApplier::OperationPtrs* ops,
-                                  const HostAndPort& source,
-                                  AtomicUInt32* fetchCount) override;
+                                   OplogApplier::Observer* observer,
+                                   const HostAndPort& source,
+                                   ThreadPool* writerPool) override;
 };
 
 

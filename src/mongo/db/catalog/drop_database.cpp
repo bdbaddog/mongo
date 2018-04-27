@@ -35,11 +35,12 @@
 #include <algorithm>
 
 #include "mongo/db/background.h"
-#include "mongo/db/catalog/catalog_raii.h"
+#include "mongo/db/catalog_raii.h"
 #include "mongo/db/client.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/curop.h"
 #include "mongo/db/op_observer.h"
+#include "mongo/db/repl/repl_client_info.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/write_concern_options.h"
@@ -93,6 +94,12 @@ Status dropDatabase(OperationContext* opCtx, const std::string& dbName) {
     uassert(ErrorCodes::IllegalOperation,
             "Cannot drop a database in read-only mode",
             !storageGlobalParams.readOnly);
+
+    // As of SERVER-32205, dropping the admin database is prohibited.
+    uassert(ErrorCodes::IllegalOperation,
+            str::stream() << "Dropping the '" << dbName << "' database is prohibited.",
+            dbName != NamespaceString::kAdminDb);
+
     // TODO (Kal): OldClientContext legacy, needs to be removed
     {
         CurOp::get(opCtx)->ensureStarted();
@@ -110,6 +117,7 @@ Status dropDatabase(OperationContext* opCtx, const std::string& dbName) {
     using Result = boost::optional<Status>;
     // Get an optional result--if it's there, early return; otherwise, wait for collections to drop.
     auto result = writeConflictRetry(opCtx, "dropDatabase_collection", dbName, [&] {
+        UninterruptibleLockGuard noInterrupt(opCtx->lockState());
         Lock::GlobalWrite lk(opCtx);
         AutoGetDb autoDB(opCtx, dbName, MODE_X);
         Database* const db = autoDB.getDb();
@@ -136,7 +144,7 @@ Status dropDatabase(OperationContext* opCtx, const std::string& dbName) {
         auto dropPendingGuard = MakeGuard([&db, opCtx] { db->setDropPending(opCtx, false); });
 
         std::vector<NamespaceString> collectionsToDrop;
-        for (auto collection : *db) {
+        for (Collection* collection : *db) {
             const auto& nss = collection->ns();
             if (nss.isDropPendingNamespace() && replCoord->isReplEnabled() &&
                 opCtx->writesAreReplicated()) {
@@ -156,8 +164,21 @@ Status dropDatabase(OperationContext* opCtx, const std::string& dbName) {
               << " collections";
         for (auto nss : collectionsToDrop) {
             log() << "dropDatabase " << dbName << " - dropping collection: " << nss;
+            if (!opCtx->writesAreReplicated()) {
+                // Dropping a database on a primary replicates individual collection drops
+                // followed by a database drop oplog entry. When a secondary observes the database
+                // drop oplog entry, all of the replicated collections that were dropped must have
+                // been processed. Only non-replicated collections like `system.profile` should be
+                // left to remove. Collections with the `tmp.mr` namespace may or may not be
+                // getting replicated; be conservative and assume they are not.
+                invariant(!nss.isReplicated() || nss.coll().startsWith("tmp.mr"));
+            }
+
             WriteUnitOfWork wunit(opCtx);
-            fassertStatusOK(40476, db->dropCollectionEvenIfSystem(opCtx, nss));
+            // A primary processing this will assign a timestamp when the operation is written to
+            // the oplog. As stated above, a secondary processing must only observe non-replicated
+            // collections, thus this should not be timestamped.
+            fassert(40476, db->dropCollectionEvenIfSystem(opCtx, nss));
             wunit.commit();
         }
         dropPendingGuard.Dismiss();
@@ -177,6 +198,7 @@ Status dropDatabase(OperationContext* opCtx, const std::string& dbName) {
     // If waitForWriteConcern() returns an error or throws an exception, we should reset the
     // drop-pending state on Database.
     auto dropPendingGuardWhileAwaitingReplication = MakeGuard([dbName, opCtx] {
+        UninterruptibleLockGuard noInterrupt(opCtx->lockState());
         Lock::GlobalWrite lk(opCtx);
         AutoGetDb autoDB(opCtx, dbName, MODE_X);
         if (auto db = autoDB.getDb()) {
@@ -199,46 +221,39 @@ Status dropDatabase(OperationContext* opCtx, const std::string& dbName) {
         // the global lock.
         Lock::TempRelease release(opCtx->lockState());
 
-        if (numCollectionsToDrop > 0U) {
-            auto status =
-                replCoord->awaitReplicationOfLastOpForClient(opCtx, kDropDatabaseWriteConcern)
-                    .status;
-            if (!status.isOK()) {
-                return Status(status.code(),
-                              str::stream() << "dropDatabase " << dbName << " failed waiting for "
-                                            << numCollectionsToDrop
-                                            << " collection drops to replicate: "
-                                            << status.reason());
+        auto awaitOpTime = [&]() {
+            if (numCollectionsToDrop > 0U) {
+                const auto& clientInfo = repl::ReplClientInfo::forClient(opCtx->getClient());
+                return clientInfo.getLastOp();
             }
-
-            log() << "dropDatabase " << dbName << " - successfully dropped " << numCollectionsToDrop
-                  << " collections. dropping database";
-        } else {
             invariant(!latestDropPendingOpTime.isNull());
-            auto status =
-                replCoord
-                    ->awaitReplication(opCtx, latestDropPendingOpTime, kDropDatabaseWriteConcern)
-                    .status;
-            if (!status.isOK()) {
-                return Status(
-                    status.code(),
-                    str::stream()
-                        << "dropDatabase "
-                        << dbName
-                        << " failed waiting for pending collection drops (most recent drop optime: "
-                        << latestDropPendingOpTime.toString()
-                        << ") to replicate: "
-                        << status.reason());
-            }
+            return latestDropPendingOpTime;
+        }();
 
-            log() << "dropDatabase " << dbName
-                  << " - pending collection drops completed. dropping database";
+        log() << "dropDatabase " << dbName << " waiting for " << awaitOpTime
+              << " to be replicated at " << kDropDatabaseWriteConcern.toBSON() << ". Dropping "
+              << numCollectionsToDrop << " collections, with last collection drop at "
+              << latestDropPendingOpTime;
+        auto result = replCoord->awaitReplication(opCtx, awaitOpTime, kDropDatabaseWriteConcern);
+        const auto& status = result.status;
+        if (!status.isOK()) {
+            return status.withContext(
+                str::stream() << "dropDatabase " << dbName << " failed waiting for "
+                              << numCollectionsToDrop
+                              << " collection drops (most recent drop optime: "
+                              << awaitOpTime.toString()
+                              << ") to replicate.");
         }
+
+        log() << "dropDatabase " << dbName << " - successfully dropped " << numCollectionsToDrop
+              << " collections (most recent drop optime: " << awaitOpTime << ") after "
+              << result.duration << ". dropping database";
     }
 
     dropPendingGuardWhileAwaitingReplication.Dismiss();
 
     return writeConflictRetry(opCtx, "dropDatabase_database", dbName, [&] {
+        UninterruptibleLockGuard noInterrupt(opCtx->lockState());
         Lock::GlobalWrite lk(opCtx);
         AutoGetDb autoDB(opCtx, dbName, MODE_X);
         auto db = autoDB.getDb();

@@ -34,6 +34,7 @@
 #include "mongo/base/status_with.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/repl/data_replicator_external_state.h"
+#include "mongo/db/repl/oplog_applier.h"
 #include "mongo/db/repl/oplog_buffer.h"
 #include "mongo/db/repl/oplog_fetcher.h"
 #include "mongo/db/repl/oplog_interface_remote.h"
@@ -59,7 +60,7 @@ class ReplicationCoordinatorExternalState;
 class ReplicationProcess;
 class StorageInterface;
 
-class BackgroundSync {
+class BackgroundSync : public OplogApplier::Observer {
     MONGO_DISALLOW_COPYING(BackgroundSync);
 
 public:
@@ -77,9 +78,15 @@ public:
      */
     enum class ProducerState { Starting, Running, Stopped };
 
-    BackgroundSync(ReplicationCoordinatorExternalState* replicationCoordinatorExternalState,
+    /**
+     * Constructs a BackgroundSync to fetch oplog entries from a sync source.
+     * The BackgroundSync does not own any of the components referenced by the constructor
+     * arguments. All these components must outlive the BackgroundSync object.
+     */
+    BackgroundSync(ReplicationCoordinator* replicationCoordinator,
+                   ReplicationCoordinatorExternalState* replicationCoordinatorExternalState,
                    ReplicationProcess* replicationProcess,
-                   std::unique_ptr<OplogBuffer> oplogBuffer);
+                   OplogBuffer* oplogBuffer);
 
     // stop syncing (when this node becomes a primary, e.g.)
     // During stepdown, the last fetched optime is not reset in order to keep track of the lastest
@@ -113,18 +120,15 @@ public:
 
     HostAndPort getSyncTarget() const;
 
-    // Interface implementation
+    /**
+     * This is called while shutting down to reset the counters for the OplogBuffer.
+     */
+    void onBufferCleared();
 
-    bool peek(OperationContext* opCtx, BSONObj* op);
-    void consume(OperationContext* opCtx);
     void clearSyncTarget();
-    void waitForMore();
 
     // For monitoring
     BSONObj getCounters();
-
-    // Clears any fetched and buffered oplog entries.
-    void clearBuffer(OperationContext* opCtx);
 
     /**
      * Returns true if any of the following is true:
@@ -139,8 +143,11 @@ public:
     // Starts the producer if it's stopped. Otherwise, let it keep running.
     void startProducerIfStopped();
 
-    // Adds a fake oplog entry to buffer. Used for testing only.
-    void pushTestOpToBuffer(OperationContext* opCtx, const BSONObj& op);
+    // OplogApplier::Observer functions
+    void onBatchBegin(const OplogApplier::Operations&) final {}
+    void onBatchEnd(const StatusWith<OpTime>&, const OplogApplier::Operations&) final {}
+    void onMissingDocumentsFetchedAndInserted(const std::vector<FetchInfo>&) final {}
+    void onOperationConsumed(const BSONObj& op) final;
 
 private:
     bool _inShutdown_inlock() const;
@@ -186,12 +193,10 @@ private:
                                             OplogInterfaceRemote::GetConnectionFn getConnection);
 
     /**
-     * Executes a rollback via refetch in either rs_rollback.cpp or rs_rollback_no_uuid.cpp
+     * Executes a rollback via refetch in rs_rollback.cpp.
      *
-     * We fall back on the rollback via refetch algorithm when:
-     * 1)  the server parameter "rollbackMethod" is set to "rollbackViaRefetch" or
-     *     "rollbackViaRefetchNoUUID"; or
-     * 2)  the storage engine does not support "rollback to a checkpoint."
+     * We fall back on the rollback via refetch algorithm when the storage engine does not support
+     * "rollback to a checkpoint," or when the forceRollbackViaRefetch parameter is set to true.
      *
      * Must be called from _runRollback() which ensures that all the conditions for entering
      * rollback have been met.
@@ -200,7 +205,6 @@ private:
                                        const HostAndPort& source,
                                        int requiredRBID,
                                        OplogInterface* localOplog,
-                                       bool useUUID,
                                        OplogInterfaceRemote::GetConnectionFn getConnection);
 
     // restart syncing
@@ -208,8 +212,8 @@ private:
 
     OpTimeWithHash _readLastAppliedOpTimeWithHash(OperationContext* opCtx);
 
-    // Production thread
-    std::unique_ptr<OplogBuffer> _oplogBuffer;
+    // This OplogBuffer holds oplog entries fetched from the sync source.
+    OplogBuffer* const _oplogBuffer;
 
     // A pointer to the replication coordinator running the show.
     ReplicationCoordinator* _replCoord;

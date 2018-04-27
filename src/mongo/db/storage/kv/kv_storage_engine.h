@@ -121,6 +121,16 @@ public:
 
     virtual bool supportsRecoverToStableTimestamp() const override;
 
+    virtual StatusWith<Timestamp> recoverToStableTimestamp(OperationContext* opCtx) override;
+
+    virtual boost::optional<Timestamp> getRecoveryTimestamp() const override;
+
+    virtual boost::optional<Timestamp> getLastStableCheckpointTimestamp() const override;
+
+    virtual Timestamp getAllCommittedTimestamp(OperationContext* opCtx) const override;
+
+    bool supportsReadConcernSnapshot() const final;
+
     virtual void replicationBatchIsComplete() const override;
 
     SnapshotManager* getSnapshotManager() const final;
@@ -149,7 +159,30 @@ public:
     StatusWith<std::vector<StorageEngine::CollectionIndexNamePair>> reconcileCatalogAndIdents(
         OperationContext* opCtx) override;
 
+    /**
+     * When loading after an unclean shutdown, this performs cleanup on the KVCatalog and unsets the
+     * startingAfterUncleanShutdown decoration on the global ServiceContext.
+     */
+    void loadCatalog(OperationContext* opCtx) final;
+
+    void closeCatalog(OperationContext* opCtx) final;
+
 private:
+    using CollIter = std::list<std::string>::iterator;
+
+    Status _dropCollectionsNoTimestamp(OperationContext* opCtx,
+                                       KVDatabaseCatalogEntryBase* dbce,
+                                       CollIter begin,
+                                       CollIter end);
+
+    Status _dropCollectionsWithTimestamp(OperationContext* opCtx,
+                                         KVDatabaseCatalogEntryBase* dbce,
+                                         std::list<std::string>& toDrop,
+                                         CollIter begin,
+                                         CollIter end);
+
+    void _dumpCatalog(OperationContext* opCtx);
+
     class RemoveDBChange;
 
     stdx::function<KVDatabaseCatalogEntryFactory> _databaseCatalogEntryFactory;
@@ -161,6 +194,7 @@ private:
 
     const bool _supportsDocLocking;
     const bool _supportsDBLocking;
+    Timestamp _initialDataTimestamp = Timestamp::kAllowUnstableCheckpointsSentinel;
 
     std::unique_ptr<RecordStore> _catalogRecordStore;
     std::unique_ptr<KVCatalog> _catalog;

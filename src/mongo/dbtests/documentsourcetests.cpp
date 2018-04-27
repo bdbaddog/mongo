@@ -113,6 +113,12 @@ protected:
         return _opCtx.get();
     }
 
+    void exhaustCursor() {
+        while (!_source->getNext().isEOF()) {
+            // Just pull everything out of the cursor.
+        }
+    }
+
 protected:
     const ServiceContext::UniqueOperationContext _opCtx = cc().makeOperationContext();
     DBDirectClient client;
@@ -279,36 +285,69 @@ TEST_F(DocumentSourceCursorTest, CompoundIndexScanProvidesMultipleSorts) {
     source()->dispose();
 }
 
-TEST_F(DocumentSourceCursorTest, SerializationRespectsExplainModes) {
+TEST_F(DocumentSourceCursorTest, SerializationNoExplainLevel) {
+    // Nothing serialized when no explain mode specified.
     createSource();
+    auto explainResult = source()->serialize();
+    ASSERT_TRUE(explainResult.missing());
 
-    {
-        // Nothing serialized when no explain mode specified.
-        auto explainResult = source()->serialize();
-        ASSERT_TRUE(explainResult.missing());
-    }
-
-    {
-        auto explainResult = source()->serialize(ExplainOptions::Verbosity::kQueryPlanner);
-        ASSERT_FALSE(explainResult["$cursor"]["queryPlanner"].missing());
-        ASSERT_TRUE(explainResult["$cursor"]["executionStats"].missing());
-    }
-
-    {
-        auto explainResult = source()->serialize(ExplainOptions::Verbosity::kExecStats);
-        ASSERT_FALSE(explainResult["$cursor"]["queryPlanner"].missing());
-        ASSERT_FALSE(explainResult["$cursor"]["executionStats"].missing());
-        ASSERT_TRUE(explainResult["$cursor"]["executionStats"]["allPlansExecution"].missing());
-    }
-
-    {
-        auto explainResult =
-            source()->serialize(ExplainOptions::Verbosity::kExecAllPlans).getDocument();
-        ASSERT_FALSE(explainResult["$cursor"]["queryPlanner"].missing());
-        ASSERT_FALSE(explainResult["$cursor"]["executionStats"].missing());
-        ASSERT_FALSE(explainResult["$cursor"]["executionStats"]["allPlansExecution"].missing());
-    }
     source()->dispose();
+}
+
+TEST_F(DocumentSourceCursorTest, SerializationQueryPlannerExplainLevel) {
+    auto verb = ExplainOptions::Verbosity::kQueryPlanner;
+    createSource();
+    ctx()->explain = verb;
+
+    auto explainResult = source()->serialize(verb);
+    ASSERT_FALSE(explainResult["$cursor"]["queryPlanner"].missing());
+    ASSERT_TRUE(explainResult["$cursor"]["executionStats"].missing());
+
+    source()->dispose();
+}
+
+TEST_F(DocumentSourceCursorTest, SerializationExecStatsExplainLevel) {
+    auto verb = ExplainOptions::Verbosity::kExecStats;
+    createSource();
+    ctx()->explain = verb;
+
+    // Execute the plan so that the source populates its internal execution stats.
+    exhaustCursor();
+
+    auto explainResult = source()->serialize(verb);
+    ASSERT_FALSE(explainResult["$cursor"]["queryPlanner"].missing());
+    ASSERT_FALSE(explainResult["$cursor"]["executionStats"].missing());
+    ASSERT_TRUE(explainResult["$cursor"]["executionStats"]["allPlansExecution"].missing());
+
+    source()->dispose();
+}
+
+TEST_F(DocumentSourceCursorTest, SerializationExecAllPlansExplainLevel) {
+    auto verb = ExplainOptions::Verbosity::kExecAllPlans;
+    createSource();
+    ctx()->explain = verb;
+
+    // Execute the plan so that the source populates its internal executionStats.
+    exhaustCursor();
+
+    auto explainResult = source()->serialize(verb).getDocument();
+    ASSERT_FALSE(explainResult["$cursor"]["queryPlanner"].missing());
+    ASSERT_FALSE(explainResult["$cursor"]["executionStats"].missing());
+    ASSERT_FALSE(explainResult["$cursor"]["executionStats"]["allPlansExecution"].missing());
+
+    source()->dispose();
+}
+
+TEST_F(DocumentSourceCursorTest, ExpressionContextAndSerializeVerbosityMismatch) {
+    const auto verb1 = ExplainOptions::Verbosity::kExecAllPlans;
+    const auto verb2 = ExplainOptions::Verbosity::kQueryPlanner;
+    createSource();
+    ctx()->explain = verb1;
+
+    // Execute the plan so that the source populates its internal executionStats.
+    exhaustCursor();
+
+    ASSERT_THROWS_CODE(source()->serialize(verb2), DBException, 50660);
 }
 
 TEST_F(DocumentSourceCursorTest, TailableAwaitDataCursorShouldErrorAfterTimeout) {
@@ -330,7 +369,7 @@ TEST_F(DocumentSourceCursorTest, TailableAwaitDataCursorShouldErrorAfterTimeout)
         opCtx(), collScanParams, workingSet.get(), matchExpression.get());
     auto queryRequest = stdx::make_unique<QueryRequest>(nss);
     queryRequest->setFilter(filter);
-    queryRequest->setTailableMode(TailableMode::kTailableAndAwaitData);
+    queryRequest->setTailableMode(TailableModeEnum::kTailableAndAwaitData);
     auto canonicalQuery = unittest::assertGet(
         CanonicalQuery::canonicalize(opCtx(), std::move(queryRequest), nullptr));
     auto planExecutor =
@@ -342,14 +381,15 @@ TEST_F(DocumentSourceCursorTest, TailableAwaitDataCursorShouldErrorAfterTimeout)
                                            PlanExecutor::YieldPolicy::ALWAYS_TIME_OUT));
 
     // Make a DocumentSourceCursor.
-    ctx()->tailableMode = TailableMode::kTailableAndAwaitData;
+    ctx()->tailableMode = TailableModeEnum::kTailableAndAwaitData;
     // DocumentSourceCursor expects a PlanExecutor that has had its state saved.
     planExecutor->saveState();
     auto cursor =
         DocumentSourceCursor::create(readLock.getCollection(), std::move(planExecutor), ctx());
 
     ON_BLOCK_EXIT([cursor]() { cursor->dispose(); });
-    ASSERT_THROWS_CODE(cursor->getNext().isEOF(), AssertionException, ErrorCodes::QueryPlanKilled);
+    ASSERT_THROWS_CODE(
+        cursor->getNext().isEOF(), AssertionException, ErrorCodes::ExceededTimeLimit);
 }
 
 TEST_F(DocumentSourceCursorTest, NonAwaitDataCursorShouldErrorAfterTimeout) {
@@ -379,14 +419,15 @@ TEST_F(DocumentSourceCursorTest, NonAwaitDataCursorShouldErrorAfterTimeout) {
                                            PlanExecutor::YieldPolicy::ALWAYS_TIME_OUT));
 
     // Make a DocumentSourceCursor.
-    ctx()->tailableMode = TailableMode::kNormal;
+    ctx()->tailableMode = TailableModeEnum::kNormal;
     // DocumentSourceCursor expects a PlanExecutor that has had its state saved.
     planExecutor->saveState();
     auto cursor =
         DocumentSourceCursor::create(readLock.getCollection(), std::move(planExecutor), ctx());
 
     ON_BLOCK_EXIT([cursor]() { cursor->dispose(); });
-    ASSERT_THROWS_CODE(cursor->getNext().isEOF(), AssertionException, ErrorCodes::QueryPlanKilled);
+    ASSERT_THROWS_CODE(
+        cursor->getNext().isEOF(), AssertionException, ErrorCodes::ExceededTimeLimit);
 }
 
 TEST_F(DocumentSourceCursorTest, TailableAwaitDataCursorShouldErrorAfterBeingKilled) {
@@ -408,7 +449,7 @@ TEST_F(DocumentSourceCursorTest, TailableAwaitDataCursorShouldErrorAfterBeingKil
         opCtx(), collScanParams, workingSet.get(), matchExpression.get());
     auto queryRequest = stdx::make_unique<QueryRequest>(nss);
     queryRequest->setFilter(filter);
-    queryRequest->setTailableMode(TailableMode::kTailableAndAwaitData);
+    queryRequest->setTailableMode(TailableModeEnum::kTailableAndAwaitData);
     auto canonicalQuery = unittest::assertGet(
         CanonicalQuery::canonicalize(opCtx(), std::move(queryRequest), nullptr));
     auto planExecutor =
@@ -420,7 +461,7 @@ TEST_F(DocumentSourceCursorTest, TailableAwaitDataCursorShouldErrorAfterBeingKil
                                            PlanExecutor::YieldPolicy::ALWAYS_MARK_KILLED));
 
     // Make a DocumentSourceCursor.
-    ctx()->tailableMode = TailableMode::kTailableAndAwaitData;
+    ctx()->tailableMode = TailableModeEnum::kTailableAndAwaitData;
     // DocumentSourceCursor expects a PlanExecutor that has had its state saved.
     planExecutor->saveState();
     auto cursor =
@@ -457,7 +498,7 @@ TEST_F(DocumentSourceCursorTest, NormalCursorShouldErrorAfterBeingKilled) {
                                            PlanExecutor::YieldPolicy::ALWAYS_MARK_KILLED));
 
     // Make a DocumentSourceCursor.
-    ctx()->tailableMode = TailableMode::kNormal;
+    ctx()->tailableMode = TailableModeEnum::kNormal;
     // DocumentSourceCursor expects a PlanExecutor that has had its state saved.
     planExecutor->saveState();
     auto cursor =

@@ -271,7 +271,11 @@ connection_stats = [
     CacheStat('cache_read', 'pages read into cache'),
     CacheStat('cache_read_app_count', 'application threads page read from disk to cache count'),
     CacheStat('cache_read_app_time', 'application threads page read from disk to cache time (usecs)'),
+    CacheStat('cache_read_deleted', 'pages read into cache after truncate'),
+    CacheStat('cache_read_deleted_prepared', 'pages read into cache after truncate in prepare state'),
     CacheStat('cache_read_lookaside', 'pages read into cache requiring lookaside entries'),
+    CacheStat('cache_read_lookaside_delay', 'pages read into cache with skipped lookaside entries needed later'),
+    CacheStat('cache_read_lookaside_skipped', 'pages read into cache skipping older lookaside entries'),
     CacheStat('cache_read_overflow', 'overflow pages read into cache'),
     CacheStat('cache_write', 'pages written from cache'),
     CacheStat('cache_write_app_count', 'application threads page write from cache to disk count'),
@@ -282,11 +286,13 @@ connection_stats = [
     ##########################################
     # Cursor operations
     ##########################################
+    CursorStat('cursor_cache', 'cursors cached on close'),
     CursorStat('cursor_create', 'cursor create calls'),
     CursorStat('cursor_insert', 'cursor insert calls'),
     CursorStat('cursor_modify', 'cursor modify calls'),
     CursorStat('cursor_next', 'cursor next calls'),
     CursorStat('cursor_prev', 'cursor prev calls'),
+    CursorStat('cursor_reopen', 'cursors reused from cache'),
     CursorStat('cursor_remove', 'cursor remove calls'),
     CursorStat('cursor_reserve', 'cursor reserve calls'),
     CursorStat('cursor_reset', 'cursor reset calls'),
@@ -295,6 +301,14 @@ connection_stats = [
     CursorStat('cursor_search_near', 'cursor search near calls'),
     CursorStat('cursor_truncate', 'truncate calls'),
     CursorStat('cursor_update', 'cursor update calls'),
+
+    ##########################################
+    # Cursor sweep
+    ##########################################
+    CursorStat('cursor_sweep', 'cursor sweeps'),
+    CursorStat('cursor_sweep_buckets', 'cursor sweep buckets'),
+    CursorStat('cursor_sweep_examined', 'cursor sweep cursors examined'),
+    CursorStat('cursor_sweep_closed', 'cursor sweep cursors closed'),
 
     ##########################################
     # Dhandle statistics
@@ -491,7 +505,7 @@ connection_stats = [
     TxnStat('txn_checkpoint_time_total', 'transaction checkpoint total time (msecs)', 'no_clear,no_scale'),
     TxnStat('txn_commit', 'transactions committed'),
     TxnStat('txn_commit_queue_empty', 'commit timestamp queue insert to empty'),
-    TxnStat('txn_commit_queue_head', 'commit timestamp queue inserts to head'),
+    TxnStat('txn_commit_queue_tail', 'commit timestamp queue inserts to tail'),
     TxnStat('txn_commit_queue_inserts', 'commit timestamp queue inserts total'),
     TxnStat('txn_commit_queue_len', 'commit timestamp queue length'),
     TxnStat('txn_fail_cache', 'transaction failures due to cache overflow'),
@@ -500,12 +514,19 @@ connection_stats = [
     TxnStat('txn_pinned_snapshot_range', 'transaction range of IDs currently pinned by named snapshots', 'no_clear,no_scale'),
     TxnStat('txn_pinned_timestamp', 'transaction range of timestamps currently pinned', 'no_clear,no_scale'),
     TxnStat('txn_pinned_timestamp_oldest', 'transaction range of timestamps pinned by the oldest timestamp', 'no_clear,no_scale'),
+    TxnStat('txn_prepare', 'prepared transactions'),
+    TxnStat('txn_prepare_active', 'prepared transactions currently active'),
+    TxnStat('txn_prepare_commit', 'prepared transactions committed'),
+    TxnStat('txn_prepare_rollback', 'prepared transactions rolled back'),
     TxnStat('txn_query_ts', 'query timestamp calls'),
     TxnStat('txn_read_queue_empty', 'read timestamp queue insert to empty'),
     TxnStat('txn_read_queue_head', 'read timestamp queue inserts to head'),
     TxnStat('txn_read_queue_inserts', 'read timestamp queue inserts total'),
     TxnStat('txn_read_queue_len', 'read timestamp queue length'),
     TxnStat('txn_rollback', 'transactions rolled back'),
+    TxnStat('txn_rollback_las_removed', 'rollback to stable updates removed from lookaside'),
+    TxnStat('txn_rollback_to_stable', 'rollback to stable calls'),
+    TxnStat('txn_rollback_upd_aborted', 'rollback to stable updates aborted'),
     TxnStat('txn_set_ts', 'set timestamp calls'),
     TxnStat('txn_set_ts_commit', 'set timestamp commit calls'),
     TxnStat('txn_set_ts_commit_upd', 'set timestamp commit updates'),
@@ -534,7 +555,7 @@ connection_stats = [
     YieldStat('page_locked_blocked', 'page acquire locked blocked'),
     YieldStat('page_read_blocked', 'page acquire read blocked'),
     YieldStat('page_sleep', 'page acquire time sleeping (usecs)'),
-    YieldStat('tree_descend_blocked', 'tree descend one level yielded for split page index update'),
+    YieldStat('prepared_transition_blocked_page', 'page access yielded due to prepare state change'),
     YieldStat('txn_release_blocked', 'connection close blocked waiting for transaction state stabilization'),
 ]
 
@@ -614,6 +635,8 @@ dsrc_stats = [
     CacheStat('cache_inmem_splittable', 'in-memory page passed criteria to be split'),
     CacheStat('cache_pages_requested', 'pages requested from the cache'),
     CacheStat('cache_read', 'pages read into cache'),
+    CacheStat('cache_read_deleted', 'pages read into cache after truncate'),
+    CacheStat('cache_read_deleted_prepared', 'pages read into cache after truncate in prepare state'),
     CacheStat('cache_read_lookaside', 'pages read into cache requiring lookaside entries'),
     CacheStat('cache_read_overflow', 'overflow pages read into cache'),
     CacheStat('cache_write', 'pages written from cache'),
@@ -659,6 +682,7 @@ dsrc_stats = [
     ##########################################
     # Cursor operations
     ##########################################
+    CursorStat('cursor_cache', 'cursors cached on close'),
     CursorStat('cursor_create', 'create calls'),
     CursorStat('cursor_insert', 'insert calls'),
     CursorStat('cursor_insert_bulk', 'bulk-loaded cursor-insert calls'),
@@ -668,6 +692,7 @@ dsrc_stats = [
     CursorStat('cursor_prev', 'prev calls'),
     CursorStat('cursor_remove', 'remove calls'),
     CursorStat('cursor_remove_bytes', 'cursor-remove key bytes removed', 'size'),
+    CursorStat('cursor_reopen', 'cursors reused from cache'),
     CursorStat('cursor_reserve', 'reserve calls'),
     CursorStat('cursor_reset', 'reset calls'),
     CursorStat('cursor_restart', 'restarted searches'),
@@ -714,6 +739,7 @@ dsrc_stats = [
     ##########################################
     # Session operations
     ##########################################
+    SessionStat('session_cursor_cached', 'cached cursor count', 'no_clear,no_scale'),
     SessionStat('session_compact', 'object compaction'),
     SessionStat('session_cursor_open', 'open cursor count', 'no_clear,no_scale'),
 

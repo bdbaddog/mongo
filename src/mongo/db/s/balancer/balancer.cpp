@@ -44,11 +44,9 @@
 #include "mongo/db/s/balancer/balancer_chunk_selection_policy_impl.h"
 #include "mongo/db/s/balancer/cluster_statistics_impl.h"
 #include "mongo/s/balancer_configuration.h"
-#include "mongo/s/catalog/sharding_catalog_client.h"
 #include "mongo/s/catalog/type_chunk.h"
 #include "mongo/s/catalog_cache.h"
 #include "mongo/s/client/shard_registry.h"
-#include "mongo/s/cluster_identity_loader.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/shard_util.h"
 #include "mongo/stdx/memory.h"
@@ -153,9 +151,10 @@ void warnOnMultiVersion(const vector<ClusterStatistics::ShardStatistics>& cluste
 
 Balancer::Balancer(ServiceContext* serviceContext)
     : _balancedLastTime(0),
-      _clusterStats(stdx::make_unique<ClusterStatisticsImpl>()),
+      _random(std::random_device{}()),
+      _clusterStats(stdx::make_unique<ClusterStatisticsImpl>(_random)),
       _chunkSelectionPolicy(
-          stdx::make_unique<BalancerChunkSelectionPolicyImpl>(_clusterStats.get())),
+          stdx::make_unique<BalancerChunkSelectionPolicyImpl>(_clusterStats.get(), _random)),
       _migrationManager(serviceContext) {}
 
 Balancer::~Balancer() {
@@ -468,7 +467,7 @@ bool Balancer::_checkOIDs(OperationContext* opCtx) {
     auto shardingContext = Grid::get(opCtx);
 
     vector<ShardId> all;
-    shardingContext->shardRegistry()->getAllShardIds(&all);
+    shardingContext->shardRegistry()->getAllShardIdsNoReload(&all);
 
     // map of OID machine ID => shardId
     map<int, ShardId> oids;
@@ -605,7 +604,7 @@ int Balancer::_moveChunks(OperationContext* opCtx,
             log() << "Performing a split because migration " << redact(requestIt->toString())
                   << " failed for size reasons" << causedBy(redact(status));
 
-            _splitOrMarkJumbo(opCtx, NamespaceString(requestIt->ns), requestIt->minKey);
+            _splitOrMarkJumbo(opCtx, requestIt->nss, requestIt->minKey);
             continue;
         }
 
@@ -623,15 +622,15 @@ void Balancer::_splitOrMarkJumbo(OperationContext* opCtx,
         Grid::get(opCtx)->catalogCache()->getShardedCollectionRoutingInfoWithRefresh(opCtx, nss));
     const auto cm = routingInfo.cm().get();
 
-    const auto chunk = cm->findIntersectingChunkWithSimpleCollation(minKey);
+    auto chunk = cm->findIntersectingChunkWithSimpleCollation(minKey);
 
     try {
         const auto splitPoints = uassertStatusOK(shardutil::selectChunkSplitPoints(
             opCtx,
-            chunk->getShardId(),
+            chunk.getShardId(),
             nss,
             cm->getShardKeyPattern(),
-            ChunkRange(chunk->getMin(), chunk->getMax()),
+            ChunkRange(chunk.getMin(), chunk.getMax()),
             Grid::get(opCtx)->getBalancerConfiguration()->getMaxChunkSizeBytes(),
             boost::none));
 
@@ -639,18 +638,18 @@ void Balancer::_splitOrMarkJumbo(OperationContext* opCtx,
 
         uassertStatusOK(
             shardutil::splitChunkAtMultiplePoints(opCtx,
-                                                  chunk->getShardId(),
+                                                  chunk.getShardId(),
                                                   nss,
                                                   cm->getShardKeyPattern(),
                                                   cm->getVersion(),
-                                                  ChunkRange(chunk->getMin(), chunk->getMax()),
+                                                  ChunkRange(chunk.getMin(), chunk.getMax()),
                                                   splitPoints));
     } catch (const DBException&) {
-        log() << "Marking chunk " << redact(chunk->toString()) << " as jumbo.";
+        log() << "Marking chunk " << redact(chunk.toString()) << " as jumbo.";
 
-        chunk->markAsJumbo();
+        chunk.markAsJumbo();
 
-        const std::string chunkName = ChunkType::genID(nss.ns(), chunk->getMin());
+        const std::string chunkName = ChunkType::genID(nss, chunk.getMin());
 
         auto status = Grid::get(opCtx)->catalogClient()->updateConfigDocument(
             opCtx,

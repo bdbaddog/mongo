@@ -37,28 +37,52 @@
 #include "mongo/db/kill_sessions_common.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/service_context.h"
+#include "mongo/db/session.h"
+#include "mongo/db/session_catalog.h"
 #include "mongo/util/log.h"
 
 namespace mongo {
-
-SessionKiller::Result killSessionsLocalKillCursors(OperationContext* opCtx,
-                                                   const SessionKiller::Matcher& matcher) {
+namespace {
+void killSessionsLocalKillCursors(OperationContext* opCtx, const SessionKiller::Matcher& matcher) {
 
     auto res = CursorManager::killCursorsWithMatchingSessions(opCtx, matcher);
-    auto status = res.first;
+    uassertStatusOK(res.first);
+}
+}  // namespace
 
-    if (status.isOK()) {
-        return std::vector<HostAndPort>{};
-    } else {
-        return status;
-    }
+void killSessionsLocalKillTransactions(OperationContext* opCtx,
+                                       const SessionKiller::Matcher& matcher,
+                                       bool shouldKillClientCursors) {
+    SessionCatalog::get(opCtx)->scanSessions(
+        opCtx, matcher, [shouldKillClientCursors](OperationContext* opCtx, Session* session) {
+            session->abortArbitraryTransaction(opCtx, shouldKillClientCursors);
+        });
+}
+
+void killSessionsLocalKillTransactionCursors(OperationContext* opCtx,
+                                             const SessionKiller::Matcher& matcher) {
+    SessionCatalog::get(opCtx)->scanSessions(
+        opCtx, matcher, [](OperationContext* opCtx, Session* session) {
+            session->killTransactionCursors(opCtx);
+        });
 }
 
 SessionKiller::Result killSessionsLocal(OperationContext* opCtx,
                                         const SessionKiller::Matcher& matcher,
                                         SessionKiller::UniformRandomBitGenerator* urbg) {
-    uassertStatusOK(killSessionsLocalKillCursors(opCtx, matcher));
-    return uassertStatusOK(killSessionsLocalKillOps(opCtx, matcher));
+    killSessionsLocalKillCursors(opCtx, matcher);
+    uassertStatusOK(killSessionsLocalKillOps(opCtx, matcher));
+    killSessionsLocalKillTransactions(opCtx, matcher);
+    return {std::vector<HostAndPort>{}};
+}
+
+void killAllExpiredTransactions(OperationContext* opCtx) {
+    SessionKiller::Matcher matcherAllSessions(
+        KillAllSessionsByPatternSet{makeKillAllSessionsByPattern(opCtx)});
+    SessionCatalog::get(opCtx)->scanSessions(
+        opCtx, matcherAllSessions, [](OperationContext* opCtx, Session* session) {
+            session->abortArbitraryTransactionIfExpired(opCtx);
+        });
 }
 
 }  // namespace mongo

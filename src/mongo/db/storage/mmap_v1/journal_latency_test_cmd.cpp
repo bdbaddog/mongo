@@ -39,6 +39,7 @@
 #include "mongo/db/auth/action_type.h"
 #include "mongo/db/auth/privilege.h"
 #include "mongo/db/commands.h"
+#include "mongo/db/commands/test_commands_enabled.h"
 #include "mongo/db/curop.h"
 #include "mongo/db/index/index_access_method.h"
 #include "mongo/db/index/index_descriptor.h"
@@ -68,8 +69,8 @@ class JournalLatencyTestCmd : public BasicCommand {
 public:
     JournalLatencyTestCmd() : BasicCommand("journalLatencyTest") {}
 
-    virtual bool slaveOk() const {
-        return true;
+    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
+        return AllowedOnSecondary::kAlways;
     }
     virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
         return false;
@@ -77,13 +78,13 @@ public:
     virtual bool adminOnly() const {
         return true;
     }
-    virtual void help(stringstream& h) const {
-        h << "test how long to write and fsync to a test file in the journal/ directory";
+    std::string help() const override {
+        return "test how long to write and fsync to a test file in the journal/ directory";
     }
     // No auth needed because it only works when enabled via command line.
     virtual void addRequiredPrivileges(const std::string& dbname,
                                        const BSONObj& cmdObj,
-                                       std::vector<Privilege>* out) {}
+                                       std::vector<Privilege>* out) const {}
     bool run(OperationContext* opCtx,
              const string& dbname,
              const BSONObj& cmdObj,
@@ -151,7 +152,7 @@ public:
     }
 };
 MONGO_INITIALIZER(RegisterJournalLatencyTestCmd)(InitializerContext* context) {
-    if (Command::testCommandsEnabled) {
+    if (getTestCommandsEnabled()) {
         // Leaked intentionally: a Command registers itself when constructed.
         new JournalLatencyTestCmd();
     }

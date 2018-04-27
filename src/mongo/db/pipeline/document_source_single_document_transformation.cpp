@@ -45,10 +45,12 @@ using boost::intrusive_ptr;
 DocumentSourceSingleDocumentTransformation::DocumentSourceSingleDocumentTransformation(
     const intrusive_ptr<ExpressionContext>& pExpCtx,
     std::unique_ptr<TransformerInterface> parsedTransform,
-    std::string name)
+    std::string name,
+    bool isIndependentOfAnyCollection)
     : DocumentSource(pExpCtx),
       _parsedTransform(std::move(parsedTransform)),
-      _name(std::move(name)) {}
+      _name(std::move(name)),
+      _isIndependentOfAnyCollection(isIndependentOfAnyCollection) {}
 
 const char* DocumentSourceSingleDocumentTransformation::getSourceName() const {
     return _name.c_str();
@@ -73,12 +75,18 @@ intrusive_ptr<DocumentSource> DocumentSourceSingleDocumentTransformation::optimi
 }
 
 void DocumentSourceSingleDocumentTransformation::doDispose() {
-    _parsedTransform.reset();
+    if (_parsedTransform) {
+        // Cache the stage options document in case this stage is serialized after disposing.
+        _cachedStageOptions = _parsedTransform->serializeStageOptions(pExpCtx->explain);
+        _parsedTransform.reset();
+    }
 }
 
 Value DocumentSourceSingleDocumentTransformation::serialize(
     boost::optional<ExplainOptions::Verbosity> explain) const {
-    return Value(Document{{getSourceName(), _parsedTransform->serializeStageOptions(explain)}});
+    return Value(Document{{getSourceName(),
+                           _parsedTransform ? _parsedTransform->serializeStageOptions(explain)
+                                            : _cachedStageOptions}});
 }
 
 Pipeline::SourceContainer::iterator DocumentSourceSingleDocumentTransformation::doOptimizeAt(

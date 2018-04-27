@@ -34,6 +34,7 @@
 #include "mongo/bson/util/bson_extract.h"
 #include "mongo/db/query/canonical_query.h"
 #include "mongo/db/query/query_request.h"
+#include "mongo/db/repl/read_concern_args.h"
 #include "mongo/stdx/memory.h"
 #include "mongo/util/mongoutils/str.h"
 
@@ -206,8 +207,7 @@ StatusWith<ParsedDistinct> ParsedDistinct::parse(OperationContext* opCtx,
                                            std::move(qr),
                                            expCtx,
                                            extensionsCallback,
-                                           MatchExpressionParser::kAllowAllSpecialFeatures &
-                                               ~MatchExpressionParser::AllowedFeatures::kIsolated);
+                                           MatchExpressionParser::kAllowAllSpecialFeatures);
     if (!cq.isOK()) {
         return cq.getStatus();
     }

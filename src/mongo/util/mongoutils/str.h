@@ -53,6 +53,10 @@ namespace str {
     since the following doesn't work:
 
        (std::stringstream() << 1).str();
+
+    TODO: To avoid implicit conversions in relational operation expressions, this stream
+    class should provide a full symmetric set of relational operators vs itself, vs
+    std::string, vs mongo::StringData, and vs const char*, but that's a lot of functions.
 */
 class stream {
 public:
@@ -68,6 +72,14 @@ public:
     operator mongo::StringData() const {
         return ss.stringData();
     }
+
+    /**
+     * Fail to compile if passed an unevaluated function, rather than allow it to decay and invoke
+     * the bool overload. This catches both passing std::hex (which isn't supported by this type)
+     * and forgetting to add () when doing `stream << someFuntion`.
+     */
+    template <typename R, typename... Args>
+    stream& operator<<(R (*val)(Args...)) = delete;
 };
 
 inline bool startsWith(const char* str, const char* prefix) {

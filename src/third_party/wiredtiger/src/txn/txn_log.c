@@ -25,6 +25,7 @@ __txn_op_log_row_key_check(WT_SESSION_IMPL *session, WT_CURSOR_BTREE *cbt)
 	WT_ITEM key;
 	WT_PAGE *page;
 	WT_ROW *rip;
+	int cmp;
 
 	cursor = &cbt->iface;
 	WT_ASSERT(session, F_ISSET(cursor, WT_CURSTD_KEY_SET));
@@ -50,8 +51,9 @@ __txn_op_log_row_key_check(WT_SESSION_IMPL *session, WT_CURSOR_BTREE *cbt)
 		key.size = WT_INSERT_KEY_SIZE(cbt->ins);
 	}
 
-	WT_ASSERT(session, key.size == cursor->key.size &&
-	    memcmp(key.data, cursor->key.data, key.size) == 0);
+	WT_ASSERT(session, __wt_compare(
+	    session, cbt->btree->collator, &key, &cursor->key, &cmp) == 0);
+	WT_ASSERT(session, cmp == 0);
 
 	__wt_buf_free(session, &key);
 }
@@ -162,10 +164,10 @@ void
 __wt_txn_op_free(WT_SESSION_IMPL *session, WT_TXN_OP *op)
 {
 	switch (op->type) {
+	case WT_TXN_OP_NONE:
 	case WT_TXN_OP_BASIC:
-	case WT_TXN_OP_BASIC_TS:
 	case WT_TXN_OP_INMEM:
-	case WT_TXN_OP_REF:
+	case WT_TXN_OP_REF_DELETE:
 	case WT_TXN_OP_TRUNCATE_COL:
 		break;
 
@@ -243,13 +245,13 @@ __wt_txn_log_op(WT_SESSION_IMPL *session, WT_CURSOR_BTREE *cbt)
 	logrec = txn->logrec;
 
 	switch (op->type) {
-	case WT_TXN_OP_BASIC:
-	case WT_TXN_OP_BASIC_TS:
-		ret = __txn_op_log(session, logrec, op, cbt);
-		break;
+	case WT_TXN_OP_NONE:
 	case WT_TXN_OP_INMEM:
-	case WT_TXN_OP_REF:
+	case WT_TXN_OP_REF_DELETE:
 		/* Nothing to log, we're done. */
+		break;
+	case WT_TXN_OP_BASIC:
+		ret = __txn_op_log(session, logrec, op, cbt);
 		break;
 	case WT_TXN_OP_TRUNCATE_COL:
 		ret = __wt_logop_col_truncate_pack(session, logrec,

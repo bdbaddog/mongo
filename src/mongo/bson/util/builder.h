@@ -37,6 +37,7 @@
 #include <string.h>
 #include <string>
 
+#include <boost/optional.hpp>
 
 #include "mongo/base/data_type_endian.h"
 #include "mongo/base/data_view.h"
@@ -448,6 +449,19 @@ public:
         append(ErrorCodes::errorString(code));
         return *this;
     }
+
+    template <typename T>
+    StringBuilderImpl& operator<<(const boost::optional<T>& optional) {
+        return optional ? *this << *optional : *this << "(None)";
+    }
+
+    /**
+     * Fail to compile if passed an unevaluated function, rather than allow it to decay and invoke
+     * the bool overload. This catches both passing std::hex (which isn't supported by this type)
+     * and forgetting to add () when doing `stream << someFuntion`.
+     */
+    template <typename R, typename... Args>
+    StringBuilderImpl& operator<<(R (*val)(Args...)) = delete;
 
     void appendDoubleNice(double x) {
         const int prev = _buf.l;

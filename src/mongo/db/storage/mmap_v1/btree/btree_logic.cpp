@@ -405,7 +405,7 @@ bool BtreeLogic<BtreeLayout>::pushBack(BucketType* bucket,
                   << endl;
             log() << "  klast: " << klast.data.toString() << endl;
             log() << "  key:   " << key.toString() << endl;
-            invariant(false);
+            MONGO_UNREACHABLE;
         }
     }
 
@@ -1105,7 +1105,7 @@ Status BtreeLogic<BtreeLayout>::_find(OperationContext* opCtx,
 
     // Some debugging checks.
     if (low != bucket->n) {
-        wassert(key.woCompare(getFullKey(bucket, low).data, _ordering) <= 0);
+        invariant(key.woCompare(getFullKey(bucket, low).data, _ordering) <= 0);
 
         if (low > 0) {
             if (getFullKey(bucket, low - 1).data.woCompare(key, _ordering) > 0) {
@@ -1113,7 +1113,7 @@ Status BtreeLogic<BtreeLayout>::_find(OperationContext* opCtx,
                     log() << key.toString() << endl;
                     log() << getFullKey(bucket, low - 1).data.toString() << endl;
                 }
-                wassert(false);
+                MONGO_UNREACHABLE;
             }
         }
     }
@@ -1456,8 +1456,7 @@ int BtreeLogic<BtreeLayout>::indexInParent(OperationContext* opCtx,
     // dump();
     log() << "Parent: " << bucket->parent << "\n";
     // p->dump();
-    invariant(false);
-    return -1;  // just to compile
+    MONGO_UNREACHABLE;
 }
 
 template <class BtreeLayout>
@@ -1737,7 +1736,7 @@ void BtreeLogic<BtreeLayout>::insertHere(OperationContext* opCtx,
         // It's the last key.
         if (bucket->nextChild != leftChildLoc) {
             // XXX log more
-            invariant(false);
+            MONGO_UNREACHABLE;
         }
         kn->prevChildBucket = bucket->nextChild;
         invariant(kn->prevChildBucket == leftChildLoc);
@@ -1749,7 +1748,7 @@ void BtreeLogic<BtreeLayout>::insertHere(OperationContext* opCtx,
         kn->prevChildBucket = leftChildLoc;
         if (getKeyHeader(bucket, pos + 1).prevChildBucket != leftChildLoc) {
             // XXX: log more
-            invariant(false);
+            MONGO_UNREACHABLE;
         }
         const LocType* pc = &getKeyHeader(bucket, pos + 1).prevChildBucket;
         // Intent declared in basicInsert()
@@ -2061,8 +2060,8 @@ long long BtreeLogic<BtreeLayout>::_fullValidate(OperationContext* opCtx,
 
             if (strict) {
                 invariant(b->parent == bucketLoc);
-            } else {
-                wassert(b->parent == bucketLoc);
+            } else if (b->parent != bucketLoc) {
+                warning() << "index corruption detected: b->parent != bucketLoc";
             }
 
             keyCount += _fullValidate(opCtx, left, unusedCount, strict, dumpBuckets, depth + 1);
@@ -2073,8 +2072,8 @@ long long BtreeLogic<BtreeLayout>::_fullValidate(OperationContext* opCtx,
         BucketType* b = getBucket(opCtx, bucket->nextChild);
         if (strict) {
             invariant(b->parent == bucketLoc);
-        } else {
-            wassert(b->parent == bucketLoc);
+        } else if (b->parent != bucketLoc) {
+            warning() << "index corruption detected: b->parent != bucketLoc";
         }
 
         keyCount +=
@@ -2119,7 +2118,7 @@ void BtreeLogic<BtreeLayout>::assertValid(const std::string& ns,
                     }
                     dumpBucket(bucket);
                 }
-                wassert(false);
+                MONGO_UNREACHABLE;
                 break;
             } else if (z == 0) {
                 if (!(firstKey.header.recordLoc < secondKey.header.recordLoc)) {
@@ -2128,7 +2127,7 @@ void BtreeLogic<BtreeLayout>::assertValid(const std::string& ns,
                           << " RL:" << firstKey.header.recordLoc.toString() << endl;
                     log() << " k(" << i + 1 << ")" << redact(secondKey.data.toString())
                           << " RL:" << secondKey.header.recordLoc.toString() << endl;
-                    wassert(firstKey.header.recordLoc < secondKey.header.recordLoc);
+                    invariant(firstKey.header.recordLoc < secondKey.header.recordLoc);
                 }
             }
         }
@@ -2139,11 +2138,10 @@ void BtreeLogic<BtreeLayout>::assertValid(const std::string& ns,
             FullKey k1 = getFullKey(bucket, 0);
             FullKey k2 = getFullKey(bucket, bucket->n - 1);
             int z = k1.data.woCompare(k2.data, ordering);
-            // wassert( z <= 0 );
             if (z > 0) {
                 log() << "Btree keys out of order in collection " << ns;
                 std::call_once(assertValidFlag, [&bucket]() { dumpBucket(bucket); });
-                invariant(false);
+                MONGO_UNREACHABLE;
             }
         }
     }
@@ -2238,7 +2236,7 @@ DiskLoc BtreeLogic<BtreeLayout>::advance(OperationContext* opCtx,
         log() << "  keyOfs: " << *posInOut << " n:" << bucket->n << " direction: " << direction
               << endl;
         // log() << bucketSummary() << endl;
-        invariant(false);
+        MONGO_UNREACHABLE;
     }
 
     // XXX document

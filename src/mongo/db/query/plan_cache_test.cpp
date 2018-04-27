@@ -155,7 +155,6 @@ unique_ptr<CanonicalQuery> canonicalize(const char* queryStr,
                                         const char* hintStr,
                                         const char* minStr,
                                         const char* maxStr,
-                                        bool snapshot,
                                         bool explain) {
     QueryTestServiceContext serviceContext;
     auto opCtx = serviceContext.makeOperationContext();
@@ -173,7 +172,6 @@ unique_ptr<CanonicalQuery> canonicalize(const char* queryStr,
     qr->setHint(fromjson(hintStr));
     qr->setMin(fromjson(minStr));
     qr->setMax(fromjson(maxStr));
-    qr->setSnapshot(snapshot);
     qr->setExplain(explain);
     const boost::intrusive_ptr<ExpressionContext> expCtx;
     auto statusWithCQ =
@@ -412,9 +410,8 @@ TEST(PlanCacheTest, ShouldNotCacheQueryExplain) {
                                                0,
                                                "{}",
                                                "{}",
-                                               "{}",   // min, max
-                                               false,  // snapshot
-                                               true    // explain
+                                               "{}",  // min, max
+                                               true   // explain
                                                ));
     const QueryRequest& qr = cq->getQueryRequest();
     ASSERT_TRUE(qr.isExplain());
@@ -479,12 +476,6 @@ protected:
         addIndex(BSON("_id" << 1), "_id_");
     }
 
-    void tearDown() {
-        for (vector<QuerySolution*>::iterator it = solns.begin(); it != solns.end(); ++it) {
-            delete *it;
-        }
-    }
-
     void addIndex(BSONObj keyPattern, const std::string& indexName, bool multikey = false) {
         // The first false means not multikey.
         // The second false means not sparse.
@@ -540,7 +531,7 @@ protected:
                             const BSONObj& hint,
                             const BSONObj& minObj,
                             const BSONObj& maxObj) {
-        runQueryFull(query, BSONObj(), BSONObj(), 0, 0, hint, minObj, maxObj, false);
+        runQueryFull(query, BSONObj(), BSONObj(), 0, 0, hint, minObj, maxObj);
     }
 
     void runQuerySortProjSkipLimitHint(const BSONObj& query,
@@ -549,11 +540,7 @@ protected:
                                        long long skip,
                                        long long limit,
                                        const BSONObj& hint) {
-        runQueryFull(query, sort, proj, skip, limit, hint, BSONObj(), BSONObj(), false);
-    }
-
-    void runQuerySnapshot(const BSONObj& query) {
-        runQueryFull(query, BSONObj(), BSONObj(), 0, 0, BSONObj(), BSONObj(), BSONObj(), true);
+        runQueryFull(query, sort, proj, skip, limit, hint, BSONObj(), BSONObj());
     }
 
     void runQueryFull(const BSONObj& query,
@@ -563,16 +550,11 @@ protected:
                       long long limit,
                       const BSONObj& hint,
                       const BSONObj& minObj,
-                      const BSONObj& maxObj,
-                      bool snapshot) {
+                      const BSONObj& maxObj) {
         QueryTestServiceContext serviceContext;
         auto opCtx = serviceContext.makeOperationContext();
 
         // Clean up any previous state from a call to runQueryFull or runQueryAsCommand.
-        for (vector<QuerySolution*>::iterator it = solns.begin(); it != solns.end(); ++it) {
-            delete *it;
-        }
-
         solns.clear();
 
         auto qr = stdx::make_unique<QueryRequest>(nss);
@@ -588,7 +570,6 @@ protected:
         qr->setHint(hint);
         qr->setMin(minObj);
         qr->setMax(maxObj);
-        qr->setSnapshot(snapshot);
         const boost::intrusive_ptr<ExpressionContext> expCtx;
         auto statusWithCQ =
             CanonicalQuery::canonicalize(opCtx.get(),
@@ -597,8 +578,9 @@ protected:
                                          ExtensionsCallbackNoop(),
                                          MatchExpressionParser::kAllowAllSpecialFeatures);
         ASSERT_OK(statusWithCQ.getStatus());
-        Status s = QueryPlanner::plan(*statusWithCQ.getValue(), params, &solns);
-        ASSERT_OK(s);
+        auto statusWithSolutions = QueryPlanner::plan(*statusWithCQ.getValue(), params);
+        ASSERT_OK(statusWithSolutions.getStatus());
+        solns = std::move(statusWithSolutions.getValue());
     }
 
     void runQueryAsCommand(const BSONObj& cmdObj) {
@@ -606,10 +588,6 @@ protected:
         auto opCtx = serviceContext.makeOperationContext();
 
         // Clean up any previous state from a call to runQueryFull or runQueryAsCommand.
-        for (vector<QuerySolution*>::iterator it = solns.begin(); it != solns.end(); ++it) {
-            delete *it;
-        }
-
         solns.clear();
 
         const bool isExplain = false;
@@ -624,8 +602,9 @@ protected:
                                          ExtensionsCallbackNoop(),
                                          MatchExpressionParser::kAllowAllSpecialFeatures);
         ASSERT_OK(statusWithCQ.getStatus());
-        Status s = QueryPlanner::plan(*statusWithCQ.getValue(), params, &solns);
-        ASSERT_OK(s);
+        auto statusWithSolutions = QueryPlanner::plan(*statusWithCQ.getValue(), params);
+        ASSERT_OK(statusWithSolutions.getStatus());
+        solns = std::move(statusWithSolutions.getValue());
     }
 
     //
@@ -633,8 +612,8 @@ protected:
     //
 
     void dumpSolutions(str::stream& ost) const {
-        for (vector<QuerySolution*>::const_iterator it = solns.begin(); it != solns.end(); ++it) {
-            ost << (*it)->toString() << '\n';
+        for (auto&& soln : solns) {
+            ost << soln->toString() << '\n';
         }
     }
 
@@ -644,8 +623,8 @@ protected:
     size_t numSolutionMatches(const string& solnJson) const {
         BSONObj testSoln = fromjson(solnJson);
         size_t matches = 0;
-        for (vector<QuerySolution*>::const_iterator it = solns.begin(); it != solns.end(); ++it) {
-            QuerySolutionNode* root = (*it)->root.get();
+        for (auto&& soln : solns) {
+            QuerySolutionNode* root = soln->root.get();
             if (QueryPlannerTestLib::solutionMatches(testSoln, root)) {
                 ++matches;
             }
@@ -673,27 +652,15 @@ protected:
     }
 
     /**
-     * Plan 'query' from the cache. A mock cache entry is created using
-     * the cacheData stored inside the QuerySolution 'soln'.
-     *
-     * Does not take ownership of 'soln'.
-     */
-    QuerySolution* planQueryFromCache(const BSONObj& query, const QuerySolution& soln) const {
-        return planQueryFromCache(query, BSONObj(), BSONObj(), BSONObj(), soln);
-    }
-
-    /**
      * Plan 'query' from the cache with sort order 'sort', projection 'proj', and collation
      * 'collation'. A mock cache entry is created using the cacheData stored inside the
      * QuerySolution 'soln'.
-     *
-     * Does not take ownership of 'soln'.
      */
-    QuerySolution* planQueryFromCache(const BSONObj& query,
-                                      const BSONObj& sort,
-                                      const BSONObj& proj,
-                                      const BSONObj& collation,
-                                      const QuerySolution& soln) const {
+    std::unique_ptr<QuerySolution> planQueryFromCache(const BSONObj& query,
+                                                      const BSONObj& sort,
+                                                      const BSONObj& proj,
+                                                      const BSONObj& collation,
+                                                      const QuerySolution& soln) const {
         QueryTestServiceContext serviceContext;
         auto opCtx = serviceContext.makeOperationContext();
 
@@ -721,11 +688,9 @@ protected:
         PlanCacheEntry entry(solutions, createDecision(1U));
         CachedSolution cachedSoln(ck, entry);
 
-        QuerySolution* out;
-        Status s = QueryPlanner::planFromCache(*scopedCq, params, cachedSoln, &out);
-        ASSERT_OK(s);
-
-        return out;
+        auto statusWithQs = QueryPlanner::planFromCache(*scopedCq, params, cachedSoln);
+        ASSERT_OK(statusWithQs.getStatus());
+        return std::move(statusWithQs.getValue());
     }
 
     /**
@@ -736,10 +701,10 @@ protected:
      */
     QuerySolution* firstMatchingSolution(const string& solnJson) const {
         BSONObj testSoln = fromjson(solnJson);
-        for (vector<QuerySolution*>::const_iterator it = solns.begin(); it != solns.end(); ++it) {
-            QuerySolutionNode* root = (*it)->root.get();
+        for (auto&& soln : solns) {
+            QuerySolutionNode* root = soln->root.get();
             if (QueryPlannerTestLib::solutionMatches(testSoln, root)) {
-                return *it;
+                return soln.get();
             }
         }
 
@@ -791,10 +756,9 @@ protected:
                                          const BSONObj& proj,
                                          const BSONObj& collation,
                                          const string& solnJson) {
-        QuerySolution* bestSoln = firstMatchingSolution(solnJson);
-        QuerySolution* planSoln = planQueryFromCache(query, sort, proj, collation, *bestSoln);
-        assertSolutionMatches(planSoln, solnJson);
-        delete planSoln;
+        auto bestSoln = firstMatchingSolution(solnJson);
+        auto planSoln = planQueryFromCache(query, sort, proj, collation, *bestSoln);
+        assertSolutionMatches(planSoln.get(), solnJson);
     }
 
     /**
@@ -813,7 +777,7 @@ protected:
 
     BSONObj queryObj;
     QueryPlannerParams params;
-    vector<QuerySolution*> solns;
+    std::vector<std::unique_ptr<QuerySolution>> solns;
 };
 
 const PlanCacheKey CachePlanSelectionTest::ck = "mock_cache_key";

@@ -10,9 +10,13 @@ selector:
   - jstests/disk/repair3.js
   - jstests/disk/repair4.js
   exclude_with_any_tags:
+  - requires_mobile_se
   - requires_wiredtiger
 
 executor:
+  archive:
+    hooks:
+      - ValidateCollections
   config:
     shell_options:
       global_vars:

@@ -171,7 +171,10 @@ void LogicalTimeValidator::init(ServiceContext* service) {
 }
 
 void LogicalTimeValidator::shutDown() {
-    _getKeyManagerCopy()->stopMonitoring();
+    stdx::lock_guard<stdx::mutex> lk(_mutexKeyManager);
+    if (_keyManager) {
+        _keyManager->stopMonitoring();
+    }
 }
 
 void LogicalTimeValidator::enableKeyGenerator(OperationContext* opCtx, bool doEnable) {
@@ -190,28 +193,30 @@ bool LogicalTimeValidator::shouldGossipLogicalTime() {
     return _getKeyManagerCopy()->hasSeenKeys();
 }
 
-void LogicalTimeValidator::forceKeyRefreshNow(OperationContext* opCtx) {
-    _getKeyManagerCopy()->refreshNow(opCtx);
-}
-
-void LogicalTimeValidator::resetKeyManagerCache(ServiceContext* service) {
+void LogicalTimeValidator::resetKeyManagerCache() {
     log() << "Resetting key manager cache";
-    if (auto keyManager = _getKeyManagerCopy()) {
-        keyManager->stopMonitoring();
-        keyManager->startMonitoring(service);
-        _lastSeenValidTime = SignedLogicalTime();
-        _timeProofService.resetCache();
+    {
+        stdx::lock_guard<stdx::mutex> keyManagerLock(_mutexKeyManager);
+        invariant(_keyManager);
+        _keyManager->clearCache();
     }
+    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    _lastSeenValidTime = SignedLogicalTime();
+    _timeProofService.resetCache();
 }
 
 void LogicalTimeValidator::resetKeyManager() {
-    log() << "Resetting key manager";
-    stdx::lock_guard<stdx::mutex> lk(_mutexKeyManager);
+    stdx::lock_guard<stdx::mutex> keyManagerLock(_mutexKeyManager);
     if (_keyManager) {
+        log() << "Resetting key manager";
         _keyManager->stopMonitoring();
         _keyManager.reset();
+
+        stdx::lock_guard<stdx::mutex> lk(_mutex);
         _lastSeenValidTime = SignedLogicalTime();
         _timeProofService.resetCache();
+    } else {
+        log() << "Resetting key manager: no key manager exists.";
     }
 }
 

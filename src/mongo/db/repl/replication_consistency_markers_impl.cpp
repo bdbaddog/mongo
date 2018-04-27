@@ -45,14 +45,11 @@ namespace repl {
 
 constexpr StringData ReplicationConsistencyMarkersImpl::kDefaultMinValidNamespace;
 constexpr StringData ReplicationConsistencyMarkersImpl::kDefaultOplogTruncateAfterPointNamespace;
-constexpr StringData ReplicationConsistencyMarkersImpl::kDefaultCheckpointTimestampNamespace;
 
 namespace {
 const BSONObj kInitialSyncFlag(BSON(MinValidDocument::kInitialSyncFlagFieldName << true));
 const BSONObj kOplogTruncateAfterPointId(BSON("_id"
                                               << "oplogTruncateAfterPoint"));
-const BSONObj kCheckpointTimestampId(BSON("_id"
-                                          << "checkpointTimestamp"));
 }  // namespace
 
 ReplicationConsistencyMarkersImpl::ReplicationConsistencyMarkersImpl(
@@ -61,19 +58,15 @@ ReplicationConsistencyMarkersImpl::ReplicationConsistencyMarkersImpl(
           storageInterface,
           NamespaceString(ReplicationConsistencyMarkersImpl::kDefaultMinValidNamespace),
           NamespaceString(
-              ReplicationConsistencyMarkersImpl::kDefaultOplogTruncateAfterPointNamespace),
-          NamespaceString(
-              ReplicationConsistencyMarkersImpl::kDefaultCheckpointTimestampNamespace)) {}
+              ReplicationConsistencyMarkersImpl::kDefaultOplogTruncateAfterPointNamespace)) {}
 
 ReplicationConsistencyMarkersImpl::ReplicationConsistencyMarkersImpl(
     StorageInterface* storageInterface,
     NamespaceString minValidNss,
-    NamespaceString oplogTruncateAfterPointNss,
-    NamespaceString checkpointTimestampNss)
+    NamespaceString oplogTruncateAfterPointNss)
     : _storageInterface(storageInterface),
       _minValidNss(minValidNss),
-      _oplogTruncateAfterPointNss(oplogTruncateAfterPointNss),
-      _checkpointTimestampNss(checkpointTimestampNss) {}
+      _oplogTruncateAfterPointNss(oplogTruncateAfterPointNss) {}
 
 boost::optional<MinValidDocument> ReplicationConsistencyMarkersImpl::_getMinValidDocument(
     OperationContext* opCtx) const {
@@ -95,7 +88,7 @@ boost::optional<MinValidDocument> ReplicationConsistencyMarkersImpl::_getMinVali
 void ReplicationConsistencyMarkersImpl::_updateMinValidDocument(
     OperationContext* opCtx, const TimestampedBSONObj& updateSpec) {
     Status status = _storageInterface->putSingleton(opCtx, _minValidNss, updateSpec);
-    invariantOK(status);
+    invariant(status);
 }
 
 void ReplicationConsistencyMarkersImpl::initializeMinValidDocument(OperationContext* opCtx) {
@@ -115,18 +108,7 @@ void ReplicationConsistencyMarkersImpl::initializeMinValidDocument(OperationCont
     // the 'minValid' document, but we still want the initialization write to go into the next
     // checkpoint since a newly initialized 'minValid' document is always valid.
     upsert.timestamp = Timestamp();
-
-    Status status = _storageInterface->putSingleton(opCtx, _minValidNss, upsert);
-
-    // If the collection doesn't exist, create it and try again.
-    if (status == ErrorCodes::NamespaceNotFound) {
-        status = _storageInterface->createCollection(opCtx, _minValidNss, CollectionOptions());
-        fassertStatusOK(40509, status);
-
-        status = _storageInterface->putSingleton(opCtx, _minValidNss, upsert);
-    }
-
-    fassertStatusOK(40467, status);
+    fassert(40467, _storageInterface->putSingleton(opCtx, _minValidNss, upsert));
 }
 
 bool ReplicationConsistencyMarkersImpl::getInitialSyncFlag(OperationContext* opCtx) const {
@@ -252,7 +234,7 @@ void ReplicationConsistencyMarkersImpl::setMinValidToAtLeast(OperationContext* o
     update.timestamp = minValid.getTimestamp();
 
     Status status = _storageInterface->updateSingleton(opCtx, _minValidNss, query, update);
-    invariantOK(status);
+    invariant(status);
 }
 
 void ReplicationConsistencyMarkersImpl::removeOldOplogDeleteFromPointField(
@@ -330,20 +312,9 @@ ReplicationConsistencyMarkersImpl::_getOplogTruncateAfterPointDocument(
 
 void ReplicationConsistencyMarkersImpl::_upsertOplogTruncateAfterPointDocument(
     OperationContext* opCtx, const BSONObj& updateSpec) {
-    auto status = _storageInterface->upsertById(
-        opCtx, _oplogTruncateAfterPointNss, kOplogTruncateAfterPointId["_id"], updateSpec);
-
-    // If the collection doesn't exist, creates it and tries again.
-    if (status == ErrorCodes::NamespaceNotFound) {
-        status = _storageInterface->createCollection(
-            opCtx, _oplogTruncateAfterPointNss, CollectionOptions());
-        fassertStatusOK(40511, status);
-
-        status = _storageInterface->upsertById(
-            opCtx, _oplogTruncateAfterPointNss, kOplogTruncateAfterPointId["_id"], updateSpec);
-    }
-
-    fassertStatusOK(40512, status);
+    fassert(40512,
+            _storageInterface->upsertById(
+                opCtx, _oplogTruncateAfterPointNss, kOplogTruncateAfterPointId["_id"], updateSpec));
 }
 
 void ReplicationConsistencyMarkersImpl::setOplogTruncateAfterPoint(OperationContext* opCtx,
@@ -359,12 +330,6 @@ Timestamp ReplicationConsistencyMarkersImpl::getOplogTruncateAfterPoint(
     OperationContext* opCtx) const {
     auto doc = _getOplogTruncateAfterPointDocument(opCtx);
     if (!doc) {
-        if (serverGlobalParams.featureCompatibility.getVersion() !=
-            ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo36) {
-            LOG(3) << "Falling back on old oplog delete from point because there is no oplog "
-                      "truncate after point and we are in FCV 3.4.";
-            return _getOldOplogDeleteFromPoint(opCtx);
-        }
         LOG(3) << "Returning empty oplog truncate after point since document did not exist";
         return {};
     }
@@ -390,69 +355,18 @@ Timestamp ReplicationConsistencyMarkersImpl::_getOldOplogDeleteFromPoint(
     return oplogDeleteFromPoint.get();
 }
 
-void ReplicationConsistencyMarkersImpl::_upsertCheckpointTimestampDocument(
-    OperationContext* opCtx, const BSONObj& updateSpec) {
-    auto status = _storageInterface->upsertById(
-        opCtx, _checkpointTimestampNss, kCheckpointTimestampId["_id"], updateSpec);
-
-    // If the collection doesn't exist, creates it and tries again.
-    if (status == ErrorCodes::NamespaceNotFound) {
-        status = _storageInterface->createCollection(
-            opCtx, _checkpointTimestampNss, CollectionOptions());
-        fassertStatusOK(40581, status);
-
-        status = _storageInterface->upsertById(
-            opCtx, _checkpointTimestampNss, kCheckpointTimestampId["_id"], updateSpec);
-    }
-
-    fassertStatusOK(40582, status);
-}
-
-void ReplicationConsistencyMarkersImpl::writeCheckpointTimestamp(OperationContext* opCtx,
-                                                                 const Timestamp& timestamp) {
-    LOG(3) << "setting checkpoint timestamp to: " << timestamp.toBSON();
-
-    auto timestampField = CheckpointTimestampDocument::kCheckpointTimestampFieldName;
-    auto spec = BSON("$set" << BSON(timestampField << timestamp));
-
-    // TODO: When SERVER-28602 is completed, utilize RecoveryUnit::setTimestamp so that this
-    // write operation itself is committed with a timestamp that is included in the checkpoint.
-    _upsertCheckpointTimestampDocument(opCtx, spec);
-}
-
-boost::optional<CheckpointTimestampDocument>
-ReplicationConsistencyMarkersImpl::_getCheckpointTimestampDocument(OperationContext* opCtx) const {
-    auto doc =
-        _storageInterface->findById(opCtx, _checkpointTimestampNss, kCheckpointTimestampId["_id"]);
-
-    if (!doc.isOK()) {
-        if (doc.getStatus() == ErrorCodes::NoSuchKey ||
-            doc.getStatus() == ErrorCodes::NamespaceNotFound) {
-            return boost::none;
-        } else {
-            // Fails if there is an error other than the collection being missing or being empty.
-            fassertFailedWithStatus(40583, doc.getStatus());
+Status ReplicationConsistencyMarkersImpl::createInternalCollections(OperationContext* opCtx) {
+    for (auto nss : std::vector<NamespaceString>({_oplogTruncateAfterPointNss, _minValidNss})) {
+        auto status = _storageInterface->createCollection(opCtx, nss, CollectionOptions());
+        if (!status.isOK() && status.code() != ErrorCodes::NamespaceExists) {
+            return {ErrorCodes::CannotCreateCollection,
+                    str::stream() << "Failed to create collection. Ns: " << nss.ns() << " Error: "
+                                  << status.toString()};
         }
     }
 
-    auto checkpointTimestampDoc = CheckpointTimestampDocument::parse(
-        IDLParserErrorContext("CheckpointTimestampDocument"), doc.getValue());
-    return checkpointTimestampDoc;
+    return Status::OK();
 }
-
-Timestamp ReplicationConsistencyMarkersImpl::getCheckpointTimestamp(OperationContext* opCtx) {
-    auto doc = _getCheckpointTimestampDocument(opCtx);
-    if (!doc) {
-        LOG(3) << "Returning empty checkpoint timestamp since document did not exist";
-        return {};
-    }
-
-    Timestamp out = doc->getCheckpointTimestamp();
-
-    LOG(3) << "returning checkpoint timestamp: " << out;
-    return out;
-}
-
 
 }  // namespace repl
 }  // namespace mongo

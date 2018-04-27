@@ -19,17 +19,15 @@
     var secondaries = replTest.getSecondaries();
     var configConnStr = st.configRS.getURL();
 
+    // Shards start in FCV 3.6 until a config server reaches out to them. This causes storage to
+    // shutdown with 3.6 compatible files, requiring rollback via refetch.
+    priConn.adminCommand({setFeatureCompatibilityVersion: "4.0"});
+
     // Wait for the secondaries to have the latest oplog entries before stopping the fetcher to
     // avoid the situation where one of the secondaries will not have an overlapping oplog with
     // the other nodes once the primary is killed.
     replTest.awaitSecondaryNodes();
 
-    // This replica set is started with --shardsvr and terminated prior to addShard being called,
-    // hence before the featureCompatibilityVersion document is created, so we need to manually
-    // call setFeatureCompatibilityVersion because SERVER-29452 causes mongod to fail to start up
-    // without such a document.
-    assert.commandWorked(
-        priConn.getDB("admin").runCommand({setFeatureCompatibilityVersion: "3.6"}));
     replTest.awaitReplication();
 
     stopServerReplication(secondaries);

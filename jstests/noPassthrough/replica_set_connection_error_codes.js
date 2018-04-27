@@ -1,6 +1,7 @@
 /**
  * Tests that DBClientRS performs re-targeting when it sees an ErrorCodes.NotMaster error response
  * from a command even if "not master" doesn't appear in the message.
+ * @tags: [requires_replication]
  */
 (function() {
     "use strict";
@@ -46,8 +47,9 @@
 
     const awaitShell = stepDownPrimary(rst);
 
-    // Step up the secondary so there is a primary when the ReplicaSetMonitor goes looking for one.
-    assert.commandWorked(secondary1.adminCommand({replSetStepUp: 1}));
+    // Wait for a new primary to be elected and agreed upon by nodes.
+    rst.getPrimary();
+    rst.awaitNodesAgreeOnPrimary();
 
     // DBClientRS will continue to send command requests to the node it believed to be primary even
     // after it stepped down so long as it hasn't closed its connection.

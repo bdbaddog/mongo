@@ -36,7 +36,6 @@
 
 #include "mongo/db/repl/repl_set_config.h"
 #include "mongo/db/repl/replication_coordinator.h"
-#include "mongo/db/repl/replication_coordinator_global.h"
 #include "mongo/db/server_options.h"
 #include "mongo/db/server_options_helpers.h"
 #include "mongo/util/log.h"
@@ -59,12 +58,12 @@ void logProcessDetails() {
     printCommandLineOpts();
 }
 
-void logProcessDetailsForLogRotate() {
+void logProcessDetailsForLogRotate(ServiceContext* serviceContext) {
     log() << "pid=" << ProcessId::getCurrent() << " port=" << serverGlobalParams.port
           << (is32bit() ? " 32" : " 64") << "-bit "
           << "host=" << getHostNameCached();
 
-    auto replCoord = repl::getGlobalReplicationCoordinator();
+    auto replCoord = repl::ReplicationCoordinator::get(serviceContext);
     if (replCoord != nullptr &&
         replCoord->getReplicationMode() == repl::ReplicationCoordinator::modeReplSet) {
         auto rsConfig = replCoord->getConfig();

@@ -37,8 +37,8 @@
 #include "mongo/executor/network_interface_mock.h"
 #include "mongo/executor/task_executor.h"
 #include "mongo/s/catalog/sharding_catalog_client_impl.h"
-#include "mongo/s/catalog/sharding_catalog_test_fixture.h"
 #include "mongo/s/client/shard_registry.h"
+#include "mongo/s/sharding_router_test_fixture.h"
 #include "mongo/stdx/chrono.h"
 #include "mongo/stdx/future.h"
 #include "mongo/util/log.h"
@@ -56,7 +56,7 @@ using unittest::assertGet;
 const Seconds kFutureTimeout{5};
 const HostAndPort configHost{"TestHost1"};
 
-class InfoLoggingTest : public ShardingCatalogTestFixture {
+class InfoLoggingTest : public ShardingTestFixture {
 public:
     enum CollType { ActionLog, ChangeLog };
 
@@ -64,7 +64,7 @@ public:
         : _configCollType(configCollType), _cappedSize(cappedSize) {}
 
     void setUp() override {
-        ShardingCatalogTestFixture::setUp();
+        ShardingTestFixture::setUp();
 
         configTargeter()->setFindHostReturnValue(configHost);
     }
@@ -109,8 +109,8 @@ protected:
         });
 
         BSONObjBuilder createResponseBuilder;
-        Command::appendCommandStatus(createResponseBuilder,
-                                     Status(ErrorCodes::NamespaceExists, "coll already exists"));
+        CommandHelpers::appendCommandStatus(
+            createResponseBuilder, Status(ErrorCodes::NamespaceExists, "coll already exists"));
         expectConfigCollectionCreate(
             configHost, getConfigCollName(), _cappedSize, createResponseBuilder.obj());
         expectConfigCollectionInsert(configHost,
@@ -146,8 +146,8 @@ protected:
         });
 
         BSONObjBuilder createResponseBuilder;
-        Command::appendCommandStatus(createResponseBuilder,
-                                     Status(ErrorCodes::ExceededTimeLimit, "operation timed out"));
+        CommandHelpers::appendCommandStatus(
+            createResponseBuilder, Status(ErrorCodes::ExceededTimeLimit, "operation timed out"));
         expectConfigCollectionCreate(
             configHost, getConfigCollName(), _cappedSize, createResponseBuilder.obj());
 

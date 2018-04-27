@@ -1,6 +1,7 @@
 /*
  * Verify that retryable writes aren't allowed on mmapv1, because it doesn't have document-level
  * locking.
+ * @tags: [requires_sharding]
  */
 (function() {
     "use strict";
@@ -16,7 +17,7 @@
 
     let testDB = rst.getPrimary().startSession({retryWrites: true}).getDatabase("test");
 
-    assert.writeErrorWithCode(
+    assert.commandFailedWithCode(
         testDB.foo.insert({x: 1}),
         ErrorCodes.IllegalOperation,
         "expected command with txnNumber to fail without document-level locking");
@@ -27,7 +28,7 @@
 
     testDB = st.s.startSession({retryWrites: true}).getDatabase("test");
 
-    assert.writeErrorWithCode(
+    assert.commandFailedWithCode(
         testDB.foo.insert({x: 1}),
         ErrorCodes.IllegalOperation,
         "expected command with txnNumber to fail without document-level locking");

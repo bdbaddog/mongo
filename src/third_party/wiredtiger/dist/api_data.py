@@ -2,7 +2,18 @@
 
 class Method:
     def __init__(self, config):
-        self.config = config
+        # Deal with duplicates: with complex configurations (like
+        # WT_SESSION::create), it's simpler to deal with duplicates once than
+        # manually as configurations are defined
+        self.config = []
+        lastname = None
+        for c in sorted(config):
+            if '.' in c.name:
+                raise "Bad config key '%s'" % c.name
+            if c.name == lastname:
+                continue
+            lastname = c.name
+            self.config.append(c)
 
 class Config:
     def __init__(self, name, default, desc, subconfig=None, **flags):
@@ -15,10 +26,13 @@ class Config:
     def __cmp__(self, other):
         return cmp(self.name, other.name)
 
-# Metadata shared by all schema objects
-common_meta = [
+common_runtime_config = [
     Config('app_metadata', '', r'''
         application-owned metadata for this object'''),
+]
+
+# Metadata shared by all schema objects
+common_meta = common_runtime_config + [
     Config('collator', 'none', r'''
         configure custom collation for keys.  Permitted values are \c "none"
         or a custom collator name created with WT_CONNECTION::add_collator'''),
@@ -130,7 +144,7 @@ lsm_config = [
     ]),
 ]
 
-file_runtime_config = [
+file_runtime_config = common_runtime_config + [
     Config('access_pattern_hint', 'none', r'''
         It is recommended that workloads that consist primarily of
         updates and/or point queries specify \c random.  Workloads that
@@ -149,8 +163,10 @@ file_runtime_config = [
         Config('commit_timestamp', 'none', r'''
             verify that timestamps should 'always' or 'never' be used
             on modifications with this table.  Verification is 'none'
-            if mixed update use is allowed.''',
-            choices=['always','never','none']),
+            if mixed update use is allowed. If 'key_consistent' is
+            set then all updates to a specific key must be the same
+            with respect to timestamp usage or not.''',
+            choices=['always','key_consistent', 'never','none']),
         Config('read_timestamp', 'none', r'''
             verify that timestamps should 'always' or 'never' be used
             on reads with this table.  Verification is 'none'
@@ -454,29 +470,36 @@ connection_runtime_config = [
             ]),
     Config('eviction_checkpoint_target', '5', r'''
         perform eviction at the beginning of checkpoints to bring the dirty
-        content in cache to this level, expressed as a percentage of the total
-        cache size.  Ignored if set to zero or \c in_memory is \c true''',
-        min=0, max=99),
+        content in cache to this level. It is a percentage of the cache size if
+        the value is within the range of 0 to 100 or an absolute size when
+        greater than 100. The value is not allowed to exceed the \c cache_size.
+        Ignored if set to zero or \c in_memory is \c true''',
+        min=0, max='10TB'),
     Config('eviction_dirty_target', '5', r'''
         perform eviction in worker threads when the cache contains at least
-        this much dirty content, expressed as a percentage of the total cache
-        size.''',
-        min=1, max=99),
+        this much dirty content. It is a percentage of the cache size if the
+        value is within the range of 1 to 100 or an absolute size when greater
+        than 100. The value is not allowed to exceed the \c cache_size.''',
+        min=1, max='10TB'),
     Config('eviction_dirty_trigger', '20', r'''
         trigger application threads to perform eviction when the cache contains
-        at least this much dirty content, expressed as a percentage of the
-        total cache size. This setting only alters behavior if it is lower than
-        eviction_trigger''',
-        min=1, max=99),
+        at least this much dirty content. It is a percentage of the cache size
+        if the value is within the range of 1 to 100 or an absolute size when
+        greater than 100. The value is not allowed to exceed the \c cache_size.
+        This setting only alters behavior if it is lower than eviction_trigger
+        ''', min=1, max='10TB'),
     Config('eviction_target', '80', r'''
         perform eviction in worker threads when the cache contains at least
-        this much content, expressed as a percentage of the total cache size.
-        Must be less than \c eviction_trigger''',
-        min=10, max=99),
+        this much content. It is a percentage of the cache size if the value is
+        within the range of 10 to 100 or an absolute size when greater than 100.
+        The value is not allowed to exceed the \c cache_size.''',
+        min=10, max='10TB'),
     Config('eviction_trigger', '95', r'''
         trigger application threads to perform eviction when the cache contains
-        at least this much content, expressed as a percentage of the
-        total cache size''', min=10, max=99),
+        at least this much content. It is a percentage of the cache size if the
+        value is within the range of 10 to 100 or an absolute size when greater
+        than 100.  The value is not allowed to exceed the \c cache_size.''',
+        min=10, max='10TB'),
     Config('file_manager', '', r'''
         control how file handles are managed''',
         type='category', subconfig=[
@@ -525,7 +548,9 @@ connection_runtime_config = [
     Config('shared_cache', '', r'''
         shared cache configuration options. A database should configure
         either a cache_size or a shared_cache not both. Enabling a
-        shared cache uses a session from the configured session_max''',
+        shared cache uses a session from the configured session_max. A
+        shared cache can not have absolute values configured for cache
+        eviction settings''',
         type='category', subconfig=[
         Config('chunk', '10MB', r'''
             the granularity that a shared cache is redistributed''',
@@ -562,14 +587,13 @@ connection_runtime_config = [
         type='list',
         choices=['all', 'cache_walk', 'fast', 'none', 'clear', 'tree_walk']),
     Config('timing_stress_for_test', '', r'''
-        enable code that interrupts the usual timing of operations with a
-        goal of uncovering race conditions and unexpected blocking.
-        This option is intended for use with internal stress
-        testing of WiredTiger. Options are given as a list, such as
-        <code>"timing_stress_for_test=[checkpoint_slow,
-            internal_page_split_race, page_split_race]"</code>''',
-        type='list', undoc=True, choices=[
-            'checkpoint_slow', 'internal_page_split_race', 'page_split_race']),
+        enable code that interrupts the usual timing of operations with a goal
+        of uncovering race conditions and unexpected blocking. This option is
+        intended for use with internal stress testing of WiredTiger.''',
+        type='list', undoc=True,
+        choices=[
+        'checkpoint_slow', 'split_race_1', 'split_race_2', 'split_race_3',
+        'split_race_4', 'split_race_5', 'split_race_6', 'split_race_7']),
     Config('verbose', '', r'''
         enable messages for various events. Options are given as a
         list, such as <code>"verbose=[evictserver,read]"</code>''',
@@ -708,6 +732,14 @@ wiredtiger_open_statistics_log_configuration = [
 ]
 
 session_config = [
+    Config('cache_cursors', 'true', r'''
+        enable caching of cursors for reuse. Any calls to WT_CURSOR::close
+        for a cursor created in this session will mark the cursor
+        as cached and keep it available to be reused for later calls
+        to WT_SESSION::open_cursor. Cached cursors may be eventually
+        closed. This value is inherited from ::wiredtiger_open
+        \c cache_cursors''',
+        type='boolean'),
     Config('ignore_cache_size', 'false', r'''
         when set, operations performed by this session ignore the cache size
         and are not blocked when the cache is full.  Note that use of this
@@ -734,6 +766,11 @@ wiredtiger_open_common =\
         values are passed to WT_CONNECTION::load_extension as the \c config
         parameter (for example,
         <code>builtin_extension_config={zlib={compression_level=3}}</code>)'''),
+    Config('cache_cursors', 'true', r'''
+        enable caching of cursors for reuse. This is the default value
+        for any sessions created, and can be overridden in configuring
+        \c cache_cursors in WT_CONNECTION.open_session.''',
+        type='boolean'),
     Config('checkpoint_sync', 'true', r'''
         flush files to stable storage when closing or writing
         checkpoints''',
@@ -812,6 +849,9 @@ wiredtiger_open_common =\
     Config('session_scratch_max', '2MB', r'''
         maximum memory to cache in each session''',
         type='int', undoc=True),
+    Config('session_table_cache', 'true', r'''
+        Maintain a per-session cache of tables''',
+        type='boolean', undoc=True), # Obsolete after WT-3476
     Config('transaction_sync', '', r'''
         how to sync log records when the transaction commits''',
         type='category', subconfig=[
@@ -1126,6 +1166,10 @@ methods = {
 ]),
 
 'WT_SESSION.begin_transaction' : Method([
+    Config('ignore_prepare', 'false', r'''
+        whether to ignore the updates by other prepared transactions as part of
+        read operations of this transaction''',
+        type='boolean'),
     Config('isolation', '', r'''
         the isolation level for this transaction; defaults to the
         session's isolation level''',
@@ -1137,7 +1181,7 @@ methods = {
         Transactions with higher values are less likely to abort''',
         min='-100', max='100'),
     Config('read_timestamp', '', r'''
-        read using the specified timestamp.  The supplied value should not be
+        read using the specified timestamp.  The supplied value must not be
         older than the current oldest timestamp.  See
         @ref transaction_timestamps'''),
     Config('round_to_oldest', 'false', r'''
@@ -1156,8 +1200,8 @@ methods = {
 'WT_SESSION.commit_transaction' : Method([
     Config('commit_timestamp', '', r'''
         set the commit timestamp for the current transaction.  The supplied
-        value should not be older than the first commit timestamp set for the
-        current transaction.  The value should also not be older than the
+        value must not be older than the first commit timestamp set for the
+        current transaction.  The value must also not be older than the
         current oldest and stable timestamps.  See
         @ref transaction_timestamps'''),
     Config('sync', '', r'''
@@ -1171,13 +1215,29 @@ methods = {
         choices=['background', 'off', 'on']),
 ]),
 
+'WT_SESSION.prepare_transaction' : Method([
+    Config('prepare_timestamp', '', r'''
+        set the prepare timestamp for the updates of the current transaction.
+        The supplied value must not be older than any active read timestamps.
+        This configuration option is mandatory.  See
+        @ref transaction_timestamps'''),
+]),
+
 'WT_SESSION.timestamp_transaction' : Method([
     Config('commit_timestamp', '', r'''
         set the commit timestamp for the current transaction.  The supplied
-        value should not be older than the first commit timestamp set for the
-        current transaction.  The value should also not be older than the
+        value must not be older than the first commit timestamp set for the
+        current transaction.  The value must also not be older than the
         current oldest and stable timestamps.  See
         @ref transaction_timestamps'''),
+    Config('read_timestamp', '', r'''
+        read using the specified timestamp.  The supplied value must not be
+        older than the current oldest timestamp.  This can only be set once
+        for a transaction.  @ref transaction_timestamps'''),
+    Config('round_to_oldest', 'false', r'''
+        if read timestamp is earlier than oldest timestamp,
+        read timestamp will be rounded to oldest timestamp''',
+        type='boolean'),
 ]),
 
 'WT_SESSION.rollback_transaction' : Method([]),
@@ -1263,6 +1323,12 @@ methods = {
     Config('leak_memory', 'false', r'''
         don't free memory during close''',
         type='boolean'),
+    Config('use_timestamp', 'true', r'''
+        by default, create the close checkpoint as of the last stable timestamp
+        if timestamps are in use, or all current updates if there is no
+        stable timestamp set.  If false, this option generates a checkpoint
+        with all updates''',
+        type='boolean'),
 ]),
 'WT_CONNECTION.debug_info' : Method([
     Config('cache', 'false', r'''
@@ -1310,13 +1376,14 @@ methods = {
 'WT_CONNECTION.query_timestamp' : Method([
     Config('get', 'all_committed', r'''
         specify which timestamp to query: \c all_committed returns the largest
-        timestamp such that all earlier timestamps have committed, \c oldest
-        returns the most recent \c oldest_timestamp set with
+        timestamp such that all timestamps up to that value have committed,
+        \c oldest returns the most recent \c oldest_timestamp set with
         WT_CONNECTION::set_timestamp, \c pinned returns the minimum of the
         \c oldest_timestamp and the read timestamps of all active readers, and
         \c stable returns the most recent \c stable_timestamp set with
         WT_CONNECTION::set_timestamp.  See @ref transaction_timestamps''',
-        choices=['all_committed','oldest','pinned','stable']),
+        choices=['all_committed','last_checkpoint',
+            'oldest','pinned','recovery','stable']),
 ]),
 
 'WT_CONNECTION.set_timestamp' : Method([
@@ -1326,7 +1393,7 @@ methods = {
         timestamps greater than the specified value until the next commit moves
         the tracked commit timestamp forwards.  This is only intended for use
         where the application is rolling back locally committed transactions.
-        The supplied value should not be older than the current oldest and
+        The supplied value must not be older than the current oldest and
         stable timestamps.  See @ref transaction_timestamps'''),
     Config('force', 'false', r'''
         set timestamps even if they violate normal ordering requirements.
@@ -1336,13 +1403,13 @@ methods = {
         future commits and queries will be no earlier than the specified
         timestamp.  Supplied values must be monotonically increasing, any
         attempt to set the value to older than the current is silently ignored.
-        The supplied value should not be newer than the current
+        The supplied value must not be newer than the current
         stable timestamp.  See @ref transaction_timestamps'''),
     Config('stable_timestamp', '', r'''
         checkpoints will not include commits that are newer than the specified
         timestamp in tables configured with \c log=(enabled=false).  Supplied
         values must be monotonically increasing, any attempt to set the value to
-        older than the current is silently ignored.  The supplied value should
+        older than the current is silently ignored.  The supplied value must
         not be older than the current oldest timestamp.  See
         @ref transaction_timestamps'''),
 ]),

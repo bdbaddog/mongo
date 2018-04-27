@@ -39,7 +39,6 @@
 #include "mongo/db/record_id.h"
 #include "mongo/db/server_options.h"
 #include "mongo/db/storage/record_store.h"
-#include "mongo/platform/unordered_map.h"
 
 namespace mongo {
 
@@ -85,8 +84,7 @@ public:
     /**
      * Returns the spec for the id index to create by default for this collection.
      */
-    BSONObj getDefaultIdIndexSpec(ServerGlobalParams::FeatureCompatibility::Version
-                                      featureCompatibilityVersion) const override;
+    BSONObj getDefaultIdIndexSpec() const override;
 
     IndexDescriptor* findIdIndex(OperationContext* opCtx) const override;
 
@@ -286,17 +284,29 @@ public:
 
         ~IndexBuildBlock();
 
+        /**
+         * Must be called from within a `WriteUnitOfWork`
+         */
         Status init();
 
+        /**
+         * Must be called from within a `WriteUnitOfWork`
+         */
         void success();
 
         /**
          * index build failed, clean up meta data
+         *
+         * Must be called from within a `WriteUnitOfWork`
          */
         void fail();
 
         IndexCatalogEntry* getEntry() {
             return _entry;
+        }
+
+        const std::string& getIndexName() {
+            return _indexName;
         }
 
     private:

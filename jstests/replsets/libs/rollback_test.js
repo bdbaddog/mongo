@@ -1,51 +1,118 @@
 /**
  * Wrapper around ReplSetTest for testing rollback behavior. It allows the caller to easily
- * transition between stages of a rollback without having to configure the replset explicitly.
+ * transition between stages of a rollback without having to manually operate on the replset.
  *
- * This library exposes the following 3 sequential stages of rollback:
+ * This library exposes the following 5 sequential stages of rollback:
  * 1. RollbackTest starts in kSteadyStateOps: the replica set is in steady state replication.
  *        Operations applied will be replicated.
  * 2. kRollbackOps: operations applied during this phase will not be replicated and eventually be
  *        rolled back.
- * 3. kSyncSourceOps: operations applied during this stage will not be replicated initially,
- *        causing the data-bearing nodes to diverge. The data will be replicated after other
- *        nodes are rolled back.
- * 4. kSteadyStateOps: (back to stage 1) with the option of waiting for the rollback to finish.
+ * 3. kSyncSourceOpsBeforeRollback: apply operations on the sync source before rollback begins.
+ * 4. kSyncSourceOpsDuringRollback: apply operations on the sync source after rollback has begun.
+ * 5. kSteadyStateOps: (same as stage 1) with the option of waiting for the rollback to finish.
  *
  * Please refer to the various `transition*` functions for more information on the behavior
  * of each stage.
  */
-load("jstests/replsets/rslib.js");
 
-function RollbackTest(name = "RollbackTest") {
+"use strict";
+
+load("jstests/replsets/rslib.js");
+load("jstests/hooks/validate_collections.js");
+
+/**
+ * This fixture allows the user to optionally pass in a custom ReplSetTest
+ * to be used for the test. The underlying replica set must meet the following
+ * requirements:
+ *      1. It must have exactly three nodes: a primary, a secondary and an arbiter.
+ *      2. It must be running with mongobridge.
+ *
+ * If the caller does not provide their own replica set, a standard three-node
+ * replset will be initialized instead, with all nodes running the latest version.
+ *
+ * @param {string} [optional] name the name of the test being run
+ * @param {Object} [optional] replSet the ReplSetTest instance to adopt
+ */
+function RollbackTest(name = "RollbackTest", replSet) {
     const State = {
-        kStopped: "stopped",
-        kRollbackOps: "doing operations that will be rolled back",
-        kSyncSourceOps: "doing operations on sync source",
-        kSteadyStateOps: "doing operations during steady state replication",
+        kStopped: "kStopped",
+        kRollbackOps: "kRollbackOps",
+        // DEPRECATED: Remove this line after TIG-680.
+        kSyncSourceOps: "kSyncSourceOpsBeforeRollback",
+        kSyncSourceOpsBeforeRollback: "kSyncSourceOpsBeforeRollback",
+        kSyncSourceOpsDuringRollback: "kSyncSourceOpsDuringRollback",
+        kSteadyStateOps: "kSteadyStateOps",
     };
 
     const AcceptableTransitions = {
         [State.kStopped]: [],
-        [State.kRollbackOps]: [State.kSyncSourceOps],
-        [State.kSyncSourceOps]: [State.kSteadyStateOps],
+        [State.kRollbackOps]: [State.kSyncSourceOpsBeforeRollback],
+        // DEPRECATED: remove transition to State.kSteadyStateOps after TIG-680.
+        [State.kSyncSourceOpsBeforeRollback]:
+            [State.kSyncSourceOpsDuringRollback, State.kSteadyStateOps],
+        [State.kSyncSourceOpsDuringRollback]: [State.kSteadyStateOps],
         [State.kSteadyStateOps]: [State.kStopped, State.kRollbackOps],
     };
 
-    const rst = new ReplSetTest({name, nodes: 3, useBridge: true});
+    const collectionValidator = new CollectionValidator();
 
+    let rst;
     let curPrimary;
     let curSecondary;
     let arbiter;
-    let curState;
 
-    // Do more complicated instantiation in this init() function. This reduces the amount of code
-    // run at the class level (i.e. outside of any functions) and improves readability.
-    (function init() {
-        rst.startSet();
+    let curState = State.kSteadyStateOps;
+    let lastRBID;
 
-        const nodes = rst.nodeList();
-        rst.initiate({
+    // Make sure we have a replica set up and running.
+    replSet = (replSet === undefined) ? performStandardSetup() : replSet;
+    validateAndUseSetup(replSet);
+
+    /**
+     * Validate and use the provided replica set.
+     *
+     * @param {Object} replSet the ReplSetTest instance to adopt
+     */
+    function validateAndUseSetup(replSet) {
+        assert.eq(true,
+                  replSet instanceof ReplSetTest,
+                  `Must provide an instance of ReplSetTest. Have: ${tojson(replSet)}`);
+
+        assert.eq(true, replSet.usesBridge(), "Must set up ReplSetTest with mongobridge enabled.");
+        assert.eq(3, replSet.nodes.length, "Replica set must contain exactly three nodes.");
+
+        // Make sure we have a primary.
+        curPrimary = replSet.getPrimary();
+
+        // Extract the other two nodes and wait for them to be ready.
+        let secondaries = replSet.getSecondaries();
+        arbiter = replSet.getArbiter();
+        curSecondary = (secondaries[0] === arbiter) ? secondaries[1] : secondaries[0];
+
+        waitForState(curSecondary, ReplSetTest.State.SECONDARY);
+        waitForState(arbiter, ReplSetTest.State.ARBITER);
+
+        rst = replSet;
+        lastRBID = assert.commandWorked(curSecondary.adminCommand("replSetGetRBID")).rbid;
+    }
+
+    /**
+     * Return an instance of ReplSetTest initialized with a standard
+     * three-node replica set running with the latest version.
+     */
+    function performStandardSetup() {
+        let nodeOptions = {};
+        if (TestData.logComponentVerbosity) {
+            nodeOptions["setParameter"] = {
+                "logComponentVerbosity": tojsononeline(TestData.logComponentVerbosity)
+            };
+        }
+
+        let replSet = new ReplSetTest({name, nodes: 3, useBridge: true, nodeOptions: nodeOptions});
+        replSet.startSet();
+
+        const nodes = replSet.nodeList();
+        replSet.initiate({
             _id: name,
             members: [
                 {_id: 0, host: nodes[0]},
@@ -53,19 +120,28 @@ function RollbackTest(name = "RollbackTest") {
                 {_id: 2, host: nodes[2], arbiterOnly: true}
             ]
         });
+        return replSet;
+    }
 
-        // The primary is always the first node after calling ReplSetTest.initiate();
-        curPrimary = rst.nodes[0];
-        curSecondary = rst.nodes[1];
-        arbiter = rst.nodes[2];
+    function checkDataConsistency() {
+        assert.eq(curState,
+                  State.kSteadyStateOps,
+                  "Not in kSteadyStateOps state, cannot check data consistency");
+        const name = rst.name;
+        // We must check counts before we validate since validate fixes counts.
+        rst.checkCollectionCounts(name);
+        rst.checkOplogs(name);
+        rst.checkReplicatedDataHashes(name);
+        collectionValidator.validateNodes(rst.nodeList());
+    }
 
-        // Wait for the primary to be ready.
-        const actualPrimary = rst.getPrimary();
-
-        assert.eq(actualPrimary, curPrimary, 'The ReplSetTest.node[0] is not the primary');
-
-        curState = State.kSteadyStateOps;
-    })();
+    function log(msg, important = false) {
+        if (important) {
+            jsTestLog(`[${name}] ${msg}`);
+        } else {
+            print(`[${name}] ${msg}`);
+        }
+    }
 
     /**
      * return whether the cluster can transition from the current State to `newState`.
@@ -73,7 +149,7 @@ function RollbackTest(name = "RollbackTest") {
      */
     function transitionIfAllowed(newState) {
         if (AcceptableTransitions[curState].includes(newState)) {
-            jsTestLog(`[${name}] Transitioning to: "${newState}"`);
+            log(`Transitioning to: "${newState}"`, true);
             curState = newState;
         } else {
             // Transitioning to a disallowed State is likely a bug in the code, so we throw an
@@ -85,31 +161,45 @@ function RollbackTest(name = "RollbackTest") {
     /**
      * Transition from a rollback state to a steady state. Operations applied in this phase will
      * be replicated to all nodes and should not be rolled back.
-     *
-     * @param waitForRollback specify whether to wait for rollback to finish before returning.
      */
-    this.transitionToSteadyStateOperations = function(
-        {waitForRollback: waitForRollback = true} = {}) {
-        transitionIfAllowed(State.kSteadyStateOps);
+    this.transitionToSteadyStateOperations = function() {
 
-        const originalRBID = assert.commandWorked(curSecondary.adminCommand("replSetGetRBID")).rbid;
-
-        // Connect the secondary to everything else so it'll go into rollback.
+        // Ensure the secondary is connected. It may already have been connected from a previous
+        // stage.
+        log(`Ensuring the secondary ${curSecondary.host} is connected to the other nodes`);
         curSecondary.reconnect([curPrimary, arbiter]);
 
-        if (waitForRollback) {
-            jsTestLog(`[${name}] Waiting for rollback to complete`);
-            assert.soonNoExcept(() => {
+        log("Waiting for rollback to complete", true);
+        let rbid = -1;
+        assert.soon(() => {
+            try {
+                rbid = assert.commandWorked(curSecondary.adminCommand("replSetGetRBID")).rbid;
+            } catch (e) {
                 // Command can fail when sync source is being cleared.
-                const rbid = assert.commandWorked(curSecondary.adminCommand("replSetGetRBID")).rbid;
-                return rbid === originalRBID + 1;
-            }, 'Timed out waiting for RBID to increment');
+            }
+            // Fail early if the rbid is greater than lastRBID+1.
+            assert.lte(rbid,
+                       lastRBID + 1,
+                       `RBID is too large. current RBID: ${rbid}, last RBID: ${lastRBID}`);
 
-            rst.awaitSecondaryNodes();
-            rst.awaitReplication();
+            return rbid === lastRBID + 1;
 
-            jsTestLog(`[${name}] Rollback completed`);
-        }
+        }, "Timed out waiting for RBID to increment");
+
+        rst.awaitSecondaryNodes();
+        rst.awaitReplication();
+
+        log("Rollback and awaitReplication completed", true);
+
+        // We call transition to steady state ops after awaiting replication has finished,
+        // otherwise it could be confusing to see operations being replicated when we're already
+        // in rollback complete state.
+        transitionIfAllowed(State.kSteadyStateOps);
+
+        // After the previous rollback (if any) has completed and await replication has finished,
+        // the replica set should be in a consistent and "fresh" state. We now prepare for the next
+        // rollback.
+        checkDataConsistency();
 
         return curPrimary;
     };
@@ -119,15 +209,17 @@ function RollbackTest(name = "RollbackTest") {
      * its operations will eventually be rolled back.
      */
     this.transitionToRollbackOperations = function() {
-        transitionIfAllowed(State.kRollbackOps);
-
         // Ensure previous operations are replicated. The current secondary will be used as the sync
         // source later on, so it must be up-to-date to prevent any previous operations from being
         // rolled back.
+        rst.awaitSecondaryNodes();
         rst.awaitReplication();
+
+        transitionIfAllowed(State.kRollbackOps);
 
         // Disconnect the current primary from the secondary so operations on it will eventually be
         // rolled back. But do not disconnect it from the arbiter so it can stay as the primary.
+        log(`Isolating the primary ${curPrimary.host} from the secondary ${curSecondary.host}`);
         curPrimary.disconnect([curSecondary]);
 
         return curPrimary;
@@ -139,46 +231,79 @@ function RollbackTest(name = "RollbackTest") {
      * primary so that that optimes diverge and previous operations on the old primary will be
      * rolled back.
      */
-    this.transitionToSyncSourceOperations = function() {
-        transitionIfAllowed(State.kSyncSourceOps);
+    this.transitionToSyncSourceOperationsBeforeRollback = function() {
+        transitionIfAllowed(State.kSyncSourceOpsBeforeRollback);
 
-        // Isolate the current primary from everything so it steps down.
+        // Insert one document to ensure rollback will not be skipped.
+        let dbName = "EnsureThereIsAtLeastOneOperationToRollback";
+        assert.writeOK(curPrimary.getDB(dbName).ensureRollback.insert(
+            {thisDocument: 'is inserted to ensure rollback is not skipped'}));
+
+        log(`Isolating the primary ${curPrimary.host} so it will step down`);
         curPrimary.disconnect([curSecondary, arbiter]);
 
-        // Wait for the primary to step down.
+        log(`Waiting for the primary ${curPrimary.host} to step down`);
+        try {
+            // The stepdown freeze period is short because the node is disconnected from
+            // the rest of the replica set, so it physically can't become the primary.
+            curPrimary.adminCommand({replSetStepDown: 1, force: true});
+        } catch (e) {
+            // Stepdown may fail if the node has already started stepping down.
+            print('Caught exception from replSetStepDown: ' + e);
+        }
+
         waitForState(curPrimary, ReplSetTest.State.SECONDARY);
 
-        // Reconnect the secondary to the arbiter so it can be elected.
+        log(`Reconnecting the secondary ${curSecondary.host} to the arbiter so it can be elected`);
         curSecondary.reconnect([arbiter]);
 
-        // Wait for the old secondary to become the new primary, which will be used as the sync
-        // source later on when the old primary rolls back.
+        log(`Waiting for the new primary ${curSecondary.host} to be elected`);
+        assert.soonNoExcept(() => {
+            const res = curSecondary.adminCommand({replSetStepUp: 1});
+            return res.ok;
+        });
+
         const newPrimary = rst.getPrimary();
 
         // As a sanity check, ensure the new primary is the old secondary. The opposite scenario
         // should never be possible with 2 electable nodes and the sequence of operations thus far.
         assert.eq(newPrimary, curSecondary, "Did not elect a new node as primary");
-
-        // Add a sleep and a dummy write to ensure the new primary has an optime greater than
-        // the last optime on the node that will undergo rollback. This greater optime ensures that
-        // the new primary is eligible to become a sync source in pv0.
-        sleep(1000);
-        var dbName = "ensureEligiblePV0";
-        assert.writeOK(newPrimary.getDB(dbName).testColl.insert({id: 0}));
+        log(`Elected the old secondary ${newPrimary.host} as the new primary`);
 
         // The old primary is the new secondary; the old secondary just got elected as the new
         // primary, so we update the topology to reflect this change.
         curSecondary = curPrimary;
         curPrimary = newPrimary;
 
+        lastRBID = assert.commandWorked(curSecondary.adminCommand("replSetGetRBID")).rbid;
+
+        return curPrimary;
+    };
+
+    // DEPRECATED: remove this line after TIG-680.
+    this.transitionToSyncSourceOperations = this.transitionToSyncSourceOperationsBeforeRollback;
+
+    /**
+     * Transition to the third stage of rollback testing, where we reconnect the rollback node so
+     * it will start rolling back.
+     *
+     * Note that there is no guarantee that operations performed on the sync source while in this
+     * state will actually occur *during* the rollback process. They may happen before the rollback
+     * is finished or after the rollback is done. We provide this state, though, as an attempt to
+     * provide a way to test this behavior, even if it's non-deterministic.
+     */
+    this.transitionToSyncSourceOperationsDuringRollback = function() {
+        transitionIfAllowed(State.kSyncSourceOpsDuringRollback);
+
+        log(`Reconnecting the secondary ${curSecondary.host} so it'll go into rollback`);
+        curSecondary.reconnect([curPrimary, arbiter]);
+
         return curPrimary;
     };
 
     this.stop = function() {
+        checkDataConsistency();
         transitionIfAllowed(State.kStopped);
-        const name = rst.name;
-        rst.checkOplogs(name);
-        rst.checkReplicatedDataHashes(name);
         return rst.stopSet();
     };
 

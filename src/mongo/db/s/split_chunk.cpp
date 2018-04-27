@@ -34,8 +34,8 @@
 
 #include "mongo/base/status_with.h"
 #include "mongo/bson/util/bson_extract.h"
-#include "mongo/db/catalog/catalog_raii.h"
 #include "mongo/db/catalog/index_catalog.h"
+#include "mongo/db/catalog_raii.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/dbhelpers.h"
 #include "mongo/db/index/index_descriptor.h"
@@ -44,6 +44,7 @@
 #include "mongo/db/query/internal_plans.h"
 #include "mongo/db/s/collection_metadata.h"
 #include "mongo/db/s/collection_sharding_state.h"
+#include "mongo/db/s/shard_filtering_metadata_refresh.h"
 #include "mongo/db/s/sharding_state.h"
 #include "mongo/s/catalog/type_chunk.h"
 #include "mongo/s/client/shard_registry.h"
@@ -97,7 +98,7 @@ bool checkMetadataForSuccessfulSplitChunk(OperationContext* opCtx,
                                           const std::vector<BSONObj>& splitKeys) {
     const auto metadataAfterSplit = [&] {
         AutoGetCollection autoColl(opCtx, nss, MODE_IS);
-        return CollectionShardingState::get(opCtx, nss.ns())->getMetadata();
+        return CollectionShardingState::get(opCtx, nss)->getMetadata(opCtx);
     }();
 
     uassert(ErrorCodes::StaleEpoch,
@@ -122,7 +123,7 @@ bool checkMetadataForSuccessfulSplitChunk(OperationContext* opCtx,
     return true;
 }
 
-}  // anonymous namespace
+}  // namespace
 
 StatusWith<boost::optional<ChunkRange>> splitChunk(OperationContext* opCtx,
                                                    const NamespaceString& nss,
@@ -131,10 +132,6 @@ StatusWith<boost::optional<ChunkRange>> splitChunk(OperationContext* opCtx,
                                                    const std::vector<BSONObj>& splitKeys,
                                                    const std::string& shardName,
                                                    const OID& expectedCollectionEpoch) {
-
-    ShardingState* shardingState = ShardingState::get(opCtx);
-    std::string errmsg;
-
     //
     // Lock the collection's metadata and get highest version for the current shard
     // TODO(SERVER-25086): Remove distLock acquisition from split chunk
@@ -144,10 +141,10 @@ StatusWith<boost::optional<ChunkRange>> splitChunk(OperationContext* opCtx,
     auto scopedDistLock = Grid::get(opCtx)->catalogClient()->getDistLockManager()->lock(
         opCtx, nss.ns(), whyMessage, DistLockManager::kSingleLockAttemptTimeout);
     if (!scopedDistLock.isOK()) {
-        errmsg = str::stream() << "could not acquire collection lock for " << nss.toString()
-                               << " to split chunk " << chunkRange.toString() << " "
-                               << causedBy(scopedDistLock.getStatus());
-        return {scopedDistLock.getStatus().code(), errmsg};
+        return scopedDistLock.getStatus().withContext(
+            str::stream() << "could not acquire collection lock for " << nss.toString()
+                          << " to split chunk "
+                          << chunkRange.toString());
     }
 
     // If the shard key is hashed, then we must make sure that the split points are of type
@@ -158,12 +155,13 @@ StatusWith<boost::optional<ChunkRange>> splitChunk(OperationContext* opCtx,
             while (it.more()) {
                 BSONElement splitKeyElement = it.next();
                 if (splitKeyElement.type() != NumberLong) {
-                    errmsg = str::stream() << "splitChunk cannot split chunk "
-                                           << chunkRange.toString() << ", split point "
-                                           << splitKeyElement.toString()
-                                           << " must be of type "
-                                              "NumberLong for hashed shard key patterns";
-                    return {ErrorCodes::CannotSplit, errmsg};
+                    return {ErrorCodes::CannotSplit,
+                            str::stream() << "splitChunk cannot split chunk "
+                                          << chunkRange.toString()
+                                          << ", split point "
+                                          << splitKeyElement.toString()
+                                          << " must be of type "
+                                             "NumberLong for hashed shard key patterns"};
                 }
             }
         }
@@ -206,23 +204,7 @@ StatusWith<boost::optional<ChunkRange>> splitChunk(OperationContext* opCtx,
     // succeeds, thus the automatic retry fails with a precondition violation, for example.
     //
     if (!commandStatus.isOK() || !writeConcernStatus.isOK()) {
-        {
-            ChunkVersion unusedShardVersion;
-            Status refreshStatus =
-                shardingState->refreshMetadataNow(opCtx, nss, &unusedShardVersion);
-
-            if (!refreshStatus.isOK()) {
-                Status errorStatus = commandStatus.isOK() ? writeConcernStatus : commandStatus;
-                errmsg = str::stream()
-                    << "splitChunk failed for chunk " << chunkRange.toString() << ", collection '"
-                    << nss.ns() << "' due to " << errorStatus.toString()
-                    << ". Attempt to verify if the commit succeeded anyway failed due to: "
-                    << refreshStatus.toString();
-
-                warning() << redact(errmsg);
-                return {errorStatus.code(), errmsg};
-            }
-        }
+        forceShardFilteringMetadataRefresh(opCtx, nss);
 
         if (checkMetadataForSuccessfulSplitChunk(opCtx, nss, chunkRange, splitKeys)) {
             // Split was committed.

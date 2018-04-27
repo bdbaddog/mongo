@@ -36,7 +36,7 @@
 #include "mongo/bson/bsonobj.h"
 #include "mongo/db/cursor_id.h"
 #include "mongo/executor/task_executor.h"
-#include "mongo/s/query/cluster_client_cursor_params.h"
+#include "mongo/s/query/async_results_merger_params_gen.h"
 #include "mongo/stdx/mutex.h"
 #include "mongo/util/net/hostandport.h"
 #include "mongo/util/time_support.h"
@@ -49,26 +49,23 @@ class CursorResponse;
  * Establishes cursors on the remote shards by issuing requests in parallel, using the readPref to
  * select a host within each shard.
  *
- * If any of the cursors fails to be established, performs cleanup by sending killCursors to any
- * cursors that were established and returns a non-OK status.
+ * If any of the cursors fail to be established, this function performs cleanup by sending
+ * killCursors to any cursors that were established, then throws the error. If the namespace
+ * represents a view, an exception containing a ResolvedView is thrown. Calling code can then
+ * attempt to establish cursors against the base collection using this view.
  *
- * If an OK status is returned, the ownership of the cursors is transferred to the caller. This
- * means the caller is now responsible for either exhausting the cursors or sending killCursors to
- * them.
+ * On success, the ownership of the cursors is transferred to the caller. This means the caller is
+ * now responsible for either exhausting the cursors or sending killCursors to them.
  *
  * @param allowPartialResults: If true, unreachable hosts are ignored, and only cursors established
  *                             on reachable hosts are returned.
- * @param viewDefinition: If the namespace represents a view, an error is returned and the view
- *                        definition is stored in this parameter. Calling code can then attempt to
- *                        establish cursors against the base collection using this viewDefinition.
+ *
  */
-StatusWith<std::vector<ClusterClientCursorParams::RemoteCursor>> establishCursors(
-    OperationContext* opCtx,
-    executor::TaskExecutor* executor,
-    const NamespaceString& nss,
-    const ReadPreferenceSetting readPref,
-    const std::vector<std::pair<ShardId, BSONObj>>& remotes,
-    bool allowPartialResults,
-    BSONObj* viewDefinition);
+std::vector<RemoteCursor> establishCursors(OperationContext* opCtx,
+                                           executor::TaskExecutor* executor,
+                                           const NamespaceString& nss,
+                                           const ReadPreferenceSetting readPref,
+                                           const std::vector<std::pair<ShardId, BSONObj>>& remotes,
+                                           bool allowPartialResults);
 
 }  // namespace mongo

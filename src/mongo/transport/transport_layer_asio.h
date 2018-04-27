@@ -38,7 +38,6 @@
 #include "mongo/stdx/memory.h"
 #include "mongo/stdx/mutex.h"
 #include "mongo/stdx/thread.h"
-#include "mongo/transport/ticket_impl.h"
 #include "mongo/transport/transport_layer.h"
 #include "mongo/transport/transport_mode.h"
 #include "mongo/util/net/hostandport.h"
@@ -75,8 +74,21 @@ class TransportLayerASIO final : public TransportLayer {
 
 public:
     struct Options {
+        constexpr static auto kIngress = 0x1;
+        constexpr static auto kEgress = 0x10;
+
         explicit Options(const ServerGlobalParams* params);
         Options() = default;
+
+        int mode = kIngress | kEgress;
+
+        bool isIngress() const {
+            return mode & kIngress;
+        }
+
+        bool isEgress() const {
+            return mode & kEgress;
+        }
 
         int port = ServerGlobalParams::DefaultDBPort;  // port to bind to
         std::string ipList;                            // addresses to bind to
@@ -93,26 +105,21 @@ public:
 
     virtual ~TransportLayerASIO();
 
-    Ticket sourceMessage(const SessionHandle& session,
-                         Message* message,
-                         Date_t expiration = Ticket::kNoExpirationDate) final;
+    StatusWith<SessionHandle> connect(HostAndPort peer,
+                                      ConnectSSLMode sslMode,
+                                      Milliseconds timeout) final;
 
-    Ticket sinkMessage(const SessionHandle& session,
-                       const Message& message,
-                       Date_t expiration = Ticket::kNoExpirationDate) final;
-
-    Status wait(Ticket&& ticket) final;
-
-    void asyncWait(Ticket&& ticket, TicketCallback callback) final;
-
-    void end(const SessionHandle& session) final;
+    Future<SessionHandle> asyncConnect(HostAndPort peer,
+                                       ConnectSSLMode sslMode,
+                                       const ReactorHandle& reactor) final;
 
     Status setup() final;
+
+    ReactorHandle getReactor(WhichReactor which) final;
+
     Status start() final;
 
     void shutdown() final;
-
-    const std::shared_ptr<asio::io_context>& getIOContext();
 
     int listenerPort() const {
         return _listenerPort;
@@ -120,49 +127,54 @@ public:
 
 private:
     class ASIOSession;
-    class ASIOTicket;
-    class ASIOSourceTicket;
-    class ASIOSinkTicket;
+    class ASIOReactor;
 
     using ASIOSessionHandle = std::shared_ptr<ASIOSession>;
     using ConstASIOSessionHandle = std::shared_ptr<const ASIOSession>;
     using GenericAcceptor = asio::basic_socket_acceptor<asio::generic::stream_protocol>;
 
     void _acceptConnection(GenericAcceptor& acceptor);
+
+    template <typename Endpoint>
+    StatusWith<ASIOSessionHandle> _doSyncConnect(Endpoint endpoint,
+                                                 const HostAndPort& peer,
+                                                 const Milliseconds& timeout);
+
 #ifdef MONGO_CONFIG_SSL
     SSLParams::SSLModes _sslMode() const;
 #endif
 
     stdx::mutex _mutex;
 
-    // There are two IO contexts that are used by TransportLayerASIO. The _workerIOContext
-    // contains all the accepted sockets and all normal networking activity. The
-    // _acceptorIOContext contains all the sockets in _acceptors.
+    // There are three reactors that are used by TransportLayerASIO. The _ingressReactor contains
+    // all the accepted sockets and all ingress networking activity. The _acceptorReactor contains
+    // all the sockets in _acceptors.  The _egressReactor contains egress connections.
     //
-    // TransportLayerASIO should never call run() on the _workerIOContext.
+    // TransportLayerASIO should never call run() on the _ingressReactor.
     // In synchronous mode, this will cause a massive performance degradation due to
     // unnecessary wakeups on the asio thread for sockets we don't intend to interact
     // with asynchronously. The additional IO context avoids registering those sockets
     // with the acceptors epoll set, thus avoiding those wakeups.  Calling run will
     // undo that benefit.
     //
-    // TransportLayerASIO should run its own thread that calls run() on the _acceptorIOContext
+    // TransportLayerASIO should run its own thread that calls run() on the _acceptorReactor
     // to process calls to async_accept - this is the equivalent of the "listener" thread in
     // other TransportLayers.
     //
     // The underlying problem that caused this is here:
     // https://github.com/chriskohlhoff/asio/issues/240
     //
-    // It is important that the io_context be declared before the
-    // vector of acceptors (or any other state that is associated with
-    // the io_context), so that we destroy any existing acceptors or
-    // other io_service associated state before we drop the refcount
-    // on the io_context, which may destroy it.
-    std::shared_ptr<asio::io_context> _workerIOContext;
-    std::unique_ptr<asio::io_context> _acceptorIOContext;
+    // It is important that the reactors be declared before the vector of acceptors (or any other
+    // state that is associated with the reactors), so that we destroy any existing acceptors or
+    // other reactor associated state before we drop the refcount on the reactor, which may destroy
+    // it.
+    std::shared_ptr<ASIOReactor> _ingressReactor;
+    std::shared_ptr<ASIOReactor> _egressReactor;
+    std::shared_ptr<ASIOReactor> _acceptorReactor;
 
 #ifdef MONGO_CONFIG_SSL
-    std::unique_ptr<asio::ssl::context> _sslContext;
+    std::unique_ptr<asio::ssl::context> _ingressSSLContext;
+    std::unique_ptr<asio::ssl::context> _egressSSLContext;
 #endif
 
     std::vector<std::pair<SockAddr, GenericAcceptor>> _acceptors;

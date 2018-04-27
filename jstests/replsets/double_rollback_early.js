@@ -4,8 +4,14 @@
  * rollback and refuse to choose node 1 as its sync source because it doesn't have the minValid.
  */
 
+// Rollback to a stable timestamp does not set a minValid and should be able to sync from any node.
+// @tags: [requires_mmapv1]
+
 (function() {
     'use strict';
+
+    // Skip db hash check because replset is partitioned.
+    TestData.skipCheckDBHashes = true;
 
     load("jstests/libs/check_log.js");
     load("jstests/replsets/rslib.js");

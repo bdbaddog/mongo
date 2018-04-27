@@ -89,6 +89,14 @@ public:
     }
 
     /**
+     * Returns the number of remote hosts involved in this execution plan.
+     */
+    virtual std::size_t getNumRemotes() const {
+        invariant(_child);  // The default implementation forwards to the child stage.
+        return _child->getNumRemotes();
+    }
+
+    /**
      * Returns whether or not all the remote cursors are exhausted.
      */
     virtual bool remotesExhausted() {
@@ -141,6 +149,13 @@ public:
         doDetachFromOperationContext();
     }
 
+    /**
+     * Returns a pointer to the current OperationContext, or nullptr if there is no context.
+     */
+    OperationContext* getOpCtx() {
+        return _opCtx;
+    }
+
 protected:
     /**
      * Performs any stage-specific reattach actions. Called after the OperationContext has been set
@@ -166,13 +181,6 @@ protected:
      */
     RouterExecStage* getChildStage() {
         return _child.get();
-    }
-
-    /**
-     * Returns a pointer to the current OperationContext, or nullptr if there is no context.
-     */
-    OperationContext* getOpCtx() {
-        return _opCtx;
     }
 
 private:

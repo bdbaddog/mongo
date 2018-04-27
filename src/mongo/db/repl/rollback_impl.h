@@ -29,6 +29,9 @@
 #pragma once
 
 #include "mongo/base/status_with.h"
+#include "mongo/db/op_observer.h"
+#include "mongo/db/repl/oplog_entry.h"
+#include "mongo/db/repl/roll_back_local_operations.h"
 #include "mongo/db/repl/rollback.h"
 #include "mongo/db/repl/storage_interface.h"
 #include "mongo/stdx/functional.h"
@@ -42,6 +45,65 @@ namespace repl {
 class OplogInterface;
 class ReplicationCoordinator;
 class ReplicationProcess;
+
+/**
+ * Tracks statistics about rollback, and is used to generate a summary about what has occurred.
+ * Because it is possible for rollback to exit early, fields are initialized to boost::none and are
+ * populated with actual values during the rollback process.
+ */
+struct RollbackStats {
+    /**
+     * The wall clock time when rollback started.
+     */
+    Date_t startTime;
+
+    /**
+     * The wall clock time when rollback completed, either successfully or unsuccessfully.
+     */
+    Date_t endTime;
+
+    /**
+     * The id number generated for this rollback event.
+     */
+    boost::optional<int> rollbackId;
+
+    /**
+     * The last optime on the branch of history being rolled back.
+     */
+    boost::optional<OpTime> lastLocalOptime;
+
+    /**
+     * The optime of the latest shared oplog entry between this node and the sync source.
+     */
+    boost::optional<OpTime> commonPoint;
+
+    /**
+     * The value of the oplog truncate timestamp. This is the timestamp of the entry immediately
+     * after the common point on the local oplog (that is, on the branch of history being rolled
+     * back).
+     */
+    boost::optional<Timestamp> truncateTimestamp;
+
+    /**
+     * The value of the stable timestamp to which rollback recovered.
+     */
+    boost::optional<Timestamp> stableTimestamp;
+
+    /**
+     * The directory containing rollback data files, if any were written.
+     */
+    boost::optional<std::string> rollbackDataFileDirectory;
+
+    /**
+     * The last wall clock time on the branch of history being rolled back, if known.
+     */
+    boost::optional<Date_t> lastLocalWallClockTime;
+
+    /**
+     * The wall clock time at the common point, if known.
+     */
+    boost::optional<Date_t> commonPointWallClockTime;
+};
 
 /**
  * During steady state replication, it is possible to find the local server in a state where it
@@ -61,19 +123,27 @@ class ReplicationProcess;
  * machinery. This class runs synchronously on the caller's thread.
  *
  * Order of actions:
- *   1. Transition to ROLLBACK
- *   2. Find the common point between the local and remote oplogs.
- *       a. Keep track of what is rolled back to provide a summary to the user
- *       b. Write rolled back documents to 'Rollback Files'
- *   3. Increment the Rollback ID (RBID)
- *   4. Write the common point as the 'OplogTruncateAfterPoint'
- *   5. Tell the storage engine to recover to the last stable timestamp
- *   6. Call recovery code
- *       a. Truncate the oplog at the common point
+ *   1. Transition to ROLLBACK.
+ *   2. Await background index completion.
+ *   3. Find the common point between the local and remote oplogs.
+ *       a. Keep track of what is rolled back to provide a summary to the user and to write
+ *          rollback files.
+ *       b. Maintain a map of how the counts of each collection change during the rollback relative
+ *          to the common point.
+ *   4. Retrieve the sizes of each collection whose size will change and calculate the
+ *      post-rollback size.
+ *   5. Increment the Rollback ID (RBID).
+ *   6. Write rolled back documents to 'Rollback Files'.
+ *   7. Tell the storage engine to recover to the last stable timestamp.
+ *   8. Write the oplog entry after the common point as the 'OplogTruncateAfterPoint'.
+ *   9. Clear drop pending state.
+ *   10. Call recovery code.
+ *       a. Truncate the oplog at the common point.
  *       b. Apply all oplog entries to the end of oplog.
- *   7. Check the shard identity document for roll back
- *   8. Clear the in-memory transaction table
- *   9. Transition to SECONDARY
+ *   11. Correct the counts of any collections whose counts changed.
+ *   12. Reset last optimes from the oplog.
+ *   13. Trigger the on-rollback op observer.
+ *   14. Transition to SECONDARY.
  *
  * If the node crashes while in rollback and the storage engine has not recovered to the last
  * stable timestamp yet, then rollback will simply restart against the new sync source upon restart.
@@ -86,6 +156,12 @@ class ReplicationProcess;
  */
 class RollbackImpl : public Rollback {
 public:
+    /**
+     * Used to indicate that the files we create with deleted documents are from rollback.
+     */
+    static constexpr auto kRollbackRemoveSaverType = "rollback";
+    static constexpr auto kRollbackRemoveSaverWhy = "removed";
+
     /**
      * A class with functions that get called throughout rollback. These can be overridden to
      * instrument this class for diagnostics and testing.
@@ -100,19 +176,67 @@ public:
         virtual void onTransitionToRollback() noexcept {}
 
         /**
+         * Function called after all background index builds have completed.
+         */
+        virtual void onBgIndexesComplete() noexcept {}
+
+        /**
          * Function called after we find the common point.
          */
         virtual void onCommonPointFound(Timestamp commonPoint) noexcept {}
 
         /**
+         * Function called after a rollback file has been written for each namespace with inserts or
+         * updates that are being rolled back.
+         */
+        virtual void onRollbackFileWrittenForNamespace(UUID, NamespaceString) noexcept {}
+
+        /**
          * Function called after we recover to the stable timestamp.
          */
-        virtual void onRecoverToStableTimestamp() noexcept {}
+        virtual void onRecoverToStableTimestamp(Timestamp stableTimestamp) noexcept {}
+
+        /**
+         * Function called after we set the oplog truncate after point.
+         */
+        virtual void onSetOplogTruncateAfterPoint(Timestamp truncatePoint) noexcept {}
 
         /**
          * Function called after we recover from the oplog.
          */
         virtual void onRecoverFromOplog() noexcept {}
+
+        /**
+         * Function called after we have triggered the 'onRollback' OpObserver method.
+         */
+        virtual void onRollbackOpObserver(const OpObserver::RollbackObserverInfo& rbInfo) noexcept {
+        }
+    };
+
+    class RollbackTimeLimitHolder {
+    public:
+        /**
+         * Returns the maximum amount of data we are willing to roll back, in seconds.
+         */
+        unsigned long long getRollbackTimeLimit() const {
+            const stdx::lock_guard<stdx::mutex> lock(_rollbackTimeLimitSecsMutex);
+            return _rollbackTimeLimitSecs;
+        }
+
+        /**
+         * Set a new limit on the allowed length of the rollback period. Measured in seconds.
+         */
+        void setRollbackTimeLimit(unsigned long long newLimit) {
+            const stdx::lock_guard<stdx::mutex> lock(_rollbackTimeLimitSecsMutex);
+            _rollbackTimeLimitSecs = newLimit;
+        }
+
+    private:
+        // Guards access to the _rollbackTimeLimitSecs member variable.
+        mutable stdx::mutex _rollbackTimeLimitSecsMutex;
+
+        // We disallow rollback if the data has a larger timespan, in seconds, than this number.
+        unsigned long long _rollbackTimeLimitSecs = 1800;
     };
 
     /**
@@ -140,6 +264,10 @@ public:
 
     /**
      * Runs the rollback algorithm.
+     *
+     * This method transitions to the ROLLBACK state and then performs the steps of the rollback
+     * process. It is required for this method to transition back to SECONDARY before returning,
+     * even if rollback did not complete successfully.
      */
     Status runRollback(OperationContext* opCtx);
 
@@ -147,6 +275,66 @@ public:
      * Cancels all outstanding work.
      */
     void shutdown();
+
+    /**
+     * Wrappers to expose private methods for testing.
+     */
+    StatusWith<std::set<NamespaceString>> _namespacesForOp_forTest(const OplogEntry& oplogEntry) {
+        return _namespacesForOp(oplogEntry);
+    }
+
+    /**
+     * Returns true if the rollback system should write out data files containing documents that
+     * will be deleted by rollback.
+     */
+    static bool shouldCreateDataFiles();
+
+    /**
+     * Returns a structure containing all of the documents that would have been written to a
+     * rollback data file for the namespace represented by 'uuid'.
+     *
+     * Only exposed for testing. It is invalid to call this function on a real RollbackImpl.
+     */
+    virtual const std::vector<BSONObj>& docsDeletedForNamespace_forTest(UUID uuid) const& {
+        MONGO_UNREACHABLE;
+    }
+    void docsDeletedForNamespace_forTest(UUID)&& = delete;
+
+protected:
+    /**
+     * Returns the document with _id 'id' in the namespace 'nss', or boost::none if that document
+     * no longer exists in 'nss'. This function is used to write documents to rollback data files,
+     * and this function will terminate the server if an unexpected error is returned by the storage
+     * interface.
+     *
+     * This function is protected so that subclasses can access this method for test purposes.
+     */
+    boost::optional<BSONObj> _findDocumentById(OperationContext* opCtx,
+                                               UUID uuid,
+                                               NamespaceString nss,
+                                               BSONElement id);
+
+    /**
+     * Writes a rollback file for the namespace 'nss' containing all of the documents whose _ids are
+     * listed in 'idSet'.
+     *
+     * This function is protected so that subclasses can override it for test purposes.
+     */
+    virtual void _writeRollbackFileForNamespace(OperationContext* opCtx,
+                                                UUID uuid,
+                                                NamespaceString nss,
+                                                const SimpleBSONObjUnorderedSet& idSet);
+
+    // All member variables are labeled with one of the following codes indicating the
+    // synchronization rules for accessing them.
+    //
+    // (R)  Read-only in concurrent operation; no synchronization required.
+    // (S)  Self-synchronizing; access in any way from any context.
+    // (M)  Reads and writes guarded by _mutex.
+    // (N)  Should only ever be accessed by a single thread; no synchronization required.
+
+    // A listener that's called at various points throughout rollback.
+    Listener* _listener;  // (R)
 
 private:
     /**
@@ -157,7 +345,21 @@ private:
     /**
      * Finds the common point between the local and remote oplogs.
      */
-    StatusWith<Timestamp> _findCommonPoint();
+    StatusWith<RollBackLocalOperations::RollbackCommonPoint> _findCommonPoint(
+        OperationContext* opCtx);
+
+    /**
+     * Determines whether or not we are trying to roll back too much data. Returns an
+     * UnrecoverableRollbackError if we have exceeded the limit.
+     */
+    Status _checkAgainstTimeLimit(RollBackLocalOperations::RollbackCommonPoint commonPoint);
+
+    /**
+     * Finds the timestamp of the record after the common point to put into the oplog truncate
+     * after point.
+     */
+    Timestamp _findTruncateTimestamp(
+        OperationContext* opCtx, RollBackLocalOperations::RollbackCommonPoint commonPoint) const;
 
     /**
      * Uses the ReplicationCoordinator to transition the current member state to ROLLBACK.
@@ -169,32 +371,45 @@ private:
     Status _transitionToRollback(OperationContext* opCtx);
 
     /**
+     * Waits for any in-progress background index builds to complete. We do this before beginning
+     * the rollback process to prevent any issues surrounding index builds pausing/resuming around a
+     * call to 'recoverToStableTimestamp'. It's not clear that an index build, resumed in this way,
+     * that continues until completion, would be consistent with the collection data. Waiting for
+     * all background index builds to complete is a conservative approach, to avoid any of these
+     * potential issues.
+     */
+    Status _awaitBgIndexCompletion(OperationContext* opCtx);
+
+    /**
      * Recovers to the stable timestamp while holding the global exclusive lock.
+     * Returns the stable timestamp that the storage engine recovered to.
      */
-    Status _recoverToStableTimestamp(OperationContext* opCtx);
+    StatusWith<Timestamp> _recoverToStableTimestamp(OperationContext* opCtx);
 
     /**
-     * Runs the oplog recovery logic. This involves applying oplog operations between the stable
-     * timestamp and the common point.
+     * Process a single oplog entry that is getting rolled back and update the necessary rollback
+     * info structures. This function assumes that oplog entries are processed in descending
+     * timestamp order (that is, starting from the newest oplog entry, going backwards).
      */
-    Status _oplogRecovery(OperationContext* opCtx);
+    Status _processRollbackOp(const OplogEntry& oplogEntry);
 
     /**
-     * If we detected that we rolled back the shardIdentity document as part of this rollback
-     * then we must shut down the server to clear the in-memory ShardingState associated with the
-     * shardIdentity document.
-     *
-     * 'opCtx' cannot be null.
+     * Iterates through the _countDiff map and retrieves the count of the record store pointed to
+     * by each UUID. It then saves the post-rollback counts to the _newCounts map.
      */
-    void _checkShardIdentityRollback(OperationContext* opCtx);
+    Status _findRecordStoreCounts(OperationContext* opCtx);
 
     /**
-     * In-memory sessions need to be reset after rollback, so they are forced to refetch from the
-     * transactions collection.
-     *
-     * 'opCtx' cannot be null.
+     * Sets the record store counts to be the values stored in _newCounts.
      */
-    void _resetSessions(OperationContext* opCtx);
+    void _correctRecordStoreCounts(OperationContext* opCtx);
+
+    /**
+     * Called after we have successfully recovered to the stable timestamp and recovered from the
+     * oplog. Triggers the replication rollback OpObserver method, notifying other server subsystems
+     * that a rollback has occurred.
+     */
+    Status _triggerOpObserver(OperationContext* opCtx);
 
     /**
      * Transitions the current member state from ROLLBACK to SECONDARY.
@@ -204,12 +419,34 @@ private:
      */
     void _transitionFromRollbackToSecondary(OperationContext* opCtx);
 
-    // All member variables are labeled with one of the following codes indicating the
-    // synchronization rules for accessing them.
-    //
-    // (R)  Read-only in concurrent operation; no synchronization required.
-    // (S)  Self-synchronizing; access in any way from any context.
-    // (M)  Reads and writes guarded by _mutex.
+    /**
+     * Returns a set of all collection namespaces affected by the given oplog operation. Does not
+     * handle 'applyOps' oplog entries, since it assumes their sub operations have already been
+     * extracted at a higher layer.
+     */
+    StatusWith<std::set<NamespaceString>> _namespacesForOp(const OplogEntry& oplogEntry);
+
+    /**
+     * Persists rollback files to disk for each namespace that contains documents inserted or
+     * updated after the common point, as these changes will be gone after rollback completes.
+     * Before each namespace is examined, we check for interrupt and return a non-OK status if
+     * shutdown is in progress.
+     *
+     * This function causes the server to terminate if an error occurs while fetching documents from
+     * disk or while writing documents to the rollback file. It must be called before marking the
+     * oplog truncate point, and before the storage engine recovers to the stable timestamp.
+     */
+    Status _writeRollbackFiles(OperationContext* opCtx);
+
+    /**
+     * Logs a summary of what has occurred so far during rollback to the server log.
+     */
+    void _summarizeRollback(OperationContext* opCtx) const;
+
+    /**
+     * Aligns the drop pending reaper's state with the catalog.
+     */
+    void _resetDropPendingState(OperationContext* opCtx);
 
     // Guards access to member variables.
     mutable stdx::mutex _mutex;  // (S)
@@ -235,8 +472,22 @@ private:
     // - update transition member states;
     ReplicationCoordinator* const _replicationCoordinator;  // (R)
 
-    // A listener that's called at various points throughout rollback.
-    Listener* _listener;  // (R)
+    // Contains information about the rollback that will be passed along to the rollback OpObserver
+    // method.
+    OpObserver::RollbackObserverInfo _observerInfo = {};  // (N)
+
+    // Holds information about this rollback event.
+    RollbackStats _rollbackStats;  // (N)
+
+    // Maintains a count of the difference between the count of the record store pointed to by the
+    // UUID before recover to a stable timestamp is called and the count after we recover from the
+    // oplog. This only must keep track of inserts and deletes. Rolling back drops is just a rename
+    // and rolling back creates means that the UUID does not exist post rollback.
+    stdx::unordered_map<UUID, long long, UUID::Hash> _countDiffs;  // (N)
+
+    // Maintains the count of the record store pointed to by the UUID after we recover from the
+    // oplog.
+    stdx::unordered_map<UUID, long long, UUID::Hash> _newCounts;  // (N)
 };
 
 }  // namespace repl

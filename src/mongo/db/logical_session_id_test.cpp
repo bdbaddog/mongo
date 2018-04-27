@@ -33,6 +33,8 @@
 #include "mongo/db/logical_session_id.h"
 
 #include "mongo/crypto/mechanism_scram.h"
+#include "mongo/crypto/sha1_block.h"
+#include "mongo/crypto/sha256_block.h"
 #include "mongo/db/auth/action_set.h"
 #include "mongo/db/auth/action_type.h"
 #include "mongo/db/auth/authorization_manager.h"
@@ -48,7 +50,6 @@
 #include "mongo/db/logical_session_cache_impl.h"
 #include "mongo/db/logical_session_id_helpers.h"
 #include "mongo/db/operation_context_noop.h"
-#include "mongo/db/server_options.h"
 #include "mongo/db/service_context_noop.h"
 #include "mongo/db/service_liason_mock.h"
 #include "mongo/db/sessions_collection_mock.h"
@@ -72,8 +73,6 @@ public:
     AuthorizationSessionForTest* authzSession;
 
     void setUp() {
-        serverGlobalParams.featureCompatibility.setVersion(
-            ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo36);
         session = transportLayer.createSession();
         client = serviceContext.makeClient("testClient", session);
         RestrictionEnvironment::set(
@@ -108,8 +107,8 @@ public:
     }
 
     User* addSimpleUser(UserName un) {
-        const auto creds = BSON("SCRAM-SHA-1" << scram::generateCredentials(
-                                    "a", saslGlobalParams.scramIterationCount.load()));
+        const auto creds = BSON("SCRAM-SHA-1" << scram::Secrets<SHA1Block>::generateCredentials(
+                                    "a", saslGlobalParams.scramSHA1IterationCount.load()));
         ASSERT_OK(managerState->insertPrivilegeDocument(
             _opCtx.get(),
             BSON("user" << un.getUser() << "db" << un.getDB() << "credentials" << creds << "roles"
@@ -123,8 +122,8 @@ public:
     }
 
     User* addClusterUser(UserName un) {
-        const auto creds = BSON("SCRAM-SHA-1" << scram::generateCredentials(
-                                    "a", saslGlobalParams.scramIterationCount.load()));
+        const auto creds = BSON("SCRAM-SHA-256" << scram::Secrets<SHA256Block>::generateCredentials(
+                                    "a", saslGlobalParams.scramSHA256IterationCount.load()));
         ASSERT_OK(managerState->insertPrivilegeDocument(
             _opCtx.get(),
             BSON("user" << un.getUser() << "db" << un.getDB() << "credentials" << creds << "roles"
@@ -280,7 +279,7 @@ TEST_F(LogicalSessionIdTest, InitializeOperationSessionInfo_MissingSessionIdWith
                                        true,
                                        true),
         AssertionException,
-        ErrorCodes::IllegalOperation);
+        ErrorCodes::InvalidOptions);
 }
 
 TEST_F(LogicalSessionIdTest, InitializeOperationSessionInfo_SessionIdAndTransactionNumber) {
@@ -335,6 +334,17 @@ TEST_F(LogicalSessionIdTest, InitializeOperationSessionInfo_SupportsDocLockingFa
             false),
         AssertionException,
         ErrorCodes::IllegalOperation);
+}
+
+TEST_F(LogicalSessionIdTest, ConstructorFromClientWithTooLongName) {
+    auto id = UUID::gen();
+
+    addSimpleUser(UserName(std::string(kMaximumUserNameLengthForLogicalSessions + 1, 'x'), "test"));
+
+    LogicalSessionFromClient req;
+    req.setId(id);
+
+    ASSERT_THROWS(makeLogicalSessionId(req, _opCtx.get()), AssertionException);
 }
 
 }  // namespace

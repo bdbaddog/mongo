@@ -47,15 +47,18 @@ namespace auth {
 
 struct CreateOrUpdateUserArgs {
     UserName userName;
-    bool hasHashedPassword;
-    std::string hashedPassword;
+    bool hasPassword;
+    std::string password;
     bool hasCustomData;
     BSONObj customData;
     bool hasRoles;
     std::vector<RoleName> roles;
     boost::optional<BSONArray> authenticationRestrictions;
+    std::vector<std::string> mechanisms;
+    bool digestPassword;
 
-    CreateOrUpdateUserArgs() : hasHashedPassword(false), hasCustomData(false), hasRoles(false) {}
+    CreateOrUpdateUserArgs()
+        : hasPassword(false), hasCustomData(false), hasRoles(false), digestPassword(true) {}
 };
 
 /**
@@ -100,12 +103,15 @@ Status parseAndValidateDropAllUsersFromDatabaseCommand(const BSONObj& cmdObj,
                                                        const std::string& dbname);
 
 struct UsersInfoArgs {
+    enum class Target { kExplicitUsers, kDB, kGlobal };
+
     std::vector<UserName> userNames;
-    bool allForDB = false;
+    Target target;
     bool showPrivileges = false;
     AuthenticationRestrictionsFormat authenticationRestrictionsFormat =
         AuthenticationRestrictionsFormat::kOmit;
     bool showCredentials = false;
+    boost::optional<BSONObj> filter;
 };
 
 /**

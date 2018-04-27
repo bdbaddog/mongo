@@ -30,13 +30,7 @@
 
 #include "mongo/platform/basic.h"
 
-#include <vector>
-
-#include "mongo/bson/util/bson_extract.h"
-#include "mongo/db/audit.h"
 #include "mongo/db/commands.h"
-#include "mongo/s/catalog/sharding_catalog_client.h"
-#include "mongo/s/catalog/type_shard.h"
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/request_types/add_shard_request_type.h"
@@ -44,9 +38,6 @@
 #include "mongo/util/scopeguard.h"
 
 namespace mongo {
-
-using std::string;
-
 namespace {
 
 const ReadPreferenceSetting kPrimaryOnlyReadPreference{ReadPreference::PrimaryOnly};
@@ -56,57 +47,56 @@ class AddShardCmd : public BasicCommand {
 public:
     AddShardCmd() : BasicCommand("addShard", "addshard") {}
 
-    virtual bool slaveOk() const {
+    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
+        return AllowedOnSecondary::kAlways;
+    }
+
+    bool adminOnly() const override {
         return true;
     }
 
-    virtual bool adminOnly() const {
+    bool supportsWriteConcern(const BSONObj& cmd) const override {
         return true;
     }
 
-    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
-        return true;
+    std::string help() const override {
+        return "add a new shard to the system";
     }
 
-    virtual void help(std::stringstream& help) const {
-        help << "add a new shard to the system";
-    }
-
-    virtual void addRequiredPrivileges(const std::string& dbname,
-                                       const BSONObj& cmdObj,
-                                       std::vector<Privilege>* out) {
+    void addRequiredPrivileges(const std::string& dbname,
+                               const BSONObj& cmdObj,
+                               std::vector<Privilege>* out) const override {
         ActionSet actions;
         actions.addAction(ActionType::addShard);
         out->push_back(Privilege(ResourcePattern::forClusterResource(), actions));
     }
 
-    virtual bool run(OperationContext* opCtx,
-                     const std::string& dbname,
-                     const BSONObj& cmdObj,
-                     BSONObjBuilder& result) {
+    bool run(OperationContext* opCtx,
+             const std::string& dbname,
+             const BSONObj& cmdObj,
+             BSONObjBuilder& result) override {
         auto parsedRequest = uassertStatusOK(AddShardRequest::parseFromMongosCommand(cmdObj));
 
-        // Force a reload of this node's shard list cache at the end of this command.
-        ON_BLOCK_EXIT([opCtx] {
-            if (!Grid::get(opCtx)->shardRegistry()->reload(opCtx)) {
-                Grid::get(opCtx)->shardRegistry()->reload(opCtx);
-            }
-        });
-
         auto configShard = Grid::get(opCtx)->shardRegistry()->getConfigShard();
-        auto cmdResponse = uassertStatusOK(configShard->runCommandWithFixedRetryAttempts(
+
+        // Force a reload of this node's shard list cache at the end of this command.
+        auto cmdResponseWithStatus = configShard->runCommandWithFixedRetryAttempts(
             opCtx,
             kPrimaryOnlyReadPreference,
             "admin",
-            Command::appendMajorityWriteConcern(
-                Command::appendPassthroughFields(cmdObj, parsedRequest.toCommandForConfig())),
-            Shard::RetryPolicy::kIdempotent));
+            CommandHelpers::appendMajorityWriteConcern(CommandHelpers::appendPassthroughFields(
+                cmdObj, parsedRequest.toCommandForConfig())),
+            Shard::RetryPolicy::kIdempotent);
 
-        Command::filterCommandReplyForPassthrough(cmdResponse.response, &result);
+        if (!Grid::get(opCtx)->shardRegistry()->reload(opCtx)) {
+            Grid::get(opCtx)->shardRegistry()->reload(opCtx);
+        }
+        auto cmdResponse = uassertStatusOK(cmdResponseWithStatus);
+        CommandHelpers::filterCommandReplyForPassthrough(cmdResponse.response, &result);
         return true;
     }
 
-} addShard;
+} addShardCmd;
 
 }  // namespace
 }  // namespace mongo

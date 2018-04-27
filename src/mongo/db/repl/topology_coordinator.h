@@ -35,6 +35,7 @@
 #include "mongo/db/repl/last_vote.h"
 #include "mongo/db/repl/repl_set_heartbeat_response.h"
 #include "mongo/db/repl/replication_coordinator.h"
+#include "mongo/db/repl/update_position_args.h"
 #include "mongo/db/server_options.h"
 #include "mongo/stdx/functional.h"
 #include "mongo/util/net/hostandport.h"
@@ -51,6 +52,9 @@ class ReplSetHeartbeatArgs;
 class ReplSetConfig;
 class TagSubgroup;
 struct MemberState;
+
+// Maximum number of retries for a failed heartbeat.
+const int kMaxHeartbeatRetries = 2;
 
 /**
  * Replication Topology Coordinator
@@ -351,6 +355,10 @@ public:
         unsigned selfUptime;
         const OpTime& readConcernMajorityOpTime;
         const BSONObj& initialSyncStatus;
+
+        // boost::none if the storage engine does not support recovering to a
+        // timestamp. Timestamp::min() if a stable checkpoint is yet to be taken.
+        const boost::optional<Timestamp> lastStableCheckpointTimestamp;
     };
 
     // produce a reply to a status request
@@ -468,9 +476,7 @@ public:
      * "durablyWritten" indicates whether the operation has to be durably applied.
      * "skipSelf" means to exclude this node whether or not the op has been applied.
      */
-    std::vector<HostAndPort> getHostsWrittenTo(const OpTime& op,
-                                               bool durablyWritten,
-                                               bool skipSelf);
+    std::vector<HostAndPort> getHostsWrittenTo(const OpTime& op, bool durablyWritten);
 
     /**
      * Marks a member as down from our perspective and returns a bool which indicates if we can no
@@ -509,33 +515,36 @@ public:
     OpTime getMyLastAppliedOpTime() const;
 
     /*
+     * Sets the last optime that this node has applied, whether or not it has been journaled. Fails
+     * with an invariant if 'isRollbackAllowed' is false and we're attempting to set the optime
+     * backwards. The Date_t 'now' is used to track liveness; setting a node's applied optime
+     * updates its liveness information.
+     */
+    void setMyLastAppliedOpTime(OpTime opTime, Date_t now, bool isRollbackAllowed);
+
+    /*
      * Returns the last optime that this node has applied and journaled.
      */
     OpTime getMyLastDurableOpTime() const;
 
     /*
-     * Returns information we have on the state of this node.
+     * Sets the last optime that this node has applied and journaled. Fails with an invariant if
+     * 'isRollbackAllowed' is false and we're attempting to set the optime backwards. The Date_t
+     * 'now' is used to track liveness; setting a node's durable optime updates its liveness
+     * information.
      */
-    MemberData* getMyMemberData();
+    void setMyLastDurableOpTime(OpTime opTime, Date_t now, bool isRollbackAllowed);
 
     /*
-     * Returns information we have on the state of the node identified by memberId.  Returns
-     * nullptr if memberId is not found in the configuration.
+     * Sets the last optimes for a node, other than this node, based on the data from a
+     * replSetUpdatePosition command.
+     *
+     * Returns a Status if the position could not be set, false if the last optimes for the node
+     * did not change, or true if either the last applied or last durable optime did change.
      */
-    MemberData* findMemberDataByMemberId(const int memberId);
-
-    /*
-     * Returns information we have on the state of the node identified by rid.  Returns
-     * nullptr if rid is not found in the heartbeat data.  This method is used only for
-     * master/slave replication.
-     */
-    MemberData* findMemberDataByRid(const OID rid);
-
-    /*
-     * Adds and returns a memberData entry for the given RID.
-     * Used only in master/slave mode.
-     */
-    MemberData* addSlaveMemberData(const OID rid);
+    StatusWith<bool> setLastOptime(const UpdatePositionArgs::UpdateInfo& args,
+                                   Date_t now,
+                                   long long* configVersion);
 
     /**
      * If getRole() == Role::candidate and this node has not voted too recently, updates the
@@ -577,8 +586,9 @@ public:
      * Readies the TopologyCoordinator for an attempt to stepdown that may fail.  This is used
      * when we receive a stepdown command (which can fail if not enough secondaries are caught up)
      * to ensure that we never process more than one stepdown request at a time.
-     * Returns OK if it is safe to continue with the stepdown attempt, or returns
-     * ConflictingOperationInProgess if this node is already processing a stepdown request of any
+     * Returns OK if it is safe to continue with the stepdown attempt, or returns:
+     * - NotMaster if this node is not a leader.
+     * - ConflictingOperationInProgess if this node is already processing a stepdown request of any
      * kind.
      */
     Status prepareForStepDownAttempt();
@@ -833,11 +843,20 @@ private:
     // Helper shortcut to self config
     const MemberConfig& _selfConfig() const;
 
-    // Helper shortcut to self member data
+    // Helper shortcut to self member data for const members.
     const MemberData& _selfMemberData() const;
+
+    // Helper shortcut to self member data for non-const members.
+    MemberData& _selfMemberData();
 
     // Index of self member in member data.
     const int _selfMemberDataIndex() const;
+
+    /*
+     * Returns information we have on the state of the node identified by memberId.  Returns
+     * nullptr if memberId is not found in the configuration.
+     */
+    MemberData* _findMemberDataByMemberId(const int memberId);
 
     // Returns NULL if there is no primary, or the MemberConfig* for the current primary
     const MemberConfig* _currentPrimaryMember() const;
@@ -991,18 +1010,18 @@ private:
 };
 
 /**
- * Represents a latency measurement for each replica set member based on heartbeat requests.
- * The measurement is an average weighted 80% to the old value, and 20% to the new value.
+ * A PingStats object stores data about heartbeat attempts to a particular target node. Over the
+ * course of its lifetime, it may be used for multiple rounds of heartbeats. This allows for the
+ * collection of statistics like average heartbeat latency to a target. The heartbeat latency
+ * measurement it stores for each replica set member is an average weighted 80% to the old value,
+ * and 20% to the new value.
  *
- * Also stores information about heartbeat progress and retries.
  */
 class TopologyCoordinator::PingStats {
 public:
     /**
-     * Records that a new heartbeat request started at "now".
-     *
-     * This resets the failure count used in determining whether the next request to a target
-     * should be a retry or a regularly scheduled heartbeat message.
+     * Starts a new round of heartbeat attempts by transitioning to 'TRYING' and resetting the
+     * failure count. Also records that a new heartbeat request started at "now".
      */
     void start(Date_t now);
 
@@ -1021,7 +1040,7 @@ public:
      * Gets the number of hit() calls.
      */
     unsigned int getCount() const {
-        return count;
+        return hitCount;
     }
 
     /**
@@ -1029,7 +1048,7 @@ public:
      * Returns 0 if there have been no pings recorded yet.
      */
     Milliseconds getMillis() const {
-        return value == UninitializedPing ? Milliseconds(0) : value;
+        return averagePingTimeMs == UninitializedPingTime ? Milliseconds(0) : averagePingTimeMs;
     }
 
     /**
@@ -1041,22 +1060,89 @@ public:
     }
 
     /**
-     * Gets the number of failures since start() was last called.
-     *
-     * This value is incremented by calls to miss(), cleared by calls to start() and
-     * set to the maximum possible value by calls to hit().
+     * Returns true if the number of failed heartbeats for the most recent round of attempts has
+     * exceeded the max number of heartbeat retries.
      */
-    int getNumFailuresSinceLastStart() const {
-        return _numFailuresSinceLastStart;
+    bool failed() const {
+        return _state == FAILED;
+    }
+
+    /**
+     * Returns true if a good heartbeat has been received for the most recent round of heartbeat
+     * attempts before the maximum number of retries has been exceeded. Returns false otherwise.
+     */
+    bool succeeded() const {
+        return _state == SUCCEEDED;
+    }
+
+    /**
+     * Returns true if a heartbeat attempt is currently in progress and there are still retries
+     * left.
+     */
+    bool trying() const {
+        return _state == TRYING;
+    }
+
+    /**
+     * Returns true if 'start' has never been called on this instance of PingStats. Otherwise
+     * returns false.
+     */
+    bool uninitialized() const {
+        return _state == UNINITIALIZED;
+    }
+
+    /**
+     * Gets the number of retries left for this heartbeat attempt. Invalid to call if the current
+     * state is 'UNINITIALIZED'.
+    */
+    int retriesLeft() const {
+        return kMaxHeartbeatRetries - _numFailuresSinceLastStart;
     }
 
 private:
-    static constexpr Milliseconds UninitializedPing{-1};
+    /**
+     * Represents the current state of this PingStats object.
+     *
+     * At creation time, a PingStats object is in the 'UNINITIALIZED' state, and will remain so
+     * until the first heartbeat attempt is initiated. Heartbeat attempts are initiated by calls to
+     * 'start', which puts the object into 'TRYING' state. If all heartbeat retries are used up
+     * before receiving a good response, it will enter the 'FAILED' state. If a good heartbeat
+     * response is received before exceeding the maximum number of retries, the object enters the
+     * 'SUCCEEDED' state. From either the 'SUCCEEDED' or 'FAILED' state, the object can go back into
+     * 'TRYING' state, to begin a new heartbeat attempt. The following is a simple state transition
+     * table illustrating this behavior:
+     *
+     * UNINITIALIZED:   [TRYING]
+     * TRYING:          [SUCCEEDED, FAILED]
+     * SUCCEEDED:       [TRYING]
+     * FAILED:          [TRYING]
+     *
+     */
+    enum HeartbeatState { UNINITIALIZED, TRYING, SUCCEEDED, FAILED };
 
-    unsigned int count = 0;
-    Milliseconds value = UninitializedPing;
+    // The current state of this PingStats object.
+    HeartbeatState _state = UNINITIALIZED;
+
+    // Represents the uninitialized value of a counter that should only ever be >=0 after
+    // initialization.
+    static constexpr int UninitializedCount{-1};
+
+    // The value of 'averagePingTimeMs' before any good heartbeats have been received.
+    static constexpr Milliseconds UninitializedPingTime{UninitializedCount};
+
+    // The number of successful heartbeats that have ever been received i.e. the total number of
+    // calls to 'PingStats::hit'.
+    unsigned int hitCount = 0;
+
+    // The running, weighted average round trip time for heartbeat messages to the target node.
+    // Weighted 80% to the old round trip ping time, and 20% to the new round trip ping time.
+    Milliseconds averagePingTimeMs = UninitializedPingTime;
+
+    // The time of the most recent call to 'PingStats::start'.
     Date_t _lastHeartbeatStartDate;
-    int _numFailuresSinceLastStart = std::numeric_limits<int>::max();
+
+    // The number of failed heartbeat attempts since the most recent call to 'PingStats::start'.
+    int _numFailuresSinceLastStart = UninitializedCount;
 };
 
 //

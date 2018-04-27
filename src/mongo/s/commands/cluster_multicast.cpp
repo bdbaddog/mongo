@@ -32,6 +32,7 @@
 
 #include "mongo/base/init.h"
 #include "mongo/db/commands.h"
+#include "mongo/db/commands/test_commands_enabled.h"
 #include "mongo/executor/async_multicaster.h"
 #include "mongo/executor/task_executor_pool.h"
 #include "mongo/s/catalog/sharding_catalog_client.h"
@@ -47,7 +48,7 @@ std::vector<HostAndPort> getAllClusterHosts(OperationContext* opCtx) {
     auto registry = Grid::get(opCtx)->shardRegistry();
 
     std::vector<ShardId> shardIds;
-    registry->getAllShardIds(&shardIds);
+    registry->getAllShardIds(opCtx, &shardIds);
 
     std::vector<HostAndPort> servers;
     for (const auto& shardId : shardIds) {
@@ -66,10 +67,9 @@ class MulticastCmd : public BasicCommand {
 public:
     MulticastCmd() : BasicCommand("multicast") {}
 
-    bool slaveOk() const override {
-        return true;
+    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
+        return AllowedOnSecondary::kAlways;
     }
-
     bool adminOnly() const override {
         return true;
     }
@@ -79,14 +79,14 @@ public:
         return false;
     }
 
-    void help(std::stringstream& help) const override {
-        help << "multicasts a command to hosts in a system";
+    std::string help() const override {
+        return "multicasts a command to hosts in a system";
     }
 
     // no privs because it's a test command
     void addRequiredPrivileges(const std::string& dbname,
                                const BSONObj& cmdObj,
-                               std::vector<Privilege>* out) override {}
+                               std::vector<Privilege>* out) const override {}
 
     bool run(OperationContext* opCtx,
              const std::string& dbname,
@@ -132,7 +132,7 @@ public:
                 {
                     BSONObjBuilder subbob(bob.subobjStart(host.toString()));
 
-                    if (appendCommandStatus(subbob, response.status)) {
+                    if (CommandHelpers::appendCommandStatus(subbob, response.status)) {
                         subbob.append("data", response.data);
                         subbob.append("metadata", response.metadata);
                         if (response.elapsedMillis) {
@@ -148,7 +148,7 @@ public:
 };
 
 MONGO_INITIALIZER(RegisterMulticast)(InitializerContext* context) {
-    if (Command::testCommandsEnabled) {
+    if (getTestCommandsEnabled()) {
         new MulticastCmd();
     }
     return Status::OK();

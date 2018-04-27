@@ -28,7 +28,7 @@
 
 #pragma once
 
-#include "mongo/db/pipeline/mongo_process_interface.h"
+#include "mongo/db/pipeline/mongo_process_common.h"
 #include "mongo/db/pipeline/pipeline.h"
 
 namespace mongo {
@@ -43,13 +43,23 @@ public:
      * Class to provide access to mongos-specific implementations of methods required by some
      * document sources.
      */
-    class MongoSInterface final : public MongoProcessInterface {
+    class MongoSInterface final : public MongoProcessCommon {
     public:
         MongoSInterface() = default;
 
         virtual ~MongoSInterface() = default;
 
         void setOperationContext(OperationContext* opCtx) final {}
+
+        boost::optional<Document> lookupSingleDocument(
+            const boost::intrusive_ptr<ExpressionContext>& expCtx,
+            const NamespaceString& nss,
+            UUID collectionUUID,
+            const Document& documentKey,
+            boost::optional<BSONObj> readConcern) final;
+
+        std::vector<GenericCursor> getCursors(
+            const boost::intrusive_ptr<ExpressionContext>& expCtx) const final;
 
         DBClientBase* directClient() final {
             MONGO_UNREACHABLE;
@@ -108,20 +118,12 @@ public:
             MONGO_UNREACHABLE;
         }
 
-        std::vector<BSONObj> getCurrentOps(OperationContext* opCtx,
-                                           CurrentOpConnectionsMode connMode,
-                                           CurrentOpUserMode userMode,
-                                           CurrentOpTruncateMode truncateMode) const final {
-            MONGO_UNREACHABLE;
-        }
-
         std::string getShardName(OperationContext* opCtx) const final {
             MONGO_UNREACHABLE;
         }
 
-        std::vector<FieldPath> collectDocumentKeyFields(OperationContext*,
-                                                        const NamespaceString&,
-                                                        UUID) const final {
+        std::pair<std::vector<FieldPath>, bool> collectDocumentKeyFields(OperationContext*,
+                                                                         UUID) const final {
             MONGO_UNREACHABLE;
         }
 
@@ -132,15 +134,17 @@ public:
             MONGO_UNREACHABLE;
         }
 
-        boost::optional<Document> lookupSingleDocument(
-            const boost::intrusive_ptr<ExpressionContext>& expCtx,
-            const NamespaceString& nss,
-            UUID collectionUUID,
-            const Document& documentKey,
-            boost::optional<BSONObj> readConcern) final;
+    protected:
+        BSONObj _reportCurrentOpForClient(OperationContext* opCtx,
+                                          Client* client,
+                                          CurrentOpTruncateMode truncateOps) const final;
 
-        std::vector<GenericCursor> getCursors(
-            const boost::intrusive_ptr<ExpressionContext>& expCtx) const final;
+        void _reportCurrentOpsForIdleSessions(OperationContext* opCtx,
+                                              CurrentOpUserMode userMode,
+                                              std::vector<BSONObj>* ops) const final {
+            // This implementation is a no-op, since mongoS does not maintain a SessionCatalog or
+            // hold stashed locks for idle sessions.
+        }
     };
 
 private:

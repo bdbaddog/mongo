@@ -31,20 +31,21 @@
 #include <string>
 
 #include "mongo/base/disallow_copying.h"
+#include "mongo/bson/simple_bsonobj_comparator.h"
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/collection_options.h"
 #include "mongo/db/jsobj.h"
+#include "mongo/db/repl/rollback.h"
 #include "mongo/db/s/collection_sharding_state.h"
 
 namespace mongo {
-struct CollectionOptions;
+
 struct InsertStatement;
-class NamespaceString;
 class OperationContext;
 
 namespace repl {
 class OpTime;
-}  // repl
+}  // namespace repl
 
 /**
  * Holds document update information used in logging.
@@ -83,6 +84,15 @@ struct TTLCollModInfo {
     std::string indexName;
 };
 
+/**
+ * The OpObserver interface contains methods that get called on certain database events. It provides
+ * a way for various server subsystems to be notified of other events throughout the server.
+ *
+ * In order to call any OpObserver method, you must be in a 'WriteUnitOfWork'. This means that any
+ * locks acquired for writes in that WUOW are still held. So, you can assume that any locks required
+ * to perform the operation being observed are still held. These rules should apply for all observer
+ * methods unless otherwise specified.
+ */
 class OpObserver {
 public:
     virtual ~OpObserver() = default;
@@ -212,7 +222,6 @@ public:
                                             const NamespaceString& fromCollection,
                                             const NamespaceString& toCollection,
                                             OptionalCollectionUUID uuid,
-                                            bool dropTarget,
                                             OptionalCollectionUUID dropTargetUUID,
                                             bool stayTemp) = 0;
     virtual void onApplyOps(OperationContext* opCtx,
@@ -221,6 +230,119 @@ public:
     virtual void onEmptyCapped(OperationContext* opCtx,
                                const NamespaceString& collectionName,
                                OptionalCollectionUUID uuid) = 0;
+    /**
+     * The onTransactionCommit method is called on the commit of an atomic transaction, before the
+     * RecoveryUnit onCommit() is called.  It must not be called when no transaction is active.
+     */
+    virtual void onTransactionCommit(OperationContext* opCtx) = 0;
+
+    /**
+     * The onTransactionPrepare method is called when an atomic transaction is prepared. It must be
+     * called when a transaction is active. It generates an OpTime and sets the prepare timestamp on
+     * the recovery unit.
+     * TODO: This is an incomplete implementation and should only be used for testing. It does not
+     * write the prepare oplog entry, only generates an OpTime.
+     */
+    virtual void onTransactionPrepare(OperationContext* opCtx) = 0;
+
+    /**
+     * The onTransactionAbort method is called when an atomic transaction aborts, before the
+     * RecoveryUnit onRollback() is called.  It must not be called when no transaction is active.
+     */
+    virtual void onTransactionAbort(OperationContext* opCtx) = 0;
+
+    /**
+     * A structure to hold information about a replication rollback suitable to be passed along to
+     * any external subsystems that need to be notified of a rollback occurring.
+     */
+    struct RollbackObserverInfo {
+        // A count of all oplog entries seen during rollback (even no-op entries).
+        std::uint32_t numberOfEntriesObserved;
+
+        // Set of all namespaces from ops being rolled back.
+        std::set<NamespaceString> rollbackNamespaces = {};
+
+        // Set of all session ids from ops being rolled back.
+        std::set<UUID> rollbackSessionIds = {};
+
+        // Maps UUIDs to a set of BSONObjs containing the _ids of the documents that will be deleted
+        // from that collection due to rollback, and is used to populate rollback files.
+        // For simplicity, this BSONObj set uses the simple binary comparison, as it is never wrong
+        // to consider two _ids as distinct even if the collection default collation would put them
+        // in the same equivalence class.
+        stdx::unordered_map<UUID, SimpleBSONObjUnorderedSet, UUID::Hash> rollbackDeletedIdsMap;
+
+        // True if the shard identity document was rolled back.
+        bool shardIdentityRolledBack = false;
+
+        // True if the config.version document was rolled back.
+        bool configServerConfigVersionRolledBack = false;
+
+        // Maps command names to a count of the number of those commands that are being rolled back.
+        StringMap<std::uint32_t> rollbackCommandCounts;
+    };
+
+    /**
+     * This function will get called after the replication system has completed a rollback. This
+     * means that all on-disk, replicated data will have been reverted to the rollback common point
+     * by the time this function is called. Subsystems may use this method to invalidate any in
+     * memory caches or, optionally, rebuild any data structures from the data that is now on disk.
+     * This function should not write any persistent state.
+     *
+     * When this function is called, there will be no locks held on the given OperationContext, and
+     * it will not be called inside an existing WriteUnitOfWork. Any work done inside this handler
+     * is expected to handle this on its own.
+     *
+     * This method is only applicable to the "rollback to a stable timestamp" algorithm, and is not
+     * called when using any other rollback algorithm i.e "rollback via refetch".
+     */
+    virtual void onReplicationRollback(OperationContext* opCtx,
+                                       const RollbackObserverInfo& rbInfo) = 0;
+
+    struct Times;
+
+protected:
+    class ReservedTimes;
+};
+
+/**
+ * This struct is a decoration for `OperationContext` which contains collected `repl::OpTime`
+ * and `Date_t` timestamps of various critical stages of an operation performed by an OpObserver
+ * chain.
+ */
+struct OpObserver::Times {
+    static Times& get(OperationContext*);
+
+    std::vector<repl::OpTime> reservedOpTimes;
+
+private:
+    friend OpObserver::ReservedTimes;
+
+    // Because `OpObserver`s are re-entrant, it is necessary to track the recursion depth to know
+    // when to actually clear the `reservedOpTimes` vector, using the `ReservedTimes` scope object.
+    int _recursionDepth = 0;
+};
+
+/**
+ * This class is an RAII object to manage the state of the `OpObserver::Times` decoration on an
+ * operation context. Upon destruction the list of times in the decoration on the operation context
+ * is cleared. It is intended for use as a scope object in `OpObserverRegistry` to manage
+ * re-entrancy.
+ */
+class OpObserver::ReservedTimes {
+    ReservedTimes(const ReservedTimes&) = delete;
+    ReservedTimes& operator=(const ReservedTimes&) = delete;
+
+public:
+    explicit ReservedTimes(OperationContext* const opCtx);
+    ~ReservedTimes();
+
+    const Times& get() const {
+        return _times;
+    }
+
+private:
+    Times& _times;
 };
 
 }  // namespace mongo

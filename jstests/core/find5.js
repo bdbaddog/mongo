@@ -1,3 +1,5 @@
+// @tags: [requires_fastcount]
+
 (function() {
     "use strict";
 
@@ -10,7 +12,7 @@
     assert.eq(2, coll.find({}, {b: 1}).count(), "A");
 
     function getIds(projection) {
-        return coll.find({}, projection).map(doc => doc._id);
+        return coll.find({}, projection).map(doc => doc._id).sort();
     }
 
     assert.eq(Array.tojson(getIds(null)), Array.tojson(getIds({})), "B1 ");

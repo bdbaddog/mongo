@@ -396,29 +396,6 @@ void logMongodStartupWarnings(const StorageGlobalParams& storageParams,
         warned = true;
     }
 
-    // Check if in master-slave mode
-    auto replCoord = repl::ReplicationCoordinator::get(svcCtx);
-    if (replCoord->getReplicationMode() == repl::ReplicationCoordinator::modeMasterSlave) {
-        log() << startupWarningsLog;
-        log() << "** WARNING: This node was started in master-slave replication mode."
-              << startupWarningsLog;
-        log() << "**          Master-slave replication is deprecated and subject to be removed "
-              << startupWarningsLog;
-        log() << "**          in a future version." << startupWarningsLog;
-        warned = true;
-    }
-
-    // Check if --nojournal
-    bool isReplSet = replCoord->getReplicationMode() == repl::ReplicationCoordinator::modeReplSet;
-    if (isReplSet && storageParams.engine == "wiredTiger" && !storageParams.dur) {
-        log() << startupWarningsLog;
-        log() << "** WARNING: Running wiredTiger with the --nojournal option in a replica set"
-              << startupWarningsLog;
-        log() << "**          is deprecated and subject to be removed in a future version."
-              << startupWarningsLog;
-        warned = true;
-    }
-
     if (warned) {
         log() << startupWarningsLog;
     }

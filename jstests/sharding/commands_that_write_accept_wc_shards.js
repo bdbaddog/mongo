@@ -376,8 +376,8 @@ load('jstests/libs/write_concern_util.js');
         dropTestDatabase();
         cmd.setupFunc();
         var res = runCommandCheckAdmin(db, cmd);
-        assert.commandWorked(res);
-        assertWriteConcernError(res);
+        assert.commandWorkedIgnoringWriteConcernErrors(res);
+        assertWriteConcernError(res, ErrorCodes.UnknownReplWriteConcern);
         cmd.confirmFunc();
     }
 
@@ -385,4 +385,6 @@ load('jstests/libs/write_concern_util.js');
         testValidWriteConcern(cmd);
         testInvalidWriteConcern(cmd);
     });
+
+    st.stop();
 })();

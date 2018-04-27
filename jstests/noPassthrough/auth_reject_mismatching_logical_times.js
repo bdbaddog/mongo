@@ -1,6 +1,7 @@
 /**
  * Verifies mismatching cluster time objects are rejected by a sharded cluster when auth is on. In
  * noPassthrough because auth is manually set.
+ * @tags: [requires_replication, requires_sharding]
  */
 (function() {
     "use strict";
@@ -29,11 +30,12 @@
     }
 
     // Start the sharding test with auth on.
+    // TODO: Remove 'shardAsReplicaSet: false' when SERVER-32672 is fixed.
     const st = new ShardingTest({
         mongos: 1,
         manualAddShard: true,
         mongosWaitsForKeys: true,
-        other: {keyFile: "jstests/libs/key1"}
+        other: {keyFile: "jstests/libs/key1", shardAsReplicaSet: false}
     });
 
     // Create admin user and authenticate as them.
@@ -43,7 +45,9 @@
     // Add shard with auth enabled.
     const rst = new ReplSetTest({nodes: 2});
     rst.startSet({keyFile: "jstests/libs/key1", shardsvr: ""});
-    rst.initiate();
+
+    // TODO: Wait for stable checkpoint when SERVER-32672 is fixed.
+    rst.initiateWithAnyNodeAsPrimary(null, "replSetInitiate", {doNotWaitForStableCheckpoint: true});
     assert.commandWorked(st.s.adminCommand({addShard: rst.getURL()}));
 
     const testDB = st.s.getDB("test");
@@ -68,4 +72,5 @@
     assertAcceptsValidLogicalTime(st.configRS.getPrimary().getDB("admin"));
 
     st.stop();
+    rst.stopSet();
 })();

@@ -45,7 +45,7 @@
 #include "mongo/db/db_raii.h"
 #include "mongo/db/index_builder.h"
 #include "mongo/db/jsobj.h"
-#include "mongo/db/repl/replication_coordinator_global.h"
+#include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/util/log.h"
 
 namespace mongo {
@@ -61,28 +61,28 @@ public:
     virtual bool adminOnly() const {
         return false;
     }
-    virtual bool slaveOk() const {
-        return true;
+    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
+        return AllowedOnSecondary::kAlways;
     }
     virtual bool maintenanceMode() const {
         return true;
     }
     virtual void addRequiredPrivileges(const std::string& dbname,
                                        const BSONObj& cmdObj,
-                                       std::vector<Privilege>* out) {
+                                       std::vector<Privilege>* out) const {
         ActionSet actions;
         actions.addAction(ActionType::compact);
         out->push_back(Privilege(parseResourcePattern(dbname, cmdObj), actions));
     }
-    virtual void help(stringstream& help) const {
-        help << "compact collection\n"
-                "warning: this operation locks the database and is slow. you can cancel with "
-                "killOp()\n"
-                "{ compact : <collection_name>, [force:<bool>], [validate:<bool>],\n"
-                "  [paddingFactor:<num>], [paddingBytes:<num>] }\n"
-                "  force - allows to run on a replica set primary\n"
-                "  validate - check records are noncorrupt before adding to newly compacting "
-                "extents. slower but safer (defaults to true in this version)\n";
+    std::string help() const override {
+        return "compact collection\n"
+               "warning: this operation locks the database and is slow. you can cancel with "
+               "killOp()\n"
+               "{ compact : <collection_name>, [force:<bool>], [validate:<bool>],\n"
+               "  [paddingFactor:<num>], [paddingBytes:<num>] }\n"
+               "  force - allows to run on a replica set primary\n"
+               "  validate - check records are noncorrupt before adding to newly compacting "
+               "extents. slower but safer (defaults to true in this version)\n";
     }
     CompactCmd() : ErrmsgCommandDeprecated("compact") {}
 
@@ -91,9 +91,9 @@ public:
                            const BSONObj& cmdObj,
                            string& errmsg,
                            BSONObjBuilder& result) {
-        NamespaceString nss = parseNsCollectionRequired(db, cmdObj);
+        NamespaceString nss = CommandHelpers::parseNsCollectionRequired(db, cmdObj);
 
-        repl::ReplicationCoordinator* replCoord = repl::getGlobalReplicationCoordinator();
+        repl::ReplicationCoordinator* replCoord = repl::ReplicationCoordinator::get(opCtx);
         if (replCoord->getMemberState().primary() && !cmdObj["force"].trueValue()) {
             errmsg =
                 "will not run compact on an active replica set primary as this is a slow blocking "
@@ -153,10 +153,10 @@ public:
         // If db/collection does not exist, short circuit and return.
         if (!collDB || !collection) {
             if (view)
-                return appendCommandStatus(
+                return CommandHelpers::appendCommandStatus(
                     result, {ErrorCodes::CommandNotSupportedOnView, "can't compact a view"});
             else
-                return appendCommandStatus(
+                return CommandHelpers::appendCommandStatus(
                     result, {ErrorCodes::NamespaceNotFound, "collection does not exist"});
         }
 
@@ -167,7 +167,7 @@ public:
 
         StatusWith<CompactStats> status = collection->compact(opCtx, &compactOptions);
         if (!status.isOK())
-            return appendCommandStatus(result, status.getStatus());
+            return CommandHelpers::appendCommandStatus(result, status.getStatus());
 
         if (status.getValue().corruptDocuments > 0)
             result.append("invalidObjects", status.getValue().corruptDocuments);

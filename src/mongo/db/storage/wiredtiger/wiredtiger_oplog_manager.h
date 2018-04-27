@@ -30,7 +30,6 @@
 #pragma once
 
 #include "mongo/base/disallow_copying.h"
-#include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_record_store.h"
 #include "mongo/stdx/condition_variable.h"
 #include "mongo/stdx/mutex.h"
@@ -79,10 +78,13 @@ public:
     void waitForAllEarlierOplogWritesToBeVisible(const WiredTigerRecordStore* oplogRecordStore,
                                                  OperationContext* opCtx) const;
 
+    // Returns the all committed timestamp. All transactions with timestamps earlier than the
+    // all committed timestamp are committed.
+    uint64_t fetchAllCommittedValue(OperationContext* opCtx);
+
 private:
     void _oplogJournalThreadLoop(WiredTigerSessionCache* sessionCache,
-                                 WiredTigerRecordStore* oplogRecordStore,
-                                 bool isMasterSlave) noexcept;
+                                 WiredTigerRecordStore* oplogRecordStore) noexcept;
 
     void _setOplogReadTimestamp(WithLock, uint64_t newTimestamp);
 

@@ -1,42 +1,63 @@
 # -*- mode: python; -*-
 
 Import('env')
+Import('ssl_provider')
 
 env = env.Clone()
 
 env.Library(
-    target='network',
+    target='host',
     source=[
         "cidr.cpp",
         "hostandport.cpp",
         "hostname_canonicalization.cpp",
-        "listen.cpp",
+        "sockaddr.cpp",
+        env.Idlc('hostandport.idl')[0],
+    ],
+    LIBDEPS=[
+        '$BUILD_DIR/mongo/base',
+    ],
+)
+
+env.Library(
+    target='network',
+    source=[
         "message.cpp",
-        "message_port.cpp",
         "op_msg.cpp",
         "private/socket_poll.cpp",
         "private/ssl_expiration.cpp",
         "sock.cpp",
-        "sockaddr.cpp",
         "socket_exception.cpp",
         "ssl_manager.cpp",
+        'ssl_manager_%s.cpp' % (ssl_provider),
         "ssl_options.cpp",
-        "thread_idle_callback.cpp",
+        "ssl_parameters.cpp",
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/base',
         '$BUILD_DIR/mongo/db/auth/auth_rolename',
         '$BUILD_DIR/mongo/util/concurrency/ticketholder',
-        '$BUILD_DIR/mongo/util/decorable',
+        'host',
     ],
     LIBDEPS_PRIVATE=[
+        '$BUILD_DIR/mongo/db/auth/authcommon',
         '$BUILD_DIR/mongo/db/bson/dotted_path_support',
         '$BUILD_DIR/mongo/db/server_options_core',
         '$BUILD_DIR/mongo/util/background_job',
         '$BUILD_DIR/mongo/util/fail_point',
         '$BUILD_DIR/mongo/util/options_parser/options_parser',
         '$BUILD_DIR/mongo/util/winutil',
+        'ssl_stream',
     ],
+)
+
+env.Library(
+    target="ssl_stream",
+    source=[
+        "ssl_stream.cpp"],
+    LIBDEPS=[
+        '$BUILD_DIR/third_party/shim_asio',
+    ]
 )
 
 env.CppUnitTest(
@@ -58,6 +79,7 @@ env.CppUnitTest(
     target='ssl_manager_test',
     source=[
         'ssl_manager_test.cpp',
+        'ssl_options_test.cpp',
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/base',

@@ -93,13 +93,15 @@ public:
         std::string collectionName;
         BSONObj collectionInfo;
         BSONObj idIndexSpec;
+        bool shardedColl = false;
     };
 
     // Executes 'createCollection' for each collection described in 'createCollectionParams', in
     // 'dbName'.
     Status createCollectionsForDb(OperationContext* opCtx,
                                   const std::vector<CreateCollectionParams>& createCollectionParams,
-                                  const std::string& dbName);
+                                  const std::string& dbName,
+                                  const CloneOptions& opts);
 
     /*
      * Returns the _id index spec from 'indexSpecs', or an empty BSONObj if none is found.
@@ -130,19 +132,15 @@ private:
 /**
  *  slaveOk     - if true it is ok if the source of the data is !ismaster.
  *  useReplAuth - use the credentials we normally use as a replication slave for the cloning
- *  snapshot    - use snapshot mode for copying collections.  note this should not be used
- *                when it isn't required, as it will be slower.  for example,
- *                repairDatabase need not use it.
  *  createCollections - When 'true', will fetch a list of collections from the remote and create
  *                them.  When 'false', assumes collections have already been created ahead of time.
  */
 struct CloneOptions {
     std::string fromDB;
-    std::set<std::string> collsToIgnore;
+    std::set<std::string> shardedColls;
 
     bool slaveOk = false;
     bool useReplAuth = false;
-    bool snapshot = true;
 
     bool syncData = true;
     bool syncIndexes = true;

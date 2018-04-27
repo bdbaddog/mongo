@@ -371,8 +371,7 @@ StatusWith<BSONObj> validateIndexSpec(
     }
 
     if (!resolvedIndexVersion) {
-        resolvedIndexVersion =
-            IndexDescriptor::getDefaultIndexVersion(featureCompatibility.getVersion());
+        resolvedIndexVersion = IndexDescriptor::getDefaultIndexVersion();
     }
 
     if (!hasKeyPatternField) {

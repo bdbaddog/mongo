@@ -45,8 +45,8 @@ class DropCmd : public BasicCommand {
 public:
     DropCmd() : BasicCommand("drop") {}
 
-    bool slaveOk() const override {
-        return true;
+    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
+        return AllowedOnSecondary::kAlways;
     }
 
     bool adminOnly() const override {
@@ -59,7 +59,7 @@ public:
 
     void addRequiredPrivileges(const std::string& dbname,
                                const BSONObj& cmdObj,
-                               std::vector<Privilege>* out) override {
+                               std::vector<Privilege>* out) const override {
         ActionSet actions;
         actions.addAction(ActionType::dropCollection);
         out->push_back(Privilege(parseResourcePattern(dbname, cmdObj), actions));
@@ -70,7 +70,7 @@ public:
              const BSONObj& cmdObj,
              BSONObjBuilder& result) override {
 
-        const NamespaceString nss(parseNsCollectionRequired(dbname, cmdObj));
+        const NamespaceString nss(CommandHelpers::parseNsCollectionRequired(dbname, cmdObj));
 
         // Invalidate the routing table cache entry for this collection so that we reload it the
         // next time it is accessed, even if sending the command to the config server fails due
@@ -83,11 +83,11 @@ public:
             opCtx,
             ReadPreferenceSetting(ReadPreference::PrimaryOnly),
             "admin",
-            Command::appendMajorityWriteConcern(Command::appendPassthroughFields(
+            CommandHelpers::appendMajorityWriteConcern(CommandHelpers::appendPassthroughFields(
                 cmdObj, BSON("_configsvrDropCollection" << nss.toString()))),
             Shard::RetryPolicy::kIdempotent));
 
-        Command::filterCommandReplyForPassthrough(cmdResponse.response, &result);
+        CommandHelpers::filterCommandReplyForPassthrough(cmdResponse.response, &result);
         return true;
     }
 

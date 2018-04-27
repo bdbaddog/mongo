@@ -114,9 +114,9 @@ bool PlanCacheCommand::run(OperationContext* opCtx,
                            const string& dbname,
                            const BSONObj& cmdObj,
                            BSONObjBuilder& result) {
-    const NamespaceString nss(parseNsCollectionRequired(dbname, cmdObj));
+    const NamespaceString nss(CommandHelpers::parseNsCollectionRequired(dbname, cmdObj));
     Status status = runPlanCacheCommand(opCtx, nss.ns(), cmdObj, &result);
-    return appendCommandStatus(result, status);
+    return CommandHelpers::appendCommandStatus(result, status);
 }
 
 
@@ -124,21 +124,17 @@ bool PlanCacheCommand::supportsWriteConcern(const BSONObj& cmd) const {
     return false;
 }
 
-bool PlanCacheCommand::slaveOk() const {
-    return false;
+Command::AllowedOnSecondary PlanCacheCommand::secondaryAllowed(ServiceContext*) const {
+    return AllowedOnSecondary::kOptIn;
 }
 
-bool PlanCacheCommand::slaveOverrideOk() const {
-    return true;
-}
-
-void PlanCacheCommand::help(stringstream& ss) const {
-    ss << helpText;
+std::string PlanCacheCommand::help() const {
+    return helpText;
 }
 
 Status PlanCacheCommand::checkAuthForCommand(Client* client,
                                              const std::string& dbname,
-                                             const BSONObj& cmdObj) {
+                                             const BSONObj& cmdObj) const {
     AuthorizationSession* authzSession = AuthorizationSession::get(client);
     ResourcePattern pattern = parseResourcePattern(dbname, cmdObj);
 

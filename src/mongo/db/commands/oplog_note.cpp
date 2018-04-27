@@ -46,7 +46,6 @@
 #include "mongo/db/operation_context.h"
 #include "mongo/db/repl/oplog.h"
 #include "mongo/db/repl/replication_coordinator.h"
-#include "mongo/db/repl/replication_coordinator_global.h"
 #include "mongo/db/service_context.h"
 #include "mongo/util/log.h"
 
@@ -57,7 +56,7 @@ Status _performNoopWrite(OperationContext* opCtx, BSONObj msgObj, StringData not
     // Use GlobalLock + lockMMAPV1Flush instead of DBLock to allow return when the lock is not
     // available. It may happen when the primary steps down and a shared global lock is
     // acquired.
-    Lock::GlobalLock lock(opCtx, MODE_IX, 1);
+    Lock::GlobalLock lock(opCtx, MODE_IX, Date_t::now() + Milliseconds(1));
 
     if (!lock.isLocked()) {
         LOG(1) << "Global lock is not available skipping noopWrite";
@@ -87,8 +86,8 @@ class AppendOplogNoteCmd : public BasicCommand {
 public:
     AppendOplogNoteCmd() : BasicCommand("appendOplogNote") {}
 
-    virtual bool slaveOk() const {
-        return false;
+    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
+        return AllowedOnSecondary::kNever;
     }
 
     virtual bool adminOnly() const {
@@ -99,13 +98,13 @@ public:
         return true;
     }
 
-    virtual void help(stringstream& help) const {
-        help << "Adds a no-op entry to the oplog";
+    std::string help() const override {
+        return "Adds a no-op entry to the oplog";
     }
 
     virtual Status checkAuthForCommand(Client* client,
                                        const std::string& dbname,
-                                       const BSONObj& cmdObj) {
+                                       const BSONObj& cmdObj) const {
         if (!AuthorizationSession::get(client)->isAuthorizedForActionsOnResource(
                 ResourcePattern::forClusterResource(), ActionType::appendOplogNote)) {
             return Status(ErrorCodes::Unauthorized, "Unauthorized");
@@ -119,15 +118,16 @@ public:
                      BSONObjBuilder& result) {
         auto replCoord = repl::ReplicationCoordinator::get(opCtx);
         if (!replCoord->isReplEnabled()) {
-            return appendCommandStatus(result,
-                                       {ErrorCodes::NoReplicationEnabled,
-                                        "Must have replication set up to run \"appendOplogNote\""});
+            return CommandHelpers::appendCommandStatus(
+                result,
+                {ErrorCodes::NoReplicationEnabled,
+                 "Must have replication set up to run \"appendOplogNote\""});
         }
 
         BSONElement dataElement;
         auto dataStatus = bsonExtractTypedField(cmdObj, "data", Object, &dataElement);
         if (!dataStatus.isOK()) {
-            return appendCommandStatus(result, dataStatus);
+            return CommandHelpers::appendCommandStatus(result, dataStatus);
         }
 
         Timestamp maxClusterTime;
@@ -136,22 +136,23 @@ public:
 
         if (!maxClusterTimeStatus.isOK()) {
             if (maxClusterTimeStatus == ErrorCodes::NoSuchKey) {  // no need to use maxClusterTime
-                return appendCommandStatus(
+                return CommandHelpers::appendCommandStatus(
                     result, _performNoopWrite(opCtx, dataElement.Obj(), "appendOpLogNote"));
             }
-            return appendCommandStatus(result, maxClusterTimeStatus);
+            return CommandHelpers::appendCommandStatus(result, maxClusterTimeStatus);
         }
 
         auto lastAppliedOpTime = replCoord->getMyLastAppliedOpTime().getTimestamp();
         if (maxClusterTime > lastAppliedOpTime) {
-            return appendCommandStatus(
+            return CommandHelpers::appendCommandStatus(
                 result, _performNoopWrite(opCtx, dataElement.Obj(), "appendOpLogNote"));
         } else {
             std::stringstream ss;
             ss << "Requested maxClusterTime " << LogicalTime(maxClusterTime).toString()
                << " is less or equal to the last primary OpTime: "
                << LogicalTime(lastAppliedOpTime).toString();
-            return appendCommandStatus(result, {ErrorCodes::StaleClusterTime, ss.str()});
+            return CommandHelpers::appendCommandStatus(result,
+                                                       {ErrorCodes::StaleClusterTime, ss.str()});
         }
     }
 };

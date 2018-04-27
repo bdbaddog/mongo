@@ -13,7 +13,6 @@
     assert.eq(2, names.length);
     assert.commandWorked(s.s0.adminCommand({addshard: names[0]}));
     assert.commandWorked(s.s0.adminCommand({addshard: names[1], maxSize: MaxSizeMB}));
-
     assert.commandWorked(s.s0.adminCommand({enablesharding: "test"}));
     s.ensurePrimaryShard('test', names[0]);
 
@@ -64,7 +63,7 @@
     s.awaitBalancerRound();
 
     var chunkCounts = s.chunkCounts('foo', 'test');
-    assert.eq(0, chunkCounts.shard0001);
+    assert.eq(0, chunkCounts[s.rs1.name]);
 
     s.stop();
 })();

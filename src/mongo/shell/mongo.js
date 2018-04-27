@@ -249,7 +249,7 @@ connect = function(url, user, pass) {
 
     chatty("connecting to: " + url);
     var m = new Mongo(url);
-    db = m.getDB(m.defaultDB);
+    var db = m.getDB(m.defaultDB);
 
     if (user && pass) {
         if (!db.auth(user, pass)) {
@@ -417,7 +417,11 @@ Mongo.prototype.getClusterTime = function() {
     return this._clusterTime;
 };
 
-Mongo.prototype.startSession = function startSession(options) {
+Mongo.prototype.startSession = function startSession(options = {}) {
+    // Set retryWrites if not already set on options.
+    if (!options.hasOwnProperty("retryWrites") && this.hasOwnProperty("_retryWrites")) {
+        options.retryWrites = this._retryWrites;
+    }
     return new DriverSession(this, options);
 };
 
@@ -461,4 +465,31 @@ Mongo.prototype.waitForClusterTime = function waitForClusterTime(maxRetries = 10
         this.adminCommand({"ping": 1});
     }
     throw new Error("failed waiting for non default clusterTime");
+};
+
+Mongo.prototype.watch = function(pipeline, options) {
+    pipeline = pipeline || [];
+    options = options || {};
+    assert(pipeline instanceof Array, "'pipeline' argument must be an array");
+    assert(options instanceof Object, "'options' argument must be an object");
+
+    let changeStreamStage = {
+        allChangesForCluster: true,
+        fullDocument: options.fullDocument || "default"
+    };
+    delete options.allChangesForCluster;
+    delete options.fullDocument;
+
+    if (options.hasOwnProperty("resumeAfter")) {
+        changeStreamStage.resumeAfter = options.resumeAfter;
+        delete options.resumeAfter;
+    }
+
+    if (options.hasOwnProperty("startAtClusterTime")) {
+        changeStreamStage.startAtClusterTime = options.startAtClusterTime;
+        delete options.startAtClusterTime;
+    }
+
+    pipeline.unshift({$changeStream: changeStreamStage});
+    return this.getDB("admin")._runAggregate({aggregate: 1, pipeline: pipeline}, options);
 };

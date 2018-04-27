@@ -43,6 +43,7 @@ namespace mongo {
 
 namespace repl {
 class OplogEntryBase;
+class ReplOperation;
 }  // namespace repl
 
 namespace idl {
@@ -60,6 +61,7 @@ class UUID {
 
     // Make the IDL generated parser a friend
     friend class ConfigsvrShardCollectionResponse;
+    friend class DatabaseVersion;
     friend class DbCheckOplogCollection;
     friend class idl::import::One_UUID;
     friend class LogicalSessionId;
@@ -67,6 +69,7 @@ class UUID {
     friend class LogicalSessionIdToClient;
     friend class LogicalSessionFromClient;
     friend class repl::OplogEntryBase;
+    friend class repl::ReplOperation;
     friend class ResumeTokenInternal;
 
 public:

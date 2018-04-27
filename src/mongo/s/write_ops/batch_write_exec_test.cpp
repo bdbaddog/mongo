@@ -33,7 +33,7 @@
 #include "mongo/db/logical_session_id.h"
 #include "mongo/s/catalog/type_shard.h"
 #include "mongo/s/client/shard_registry.h"
-#include "mongo/s/sharding_test_fixture.h"
+#include "mongo/s/sharding_router_test_fixture.h"
 #include "mongo/s/write_ops/batch_write_exec.h"
 #include "mongo/s/write_ops/batched_command_request.h"
 #include "mongo/s/write_ops/batched_command_response.h"
@@ -112,7 +112,7 @@ public:
             }
 
             BatchedCommandResponse response;
-            response.setOk(true);
+            response.setStatus(Status::OK());
             response.setN(inserted.size());
 
             return response.toBSON();
@@ -138,15 +138,14 @@ public:
             }
 
             BatchedCommandResponse staleResponse;
-            staleResponse.setOk(true);
+            staleResponse.setStatus(Status::OK());
             staleResponse.setN(0);
 
             // Report a stale version error for each write in the batch.
             int i = 0;
             for (itInserted = inserted.begin(); itInserted != inserted.end(); ++itInserted) {
                 WriteErrorDetail* error = new WriteErrorDetail;
-                error->setErrCode(ErrorCodes::StaleShardVersion);
-                error->setErrMessage("mock stale error");
+                error->setStatus({ErrorCodes::StaleShardVersion, "mock stale error"});
                 error->setIndex(i);
 
                 staleResponse.addToErrDetails(error);
@@ -258,9 +257,7 @@ TEST_F(BatchWriteExecTest, MultiOpLarge) {
 
 TEST_F(BatchWriteExecTest, SingleOpError) {
     BatchedCommandResponse errResponse;
-    errResponse.setOk(false);
-    errResponse.setErrCode(ErrorCodes::UnknownError);
-    errResponse.setErrMessage("mock error");
+    errResponse.setStatus({ErrorCodes::UnknownError, "mock error"});
 
     BatchedCommandRequest request([&] {
         write_ops::Insert insertOp(nss);
@@ -281,9 +278,9 @@ TEST_F(BatchWriteExecTest, SingleOpError) {
         ASSERT(response.getOk());
         ASSERT_EQ(0, response.getN());
         ASSERT(response.isErrDetailsSet());
-        ASSERT_EQ(errResponse.getErrCode(), response.getErrDetailsAt(0)->getErrCode());
-        ASSERT(response.getErrDetailsAt(0)->getErrMessage().find(errResponse.getErrMessage()) !=
-               std::string::npos);
+        ASSERT_EQ(errResponse.toStatus().code(), response.getErrDetailsAt(0)->toStatus().code());
+        ASSERT(response.getErrDetailsAt(0)->toStatus().reason().find(
+                   errResponse.toStatus().reason()) != std::string::npos);
 
         ASSERT_EQ(1, stats.numRounds);
     });
@@ -385,8 +382,8 @@ TEST_F(BatchWriteExecTest, TooManyStaleOp) {
         ASSERT(response.getOk());
         ASSERT_EQ(0, response.getN());
         ASSERT(response.isErrDetailsSet());
-        ASSERT_EQUALS(response.getErrDetailsAt(0)->getErrCode(), ErrorCodes::NoProgressMade);
-        ASSERT_EQUALS(response.getErrDetailsAt(1)->getErrCode(), ErrorCodes::NoProgressMade);
+        ASSERT_EQUALS(response.getErrDetailsAt(0)->toStatus().code(), ErrorCodes::NoProgressMade);
+        ASSERT_EQUALS(response.getErrDetailsAt(1)->toStatus().code(), ErrorCodes::NoProgressMade);
 
         ASSERT_EQUALS(stats.numStaleBatches, (1 + kMaxRoundsWithoutProgress));
     });
@@ -458,9 +455,7 @@ TEST_F(BatchWriteExecTest, RetryableErrorNoTxnNumber) {
     request.setWriteConcern(BSONObj());
 
     BatchedCommandResponse retryableErrResponse;
-    retryableErrResponse.setOk(false);
-    retryableErrResponse.setErrCode(ErrorCodes::NotMaster);
-    retryableErrResponse.setErrMessage("mock retryable error");
+    retryableErrResponse.setStatus({ErrorCodes::NotMaster, "mock retryable error"});
 
     auto future = launchAsync([&] {
         BatchedCommandResponse response;
@@ -470,9 +465,10 @@ TEST_F(BatchWriteExecTest, RetryableErrorNoTxnNumber) {
         ASSERT(response.getOk());
         ASSERT_EQ(0, response.getN());
         ASSERT(response.isErrDetailsSet());
-        ASSERT_EQUALS(response.getErrDetailsAt(0)->getErrCode(), retryableErrResponse.getErrCode());
-        ASSERT(response.getErrDetailsAt(0)->getErrMessage().find(
-                   retryableErrResponse.getErrMessage()) != std::string::npos);
+        ASSERT_EQUALS(response.getErrDetailsAt(0)->toStatus().code(),
+                      retryableErrResponse.toStatus().code());
+        ASSERT(response.getErrDetailsAt(0)->toStatus().reason().find(
+                   retryableErrResponse.toStatus().reason()) != std::string::npos);
         ASSERT_EQ(1, stats.numRounds);
     });
 
@@ -500,9 +496,7 @@ TEST_F(BatchWriteExecTest, RetryableErrorTxnNumber) {
     operationContext()->setTxnNumber(5);
 
     BatchedCommandResponse retryableErrResponse;
-    retryableErrResponse.setOk(false);
-    retryableErrResponse.setErrCode(ErrorCodes::NotMaster);
-    retryableErrResponse.setErrMessage("mock retryable error");
+    retryableErrResponse.setStatus({ErrorCodes::NotMaster, "mock retryable error"});
 
     auto future = launchAsync([&] {
         BatchedCommandResponse response;
@@ -539,9 +533,7 @@ TEST_F(BatchWriteExecTest, NonRetryableErrorTxnNumber) {
     operationContext()->setTxnNumber(5);
 
     BatchedCommandResponse nonRetryableErrResponse;
-    nonRetryableErrResponse.setOk(false);
-    nonRetryableErrResponse.setErrCode(ErrorCodes::UnknownError);
-    nonRetryableErrResponse.setErrMessage("mock non-retryable error");
+    nonRetryableErrResponse.setStatus({ErrorCodes::UnknownError, "mock non-retryable error"});
 
     auto future = launchAsync([&] {
         BatchedCommandResponse response;
@@ -551,10 +543,10 @@ TEST_F(BatchWriteExecTest, NonRetryableErrorTxnNumber) {
         ASSERT(response.getOk());
         ASSERT_EQ(0, response.getN());
         ASSERT(response.isErrDetailsSet());
-        ASSERT_EQUALS(response.getErrDetailsAt(0)->getErrCode(),
-                      nonRetryableErrResponse.getErrCode());
-        ASSERT(response.getErrDetailsAt(0)->getErrMessage().find(
-                   nonRetryableErrResponse.getErrMessage()) != std::string::npos);
+        ASSERT_EQUALS(response.getErrDetailsAt(0)->toStatus().code(),
+                      nonRetryableErrResponse.toStatus().code());
+        ASSERT(response.getErrDetailsAt(0)->toStatus().reason().find(
+                   nonRetryableErrResponse.toStatus().reason()) != std::string::npos);
         ASSERT_EQ(1, stats.numRounds);
     });
 

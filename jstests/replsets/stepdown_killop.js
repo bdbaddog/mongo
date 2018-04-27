@@ -18,8 +18,8 @@
     replSet.initiate({
         "_id": name,
         "members": [
-            {"_id": 0, "host": nodes[0], "priority": 3},
-            {"_id": 1, "host": nodes[1]},
+            {"_id": 0, "host": nodes[0]},
+            {"_id": 1, "host": nodes[1], "priority": 0},
             {"_id": 2, "host": nodes[2], "arbiterOnly": true}
         ]
     });
@@ -61,7 +61,7 @@
 
     jsTestLog("Ensure that writes start failing with NotMaster errors");
     assert.soonNoExcept(function() {
-        assert.writeErrorWithCode(primary.getDB(name).foo.insert({x: 2}), ErrorCodes.NotMaster);
+        assert.commandFailedWithCode(primary.getDB(name).foo.insert({x: 2}), ErrorCodes.NotMaster);
         return true;
     });
 
@@ -78,4 +78,5 @@
 
     assert.writeOK(primary.getDB(name).foo.remove({}));
     restartServerReplication(secondary);
+    replSet.stopSet();
 })();

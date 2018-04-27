@@ -28,6 +28,7 @@
 
 #define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
 
+#include "mongo/config.h"
 #include "mongo/platform/basic.h"
 
 #include <type_traits>
@@ -233,14 +234,20 @@ DEATH_TEST(FassertionTerminationTest, fassertOverload, "Terminating with fassert
     fassert(40207, {ErrorCodes::InternalError, "Terminating with fassert"});
 }
 
-DEATH_TEST(FassertionTerminationTest, fassertStatusOK, "Terminating with fassertStatusOK") {
-    fassertStatusOK(40208, Status(ErrorCodes::InternalError, "Terminating with fassertStatusOK"));
+DEATH_TEST(FassertionTerminationTest, fassertStatusWithOverload, "Terminating with fassert") {
+    fassert(50733,
+            StatusWith<std::string>{ErrorCodes::InternalError,
+                                    "Terminating with fassertStatusWithOverload"});
 }
 
-DEATH_TEST(FassertionTerminationTest, fassertStatusOKOverload, "Terminating with fassertStatusOK") {
-    fassertStatusOK(
-        40209,
-        StatusWith<std::string>(ErrorCodes::InternalError, "Terminating with fassertStatusOK"));
+DEATH_TEST(FassertionTerminationTest, fassertNoTrace, "Terminating with fassertNoTrace") {
+    fassertNoTrace(50734, Status(ErrorCodes::InternalError, "Terminating with fassertNoTrace"));
+}
+
+DEATH_TEST(FassertionTerminationTest, fassertNoTraceOverload, "Terminating with fassertNoTrace") {
+    fassertNoTrace(50735,
+                   StatusWith<std::string>(ErrorCodes::InternalError,
+                                           "Terminating with fassertNoTraceOverload"));
 }
 
 DEATH_TEST(FassertionTerminationTest, fassertFailed, "40210") {
@@ -284,8 +291,13 @@ DEATH_TEST(InvariantTerminationTest, invariant, "Invariant failure false " __FIL
     invariant(false);
 }
 
-DEATH_TEST(InvariantTerminationTest, invariantOK, "Terminating with invariantOK") {
-    invariantOK(Status(ErrorCodes::InternalError, "Terminating with invariantOK"));
+DEATH_TEST(InvariantTerminationTest, invariantOverload, "Terminating with invariant") {
+    invariant(Status(ErrorCodes::InternalError, "Terminating with invariant"));
+}
+
+DEATH_TEST(InvariantTerminationTest, invariantStatusWithOverload, "Terminating with invariant") {
+    invariant(StatusWith<std::string>(ErrorCodes::InternalError,
+                                      "Terminating with invariantStatusWithOverload"));
 }
 
 DEATH_TEST(InvariantTerminationTest,
@@ -302,6 +314,63 @@ DEATH_TEST(InvariantTerminationTest,
                                           << 12345;
     invariant(false, msg);
 }
+
+DEATH_TEST(InvariantTerminationTest,
+           invariantOverloadWithStringLiteralMsg,
+           "Terminating with string literal invariant message") {
+    invariant(Status(ErrorCodes::InternalError, "Terminating with invariant"),
+              "Terminating with string literal invariant message");
+}
+
+DEATH_TEST(InvariantTerminationTest,
+           invariantOverloadWithStdStringMsg,
+           "Terminating with std::string invariant message: 12345") {
+    const std::string msg = str::stream() << "Terminating with std::string invariant message: "
+                                          << 12345;
+    invariant(Status(ErrorCodes::InternalError, "Terminating with invariant"), msg);
+}
+
+DEATH_TEST(InvariantTerminationTest,
+           invariantStatusWithOverloadWithStringLiteralMsg,
+           "Terminating with string literal invariant message") {
+    invariant(StatusWith<std::string>(ErrorCodes::InternalError, "Terminating with invariant"),
+              "Terminating with string literal invariant message");
+}
+
+DEATH_TEST(InvariantTerminationTest,
+           invariantStatusWithOverloadWithStdStringMsg,
+           "Terminating with std::string invariant message: 12345") {
+    const std::string msg = str::stream() << "Terminating with std::string invariant message: "
+                                          << 12345;
+    invariant(StatusWith<std::string>(ErrorCodes::InternalError, "Terminating with invariant"),
+              msg);
+}
+
+#if defined(MONGO_CONFIG_DEBUG_BUILD)
+// dassert and its friends
+DEATH_TEST(DassertTerminationTest, invariant, "Invariant failure false " __FILE__) {
+    dassert(false);
+}
+
+DEATH_TEST(DassertTerminationTest, dassertOK, "Terminating with dassertOK") {
+    dassert(Status(ErrorCodes::InternalError, "Terminating with dassertOK"));
+}
+
+DEATH_TEST(DassertTerminationTest,
+           invariantWithStringLiteralMsg,
+           "Terminating with string literal dassert message") {
+    const char* msg = "Terminating with string literal dassert message";
+    dassert(false, msg);
+}
+
+DEATH_TEST(DassertTerminationTest,
+           dassertWithStdStringMsg,
+           "Terminating with std::string dassert message: 12345") {
+    const std::string msg = str::stream() << "Terminating with std::string dassert message: "
+                                          << 12345;
+    dassert(false, msg);
+}
+#endif  // defined(MONGO_CONFIG_DEBUG_BUILD)
 
 }  // namespace
 }  // namespace mongo

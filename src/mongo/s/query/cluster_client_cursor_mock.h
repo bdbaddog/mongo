@@ -43,6 +43,7 @@ class ClusterClientCursorMock final : public ClusterClientCursor {
 
 public:
     ClusterClientCursorMock(boost::optional<LogicalSessionId> lsid,
+                            boost::optional<TxnNumber> txnNumber,
                             stdx::function<void(void)> killCallback = stdx::function<void(void)>());
 
     ~ClusterClientCursorMock();
@@ -51,15 +52,25 @@ public:
 
     void kill(OperationContext* opCtx) final;
 
-    void reattachToOperationContext(OperationContext* opCtx) final {}
+    void reattachToOperationContext(OperationContext* opCtx) final {
+        _opCtx = opCtx;
+    }
 
-    void detachFromOperationContext() final {}
+    void detachFromOperationContext() final {
+        _opCtx = nullptr;
+    }
+
+    OperationContext* getCurrentOperationContext() const final {
+        return _opCtx;
+    }
 
     bool isTailable() const final;
 
     bool isTailableAndAwaitData() const final;
 
-    UserNameIterator getAuthenticatedUsers() const final;
+    BSONObj getOriginatingCommand() const final;
+
+    std::size_t getNumRemotes() const final;
 
     long long getNumReturnedSoFar() const final;
 
@@ -68,6 +79,8 @@ public:
     Status setAwaitDataTimeout(Milliseconds awaitDataTimeout) final;
 
     boost::optional<LogicalSessionId> getLsid() const final;
+
+    boost::optional<TxnNumber> getTxnNumber() const final;
 
     boost::optional<ReadPreferenceSetting> getReadPreference() const final;
 
@@ -90,12 +103,19 @@ private:
     std::queue<StatusWith<ClusterQueryResult>> _resultsQueue;
     stdx::function<void(void)> _killCallback;
 
+    // Originating command object.
+    BSONObj _originatingCommand;
+
     // Number of returned documents.
     long long _numReturnedSoFar = 0;
 
     bool _remotesExhausted = true;
 
     boost::optional<LogicalSessionId> _lsid;
+
+    boost::optional<TxnNumber> _txnNumber;
+
+    OperationContext* _opCtx = nullptr;
 };
 
 }  // namespace mongo

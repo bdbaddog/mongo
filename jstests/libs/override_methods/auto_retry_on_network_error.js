@@ -11,6 +11,7 @@
 (function() {
     "use strict";
 
+    load("jstests/libs/override_methods/override_helpers.js");
     load("jstests/libs/retryable_writes_util.js");
 
     const kMaxNumRetries = 3;
@@ -302,7 +303,8 @@
                         }
 
                         // Thrown when an index build is interrupted during its collection scan.
-                        if ((cmdName === "createIndexes" && res.code === 28550)) {
+                        if (cmdName === "createIndexes" &&
+                            res.codeName === "InterruptedDueToReplStateChange") {
                             print("=-=-=-= Retrying because of interrupted collection scan: " +
                                   cmdName + ", retries remaining: " + numRetries);
                             continue;
@@ -350,20 +352,8 @@
         } while (numRetries >= 0);
     }
 
-    const startParallelShellOriginal = startParallelShell;
-
-    startParallelShell = function(jsCode, port, noConnect) {
-        let newCode;
-        const overridesFile = "jstests/libs/override_methods/auto_retry_on_network_error.js";
-        if (typeof(jsCode) === "function") {
-            // Load the override file and immediately invoke the supplied function.
-            newCode = `load("${overridesFile}"); (${jsCode})();`;
-        } else {
-            newCode = `load("${overridesFile}"); ${jsCode};`;
-        }
-
-        return startParallelShellOriginal(newCode, port, noConnect);
-    };
+    OverrideHelpers.prependOverrideInParallelShell(
+        "jstests/libs/override_methods/auto_retry_on_network_error.js");
 
     const connectOriginal = connect;
 

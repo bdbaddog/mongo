@@ -30,17 +30,26 @@
 #include "mongo/client/embedded/libmongodbcapi.h"
 
 #include <set>
+#include <yaml-cpp/yaml.h>
 
 #include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/db/commands/test_commands_enabled.h"
 #include "mongo/db/json.h"
+#include "mongo/db/server_options.h"
 #include "mongo/stdx/memory.h"
+#include "mongo/stdx/thread.h"
 #include "mongo/unittest/temp_dir.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/net/message.h"
 #include "mongo/util/net/op_msg.h"
+#include "mongo/util/options_parser/environment.h"
+#include "mongo/util/options_parser/option_section.h"
+#include "mongo/util/options_parser/options_parser.h"
 #include "mongo/util/quick_exit.h"
 #include "mongo/util/shared_buffer.h"
 #include "mongo/util/signal_handlers_synchronous.h"
+
+namespace moe = mongo::optionenvironment;
 
 namespace {
 
@@ -62,15 +71,25 @@ protected:
         if (!globalTempDir) {
             globalTempDir = mongo::stdx::make_unique<mongo::unittest::TempDir>("embedded_mongo");
         }
-        const char* argv[] = {
-            "mongo_embedded_capi_test", "--port", "0", "--dbpath", globalTempDir->path().c_str()};
-        db = libmongodbcapi_db_new(5, argv, nullptr);
+
+        YAML::Emitter yaml;
+        yaml << YAML::BeginMap;
+
+        yaml << YAML::Key << "storage";
+        yaml << YAML::Value << YAML::BeginMap;
+        yaml << YAML::Key << "dbPath";
+        yaml << YAML::Value << globalTempDir->path();
+        yaml << YAML::EndMap;  // storage
+
+        yaml << YAML::EndMap;
+
+        db = libmongodbcapi_db_new(yaml.c_str());
         ASSERT(db != nullptr);
     }
 
     void tearDown() {
         libmongodbcapi_db_destroy(db);
-        ASSERT_EQUALS(libmongodbcapi_get_last_error(), LIBMONGODB_CAPI_ERROR_SUCCESS);
+        ASSERT_EQUALS(libmongodbcapi_get_last_error(), LIBMONGODB_CAPI_SUCCESS);
     }
 
     libmongodbcapi_db* getDB() {
@@ -80,7 +99,7 @@ protected:
     MongoDBCAPIClientPtr createClient() {
         MongoDBCAPIClientPtr client(libmongodbcapi_db_client_new(db));
         ASSERT(client != nullptr);
-        ASSERT_EQUALS(libmongodbcapi_get_last_error(), LIBMONGODB_CAPI_ERROR_SUCCESS);
+        ASSERT_EQUALS(libmongodbcapi_get_last_error(), LIBMONGODB_CAPI_SUCCESS);
         return client;
     }
 
@@ -90,6 +109,30 @@ protected:
         mongo::Message msg(std::move(sb));
         return msg;
     }
+
+    mongo::BSONObj performRpc(MongoDBCAPIClientPtr& client, mongo::OpMsgRequest request) {
+        auto inputMessage = request.serialize();
+
+        // declare the output size and pointer
+        void* output;
+        size_t outputSize;
+
+        // call the wire protocol
+        int err = libmongodbcapi_db_client_wire_protocol_rpc(
+            client.get(), inputMessage.buf(), inputMessage.size(), &output, &outputSize);
+        ASSERT_EQUALS(err, LIBMONGODB_CAPI_SUCCESS);
+
+        // convert the shared buffer to a mongo::message and ensure that it is valid
+        auto outputMessage = messageFromBuffer(output, outputSize);
+        ASSERT(outputMessage.size() > 0);
+        ASSERT(outputMessage.operation() == inputMessage.operation());
+
+        // convert the message into an OpMessage to examine its BSON
+        auto outputOpMsg = mongo::OpMsg::parseOwned(outputMessage);
+        ASSERT(outputOpMsg.body.valid(mongo::BSONVersion::kLatest));
+        return outputOpMsg.body;
+    }
+
 
 private:
     libmongodbcapi_db* db;
@@ -103,10 +146,10 @@ TEST_F(MongodbCAPITest, CreateAndDestroyDBAndClient) {
     auto client = createClient();
 }
 
-// This test is to make sure that destroying the db will destroy all of its clients
-// This test will only fail under ASAN
+// This test is to make sure that destroying the db will fail if there's remaining clients left.
 TEST_F(MongodbCAPITest, DoNotDestroyClient) {
-    createClient().release();
+    auto client = createClient();
+    ASSERT(libmongodbcapi_db_destroy(getDB()) != LIBMONGODB_CAPI_SUCCESS);
 }
 
 TEST_F(MongodbCAPITest, CreateMultipleClients) {
@@ -124,7 +167,7 @@ TEST_F(MongodbCAPITest, CreateMultipleClients) {
 TEST_F(MongodbCAPITest, DBPump) {
     libmongodbcapi_db* db = getDB();
     int err = libmongodbcapi_db_pump(db);
-    ASSERT_EQUALS(err, LIBMONGODB_CAPI_ERROR_SUCCESS);
+    ASSERT_EQUALS(err, LIBMONGODB_CAPI_SUCCESS);
 }
 
 TEST_F(MongodbCAPITest, IsMaster) {
@@ -134,27 +177,80 @@ TEST_F(MongodbCAPITest, IsMaster) {
     // craft the isMaster message
     mongo::BSONObj inputObj = mongo::fromjson("{isMaster: 1}");
     auto inputOpMsg = mongo::OpMsgRequest::fromDBAndBody("admin", inputObj);
-    auto inputMessage = inputOpMsg.serialize();
+    auto output = performRpc(client, inputOpMsg);
+    ASSERT(output.getBoolField("ismaster"));
+}
 
+TEST_F(MongodbCAPITest, CreateIndex) {
+    // create the client object
+    auto client = createClient();
 
-    // declare the output size and pointer
-    void* output;
-    size_t outputSize;
+    // craft the createIndexes message
+    mongo::BSONObj inputObj = mongo::fromjson(
+        R"raw_delimiter({
+            createIndexes: 'items',
+            indexes: 
+            [
+                {
+                    key: {
+                        task: 1
+                    },
+                    name: 'task_1'
+                }
+            ]
+        })raw_delimiter");
+    auto inputOpMsg = mongo::OpMsgRequest::fromDBAndBody("index_db", inputObj);
+    auto output = performRpc(client, inputOpMsg);
 
-    // call the wire protocol
-    int err = libmongodbcapi_db_client_wire_protocol_rpc(
-        client.get(), inputMessage.buf(), inputMessage.size(), &output, &outputSize);
-    ASSERT_EQUALS(err, LIBMONGODB_CAPI_ERROR_SUCCESS);
+    ASSERT(output.hasField("ok"));
+    ASSERT(output.getField("ok").numberDouble() == 1.0);
+    ASSERT(output.getIntField("numIndexesAfter") == output.getIntField("numIndexesBefore") + 1);
+}
 
-    // convert the shared buffer to a mongo::message and ensure that it is valid
-    auto outputMessage = messageFromBuffer(output, outputSize);
-    ASSERT(outputMessage.size() > 0);
-    ASSERT(outputMessage.operation() == inputMessage.operation());
+TEST_F(MongodbCAPITest, CreateBackgroundIndex) {
+    // create the client object
+    auto client = createClient();
 
-    // convert the message into an OpMessage to examine its BSON
-    auto outputOpMsg = mongo::OpMsg::parseOwned(outputMessage);
-    ASSERT(outputOpMsg.body.valid(mongo::BSONVersion::kLatest));
-    ASSERT(outputOpMsg.body.getBoolField("ismaster"));
+    // craft the createIndexes message
+    mongo::BSONObj inputObj = mongo::fromjson(
+        R"raw_delimiter({
+            createIndexes: 'items',
+            indexes: 
+            [
+                {
+                    key: {
+                        task: 1
+                    },
+                    name: 'task_1',
+                    background: true
+                }
+            ]
+        })raw_delimiter");
+    auto inputOpMsg = mongo::OpMsgRequest::fromDBAndBody("background_index_db", inputObj);
+    auto output = performRpc(client, inputOpMsg);
+
+    ASSERT(output.hasField("ok"));
+    ASSERT(output.getField("ok").numberDouble() != 1.0);
+}
+
+TEST_F(MongodbCAPITest, TrimMemory) {
+    // create the client object
+    auto client = createClient();
+
+    // craft the isMaster message
+    mongo::BSONObj inputObj = mongo::fromjson("{trimMemory: 'aggressive'}");
+    auto inputOpMsg = mongo::OpMsgRequest::fromDBAndBody("admin", inputObj);
+    performRpc(client, inputOpMsg);
+}
+
+TEST_F(MongodbCAPITest, BatteryLevel) {
+    // create the client object
+    auto client = createClient();
+
+    // craft the isMaster message
+    mongo::BSONObj inputObj = mongo::fromjson("{setBatteryLevel: 'low'}");
+    auto inputOpMsg = mongo::OpMsgRequest::fromDBAndBody("admin", inputObj);
+    performRpc(client, inputOpMsg);
 }
 
 
@@ -164,22 +260,7 @@ TEST_F(MongodbCAPITest, InsertDocument) {
     mongo::BSONObj insertObj = mongo::fromjson(
         "{insert: 'collection_name', documents: [{firstName: 'Mongo', lastName: 'DB', age: 10}]}");
     auto insertOpMsg = mongo::OpMsgRequest::fromDBAndBody("db_name", insertObj);
-    mongo::Message insertMessage = insertOpMsg.serialize();
-
-    void* output;
-    size_t outputSize;
-    int err = libmongodbcapi_db_client_wire_protocol_rpc(
-        client.get(), insertMessage.buf(), insertMessage.size(), &output, &outputSize);
-    ASSERT_EQUALS(err, LIBMONGODB_CAPI_ERROR_SUCCESS);
-
-    auto outputMessage = messageFromBuffer(output, outputSize);
-    ASSERT(outputMessage.size() > 0);
-    ASSERT(outputMessage.operation() == insertMessage.operation());
-
-    auto outputOpMsg = mongo::OpMsg::parseOwned(outputMessage);
-    auto outputBSON = outputOpMsg.body;
-
-    ASSERT(outputBSON.valid(mongo::BSONVersion::kLatest));
+    auto outputBSON = performRpc(client, insertOpMsg);
     ASSERT(outputBSON.hasField("n"));
     ASSERT(outputBSON.getIntField("n") == 1);
     ASSERT(outputBSON.hasField("ok"));
@@ -194,26 +275,60 @@ TEST_F(MongodbCAPITest, InsertMultipleDocuments) {
         "'doc1LastName', age: 30}, {firstName: 'doc2FirstName', lastName: 'doc2LastName', age: "
         "20}]}");
     auto insertOpMsg = mongo::OpMsgRequest::fromDBAndBody("db_name", insertObj);
-    mongo::Message insertMessage = insertOpMsg.serialize();
-
-    void* output;
-    size_t outputSize;
-    int err = libmongodbcapi_db_client_wire_protocol_rpc(
-        client.get(), insertMessage.buf(), insertMessage.size(), &output, &outputSize);
-    ASSERT_EQUALS(err, LIBMONGODB_CAPI_ERROR_SUCCESS);
-
-    auto outputMessage = messageFromBuffer(output, outputSize);
-    ASSERT(outputMessage.size() > 0);
-    ASSERT(outputMessage.operation() == insertMessage.operation());
-
-    auto outputOpMsg = mongo::OpMsg::parseOwned(outputMessage);
-    auto outputBSON = outputOpMsg.body;
-
-    ASSERT(outputBSON.valid(mongo::BSONVersion::kLatest));
+    auto outputBSON = performRpc(client, insertOpMsg);
     ASSERT(outputBSON.hasField("n"));
     ASSERT(outputBSON.getIntField("n") == 2);
     ASSERT(outputBSON.hasField("ok"));
     ASSERT(outputBSON.getField("ok").numberDouble() == 1.0);
+}
+
+TEST_F(MongodbCAPITest, KillOp) {
+    auto client = createClient();
+
+    mongo::stdx::thread killOpThread([this]() {
+        auto client = createClient();
+
+        mongo::BSONObj currentOpObj = mongo::fromjson("{currentOp: 1}");
+        auto currentOpMsg = mongo::OpMsgRequest::fromDBAndBody("admin", currentOpObj);
+        mongo::BSONObj outputBSON;
+
+        // Wait for the sleep command to start in the main test thread.
+        int opid = -1;
+        do {
+            outputBSON = performRpc(client, currentOpMsg);
+            auto inprog = outputBSON.getObjectField("inprog");
+
+            // See if we find the sleep command among the running commands
+            for (const auto& elt : inprog) {
+                auto inprogObj = inprog.getObjectField(elt.fieldNameStringData());
+                std::string ns = inprogObj.getStringField("ns");
+                if (ns == "admin.$cmd") {
+                    opid = inprogObj.getIntField("opid");
+                    break;
+                }
+            }
+        } while (opid == -1);
+
+        // Sleep command found, kill it.
+        std::stringstream ss;
+        ss << "{'killOp': 1, 'op': " << opid << "}";
+        mongo::BSONObj killOpObj = mongo::fromjson(ss.str());
+        auto killOpMsg = mongo::OpMsgRequest::fromDBAndBody("admin", killOpObj);
+        outputBSON = performRpc(client, killOpMsg);
+
+        ASSERT(outputBSON.hasField("ok"));
+        ASSERT(outputBSON.getField("ok").numberDouble() == 1.0);
+    });
+
+    mongo::BSONObj sleepObj = mongo::fromjson("{'sleep': {'secs': 1000}}");
+    auto sleepOpMsg = mongo::OpMsgRequest::fromDBAndBody("admin", sleepObj);
+    auto outputBSON = performRpc(client, sleepOpMsg);
+
+    ASSERT(outputBSON.hasField("ok"));
+    ASSERT(outputBSON.getField("ok").numberDouble() != 1.0);
+    ASSERT(outputBSON.getIntField("code") == mongo::ErrorCodes::Interrupted);
+
+    killOpThread.join();
 }
 
 TEST_F(MongodbCAPITest, ReadDB) {
@@ -221,19 +336,8 @@ TEST_F(MongodbCAPITest, ReadDB) {
 
     mongo::BSONObj findObj = mongo::fromjson("{find: 'collection_name', limit: 2}");
     auto findMsg = mongo::OpMsgRequest::fromDBAndBody("db_name", findObj);
-    mongo::Message findMessage = findMsg.serialize();
+    auto outputBSON = performRpc(client, findMsg);
 
-    void* output;
-    size_t outputSize;
-    int err = libmongodbcapi_db_client_wire_protocol_rpc(
-        client.get(), findMessage.buf(), findMessage.size(), &output, &outputSize);
-    ASSERT_EQUALS(err, LIBMONGODB_CAPI_ERROR_SUCCESS);
-
-    auto outputMessage = messageFromBuffer(output, outputSize);
-    ASSERT(outputMessage.size() > 0);
-
-    auto outputOpMsg = mongo::OpMsg::parseOwned(outputMessage);
-    mongo::BSONObj outputBSON = outputOpMsg.body;
 
     ASSERT(outputBSON.valid(mongo::BSONVersion::kLatest));
     ASSERT(outputBSON.hasField("cursor"));
@@ -259,20 +363,7 @@ TEST_F(MongodbCAPITest, InsertAndRead) {
     mongo::BSONObj insertObj = mongo::fromjson(
         "{insert: 'collection_name', documents: [{firstName: 'Mongo', lastName: 'DB', age: 10}]}");
     auto insertOpMsg = mongo::OpMsgRequest::fromDBAndBody("db_name", insertObj);
-    mongo::Message insertMessage = insertOpMsg.serialize();
-
-    void* output;
-    size_t outputSize;
-    int err = libmongodbcapi_db_client_wire_protocol_rpc(
-        client.get(), insertMessage.buf(), insertMessage.size(), &output, &outputSize);
-    ASSERT_EQUALS(err, LIBMONGODB_CAPI_ERROR_SUCCESS);
-
-    auto outputMessage1 = messageFromBuffer(output, outputSize);
-    ASSERT(outputMessage1.size() > 0);
-    ASSERT(outputMessage1.operation() == insertMessage.operation());
-
-    auto outputOpMsg1 = mongo::OpMsg::parseOwned(outputMessage1);
-    mongo::BSONObj outputBSON1 = outputOpMsg1.body;
+    auto outputBSON1 = performRpc(client, insertOpMsg);
     ASSERT(outputBSON1.valid(mongo::BSONVersion::kLatest));
     ASSERT(outputBSON1.hasField("n"));
     ASSERT(outputBSON1.getIntField("n") == 1);
@@ -281,20 +372,7 @@ TEST_F(MongodbCAPITest, InsertAndRead) {
 
     mongo::BSONObj findObj = mongo::fromjson("{find: 'collection_name', limit: 1}");
     auto findMsg = mongo::OpMsgRequest::fromDBAndBody("db_name", findObj);
-    mongo::Message findMessage = findMsg.serialize();
-
-    void* output2;
-    size_t outputSize2;
-    err = libmongodbcapi_db_client_wire_protocol_rpc(
-        client.get(), findMessage.buf(), findMessage.size(), &output2, &outputSize2);
-    ASSERT_EQUALS(err, LIBMONGODB_CAPI_ERROR_SUCCESS);
-
-    auto outputMessage2 = messageFromBuffer(output2, outputSize2);
-    ASSERT(outputMessage2.size() > 0);
-
-    auto outputOpMsg2 = mongo::OpMsg::parseOwned(outputMessage2);
-    mongo::BSONObj outputBSON2 = outputOpMsg2.body;
-
+    auto outputBSON2 = performRpc(client, findMsg);
     ASSERT(outputBSON2.valid(mongo::BSONVersion::kLatest));
     ASSERT(outputBSON2.hasField("cursor"));
     ASSERT(outputBSON2.getField("cursor").embeddedObject().hasField("firstBatch"));
@@ -320,20 +398,7 @@ TEST_F(MongodbCAPITest, InsertAndReadDifferentClients) {
     mongo::BSONObj insertObj = mongo::fromjson(
         "{insert: 'collection_name', documents: [{firstName: 'Mongo', lastName: 'DB', age: 10}]}");
     auto insertOpMsg = mongo::OpMsgRequest::fromDBAndBody("db_name", insertObj);
-    mongo::Message insertMessage = insertOpMsg.serialize();
-
-    void* output;
-    size_t outputSize;
-    int err = libmongodbcapi_db_client_wire_protocol_rpc(
-        client1.get(), insertMessage.buf(), insertMessage.size(), &output, &outputSize);
-    ASSERT_EQUALS(err, LIBMONGODB_CAPI_ERROR_SUCCESS);
-
-    auto outputMessage1 = messageFromBuffer(output, outputSize);
-    ASSERT(outputMessage1.size() > 0);
-    ASSERT(outputMessage1.operation() == insertMessage.operation());
-
-    auto outputOpMsg1 = mongo::OpMsg::parseOwned(outputMessage1);
-    mongo::BSONObj outputBSON1 = outputOpMsg1.body;
+    auto outputBSON1 = performRpc(client1, insertOpMsg);
     ASSERT(outputBSON1.valid(mongo::BSONVersion::kLatest));
     ASSERT(outputBSON1.hasField("n"));
     ASSERT(outputBSON1.getIntField("n") == 1);
@@ -342,20 +407,7 @@ TEST_F(MongodbCAPITest, InsertAndReadDifferentClients) {
 
     mongo::BSONObj findObj = mongo::fromjson("{find: 'collection_name', limit: 1}");
     auto findMsg = mongo::OpMsgRequest::fromDBAndBody("db_name", findObj);
-    mongo::Message findMessage = findMsg.serialize();
-
-    void* output2;
-    size_t outputSize2;
-    err = libmongodbcapi_db_client_wire_protocol_rpc(
-        client2.get(), findMessage.buf(), findMessage.size(), &output2, &outputSize2);
-    ASSERT_EQUALS(err, LIBMONGODB_CAPI_ERROR_SUCCESS);
-
-    auto outputMessage2 = messageFromBuffer(output2, outputSize2);
-    ASSERT(outputMessage2.size() > 0);
-
-    auto outputOpMsg2 = mongo::OpMsg::parseOwned(outputMessage2);
-    mongo::BSONObj outputBSON2 = outputOpMsg2.body;
-
+    auto outputBSON2 = performRpc(client2, findMsg);
     ASSERT(outputBSON2.valid(mongo::BSONVersion::kLatest));
     ASSERT(outputBSON2.hasField("cursor"));
     ASSERT(outputBSON2.getField("cursor").embeddedObject().hasField("firstBatch"));
@@ -380,20 +432,7 @@ TEST_F(MongodbCAPITest, InsertAndDelete) {
         "{insert: 'collection_name', documents: [{firstName: 'toDelete', lastName: 'notImportant', "
         "age: 10}]}");
     auto insertOpMsg = mongo::OpMsgRequest::fromDBAndBody("db_name", insertObj);
-    mongo::Message insertMessage = insertOpMsg.serialize();
-
-    void* output;
-    size_t outputSize;
-    int err = libmongodbcapi_db_client_wire_protocol_rpc(
-        client.get(), insertMessage.buf(), insertMessage.size(), &output, &outputSize);
-    ASSERT_EQUALS(err, LIBMONGODB_CAPI_ERROR_SUCCESS);
-
-    auto outputMessage1 = messageFromBuffer(output, outputSize);
-    ASSERT(outputMessage1.size() > 0);
-    ASSERT(outputMessage1.operation() == insertMessage.operation());
-
-    auto outputOpMsg1 = mongo::OpMsg::parseOwned(outputMessage1);
-    mongo::BSONObj outputBSON1 = outputOpMsg1.body;
+    auto outputBSON1 = performRpc(client, insertOpMsg);
     ASSERT(outputBSON1.valid(mongo::BSONVersion::kLatest));
     ASSERT(outputBSON1.hasField("n"));
     ASSERT(outputBSON1.getIntField("n") == 1);
@@ -406,20 +445,7 @@ TEST_F(MongodbCAPITest, InsertAndDelete) {
         "{delete: 'collection_name', deletes:   [{q: {firstName: 'toDelete', age: 10}, limit: "
         "1}]}");
     auto deleteOpMsg = mongo::OpMsgRequest::fromDBAndBody("db_name", deleteObj);
-    mongo::Message deleteMessage = deleteOpMsg.serialize();
-
-    void* output2;
-    size_t outputSize2;
-    err = libmongodbcapi_db_client_wire_protocol_rpc(
-        client.get(), deleteMessage.buf(), deleteMessage.size(), &output2, &outputSize2);
-    ASSERT_EQUALS(err, LIBMONGODB_CAPI_ERROR_SUCCESS);
-
-    auto outputMessage2 = messageFromBuffer(output2, outputSize2);
-    ASSERT(outputMessage2.size() > 0);
-    ASSERT(outputMessage2.operation() == deleteMessage.operation());
-
-    auto outputOpMsg2 = mongo::OpMsg::parseOwned(outputMessage2);
-    mongo::BSONObj outputBSON2 = outputOpMsg2.body;
+    auto outputBSON2 = performRpc(client, deleteOpMsg);
     ASSERT(outputBSON2.valid(mongo::BSONVersion::kLatest));
     ASSERT(outputBSON2.hasField("n"));
     ASSERT(outputBSON2.getIntField("n") == 1);
@@ -435,20 +461,7 @@ TEST_F(MongodbCAPITest, InsertAndUpdate) {
         "{insert: 'collection_name', documents: [{firstName: 'toUpdate', lastName: 'notImportant', "
         "age: 10}]}");
     auto insertOpMsg = mongo::OpMsgRequest::fromDBAndBody("db_name", insertObj);
-    mongo::Message insertMessage = insertOpMsg.serialize();
-
-    void* output;
-    size_t outputSize;
-    int err = libmongodbcapi_db_client_wire_protocol_rpc(
-        client.get(), insertMessage.buf(), insertMessage.size(), &output, &outputSize);
-    ASSERT_EQUALS(err, LIBMONGODB_CAPI_ERROR_SUCCESS);
-
-    auto outputMessage1 = messageFromBuffer(output, outputSize);
-    ASSERT(outputMessage1.size() > 0);
-    ASSERT(outputMessage1.operation() == insertMessage.operation());
-
-    auto outputOpMsg1 = mongo::OpMsg::parseOwned(outputMessage1);
-    mongo::BSONObj outputBSON1 = outputOpMsg1.body;
+    auto outputBSON1 = performRpc(client, insertOpMsg);
     ASSERT(outputBSON1.valid(mongo::BSONVersion::kLatest));
     ASSERT(outputBSON1.hasField("n"));
     ASSERT(outputBSON1.getIntField("n") == 1);
@@ -461,20 +474,7 @@ TEST_F(MongodbCAPITest, InsertAndUpdate) {
         "{update: 'collection_name', updates: [ {q: {firstName: 'toUpdate', age: 10}, u: {'$inc': "
         "{age: 5}}}]}");
     auto updateOpMsg = mongo::OpMsgRequest::fromDBAndBody("db_name", updateObj);
-    mongo::Message updateMessage = updateOpMsg.serialize();
-
-    void* output2;
-    size_t outputSize2;
-    err = libmongodbcapi_db_client_wire_protocol_rpc(
-        client.get(), updateMessage.buf(), updateMessage.size(), &output2, &outputSize2);
-    ASSERT_EQUALS(err, LIBMONGODB_CAPI_ERROR_SUCCESS);
-
-    auto outputMessage2 = messageFromBuffer(output2, outputSize2);
-    ASSERT(outputMessage2.size() > 0);
-    ASSERT(outputMessage2.operation() == updateMessage.operation());
-
-    auto outputOpMsg2 = mongo::OpMsg::parseOwned(outputMessage2);
-    mongo::BSONObj outputBSON2 = outputOpMsg2.body;
+    auto outputBSON2 = performRpc(client, updateOpMsg);
     ASSERT(outputBSON2.valid(mongo::BSONVersion::kLatest));
     ASSERT(outputBSON2.hasField("ok"));
     ASSERT(outputBSON2.getField("ok").numberDouble() == 1.0);
@@ -485,7 +485,7 @@ TEST_F(MongodbCAPITest, InsertAndUpdate) {
 // This test is temporary to make sure that only one database can be created
 // This restriction may be relaxed at a later time
 TEST_F(MongodbCAPITest, CreateMultipleDBs) {
-    libmongodbcapi_db* db2 = libmongodbcapi_db_new(0, nullptr, nullptr);
+    libmongodbcapi_db* db2 = libmongodbcapi_db_new(nullptr);
     ASSERT(db2 == nullptr);
     ASSERT_EQUALS(libmongodbcapi_get_last_error(), LIBMONGODB_CAPI_ERROR_UNKNOWN);
 }
@@ -496,9 +496,76 @@ TEST_F(MongodbCAPITest, CreateMultipleDBs) {
 // call runGlobalInitializers(). The embedded C API calls mongoDbMain() which
 // calls runGlobalInitializers().
 int main(int argc, char** argv, char** envp) {
+    moe::OptionsParser parser;
+    moe::Environment environment;
+    moe::OptionSection options;
+    std::map<std::string, std::string> env;
+
+    options.addOptionChaining(
+        "tempPath", "tempPath", moe::String, "directory to place mongo::TempDir subdirectories");
+    std::vector<std::string> argVector(argv, argv + argc);
+    mongo::Status ret = parser.run(options, argVector, env, &environment);
+    if (!ret.isOK()) {
+        std::cerr << options.helpString();
+        return EXIT_FAILURE;
+    }
+    if (environment.count("tempPath")) {
+        ::mongo::unittest::TempDir::setTempPath(environment["tempPath"].as<std::string>());
+    }
+
     ::mongo::clearSignalMask();
     ::mongo::setupSynchronousSignalHandlers();
-    auto result = ::mongo::unittest::Suite::run(std::vector<std::string>(), "", 1);
+    ::mongo::serverGlobalParams.noUnixSocket = true;
+    ::mongo::unittest::setupTestLogger();
+
+    mongo::setTestCommandsEnabled(true);
+
+    // Check so we can initialize the library without providing init params
+    int init = libmongodbcapi_init(nullptr);
+    if (init != LIBMONGODB_CAPI_SUCCESS) {
+        std::cerr << "libmongodbcapi_init() failed with " << init << std::endl;
+        return EXIT_FAILURE;
+    }
+
+    int fini = libmongodbcapi_fini();
+    if (fini != LIBMONGODB_CAPI_SUCCESS) {
+        std::cerr << "libmongodbcapi_fini() failed with " << fini << std::endl;
+        return EXIT_FAILURE;
+    }
+
+    // Initialize the library with a log callback and test so we receive at least one callback
+    // during the lifetime of the test
+    libmongodbcapi_init_params params;
+    memset(&params, 0, sizeof(params));
+
+    bool receivedCallback = false;
+    params.log_flags = LIBMONGODB_CAPI_LOG_STDOUT | LIBMONGODB_CAPI_LOG_CALLBACK;
+    params.log_callback = [](void* user_data,
+                             const char* message,
+                             const char* component,
+                             const char* context,
+                             int severety) {
+        ASSERT(message);
+        ASSERT(component);
+        *reinterpret_cast<bool*>(user_data) = true;
+    };
+    params.log_user_data = &receivedCallback;
+
+    init = libmongodbcapi_init(&params);
+    if (init != LIBMONGODB_CAPI_SUCCESS) {
+        std::cerr << "libmongodbcapi_init() failed with " << init << std::endl;
+        return EXIT_FAILURE;
+    }
+
+    ::mongo::unittest::Suite::run(std::vector<std::string>(), "", 1);
+
+    fini = libmongodbcapi_fini();
+    if (fini != LIBMONGODB_CAPI_SUCCESS) {
+        std::cerr << "libmongodbcapi_fini() failed with " << fini << std::endl;
+        return EXIT_FAILURE;
+    }
+
+    ASSERT(receivedCallback);
+
     globalTempDir.reset();
-    mongo::quickExit(result);
 }

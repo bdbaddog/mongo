@@ -1,5 +1,4 @@
 #!/usr/bin/env python
-
 """Install multiple versions of MongoDB on a machine."""
 
 from __future__ import print_function
@@ -24,7 +23,7 @@ import requests
 import requests.exceptions
 
 
-def dump_stacks(_signal_num, _frame):
+def dump_stacks(_signal_num, _frame):  # pylint: disable=unused-argument
     """Dump stacks when SIGUSR1 is received."""
     print("======================================")
     print("DUMPING STACKS due to SIGUSR1 signal")
@@ -33,19 +32,21 @@ def dump_stacks(_signal_num, _frame):
 
     print("Total Threads: {:d}".format(len(threads)))
 
-    for tid, stack in sys._current_frames().items():
+    for tid, stack in sys._current_frames().items():  # pylint: disable=protected-access
         print("Thread {:d}".format(tid))
         print("".join(traceback.format_stack(stack)))
     print("======================================")
 
 
 def get_version_parts(version, for_sorting=False):
-    """Returns a list containing the components of the version string
-    as numeric values. This function can be used for numeric sorting
-    of version strings such as '2.6.0-rc1' and '2.4.0' when the
-    'for_sorting' parameter is specified as true."""
+    """Return a list containing the components of the version string as numeric values.
 
-    RC_OFFSET = -100
+    This function can be used for numeric sorting
+    of version strings such as '2.6.0-rc1' and '2.4.0' when the
+    'for_sorting' parameter is specified as true.
+    """
+
+    rc_offset = -100
     version_parts = re.split(r"\.|-", version)
 
     if version_parts[-1] == "pre":
@@ -57,7 +58,7 @@ def get_version_parts(version, for_sorting=False):
         # RC versions are weighted down to allow future RCs and general
         # releases to be sorted in ascending order (e.g., 2.6.0-rc1,
         # 2.6.0-rc2, 2.6.0).
-        version_parts[-1] = int(version_parts[-1][2:]) + RC_OFFSET
+        version_parts[-1] = int(version_parts[-1][2:]) + rc_offset
     elif version_parts[0].startswith("v") and version_parts[-1] == "latest":
         version_parts[0] = version_parts[0][1:]
         # The "<branchname>-latest" versions are weighted the highest when a particular major
@@ -74,7 +75,7 @@ def get_version_parts(version, for_sorting=False):
 
 
 def download_file(url, file_name, download_retries=5):
-    """Returns True if download was successful. Raises error if download fails."""
+    """Return True if download was successful. Raises error if download fails."""
 
     while download_retries > 0:
 
@@ -103,7 +104,8 @@ def download_file(url, file_name, download_retries=5):
                 download_retries -= 1
                 if download_retries == 0:
                     raise Exception("Downloaded file size ({} bytes) doesn't match content length"
-                        "({} bytes) for URL {}".format(file_size, url_content_length, url))
+                                    "({} bytes) for URL {}".format(file_size, url_content_length,
+                                                                   url))
                 continue
 
         return True
@@ -111,47 +113,46 @@ def download_file(url, file_name, download_retries=5):
     raise Exception("Unknown download problem for {} to file {}".format(url, file_name))
 
 
-class MultiVersionDownloader(object):
+class MultiVersionDownloader(object):  # pylint: disable=too-many-instance-attributes
     """Class to support multiversion downloads."""
 
-    def __init__(self,
-                 install_dir,
-                 link_dir,
-                 edition,
-                 platform_arch,
-                 use_latest=False):
+    def __init__(  # pylint: disable=too-many-arguments
+            self, install_dir, link_dir, edition, platform, architecture, use_latest=False):
+        """Initialize MultiVersionDownloader."""
         self.install_dir = install_dir
         self.link_dir = link_dir
         self.edition = edition.lower()
-        self.platform_arch = platform_arch.lower().replace("/", "_")
-        self.generic_arch = "linux_x86_64"
+        self.platform = platform.lower()
+        self.architecture = architecture.lower()
+        self.generic_platform = "linux"
+        self.generic_architecture = "x86_64"
         self.use_latest = use_latest
         self._links = None
         self._generic_links = None
 
     @property
     def generic_links(self):
-        """Returns a list of generic links."""
+        """Get a list of generic links."""
         if self._generic_links is None:
             self._links, self._generic_links = self.download_links()
         return self._generic_links
 
     @property
     def links(self):
-        """Returns a list of links."""
+        """Get a list of links."""
         if self._links is None:
             self._links, self._generic_links = self.download_links()
         return self._links
 
     @staticmethod
     def is_major_minor_version(version):
-        """Returns True if the version is specified as M.m."""
+        """Return True if the version is specified as M.m."""
         if re.match(r"^\d+?\.\d+?$", version) is None:
             return False
         return True
 
     def download_links(self):
-        """Returns the download and generic download links."""
+        """Return the download and generic download links."""
         temp_file = tempfile.mktemp()
         download_file("https://downloads.mongodb.org/full.json", temp_file)
         with open(temp_file) as file_handle:
@@ -162,22 +163,37 @@ class MultiVersionDownloader(object):
 
         links = {}
         generic_links = {}
+        # The generic target contains a platform and architecture.
+        generic_target = "{}_{}".format(self.generic_platform, self.generic_architecture)
         for json_version in full_json["versions"]:
-            if "version" in json_version and 'downloads' in json_version:
-                version = json_version["version"]
-                for download in json_version["downloads"]:
-                    if "target" in download and "edition" in download:
-                        if download["target"].lower() == self.platform_arch and \
-                                download["edition"].lower() == self.edition:
-                            links[version] = download["archive"]["url"]
-                        elif download["target"].lower() == self.generic_arch and \
-                                download["edition"].lower() == "base":
-                            generic_links[version] = download["archive"]["url"]
+            if "version" not in json_version or 'downloads' not in json_version:
+                continue
+            version = json_version["version"]
+            for download in json_version["downloads"]:
+                if "target" not in download or "edition" not in download:
+                    continue
+                if (download["target"].lower() == self.platform
+                        and download["arch"].lower() == self.architecture
+                        and download["edition"].lower() == self.edition):
+                    links[version] = download["archive"]["url"]
+                elif (download["target"].lower() == generic_target
+                      and download["edition"].lower() == "base"):
+                    generic_links[version] = download["archive"]["url"]
 
         return links, generic_links
 
-    def download_version(self, version):
-        """Downloads the version specified."""
+    def download_install(self, version):
+        """Download and install the version specified."""
+        dl_file = self.download_version(version)
+        if dl_file:
+            installed_dir = self.uncompress_download(dl_file)
+            self.symlink_version(version, installed_dir)
+
+    def download_version(self, version):  # pylint: disable=too-many-branches,too-many-locals,too-many-statements
+        """Download the version specified and return file location.
+
+        If no download occurs, file location is None.
+        """
 
         try:
             os.makedirs(self.install_dir)
@@ -205,7 +221,7 @@ class MultiVersionDownloader(object):
                         continue
                 urls.append((link_version, link_url))
 
-        if len(urls) == 0:
+        if not urls:
             print("Cannot find a link for version {}, versions {} found.".format(
                 version, self.links), file=sys.stderr)
             for ver, generic_url in self.generic_links.iteritems():
@@ -214,7 +230,7 @@ class MultiVersionDownloader(object):
                     if "-" in version and ver != version:
                         continue
                     urls.append((ver, generic_url))
-            if len(urls) == 0:
+            if not urls:
                 raise Exception(
                     "No fall-back generic link available or version {}.".format(version))
             else:
@@ -231,10 +247,10 @@ class MultiVersionDownloader(object):
         # of the 'extract_dir' cannot be derived from the URL, since it contains the githash.
         already_downloaded = os.path.isdir(os.path.join(self.install_dir, extract_dir))
         if already_downloaded:
-            print("Skipping download for version {} ({}) since the dest already exists '{}'"
-                  .format(version, full_version, extract_dir))
+            print("Skipping download for version {} ({}) since the dest already exists '{}'".format(
+                version, full_version, extract_dir))
+            return None
         else:
-            temp_dir = tempfile.mkdtemp()
             temp_file = tempfile.mktemp(suffix=file_suffix)
 
             latest_downloaded = False
@@ -252,57 +268,62 @@ class MultiVersionDownloader(object):
                     latest_downloaded = True
                 except requests.exceptions.HTTPError:
                     print("Failed to download {}".format(latest_url))
-                    pass
 
             if not latest_downloaded:
                 print("Downloading data for version {} ({})...".format(version, full_version))
                 print("Download url is {}".format(url))
                 download_file(url, temp_file)
+        return temp_file
 
-            print("Uncompressing data for version {} ({})...".format(version, full_version))
-            first_file = ""
-            if file_suffix == ".zip":
-                # Support .zip downloads, used for Windows binaries.
-                with zipfile.ZipFile(temp_file) as zip_handle:
-                    # Use the name of the root directory in the archive as the name of the directory
-                    # to extract the binaries into inside 'self.install_dir'. The name of the root
-                    # directory nearly always matches the parsed URL text, with the exception of
-                    # versions such as "v3.2-latest" that instead contain the githash.
-                    first_file = zip_handle.namelist()[0]
-                    zip_handle.extractall(temp_dir)
-            elif file_suffix == ".tgz":
-                # Support .tgz downloads, used for Linux binaries.
-                with contextlib.closing(tarfile.open(temp_file, "r:gz")) as tar_handle:
-                    # Use the name of the root directory in the archive as the name of the directory
-                    # to extract the binaries into inside 'self.install_dir'. The name of the root
-                    # directory nearly always matches the parsed URL text, with the exception of
-                    # versions such as "v3.2-latest" that instead contain the githash.
-                    first_file = tar_handle.getnames()[0]
-                    tar_handle.extractall(path=temp_dir)
-            else:
-                raise Exception("Unsupported file extension {}".format(file_suffix))
+    def uncompress_download(self, dl_file):
+        """Download the version specified and return root of extracted directory."""
 
-            # Sometimes the zip will contain the root directory as the first file and
-            # os.path.dirname() will return ''.
-            extract_dir = os.path.dirname(first_file)
-            if not extract_dir:
-                extract_dir = first_file
-            temp_install_dir = os.path.join(temp_dir, extract_dir)
+        print("Uncompressing data to {}...".format(self.install_dir))
+        first_file = ""
+        temp_dir = tempfile.mkdtemp()
+        _, file_suffix = os.path.splitext(dl_file)
+        if file_suffix == ".zip":
+            # Support .zip downloads, used for Windows binaries.
+            with zipfile.ZipFile(dl_file) as zip_handle:
+                # Use the name of the root directory in the archive as the name of the directory
+                # to extract the binaries into inside 'self.install_dir'. The name of the root
+                # directory nearly always matches the parsed URL text, with the exception of
+                # versions such as "v3.2-latest" that instead contain the githash.
+                first_file = zip_handle.namelist()[0]
+                zip_handle.extractall(temp_dir)
+        elif file_suffix == ".tgz":
+            # Support .tgz downloads, used for Linux binaries.
+            with contextlib.closing(tarfile.open(dl_file, "r:gz")) as tar_handle:
+                # Use the name of the root directory in the archive as the name of the directory
+                # to extract the binaries into inside 'self.install_dir'. The name of the root
+                # directory nearly always matches the parsed URL text, with the exception of
+                # versions such as "v3.2-latest" that instead contain the githash.
+                first_file = tar_handle.getnames()[0]
+                tar_handle.extractall(path=temp_dir)
+        else:
+            raise Exception("Unsupported file extension {}".format(file_suffix))
 
-            # We may not have been able to determine whether we already downloaded the requested
-            # version due to the ambiguity in the parsed URL text, so we check for it again using
-            # the adjusted 'extract_dir' value.
-            already_downloaded = os.path.isdir(os.path.join(self.install_dir, extract_dir))
-            if not already_downloaded:
-                shutil.move(temp_install_dir, self.install_dir)
+        # Sometimes the zip will contain the root directory as the first file and
+        # os.path.dirname() will return ''.
+        extract_dir = os.path.dirname(first_file)
+        if not extract_dir:
+            extract_dir = first_file
+        temp_install_dir = os.path.join(temp_dir, extract_dir)
 
-            shutil.rmtree(temp_dir)
-            os.remove(temp_file)
+        # We may not have been able to determine whether we already downloaded the requested
+        # version due to the ambiguity in the parsed URL text, so we check for it again using
+        # the adjusted 'extract_dir' value.
+        already_downloaded = os.path.isdir(os.path.join(self.install_dir, extract_dir))
+        if not already_downloaded:
+            shutil.move(temp_install_dir, self.install_dir)
 
-        self.symlink_version(version, os.path.abspath(os.path.join(self.install_dir, extract_dir)))
+        shutil.rmtree(temp_dir)
+        os.remove(dl_file)
+
+        return os.path.abspath(os.path.join(self.install_dir, extract_dir))
 
     def symlink_version(self, version, installed_dir):
-        """Symlinks the binaries in the 'installed_dir' to the 'link_dir.'"""
+        """Symlink the binaries in the 'installed_dir' to the 'link_dir'."""
         try:
             os.makedirs(self.link_dir)
         except OSError as exc:
@@ -322,7 +343,7 @@ class MultiVersionDownloader(object):
                 if os.name == "nt":
                     # os.symlink is not supported on Windows, use a direct method instead.
                     def symlink_ms(source, link_name):
-                        """Provides symlink for Windows."""
+                        """Provide symlink for Windows."""
                         import ctypes
                         csl = ctypes.windll.kernel32.CreateSymbolicLinkW
                         csl.argtypes = (ctypes.c_wchar_p, ctypes.c_wchar_p, ctypes.c_uint32)
@@ -330,6 +351,7 @@ class MultiVersionDownloader(object):
                         flags = 1 if os.path.isdir(source) else 0
                         if csl(link_name, source.replace("/", "\\"), flags) == 0:
                             raise ctypes.WinError()
+
                     os.symlink = symlink_ms
                 os.symlink(executable, executable_link)
             except OSError as exc:
@@ -340,7 +362,7 @@ class MultiVersionDownloader(object):
 
 
 def main():
-    """Main program."""
+    """Execute Main program."""
 
     # Listen for SIGUSR1 and dump stack if received.
     try:
@@ -359,12 +381,13 @@ Usage: setup_multiversion_mongodb.py [options] ver1 [vers2 ...]
 Ex: setup_multiversion_mongodb.py --installDir ./install
                                   --linkDir ./link
                                   --edition base
-                                  --platformArchitecture Linux/x86_64 2.0.6 2.0.3-rc0
+                                  --platform Linux 2.0.6 2.0.3-rc0
+                                  --architecture x86_64
                                   2.0 2.2 2.3
 Ex: setup_multiversion_mongodb.py --installDir ./install
                                   --linkDir ./link
                                   --edition enterprise
-                                  --platformArchitecture osx
+                                  --platform osx
                                   2.4 2.2
 
 After running the script you will have a directory structure like this:
@@ -377,57 +400,40 @@ Note: If "rc" is included in the version name, we'll use the exact rc, otherwise
 we'll pull the highest non-rc version compatible with the version specified.
 """)
 
-    parser.add_option("-i", "--installDir",
-                      dest="install_dir",
-                      help="Directory to install the download archive. [REQUIRED]",
-                      default=None)
-    parser.add_option("-l", "--linkDir",
-                      dest="link_dir",
-                      help="Directory to contain links to all binaries for each version in"
-                           " the install directory. [REQUIRED]",
-                      default=None)
+    parser.add_option("-i", "--installDir", dest="install_dir",
+                      help="Directory to install the download archive. [REQUIRED]", default=None)
+    parser.add_option("-l", "--linkDir", dest="link_dir",
+                      help=("Directory to contain links to all binaries for each version in"
+                            " the install directory. [REQUIRED]"), default=None)
     editions = ["base", "enterprise", "targeted"]
-    parser.add_option("-e", "--edition",
-                      dest="edition",
-                      choices=editions,
-                      help="Edition of the build to download, choose from {}, [default:"
-                           " '%default'].".format(editions),
-                      default="base")
-    parser.add_option("-p", "--platformArchitecture",
-                      dest="platform_arch",
-                      help="Platform/architecture to download. The architecture is not required."
-                           "  [REQUIRED]. Examples include: 'linux/x86_64', 'osx', 'rhel62',"
-                           " 'windows/x86_64-2008plus-ssl'.",
-                      default=None)
-    parser.add_option("-u", "--useLatest",
-                      dest="use_latest",
-                      action="store_true",
-                      help="If specified, the latest (nightly) version will be downloaded,"
-                           " if it exists, for the version specified. For example, if specifying"
-                           " version 3.2 for download, the nightly version for 3.2 will be"
-                           " downloaded if it exists, otherwise the 'highest' version will be"
-                           " downloaded, i.e., '3.2.17'",
-                      default=False)
+    parser.add_option("-e", "--edition", dest="edition", choices=editions,
+                      help=("Edition of the build to download, choose from {}, [default:"
+                            " '%default'].".format(editions)), default="base")
+    parser.add_option("-p", "--platform", dest="platform",
+                      help=("Platform to download [REQUIRED]. Examples include: 'linux',"
+                            " 'osx', 'rhel62', 'windows'."), default=None)
+    parser.add_option("-a", "--architecture", dest="architecture",
+                      help=("Architecture to download, [default: '%default']. Examples include:"
+                            " 'arm64', 'ppc64le', 's390x' and 'x86_64'."), default="x86_64")
+    parser.add_option("-u", "--useLatest", dest="use_latest", action="store_true",
+                      help=("If specified, the latest (nightly) version will be downloaded,"
+                            " if it exists, for the version specified. For example, if specifying"
+                            " version 3.2 for download, the nightly version for 3.2 will be"
+                            " downloaded if it exists, otherwise the 'highest' version will be"
+                            " downloaded, i.e., '3.2.17'"), default=False)
 
     options, versions = parser.parse_args()
 
     # Check for required options.
-    if (not versions or
-        not options.install_dir or
-        not options.link_dir or
-        not options.platform_arch):
+    if not versions or not options.install_dir or not options.link_dir or not options.platform:
         parser.print_help()
         parser.exit(1)
 
-    downloader = MultiVersionDownloader(
-        options.install_dir,
-        options.link_dir,
-        options.edition,
-        options.platform_arch,
-        options.use_latest)
+    downloader = MultiVersionDownloader(options.install_dir, options.link_dir, options.edition,
+                                        options.platform, options.architecture, options.use_latest)
 
     for version in versions:
-        downloader.download_version(version)
+        downloader.download_install(version)
 
 
 if __name__ == "__main__":

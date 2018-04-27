@@ -51,8 +51,8 @@ class ClusterCountCmd : public ErrmsgCommandDeprecated {
 public:
     ClusterCountCmd() : ErrmsgCommandDeprecated("count") {}
 
-    bool slaveOk() const override {
-        return true;
+    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
+        return AllowedOnSecondary::kAlways;
     }
 
     bool adminOnly() const override {
@@ -65,7 +65,7 @@ public:
 
     void addRequiredPrivileges(const std::string& dbname,
                                const BSONObj& cmdObj,
-                               std::vector<Privilege>* out) override {
+                               std::vector<Privilege>* out) const override {
         ActionSet actions;
         actions.addAction(ActionType::find);
         out->push_back(Privilege(parseResourcePattern(dbname, cmdObj), actions));
@@ -110,7 +110,7 @@ public:
         if (status.isOK()) {
             collation = collationElement.Obj();
         } else if (status != ErrorCodes::NoSuchKey) {
-            return appendCommandStatus(result, status);
+            return CommandHelpers::appendCommandStatus(result, status);
         }
 
         if (cmdObj["limit"].isNumber()) {
@@ -140,71 +140,56 @@ public:
 
         auto countCmdObj = countCmdBuilder.done();
 
-        BSONObj viewDefinition;
-        auto swShardResponses =
-            scatterGatherVersionedTargetByRoutingTable(opCtx,
-                                                       dbname,
-                                                       nss,
-                                                       countCmdObj,
-                                                       ReadPreferenceSetting::get(opCtx),
-                                                       Shard::RetryPolicy::kIdempotent,
-                                                       filter,
-                                                       collation,
-                                                       &viewDefinition);
-
-        if (ErrorCodes::CommandOnShardedViewNotSupportedOnMongod == swShardResponses.getStatus()) {
-            if (viewDefinition.isEmpty()) {
-                return appendCommandStatus(
-                    result,
-                    {ErrorCodes::InternalError,
-                     str::stream()
-                         << "Missing resolved view definition, but remote returned "
-                         << ErrorCodes::errorString(swShardResponses.getStatus().code())});
-            }
-
+        std::vector<AsyncRequestsSender::Response> shardResponses;
+        try {
+            const auto routingInfo = uassertStatusOK(
+                Grid::get(opCtx)->catalogCache()->getCollectionRoutingInfo(opCtx, nss));
+            shardResponses =
+                scatterGatherVersionedTargetByRoutingTable(opCtx,
+                                                           nss.db(),
+                                                           nss,
+                                                           routingInfo,
+                                                           countCmdObj,
+                                                           ReadPreferenceSetting::get(opCtx),
+                                                           Shard::RetryPolicy::kIdempotent,
+                                                           filter,
+                                                           collation);
+        } catch (const ExceptionFor<ErrorCodes::CommandOnShardedViewNotSupportedOnMongod>& ex) {
             // Rewrite the count command as an aggregation.
 
             auto countRequest = CountRequest::parseFromBSON(nss, cmdObj, false);
             if (!countRequest.isOK()) {
-                return appendCommandStatus(result, countRequest.getStatus());
+                return CommandHelpers::appendCommandStatus(result, countRequest.getStatus());
             }
 
             auto aggCmdOnView = countRequest.getValue().asAggregationCommand();
             if (!aggCmdOnView.isOK()) {
-                return appendCommandStatus(result, aggCmdOnView.getStatus());
+                return CommandHelpers::appendCommandStatus(result, aggCmdOnView.getStatus());
             }
 
             auto aggRequestOnView = AggregationRequest::parseFromBSON(nss, aggCmdOnView.getValue());
             if (!aggRequestOnView.isOK()) {
-                return appendCommandStatus(result, aggRequestOnView.getStatus());
+                return CommandHelpers::appendCommandStatus(result, aggRequestOnView.getStatus());
             }
 
-            auto resolvedView = ResolvedView::fromBSON(viewDefinition);
-            auto resolvedAggRequest =
-                resolvedView.asExpandedViewAggregation(aggRequestOnView.getValue());
+            auto resolvedAggRequest = ex->asExpandedViewAggregation(aggRequestOnView.getValue());
             auto resolvedAggCmd = resolvedAggRequest.serializeToCommandObj().toBson();
 
-            BSONObj aggResult = Command::runCommandDirectly(
+            BSONObj aggResult = CommandHelpers::runCommandDirectly(
                 opCtx, OpMsgRequest::fromDBAndBody(dbname, std::move(resolvedAggCmd)));
 
             result.resetToEmpty();
             ViewResponseFormatter formatter(aggResult);
             auto formatStatus = formatter.appendAsCountResponse(&result);
             if (!formatStatus.isOK()) {
-                return appendCommandStatus(result, formatStatus);
+                return CommandHelpers::appendCommandStatus(result, formatStatus);
             }
 
             return true;
-        }
-
-        std::vector<AsyncRequestsSender::Response> shardResponses;
-        if (ErrorCodes::NamespaceNotFound == swShardResponses.getStatus().code()) {
+        } catch (const ExceptionFor<ErrorCodes::NamespaceNotFound>&) {
             // If there's no collection with this name, the count aggregation behavior below
             // will produce a total count of 0.
             shardResponses = {};
-        } else {
-            uassertStatusOK(swShardResponses.getStatus());
-            shardResponses = std::move(swShardResponses.getValue());
         }
 
         long long total = 0;
@@ -225,10 +210,8 @@ public:
             shardSubTotal.doneFast();
             // Add error context so that you can see on which shard failed as well as details
             // about that error.
-            auto errorWithContext = Status(status.code(),
-                                           str::stream() << "failed on: " << response.shardId
-                                                         << causedBy(status.reason()));
-            return appendCommandStatus(result, errorWithContext);
+            return CommandHelpers::appendCommandStatus(
+                result, status.withContext(str::stream() << "failed on: " << response.shardId));
         }
 
         shardSubTotal.doneFast();
@@ -238,10 +221,11 @@ public:
     }
 
     Status explain(OperationContext* opCtx,
-                   const std::string& dbname,
-                   const BSONObj& cmdObj,
+                   const OpMsgRequest& request,
                    ExplainOptions::Verbosity verbosity,
                    BSONObjBuilder* out) const override {
+        std::string dbname = request.getDatabase().toString();
+        const BSONObj& cmdObj = request.body;
         const NamespaceString nss(parseNs(dbname, cmdObj));
         uassert(ErrorCodes::InvalidNamespace,
                 str::stream() << "Invalid namespace specified '" << nss.ns() << "'",
@@ -269,26 +253,21 @@ public:
         // We will time how long it takes to run the commands on the shards
         Timer timer;
 
-        BSONObj viewDefinition;
-        auto swShardResponses =
-            scatterGatherVersionedTargetByRoutingTable(opCtx,
-                                                       dbname,
-                                                       nss,
-                                                       explainCmd,
-                                                       ReadPreferenceSetting::get(opCtx),
-                                                       Shard::RetryPolicy::kIdempotent,
-                                                       targetingQuery,
-                                                       targetingCollation,
-                                                       &viewDefinition);
-
-        long long millisElapsed = timer.millis();
-
-        if (ErrorCodes::CommandOnShardedViewNotSupportedOnMongod == swShardResponses.getStatus()) {
-            uassert(ErrorCodes::InternalError,
-                    str::stream() << "Missing resolved view definition, but remote returned "
-                                  << ErrorCodes::errorString(swShardResponses.getStatus().code()),
-                    !viewDefinition.isEmpty());
-
+        std::vector<AsyncRequestsSender::Response> shardResponses;
+        try {
+            const auto routingInfo = uassertStatusOK(
+                Grid::get(opCtx)->catalogCache()->getCollectionRoutingInfo(opCtx, nss));
+            shardResponses =
+                scatterGatherVersionedTargetByRoutingTable(opCtx,
+                                                           nss.db(),
+                                                           nss,
+                                                           routingInfo,
+                                                           explainCmd,
+                                                           ReadPreferenceSetting::get(opCtx),
+                                                           Shard::RetryPolicy::kIdempotent,
+                                                           targetingQuery,
+                                                           targetingCollation);
+        } catch (const ExceptionFor<ErrorCodes::CommandOnShardedViewNotSupportedOnMongod>& ex) {
             auto countRequest = CountRequest::parseFromBSON(nss, cmdObj, true);
             if (!countRequest.isOK()) {
                 return countRequest.getStatus();
@@ -305,9 +284,7 @@ public:
                 return aggRequestOnView.getStatus();
             }
 
-            auto resolvedView = ResolvedView::fromBSON(viewDefinition);
-            auto resolvedAggRequest =
-                resolvedView.asExpandedViewAggregation(aggRequestOnView.getValue());
+            auto resolvedAggRequest = ex->asExpandedViewAggregation(aggRequestOnView.getValue());
             auto resolvedAggCmd = resolvedAggRequest.serializeToCommandObj().toBson();
 
             ClusterAggregate::Namespaces nsStruct;
@@ -318,8 +295,7 @@ public:
                 opCtx, nsStruct, resolvedAggRequest, resolvedAggCmd, out);
         }
 
-        uassertStatusOK(swShardResponses.getStatus());
-        auto shardResponses = std::move(swShardResponses.getValue());
+        long long millisElapsed = timer.millis();
 
         const char* mongosStageName =
             ClusterExplain::getStageNameForReadOp(shardResponses.size(), cmdObj);

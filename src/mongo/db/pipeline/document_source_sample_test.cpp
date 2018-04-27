@@ -40,7 +40,6 @@
 #include "mongo/db/pipeline/document_source_sample_from_random_cursor.h"
 #include "mongo/db/pipeline/document_value_test_util.h"
 #include "mongo/db/pipeline/expression_context.h"
-#include "mongo/db/service_context.h"
 #include "mongo/stdx/memory.h"
 #include "mongo/unittest/death_test.h"
 #include "mongo/unittest/unittest.h"
@@ -48,24 +47,9 @@
 #include "mongo/util/tick_source_mock.h"
 
 namespace mongo {
-
-std::unique_ptr<ServiceContextNoop> makeTestServiceContext() {
-    auto service = stdx::make_unique<ServiceContextNoop>();
-    service->setFastClockSource(stdx::make_unique<ClockSourceMock>());
-    service->setTickSource(stdx::make_unique<TickSourceMock>());
-    return service;
-}
-
 namespace {
+
 using boost::intrusive_ptr;
-
-static const char* const ns = "unittests.document_source_sample_tests";
-
-// Stub to avoid including the server environment library.
-MONGO_INITIALIZER(SetGlobalEnvironment)(InitializerContext* context) {
-    setGlobalServiceContext(makeTestServiceContext());
-    return Status::OK();
-}
 
 class SampleBasics : public AggregationContextFixture {
 public:

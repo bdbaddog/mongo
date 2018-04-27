@@ -37,12 +37,12 @@
 #include "mongo/db/sessions_collection_rs.h"
 #include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/s/catalog_cache.h"
-#include "mongo/s/commands/cluster_write.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/query/cluster_find.h"
 #include "mongo/s/write_ops/batch_write_exec.h"
 #include "mongo/s/write_ops/batched_command_request.h"
 #include "mongo/s/write_ops/batched_command_response.h"
+#include "mongo/s/write_ops/cluster_write.h"
 #include "mongo/util/net/op_msg.h"
 
 namespace mongo {
@@ -56,6 +56,11 @@ BSONObj lsidQuery(const LogicalSessionId& lsid) {
 }  // namespace
 
 Status SessionsCollectionSharded::_checkCacheForSessionsCollection(OperationContext* opCtx) {
+    // If the sharding state is not yet initialized, fail.
+    if (!Grid::get(opCtx)->isShardingInitialized()) {
+        return {ErrorCodes::ShardingStateNotInitialized, "sharding state is not yet initialized"};
+    }
+
     // If the collection doesn't exist, fail. Only the config servers generate it.
     auto res = Grid::get(opCtx)->catalogCache()->getShardedCollectionRoutingInfoWithRefresh(
         opCtx, NamespaceString(SessionsCollection::kSessionsFullNS.toString()));
@@ -85,13 +90,7 @@ Status SessionsCollectionSharded::refreshSessions(OperationContext* opCtx,
         BatchWriteExecStats stats;
 
         ClusterWriter::write(opCtx, request, &stats, &response);
-        if (response.getOk()) {
-            return Status::OK();
-        }
-
-        auto error = response.isErrCodeSet() ? ErrorCodes::Error(response.getErrCode())
-                                             : ErrorCodes::UnknownError;
-        return Status(error, response.getErrMessage());
+        return response.toStatus();
     };
 
     return doRefresh(kSessionsNamespaceString, sessions, send);
@@ -107,14 +106,7 @@ Status SessionsCollectionSharded::removeRecords(OperationContext* opCtx,
         BatchWriteExecStats stats;
 
         ClusterWriter::write(opCtx, request, &stats, &response);
-
-        if (response.getOk()) {
-            return Status::OK();
-        }
-
-        auto error = response.isErrCodeSet() ? ErrorCodes::Error(response.getErrCode())
-                                             : ErrorCodes::UnknownError;
-        return Status(error, response.getErrMessage());
+        return response.toStatus();
     };
 
     return doRemove(kSessionsNamespaceString, sessions, send);
@@ -144,12 +136,12 @@ StatusWith<LogicalSessionIdSet> SessionsCollectionSharded::findRemovedSessions(
         // Do the work to generate the first batch of results. This blocks waiting to get responses
         // from the shard(s).
         std::vector<BSONObj> batch;
-        BSONObj viewDefinition;
-        auto cursorId = ClusterFind::runQuery(
-            opCtx, *cq.getValue(), ReadPreferenceSetting::get(opCtx), &batch, &viewDefinition);
-
-        if (!cursorId.isOK()) {
-            return cursorId.getStatus();
+        CursorId cursorId;
+        try {
+            cursorId = ClusterFind::runQuery(
+                opCtx, *cq.getValue(), ReadPreferenceSetting::get(opCtx), &batch);
+        } catch (const DBException& ex) {
+            return ex.toStatus();
         }
 
         BSONObjBuilder result;
@@ -157,7 +149,7 @@ StatusWith<LogicalSessionIdSet> SessionsCollectionSharded::findRemovedSessions(
         for (const auto& obj : batch) {
             firstBatch.append(obj);
         }
-        firstBatch.done(cursorId.getValue(), nss.ns());
+        firstBatch.done(cursorId, nss.ns());
 
         return result.obj();
     };

@@ -31,21 +31,21 @@
 #include "mongo/db/initialize_operation_session_info.h"
 
 #include "mongo/db/auth/authorization_session.h"
-#include "mongo/db/commands/feature_compatibility_version.h"
 #include "mongo/db/logical_session_cache.h"
 #include "mongo/db/logical_session_id_helpers.h"
 #include "mongo/db/operation_context.h"
-#include "mongo/db/server_options.h"
 
 namespace mongo {
 
-void initializeOperationSessionInfo(OperationContext* opCtx,
-                                    const BSONObj& requestBody,
-                                    bool requiresAuth,
-                                    bool isReplSetMemberOrMongos,
-                                    bool supportsDocLocking) {
+boost::optional<OperationSessionInfoFromClient> initializeOperationSessionInfo(
+    OperationContext* opCtx,
+    const BSONObj& requestBody,
+    bool requiresAuth,
+    bool isReplSetMemberOrMongos,
+    bool supportsDocLocking) {
+
     if (!requiresAuth) {
-        return;
+        return boost::none;
     }
 
     {
@@ -55,35 +55,29 @@ void initializeOperationSessionInfo(OperationContext* opCtx,
         AuthorizationSession* authSession = AuthorizationSession::get(opCtx->getClient());
         if (authSession && authSession->isUsingLocalhostBypass() &&
             !authSession->getAuthenticatedUserNames().more()) {
-            return;
+            return boost::none;
         }
     }
 
     auto osi = OperationSessionInfoFromClient::parse("OperationSessionInfo"_sd, requestBody);
 
     if (osi.getSessionId()) {
-        uassert(ErrorCodes::InvalidOptions,
-                str::stream() << "cannot pass logical session id unless fully upgraded to "
-                                 "featureCompatibilityVersion 3.6. See "
-                              << feature_compatibility_version::kDochubLink
-                              << " .",
-                serverGlobalParams.featureCompatibility.getVersion() ==
-                    ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo36);
-
         stdx::lock_guard<Client> lk(*opCtx->getClient());
 
         opCtx->setLogicalSessionId(makeLogicalSessionId(osi.getSessionId().get(), opCtx));
 
         LogicalSessionCache* lsc = LogicalSessionCache::get(opCtx->getServiceContext());
         lsc->vivify(opCtx, opCtx->getLogicalSessionId().get());
+    } else {
+        uassert(ErrorCodes::InvalidOptions,
+                "Transaction number requires a session ID to also be specified",
+                !osi.getTxnNumber());
     }
 
     if (osi.getTxnNumber()) {
+        invariant(osi.getSessionId());
         stdx::lock_guard<Client> lk(*opCtx->getClient());
 
-        uassert(ErrorCodes::IllegalOperation,
-                "Transaction number requires a sessionId to be specified",
-                opCtx->getLogicalSessionId());
         uassert(ErrorCodes::IllegalOperation,
                 "Transaction numbers are only allowed on a replica set member or mongos",
                 isReplSetMemberOrMongos);
@@ -91,12 +85,36 @@ void initializeOperationSessionInfo(OperationContext* opCtx,
                 "Transaction numbers are only allowed on storage engines that support "
                 "document-level locking",
                 supportsDocLocking);
-        uassert(ErrorCodes::BadValue,
+        uassert(ErrorCodes::InvalidOptions,
                 "Transaction number cannot be negative",
                 *osi.getTxnNumber() >= 0);
 
         opCtx->setTxnNumber(*osi.getTxnNumber());
+    } else {
+        uassert(ErrorCodes::InvalidOptions,
+                "'autocommit' field requires a transaction number to also be specified",
+                !osi.getAutocommit());
     }
+
+    if (osi.getAutocommit()) {
+        invariant(osi.getTxnNumber());
+        uassert(ErrorCodes::InvalidOptions,
+                "Specifying autocommit=true is not allowed.",
+                !osi.getAutocommit().value());
+    } else {
+        uassert(ErrorCodes::InvalidOptions,
+                "'startTransaction' field requires 'autocommit' field to also be specified",
+                !osi.getStartTransaction());
+    }
+
+    if (osi.getStartTransaction()) {
+        invariant(osi.getAutocommit());
+        uassert(ErrorCodes::InvalidOptions,
+                "Specifying startTransaction=false is not allowed.",
+                osi.getStartTransaction().value());
+    }
+
+    return osi;
 }
 
 }  // namespace mongo

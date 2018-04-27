@@ -69,11 +69,12 @@ public:
             HostTypeRequirement::kNone,
             _mergingPresorted ? DiskUseRequirement::kNoDiskUse : DiskUseRequirement::kWritesTmpData,
             _mergingPresorted ? FacetRequirement::kNotAllowed : FacetRequirement::kAllowed,
+            TransactionRequirement::kAllowed,
             _mergingPresorted ? ChangeStreamRequirement::kWhitelist
                               : ChangeStreamRequirement::kBlacklist);
 
         // Can't swap with a $match if a limit has been absorbed, as $match can't swap with $limit.
-        constraints.canSwapWithMatch = !limitSrc;
+        constraints.canSwapWithMatch = !_limitSrc;
         return constraints;
     }
 
@@ -143,7 +144,7 @@ public:
     };
 
     boost::intrusive_ptr<DocumentSourceLimit> getLimitSrc() const {
-        return limitSrc;
+        return _limitSrc;
     }
 
 protected:
@@ -155,9 +156,6 @@ protected:
     void doDispose() final;
 
 private:
-    // This is used to merge pre-sorted results from a DocumentSourceMergeCursors.
-    class IteratorFromCursor;
-
     using MySorter = Sorter<Value, Document>;
 
     // For MySorter.
@@ -244,8 +242,8 @@ private:
      * the smallest limit.
      */
     void setLimitSrc(boost::intrusive_ptr<DocumentSourceLimit> limit) {
-        if (!limitSrc || limit->getLimit() < limitSrc->getLimit()) {
-            limitSrc = limit;
+        if (!_limitSrc || limit->getLimit() < _limitSrc->getLimit()) {
+            _limitSrc = limit;
         }
     }
 
@@ -260,11 +258,11 @@ private:
     // The set of paths on which we're sorting.
     std::set<std::string> _paths;
 
-    boost::intrusive_ptr<DocumentSourceLimit> limitSrc;
+    boost::intrusive_ptr<DocumentSourceLimit> _limitSrc;
 
     uint64_t _maxMemoryUsageBytes;
     bool _done;
-    bool _mergingPresorted;
+    bool _mergingPresorted;  // TODO SERVER-34009 Remove this flag.
     std::unique_ptr<MySorter> _sorter;
     std::unique_ptr<MySorter::Iterator> _output;
 };

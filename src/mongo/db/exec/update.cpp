@@ -43,7 +43,7 @@
 #include "mongo/db/op_observer.h"
 #include "mongo/db/ops/update_lifecycle.h"
 #include "mongo/db/query/explain.h"
-#include "mongo/db/repl/replication_coordinator_global.h"
+#include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/s/collection_metadata.h"
 #include "mongo/db/s/collection_sharding_state.h"
 #include "mongo/db/s/metadata_manager.h"
@@ -135,7 +135,7 @@ bool shouldRestartUpdateIfNoLongerMatches(const UpdateStageParams& params) {
 
 const std::vector<std::unique_ptr<FieldRef>>* getImmutableFields(OperationContext* opCtx,
                                                                  const NamespaceString& ns) {
-    auto metadata = CollectionShardingState::get(opCtx, ns)->getMetadata();
+    auto metadata = CollectionShardingState::get(opCtx, ns)->getMetadata(opCtx);
     if (metadata) {
         const std::vector<std::unique_ptr<FieldRef>>& fields = metadata->getKeyPatternFields();
         // Return shard-keys as immutable for the update system.
@@ -294,7 +294,7 @@ BSONObj UpdateStage::transformAndUpdate(const Snapshotted<BSONObj>& oldObj, Reco
             args.uuid = _collection->uuid();
             args.stmtId = request->getStmtId();
             args.update = logObj;
-            args.criteria = css->getMetadata().extractDocumentKey(newObj);
+            args.criteria = css->getMetadata(getOpCtx()).extractDocumentKey(newObj);
             uassert(16980,
                     "Multi-update operations require all documents to have an '_id' field",
                     !request->isMulti() || args.criteria.hasField("_id"_sd));
@@ -716,7 +716,7 @@ void UpdateStage::doRestoreState() {
 
     // We may have stepped down during the yield.
     bool userInitiatedWritesAndNotPrimary = getOpCtx()->writesAreReplicated() &&
-        !repl::getGlobalReplicationCoordinator()->canAcceptWritesFor(getOpCtx(), nsString);
+        !repl::ReplicationCoordinator::get(getOpCtx())->canAcceptWritesFor(getOpCtx(), nsString);
 
     if (userInitiatedWritesAndNotPrimary) {
         uasserted(ErrorCodes::PrimarySteppedDown,

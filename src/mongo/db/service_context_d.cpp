@@ -36,11 +36,14 @@
 #include "mongo/base/initializer.h"
 #include "mongo/db/client.h"
 #include "mongo/db/concurrency/lock_state.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/service_context_registrar.h"
 #include "mongo/db/service_entry_point_mongod.h"
 #include "mongo/db/storage/storage_engine.h"
 #include "mongo/db/storage/storage_engine_lock_file.h"
 #include "mongo/db/storage/storage_engine_metadata.h"
 #include "mongo/db/storage/storage_options.h"
+#include "mongo/db/unclean_shutdown.h"
 #include "mongo/stdx/memory.h"
 #include "mongo/util/log.h"
 #include "mongo/util/map_util.h"
@@ -51,19 +54,14 @@
 
 namespace mongo {
 namespace {
-auto makeMongoDServiceContext() {
-    auto service = stdx::make_unique<ServiceContextMongoD>();
-    service->setServiceEntryPoint(stdx::make_unique<ServiceEntryPointMongod>(service.get()));
-    service->setTickSource(stdx::make_unique<SystemTickSource>());
-    service->setFastClockSource(stdx::make_unique<SystemClockSource>());
-    service->setPreciseClockSource(stdx::make_unique<SystemClockSource>());
+ServiceContextRegistrar serviceContextCreator([]() {
+    auto service = std::make_unique<ServiceContextMongoD>();
+    service->setServiceEntryPoint(std::make_unique<ServiceEntryPointMongod>(service.get()));
+    service->setTickSource(std::make_unique<SystemTickSource>());
+    service->setFastClockSource(std::make_unique<SystemClockSource>());
+    service->setPreciseClockSource(std::make_unique<SystemClockSource>());
     return service;
-}
-
-MONGO_INITIALIZER(SetGlobalEnvironment)(InitializerContext* context) {
-    setGlobalServiceContext(makeMongoDServiceContext());
-    return Status::OK();
-}
+});
 }  // namespace
 
 extern bool _supportsDocLocking;
@@ -105,6 +103,7 @@ void ServiceContextMongoD::createLockFile() {
             fassertFailedNoTrace(34416);
         }
         warning() << "Detected unclean shutdown - " << _lockFile->getFilespec() << " is not empty.";
+        startingAfterUncleanShutdown(this) = true;
     }
 }
 
@@ -124,7 +123,7 @@ void ServiceContextMongoD::initializeGlobalStorageEngine() {
             log() << startupWarningsLog;
             log() << "** WARNING: Support for MMAPV1 storage engine has been deprecated and will be"
                   << startupWarningsLog;
-            log() << "**          removed in version 4.0. Please plan to migrate to the wiredTiger"
+            log() << "**          removed in version 4.2. Please plan to migrate to the wiredTiger"
                   << startupWarningsLog;
             log() << "**          storage engine." << startupWarningsLog;
             log() << "**          See http://dochub.mongodb.org/core/deprecated-mmapv1";
@@ -175,7 +174,7 @@ void ServiceContextMongoD::initializeGlobalStorageEngine() {
               << startupWarningsLog;
         log() << "**          storage engine has been deprecated and will be removed in"
               << startupWarningsLog;
-        log() << "**          version 4.0. See http://dochub.mongodb.org/core/deprecated-mmapv1";
+        log() << "**          version 4.2. See http://dochub.mongodb.org/core/deprecated-mmapv1";
         log() << startupWarningsLog;
     }
 
@@ -295,7 +294,7 @@ std::unique_ptr<OperationContext> ServiceContextMongoD::_newOpCtx(Client* client
     }
 
     opCtx->setRecoveryUnit(getGlobalStorageEngine()->newRecoveryUnit(),
-                           OperationContext::kNotInUnitOfWork);
+                           WriteUnitOfWork::RecoveryUnitState::kNotInUnitOfWork);
     return opCtx;
 }
 

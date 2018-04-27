@@ -42,6 +42,12 @@
 namespace mongo {
 namespace repl {
 
+namespace {
+
+const Milliseconds maximumVoteRequestTimeoutMS(30 * 1000);
+
+}  // namespace
+
 using executor::RemoteCommandRequest;
 using executor::RemoteCommandResponse;
 
@@ -87,7 +93,11 @@ std::vector<RemoteCommandRequest> VoteRequester::Algorithm::getRequests() const 
     std::vector<RemoteCommandRequest> requests;
     for (const auto& target : _targets) {
         requests.push_back(RemoteCommandRequest(
-            target, "admin", requestVotesCmd, nullptr, _rsConfig.getElectionTimeoutPeriod()));
+            target,
+            "admin",
+            requestVotesCmd,
+            nullptr,
+            std::min(_rsConfig.getElectionTimeoutPeriod(), maximumVoteRequestTimeoutMS)));
     }
 
     return requests;
@@ -156,7 +166,7 @@ VoteRequester::Result VoteRequester::Algorithm::getResult() const {
     }
 }
 
-unordered_set<HostAndPort> VoteRequester::Algorithm::getResponders() const {
+stdx::unordered_set<HostAndPort> VoteRequester::Algorithm::getResponders() const {
     return _responders;
 }
 
@@ -186,7 +196,7 @@ VoteRequester::Result VoteRequester::getResult() const {
     return _algorithm->getResult();
 }
 
-unordered_set<HostAndPort> VoteRequester::getResponders() const {
+stdx::unordered_set<HostAndPort> VoteRequester::getResponders() const {
     return _algorithm->getResponders();
 }
 

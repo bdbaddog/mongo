@@ -6,6 +6,9 @@
 var TagsTest = function(options) {
     'use strict';
 
+    // Skip db hash check since this test leaves replset partitioned.
+    TestData.skipCheckDBHashes = true;
+
     if (!(this instanceof TagsTest)) {
         return new TagsTest(options);
     }
@@ -50,6 +53,7 @@ var TagsTest = function(options) {
         var nextVersion = replTest.getReplSetConfigFromNode().version + 1;
         const replSetConfig = {
             _id: name,
+            protocolVersion: 1,
             members: [
                 {
                   _id: 0,

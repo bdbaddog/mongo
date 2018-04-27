@@ -242,6 +242,26 @@ wts_open(const char *home, bool set_api, WT_CONNECTION **connp)
 		CONFIG_APPEND(p,
 		    ",statistics=(%s)", g.c_statistics ? "fast" : "none");
 
+	/* Optionally stress operations. */
+	CONFIG_APPEND(p, ",timing_stress_for_test=[");
+	if (g.c_timing_stress_checkpoint)
+		CONFIG_APPEND(p, ",checkpoint_slow");
+	if (g.c_timing_stress_split_1)
+		CONFIG_APPEND(p, ",split_race_1");
+	if (g.c_timing_stress_split_2)
+		CONFIG_APPEND(p, ",split_race_2");
+	if (g.c_timing_stress_split_3)
+		CONFIG_APPEND(p, ",split_race_3");
+	if (g.c_timing_stress_split_4)
+		CONFIG_APPEND(p, ",split_race_4");
+	if (g.c_timing_stress_split_5)
+		CONFIG_APPEND(p, ",split_race_5");
+	if (g.c_timing_stress_split_6)
+		CONFIG_APPEND(p, ",split_race_6");
+	if (g.c_timing_stress_split_7)
+		CONFIG_APPEND(p, ",split_race_7");
+	CONFIG_APPEND(p, "]");
+
 	/* Extensions. */
 	CONFIG_APPEND(p,
 	    ",extensions=["
@@ -552,7 +572,7 @@ wts_verify(const char *tag)
 
 	if (g.c_txn_timestamps && g.timestamp > 0) {
 		/*
-		 * Bump the oldest timestamp, otherwise recent operation will
+		 * Bump the oldest timestamp, otherwise recent operations can
 		 * prevent verify from running.
 		 */
 		testutil_check(__wt_snprintf(

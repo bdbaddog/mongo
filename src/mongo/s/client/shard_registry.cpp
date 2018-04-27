@@ -52,7 +52,6 @@
 #include "mongo/s/catalog/sharding_catalog_client.h"
 #include "mongo/s/catalog/type_shard.h"
 #include "mongo/s/client/shard.h"
-#include "mongo/s/client/shard_connection.h"
 #include "mongo/s/client/shard_factory.h"
 #include "mongo/s/grid.h"
 #include "mongo/stdx/memory.h"
@@ -164,10 +163,24 @@ shared_ptr<Shard> ShardRegistry::lookupRSName(const string& name) const {
     return _data.findByRSName(name);
 }
 
-void ShardRegistry::getAllShardIds(vector<ShardId>* all) const {
+void ShardRegistry::getAllShardIdsNoReload(vector<ShardId>* all) const {
     std::set<ShardId> seen;
     _data.getAllShardIds(seen);
     all->assign(seen.begin(), seen.end());
+}
+
+void ShardRegistry::getAllShardIds(OperationContext* opCtx, vector<ShardId>* all) {
+    getAllShardIdsNoReload(all);
+    if (all->empty()) {
+        bool didReload = reload(opCtx);
+        getAllShardIdsNoReload(all);
+        // If we didn't do the reload ourselves, we should retry to ensure
+        // that the reload is actually initiated while we're executing this
+        if (!didReload && all->empty()) {
+            reload(opCtx);
+            getAllShardIdsNoReload(all);
+        }
+    }
 }
 
 int ShardRegistry::getNumShards() const {
@@ -330,7 +343,7 @@ bool ShardRegistry::reload(OperationContext* opCtx) {
 void ShardRegistry::replicaSetChangeShardRegistryUpdateHook(
     const std::string& setName, const std::string& newConnectionString) {
     // Inform the ShardRegsitry of the new connection string for the shard.
-    auto connString = fassertStatusOK(28805, ConnectionString::parse(newConnectionString));
+    auto connString = fassert(28805, ConnectionString::parse(newConnectionString));
     invariant(setName == connString.getSetName());
     grid.shardRegistry()->updateReplSetHosts(connString);
 }
@@ -377,17 +390,12 @@ void ShardRegistry::replicaSetChangeConfigServerUpdateHook(const std::string& se
 ////////////// ShardRegistryData //////////////////
 
 ShardRegistryData::ShardRegistryData(OperationContext* opCtx, ShardFactory* shardFactory) {
-    auto shardsStatus =
-        grid.catalogClient()->getAllShards(opCtx, repl::ReadConcernLevel::kMajorityReadConcern);
+    auto shardsAndOpTime = uassertStatusOKWithContext(
+        grid.catalogClient()->getAllShards(opCtx, repl::ReadConcernLevel::kMajorityReadConcern),
+        "could not get updated shard list from config server");
 
-    if (!shardsStatus.isOK()) {
-        uasserted(shardsStatus.getStatus().code(),
-                  str::stream() << "could not get updated shard list from config server due to "
-                                << shardsStatus.getStatus().reason());
-    }
-
-    auto shards = std::move(shardsStatus.getValue().value);
-    auto reloadOpTime = std::move(shardsStatus.getValue().opTime);
+    auto shards = std::move(shardsAndOpTime.value);
+    auto reloadOpTime = std::move(shardsAndOpTime.opTime);
 
     LOG(1) << "found " << shards.size()
            << " shards listed on config server(s) with lastVisibleOpTime: "

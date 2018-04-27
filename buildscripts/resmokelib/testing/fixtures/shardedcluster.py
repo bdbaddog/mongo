@@ -1,6 +1,4 @@
-"""
-Sharded cluster fixture for executing JSTests against.
-"""
+"""Sharded cluster fixture for executing JSTests against."""
 
 from __future__ import absolute_import
 
@@ -20,37 +18,20 @@ from ... import utils
 from ...utils import registry
 
 
-class ShardedClusterFixture(interface.Fixture):
-    """
-    Fixture which provides JSTests with a sharded cluster to run
-    against.
-    """
+class ShardedClusterFixture(interface.Fixture):  # pylint: disable=too-many-instance-attributes
+    """Fixture which provides JSTests with a sharded cluster to run against."""
 
     _CONFIGSVR_REPLSET_NAME = "config-rs"
     _SHARD_REPLSET_NAME_PREFIX = "shard-rs"
 
-    def __init__(self,
-                 logger,
-                 job_num,
-                 mongos_executable=None,
-                 mongos_options=None,
-                 mongod_executable=None,
-                 mongod_options=None,
-                 dbpath_prefix=None,
-                 preserve_dbpath=False,
-                 num_shards=1,
-                 num_rs_nodes_per_shard=None,
-                 separate_configsvr=True,
-                 enable_sharding=None,
-                 auth_options=None,
-                 configsvr_options=None,
-                 shard_options=None):
-        """
-        Initializes ShardedClusterFixture with the different options to
-        the mongod and mongos processes.
-        """
+    def __init__(  # pylint: disable=too-many-arguments,too-many-locals
+            self, logger, job_num, mongos_executable=None, mongos_options=None,
+            mongod_executable=None, mongod_options=None, dbpath_prefix=None, preserve_dbpath=False,
+            num_shards=1, num_rs_nodes_per_shard=None, num_mongos=1, enable_sharding=None,
+            enable_balancer=True, auth_options=None, configsvr_options=None, shard_options=None):
+        """Initialize ShardedClusterFixture with different options for the cluster processes."""
 
-        interface.Fixture.__init__(self, logger, job_num)
+        interface.Fixture.__init__(self, logger, job_num, dbpath_prefix=dbpath_prefix)
 
         if "dbpath" in mongod_options:
             raise ValueError("Cannot specify mongod_options.dbpath")
@@ -62,27 +43,25 @@ class ShardedClusterFixture(interface.Fixture):
         self.preserve_dbpath = preserve_dbpath
         self.num_shards = num_shards
         self.num_rs_nodes_per_shard = num_rs_nodes_per_shard
-        self.separate_configsvr = separate_configsvr
+        self.num_mongos = num_mongos
         self.enable_sharding = utils.default_if_none(enable_sharding, [])
+        self.enable_balancer = enable_balancer
         self.auth_options = auth_options
         self.configsvr_options = utils.default_if_none(configsvr_options, {})
         self.shard_options = utils.default_if_none(shard_options, {})
 
-        # Command line options override the YAML configuration.
-        dbpath_prefix = utils.default_if_none(config.DBPATH_PREFIX, dbpath_prefix)
-        dbpath_prefix = utils.default_if_none(dbpath_prefix, config.DEFAULT_DBPATH_PREFIX)
-        self._dbpath_prefix = os.path.join(dbpath_prefix, "job{}".format(self.job_num),
-                                           config.FIXTURE_SUBDIR)
+        self._dbpath_prefix = os.path.join(self._dbpath_prefix, config.FIXTURE_SUBDIR)
 
         self.configsvr = None
-        self.mongos = None
+        self.mongos = []
         self.shards = []
 
     def setup(self):
-        if self.separate_configsvr:
-            if self.configsvr is None:
-                self.configsvr = self._new_configsvr()
-            self.configsvr.setup()
+        """Set up the sharded cluster."""
+        if self.configsvr is None:
+            self.configsvr = self._new_configsvr()
+
+        self.configsvr.setup()
 
         if not self.shards:
             for i in xrange(self.num_shards):
@@ -101,6 +80,7 @@ class ShardedClusterFixture(interface.Fixture):
             shard.setup()
 
     def await_ready(self):
+        """Block until the fixture can be used for testing."""
         # Wait for the config server
         if self.configsvr is not None:
             self.configsvr.await_ready()
@@ -109,14 +89,19 @@ class ShardedClusterFixture(interface.Fixture):
         for shard in self.shards:
             shard.await_ready()
 
-        if self.mongos is None:
-            self.mongos = self._new_mongos()
+        # We call self._new_mongos() and mongos.setup() in self.await_ready() function
+        # instead of self.setup() because mongos routers have to connect to a running cluster.
+        if not self.mongos:
+            for i in range(self.num_mongos):
+                mongos = self._new_mongos(i, self.num_mongos)
+                self.mongos.append(mongos)
 
-        # Start up the mongos
-        self.mongos.setup()
+        for mongos in self.mongos:
+            # Start up the mongos.
+            mongos.setup()
 
-        # Wait for the mongos
-        self.mongos.await_ready()
+            # Wait for the mongos.
+            mongos.await_ready()
 
         client = self.mongo_client()
         if self.auth_options is not None:
@@ -124,6 +109,10 @@ class ShardedClusterFixture(interface.Fixture):
             auth_db.authenticate(self.auth_options["username"],
                                  password=self.auth_options["password"],
                                  mechanism=self.auth_options["authenticationMechanism"])
+
+        # Turn off the balancer if it is not meant to be enabled.
+        if not self.enable_balancer:
+            client.admin.command({"balancerStop": 1})
 
         # Inform mongos about each of the shards
         for shard in self.shards:
@@ -137,69 +126,53 @@ class ShardedClusterFixture(interface.Fixture):
         # Ensure that the sessions collection gets auto-sharded by the config server
         if self.configsvr is not None:
             primary = self.configsvr.get_primary().mongo_client()
-            primary.admin.command({ "refreshLogicalSessionCacheNow" : 1 })
+            primary.admin.command({"refreshLogicalSessionCacheNow": 1})
 
     def _do_teardown(self):
-        """
-        Shuts down the sharded cluster.
-        """
-        running_at_start = self.is_running()
-        success = True  # Still a success even if nothing is running.
+        """Shut down the sharded cluster."""
+        self.logger.info("Stopping all members of the sharded cluster...")
 
+        running_at_start = self.is_running()
         if not running_at_start:
-            self.logger.info(
-                "Sharded cluster was expected to be running in _do_teardown(), but wasn't.")
+            self.logger.warning("All members of the sharded cluster were expected to be running, "
+                                "but weren't.")
+
+        teardown_handler = interface.FixtureTeardownHandler(self.logger)
 
         if self.configsvr is not None:
-            if running_at_start:
-                self.logger.info("Stopping config server...")
+            teardown_handler.teardown(self.configsvr, "config server")
 
-            success = self.configsvr.teardown() and success
+        for mongos in self.mongos:
+            teardown_handler.teardown(mongos, "mongos")
 
-            if running_at_start:
-                self.logger.info("Successfully terminated the config server.")
-
-        if self.mongos is not None:
-            if running_at_start:
-                self.logger.info("Stopping mongos...")
-
-            success = self.mongos.teardown() and success
-
-            if running_at_start:
-                self.logger.info("Successfully terminated the mongos.")
-
-        if running_at_start:
-            self.logger.info("Stopping shards...")
         for shard in self.shards:
-            success = shard.teardown() and success
-        if running_at_start:
-            self.logger.info("Successfully terminated all shards.")
+            teardown_handler.teardown(shard, "shard")
 
-        return success
+        if teardown_handler.was_successful():
+            self.logger.info("Successfully stopped all members of the sharded cluster.")
+        else:
+            self.logger.error("Stopping the sharded cluster fixture failed.")
+            raise errors.ServerFailure(teardown_handler.get_error_message())
 
     def is_running(self):
-        """
-        Returns true if the config server, all shards, and the mongos
-        are all still operating, and false otherwise.
-        """
-        return (self.configsvr is not None and self.configsvr.is_running() and
-                all(shard.is_running() for shard in self.shards) and
-                self.mongos is not None and self.mongos.is_running())
+        """Return true if the all nodes in the cluster are all still operating."""
+        return (self.configsvr is not None and self.configsvr.is_running()
+                and all(shard.is_running() for shard in self.shards)
+                and all(mongos.is_running() for mongos in self.mongos))
 
     def get_internal_connection_string(self):
+        """Return the internal connection string."""
         if self.mongos is None:
             raise ValueError("Must call setup() before calling get_internal_connection_string()")
 
-        return self.mongos.get_internal_connection_string()
+        return ",".join([mongos.get_internal_connection_string() for mongos in self.mongos])
 
     def get_driver_connection_url(self):
+        """Return the driver connection URL."""
         return "mongodb://" + self.get_internal_connection_string()
 
     def _new_configsvr(self):
-        """
-        Returns a replicaset.ReplicaSetFixture configured to be used as
-        the config server of a sharded cluster.
-        """
+        """Return a replicaset.ReplicaSetFixture configured as the config server."""
 
         mongod_logger = self.logger.new_fixture_node_logger("configsvr")
 
@@ -208,7 +181,7 @@ class ShardedClusterFixture(interface.Fixture):
         auth_options = configsvr_options.pop("auth_options", self.auth_options)
         mongod_executable = configsvr_options.pop("mongod_executable", self.mongod_executable)
         preserve_dbpath = configsvr_options.pop("preserve_dbpath", self.preserve_dbpath)
-        num_nodes = configsvr_options.pop("num_nodes", 3)
+        num_nodes = configsvr_options.pop("num_nodes", 1)
 
         replset_config_options = configsvr_options.pop("replset_config_options", {})
         replset_config_options["configsvr"] = True
@@ -220,21 +193,14 @@ class ShardedClusterFixture(interface.Fixture):
         mongod_options["replSet"] = ShardedClusterFixture._CONFIGSVR_REPLSET_NAME
         mongod_options["storageEngine"] = "wiredTiger"
 
-        return replicaset.ReplicaSetFixture(mongod_logger,
-                                            self.job_num,
-                                            mongod_executable=mongod_executable,
-                                            mongod_options=mongod_options,
-                                            preserve_dbpath=preserve_dbpath,
-                                            num_nodes=num_nodes,
-                                            auth_options=auth_options,
-                                            replset_config_options=replset_config_options,
-                                            **configsvr_options)
+        return replicaset.ReplicaSetFixture(
+            mongod_logger, self.job_num, mongod_executable=mongod_executable,
+            mongod_options=mongod_options, preserve_dbpath=preserve_dbpath, num_nodes=num_nodes,
+            auth_options=auth_options, replset_config_options=replset_config_options,
+            **configsvr_options)
 
     def _new_rs_shard(self, index, num_rs_nodes_per_shard):
-        """
-        Returns a replicaset.ReplicaSetFixture configured to be used as a
-        shard in a sharded cluster.
-        """
+        """Return a replicaset.ReplicaSetFixture configured as a shard in a sharded cluster."""
 
         mongod_logger = self.logger.new_fixture_node_logger("shard{}".format(index))
 
@@ -253,21 +219,14 @@ class ShardedClusterFixture(interface.Fixture):
         mongod_options["dbpath"] = os.path.join(self._dbpath_prefix, "shard{}".format(index))
         mongod_options["replSet"] = ShardedClusterFixture._SHARD_REPLSET_NAME_PREFIX + str(index)
 
-        return replicaset.ReplicaSetFixture(mongod_logger,
-                                            self.job_num,
-                                            mongod_executable=mongod_executable,
-                                            mongod_options=mongod_options,
-                                            preserve_dbpath=preserve_dbpath,
-                                            num_nodes=num_rs_nodes_per_shard,
-                                            auth_options=auth_options,
-                                            replset_config_options=replset_config_options,
-                                            **shard_options)
+        return replicaset.ReplicaSetFixture(
+            mongod_logger, self.job_num, mongod_executable=mongod_executable,
+            mongod_options=mongod_options, preserve_dbpath=preserve_dbpath,
+            num_nodes=num_rs_nodes_per_shard, auth_options=auth_options,
+            replset_config_options=replset_config_options, **shard_options)
 
     def _new_standalone_shard(self, index):
-        """
-        Returns a standalone.MongoDFixture configured to be used as a
-        shard in a sharded cluster.
-        """
+        """Return a standalone.MongoDFixture configured as a shard in a sharded cluster."""
 
         mongod_logger = self.logger.new_fixture_node_logger("shard{}".format(index))
 
@@ -281,40 +240,37 @@ class ShardedClusterFixture(interface.Fixture):
         mongod_options["shardsvr"] = ""
         mongod_options["dbpath"] = os.path.join(self._dbpath_prefix, "shard{}".format(index))
 
-        return standalone.MongoDFixture(mongod_logger,
-                                        self.job_num,
-                                        mongod_executable=mongod_executable,
-                                        mongod_options=mongod_options,
-                                        preserve_dbpath=preserve_dbpath,
-                                        **shard_options)
+        return standalone.MongoDFixture(
+            mongod_logger, self.job_num, mongod_executable=mongod_executable,
+            mongod_options=mongod_options, preserve_dbpath=preserve_dbpath, **shard_options)
 
-    def _new_mongos(self):
+    def _new_mongos(self, index, total):
         """
-        Returns a _MongoSFixture configured to be used as the mongos for
-        a sharded cluster.
+        Return a _MongoSFixture configured to be used as the mongos for a sharded cluster.
+
+        :param index: The index of the current mongos.
+        :param total: The total number of mongos routers
+        :return: _MongoSFixture
         """
 
-        mongos_logger = self.logger.new_fixture_node_logger("mongos")
+        if total == 1:
+            logger_name = "mongos"
+        else:
+            logger_name = "mongos{}".format(index)
+
+        mongos_logger = self.logger.new_fixture_node_logger(logger_name)
 
         mongos_options = self.mongos_options.copy()
+        mongos_options["configdb"] = self.configsvr.get_internal_connection_string()
 
-        if self.separate_configsvr:
-            mongos_options["configdb"] = self.configsvr.get_internal_connection_string()
-        else:
-            mongos_options["configdb"] = "localhost:{}".format(self.shards[0].port)
-
-        return _MongoSFixture(mongos_logger,
-                              self.job_num,
-                              mongos_executable=self.mongos_executable,
+        return _MongoSFixture(mongos_logger, self.job_num, mongos_executable=self.mongos_executable,
                               mongos_options=mongos_options)
 
     def _add_shard(self, client, shard):
         """
-        Add the specified program as a shard by executing the addShard
-        command.
+        Add the specified program as a shard by executing the addShard command.
 
-        See https://docs.mongodb.org/manual/reference/command/addShard
-        for more details.
+        See https://docs.mongodb.org/manual/reference/command/addShard for more details.
         """
 
         connection_string = shard.get_internal_connection_string()
@@ -323,17 +279,12 @@ class ShardedClusterFixture(interface.Fixture):
 
 
 class _MongoSFixture(interface.Fixture):
-    """
-    Fixture which provides JSTests with a mongos to connect to.
-    """
+    """Fixture which provides JSTests with a mongos to connect to."""
 
-    REGISTERED_NAME = registry.LEAVE_UNREGISTERED
+    REGISTERED_NAME = registry.LEAVE_UNREGISTERED  # type: ignore
 
-    def __init__(self,
-                 logger,
-                 job_num,
-                 mongos_executable=None,
-                 mongos_options=None):
+    def __init__(self, logger, job_num, mongos_executable=None, mongos_options=None):
+        """Initialize _MongoSFixture."""
 
         interface.Fixture.__init__(self, logger, job_num)
 
@@ -346,24 +297,26 @@ class _MongoSFixture(interface.Fixture):
         self.port = None
 
     def setup(self):
+        """Set up the sharded cluster."""
         if "port" not in self.mongos_options:
             self.mongos_options["port"] = core.network.PortAllocator.next_fixture_port(self.job_num)
         self.port = self.mongos_options["port"]
 
-        mongos = core.programs.mongos_program(self.logger,
-                                              executable=self.mongos_executable,
+        mongos = core.programs.mongos_program(self.logger, executable=self.mongos_executable,
                                               **self.mongos_options)
         try:
             self.logger.info("Starting mongos on port %d...\n%s", self.port, mongos.as_command())
             mongos.start()
             self.logger.info("mongos started on port %d with pid %d.", self.port, mongos.pid)
-        except:
-            self.logger.exception("Failed to start mongos on port %d.", self.port)
-            raise
+        except Exception as err:
+            msg = "Failed to start mongos on port {:d}: {}".format(self.port, err)
+            self.logger.exception(msg)
+            raise errors.ServerFailure(msg)
 
         self.mongos = mongos
 
     def await_ready(self):
+        """Block until the fixture can be used for testing."""
         deadline = time.time() + standalone.MongoDFixture.AWAIT_READY_TIMEOUT_SECS
 
         # Wait until the mongos is accepting connections. The retry logic is necessary to support
@@ -374,8 +327,8 @@ class _MongoSFixture(interface.Fixture):
             exit_code = self.mongos.poll()
             if exit_code is not None:
                 raise errors.ServerFailure("Could not connect to mongos on port {}, process ended"
-                                           " unexpectedly with code {}.".format(self.port,
-                                                                                exit_code))
+                                           " unexpectedly with code {}.".format(
+                                               self.port, exit_code))
 
             try:
                 # Use a shorter connection timeout to more closely satisfy the requested deadline.
@@ -395,41 +348,41 @@ class _MongoSFixture(interface.Fixture):
         self.logger.info("Successfully contacted the mongos on port %d.", self.port)
 
     def _do_teardown(self):
-        running_at_start = self.is_running()
-        success = True  # Still a success even if nothing is running.
+        if self.mongos is None:
+            self.logger.warning("The mongos fixture has not been set up yet.")
+            return  # Teardown is still a success even if nothing is running.
 
-        if not running_at_start and self.mongos is not None:
-            self.logger.info(
-                "mongos on port %d was expected to be running in _do_teardown(), but wasn't. "
-                "Exited with code %d.",
-                self.port, self.mongos.poll())
+        self.logger.info("Stopping mongos on port %d with pid %d...", self.port, self.mongos.pid)
+        if not self.is_running():
+            exit_code = self.mongos.poll()
+            msg = ("mongos on port {:d} was expected to be running, but wasn't. "
+                   "Process exited with code {:d}").format(self.port, exit_code)
+            self.logger.warning(msg)
+            raise errors.ServerFailure(msg)
 
-        if self.mongos is not None:
-            if running_at_start:
-                self.logger.info("Stopping mongos on port %d with pid %d...",
-                                 self.port,
-                                 self.mongos.pid)
-                self.mongos.stop()
+        self.mongos.stop()
+        exit_code = self.mongos.wait()
 
-            exit_code = self.mongos.wait()
-            success = exit_code == 0
-
-            if running_at_start:
-                self.logger.info("Successfully terminated the mongos on port %d, exited with code"
-                                 " %d",
-                                 self.port,
-                                 exit_code)
-
-        return success
+        if exit_code == 0:
+            self.logger.info("Successfully stopped the mongos on port {:d}".format(self.port))
+        else:
+            self.logger.warning("Stopped the mongos on port {:d}. "
+                                "Process exited with code {:d}.".format(self.port, exit_code))
+            raise errors.ServerFailure(
+                "mongos on port {:d} with pid {:d} exited with code {:d}".format(
+                    self.port, self.mongos.pid, exit_code))
 
     def is_running(self):
+        """Return true if the cluster is still operating."""
         return self.mongos is not None and self.mongos.poll() is None
 
     def get_internal_connection_string(self):
+        """Return the internal connection string."""
         if self.mongos is None:
             raise ValueError("Must call setup() before calling get_internal_connection_string()")
 
         return "localhost:%d" % self.port
 
     def get_driver_connection_url(self):
+        """Return the driver connection URL."""
         return "mongodb://" + self.get_internal_connection_string()

@@ -22,9 +22,6 @@
     var lastTs = lastOplogDoc.ts;
     var newTs = Timestamp(lastTs.t + 1, 1);
     var term = lastOplogDoc.t;
-    if (typeof(term) == 'undefined') {
-        term = -1;  // Use a dummy term for PV0.
-    }
 
     assert.writeOK(oplog.insert({
         ts: newTs,
@@ -61,5 +58,10 @@
               "If the Timestamps differ, the server may be filling in the null timestamps");
 
     assert.throws(() => rst.restart(0));  // Restart in replSet mode again.
+
+    // fassert() calls std::abort(), which returns a different exit code for Windows vs. other
+    // platforms.
+    const exitCode = _isWindows() ? MongoRunner.EXIT_ABRUPT : MongoRunner.EXIT_ABORT;
+    rst.stop(0, undefined, {allowedExitCode: exitCode});
     rst.stopSet();
 })();

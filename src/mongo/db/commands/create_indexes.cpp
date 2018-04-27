@@ -39,6 +39,7 @@
 #include "mongo/db/catalog/index_create.h"
 #include "mongo/db/catalog/index_key_validate.h"
 #include "mongo/db/client.h"
+#include "mongo/db/command_generic_argument.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
@@ -48,9 +49,10 @@
 #include "mongo/db/ops/insert.h"
 #include "mongo/db/query/collation/collator_factory_interface.h"
 #include "mongo/db/repl/repl_client_info.h"
-#include "mongo/db/repl/replication_coordinator_global.h"
+#include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/s/collection_metadata.h"
 #include "mongo/db/s/collection_sharding_state.h"
+#include "mongo/db/s/database_sharding_state.h"
 #include "mongo/db/server_options.h"
 #include "mongo/db/views/view_catalog.h"
 #include "mongo/s/shard_key_pattern.h"
@@ -128,8 +130,7 @@ StatusWith<std::vector<BSONObj>> parseAndValidateIndexSpecs(
             }
 
             hasIndexesField = true;
-        } else if (kCommandName == cmdElemFieldName ||
-                   Command::isGenericArgument(cmdElemFieldName)) {
+        } else if (kCommandName == cmdElemFieldName || isGenericArgument(cmdElemFieldName)) {
             continue;
         } else {
             return {ErrorCodes::BadValue,
@@ -181,7 +182,7 @@ StatusWith<std::vector<BSONObj>> resolveCollectionDefaultProperties(
                                           ->makeFromBSON(collationElem.Obj());
                 // validateIndexSpecCollation() should have checked that the index collation spec is
                 // valid.
-                invariantOK(collatorStatus.getStatus());
+                invariant(collatorStatus.getStatus());
                 indexCollator = std::move(collatorStatus.getValue());
             }
             if (!CollatorInterface::collatorsMatch(collection->getDefaultCollator(),
@@ -216,13 +217,13 @@ public:
     virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
         return true;
     }
-    virtual bool slaveOk() const {
-        return false;
-    }  // TODO: this could be made true...
+    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
+        return AllowedOnSecondary::kNever;
+    }
 
     virtual Status checkAuthForCommand(Client* client,
                                        const std::string& dbname,
-                                       const BSONObj& cmdObj) {
+                                       const BSONObj& cmdObj) const {
         ActionSet actions;
         actions.addAction(ActionType::createIndex);
         Privilege p(parseResourcePattern(dbname, cmdObj), actions);
@@ -236,11 +237,11 @@ public:
                            const BSONObj& cmdObj,
                            string& errmsg,
                            BSONObjBuilder& result) {
-        const NamespaceString ns(parseNsCollectionRequired(dbname, cmdObj));
+        const NamespaceString ns(CommandHelpers::parseNsCollectionRequired(dbname, cmdObj));
 
         Status status = userAllowedWriteNS(ns);
         if (!status.isOK())
-            return appendCommandStatus(result, status);
+            return CommandHelpers::appendCommandStatus(result, status);
 
         // Disallow users from creating new indexes on config.transactions since the sessions
         // code was optimized to not update indexes.
@@ -251,15 +252,18 @@ public:
         auto specsWithStatus =
             parseAndValidateIndexSpecs(opCtx, ns, cmdObj, serverGlobalParams.featureCompatibility);
         if (!specsWithStatus.isOK()) {
-            return appendCommandStatus(result, specsWithStatus.getStatus());
+            return CommandHelpers::appendCommandStatus(result, specsWithStatus.getStatus());
         }
         auto specs = std::move(specsWithStatus.getValue());
 
+        // Index builds cannot currently handle lock interruption.
+        UninterruptibleLockGuard noInterrupt(opCtx->lockState());
+
         // now we know we have to create index(es)
-        // Note: createIndexes command does not currently respect shard versioning.
+        // Do not use AutoGetOrCreateDb because we may relock the DbLock in mode IX.
         Lock::DBLock dbLock(opCtx, ns.db(), MODE_X);
-        if (!repl::getGlobalReplicationCoordinator()->canAcceptWritesFor(opCtx, ns)) {
-            return appendCommandStatus(
+        if (!repl::ReplicationCoordinator::get(opCtx)->canAcceptWritesFor(opCtx, ns)) {
+            return CommandHelpers::appendCommandStatus(
                 result,
                 Status(ErrorCodes::NotMaster,
                        str::stream() << "Not primary while creating indexes in " << ns.ns()));
@@ -269,6 +273,7 @@ public:
         if (!db) {
             db = dbHolder().openDb(opCtx, ns.db());
         }
+        DatabaseShardingState::get(db).checkDbVersion(opCtx);
 
         Collection* collection = db->getCollection(opCtx, ns);
         if (collection) {
@@ -276,7 +281,13 @@ public:
         } else {
             if (db->getViewCatalog()->lookup(opCtx, ns.ns())) {
                 errmsg = "Cannot create indexes on a view";
-                return appendCommandStatus(result, {ErrorCodes::CommandNotSupportedOnView, errmsg});
+                return CommandHelpers::appendCommandStatus(
+                    result, {ErrorCodes::CommandNotSupportedOnView, errmsg});
+            }
+
+            status = userAllowedCreateNS(ns.db(), ns.coll());
+            if (!status.isOK()) {
+                return CommandHelpers::appendCommandStatus(result, status);
             }
 
             writeConflictRetry(opCtx, kCommandName, ns.ns(), [&] {
@@ -291,7 +302,7 @@ public:
         auto indexSpecsWithDefaults =
             resolveCollectionDefaultProperties(opCtx, collection, std::move(specs));
         if (!indexSpecsWithDefaults.isOK()) {
-            return appendCommandStatus(result, indexSpecsWithDefaults.getStatus());
+            return CommandHelpers::appendCommandStatus(result, indexSpecsWithDefaults.getStatus());
         }
         specs = std::move(indexSpecsWithDefaults.getValue());
 
@@ -318,10 +329,10 @@ public:
         for (size_t i = 0; i < specs.size(); i++) {
             const BSONObj& spec = specs[i];
             if (spec["unique"].trueValue()) {
-                status = checkUniqueIndexConstraints(opCtx, ns.ns(), spec["key"].Obj());
+                status = checkUniqueIndexConstraints(opCtx, ns, spec["key"].Obj());
 
                 if (!status.isOK()) {
-                    return appendCommandStatus(result, status);
+                    return CommandHelpers::appendCommandStatus(result, status);
                 }
             }
         }
@@ -336,8 +347,8 @@ public:
         if (indexer.getBuildInBackground()) {
             opCtx->recoveryUnit()->abandonSnapshot();
             dbLock.relockWithMode(MODE_IX);
-            if (!repl::getGlobalReplicationCoordinator()->canAcceptWritesFor(opCtx, ns)) {
-                return appendCommandStatus(
+            if (!repl::ReplicationCoordinator::get(opCtx)->canAcceptWritesFor(opCtx, ns)) {
+                return CommandHelpers::appendCommandStatus(
                     result,
                     Status(ErrorCodes::NotMaster,
                            str::stream() << "Not primary while creating background indexes in "
@@ -358,8 +369,8 @@ public:
                     // that day, to avoid data corruption due to lack of index cleanup.
                     opCtx->recoveryUnit()->abandonSnapshot();
                     dbLock.relockWithMode(MODE_X);
-                    if (!repl::getGlobalReplicationCoordinator()->canAcceptWritesFor(opCtx, ns)) {
-                        return appendCommandStatus(
+                    if (!repl::ReplicationCoordinator::get(opCtx)->canAcceptWritesFor(opCtx, ns)) {
+                        return CommandHelpers::appendCommandStatus(
                             result,
                             Status(ErrorCodes::NotMaster,
                                    str::stream()
@@ -380,9 +391,13 @@ public:
             dbLock.relockWithMode(MODE_X);
             uassert(ErrorCodes::NotMaster,
                     str::stream() << "Not primary while completing index build in " << dbname,
-                    repl::getGlobalReplicationCoordinator()->canAcceptWritesFor(opCtx, ns));
+                    repl::ReplicationCoordinator::get(opCtx)->canAcceptWritesFor(opCtx, ns));
 
             Database* db = dbHolder().get(opCtx, ns.db());
+            if (db) {
+                DatabaseShardingState::get(db).checkDbVersion(opCtx);
+            }
+
             uassert(28551, "database dropped during index build", db);
             uassert(28552, "collection dropped during index build", db->getCollection(opCtx, ns));
         }
@@ -407,11 +422,11 @@ public:
 
 private:
     static Status checkUniqueIndexConstraints(OperationContext* opCtx,
-                                              StringData ns,
+                                              const NamespaceString& nss,
                                               const BSONObj& newIdxKey) {
-        invariant(opCtx->lockState()->isCollectionLockedForMode(ns, MODE_X));
+        invariant(opCtx->lockState()->isCollectionLockedForMode(nss.ns(), MODE_X));
 
-        auto metadata(CollectionShardingState::get(opCtx, ns.toString())->getMetadata());
+        auto metadata(CollectionShardingState::get(opCtx, nss)->getMetadata(opCtx));
         if (metadata) {
             ShardKeyPattern shardKeyPattern(metadata->getKeyPattern());
             if (!shardKeyPattern.isUniqueIndexCompatible(newIdxKey)) {

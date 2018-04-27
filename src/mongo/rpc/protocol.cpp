@@ -181,7 +181,7 @@ ProtocolSet computeProtocolSet(const WireVersionInfo version) {
             result |= supports::kOpMsgOnly;
         }
         if (version.maxWireVersion >= WireVersion::FIND_COMMAND &&
-            version.maxWireVersion <= WireVersion::SUPPORTS_OP_MSG) {
+            version.maxWireVersion <= WireVersion::REPLICA_SET_TRANSACTIONS) {
             // Future versions may remove support for OP_COMMAND.
             result |= supports::kOpCommandOnly;
         }
@@ -211,16 +211,24 @@ Status validateWireVersion(const WireVersionInfo client, const WireVersionInfo s
     // We assert the invariant that min < max above.
     if (!(client.minWireVersion <= server.maxWireVersion &&
           client.maxWireVersion >= server.minWireVersion)) {
+        std::string errmsg = str::stream()
+            << "Server min and max wire version (" << server.minWireVersion << ","
+            << server.maxWireVersion << ") is incompatible with client min wire version ("
+            << client.minWireVersion << "," << client.maxWireVersion << ").";
+        if (client.maxWireVersion < server.minWireVersion) {
+            return Status(ErrorCodes::IncompatibleWithUpgradedServer,
+                          str::stream()
+                              << errmsg
+                              << "You (client) are attempting to connect to a node (server) that "
+                                 "no longer accepts connections with your (client’s) binary "
+                                 "version. Please upgrade the client’s binary version.");
+        }
         return Status(ErrorCodes::IncompatibleServerVersion,
-                      str::stream() << "Server min and max wire version are incompatible ("
-                                    << server.minWireVersion
-                                    << ","
-                                    << server.maxWireVersion
-                                    << ") with client min wire version ("
-                                    << client.minWireVersion
-                                    << ","
-                                    << client.maxWireVersion
-                                    << ")");
+                      str::stream() << errmsg
+                                    << "You (client) are attempting to connect to a node "
+                                       "(server) with a binary version with which "
+                                       "you (client) no longer accept connections. Please "
+                                       "upgrade the server’s binary version.");
     }
 
     return Status::OK();

@@ -44,6 +44,7 @@
 #include "mongo/db/clientcursor.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/commands/list_collections_filter.h"
+#include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/cursor_manager.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/exec/queued_data_stage.h"
@@ -84,9 +85,9 @@ boost::optional<vector<StringData>> _getExactNameMatches(const MatchExpression* 
     if (matchType == MatchExpression::EQ) {
         auto eqMatch = checked_cast<const EqualityMatchExpression*>(matcher);
         if (eqMatch->path() == "name") {
-            auto& elem = eqMatch->getData();
-            if (elem.type() == String) {
-                return {vector<StringData>{elem.valueStringData()}};
+            StringData name(eqMatch->getData().valuestrsafe());
+            if (name.size()) {
+                return {vector<StringData>{name}};
             } else {
                 return vector<StringData>();
             }
@@ -96,7 +97,8 @@ boost::optional<vector<StringData>> _getExactNameMatches(const MatchExpression* 
         if (matchIn->path() == "name" && matchIn->getRegexes().empty()) {
             vector<StringData> exactMatches;
             for (auto&& elem : matchIn->getEqualities()) {
-                if (elem.type() == String) {
+                StringData name(elem.valuestrsafe());
+                if (name.size()) {
                     exactMatches.push_back(elem.valueStringData());
                 }
             }
@@ -130,10 +132,14 @@ void _addWorkingSetMember(OperationContext* opCtx,
     root->pushBack(id);
 }
 
-BSONObj buildViewBson(const ViewDefinition& view) {
+BSONObj buildViewBson(const ViewDefinition& view, bool nameOnly) {
     BSONObjBuilder b;
     b.append("name", view.name().coll());
     b.append("type", "view");
+
+    if (nameOnly) {
+        return b.obj();
+    }
 
     BSONObjBuilder optionsBuilder(b.subobjStart("options"));
     optionsBuilder.append("viewOn", view.viewOn().coll());
@@ -148,9 +154,13 @@ BSONObj buildViewBson(const ViewDefinition& view) {
     return b.obj();
 }
 
+/**
+ * Return an object describing the collection. Takes a collection lock if nameOnly is false.
+ */
 BSONObj buildCollectionBson(OperationContext* opCtx,
                             const Collection* collection,
-                            bool includePendingDrops) {
+                            bool includePendingDrops,
+                            bool nameOnly) {
 
     if (!collection) {
         return {};
@@ -173,6 +183,11 @@ BSONObj buildCollectionBson(OperationContext* opCtx,
     b.append("name", collectionName);
     b.append("type", "collection");
 
+    if (nameOnly) {
+        return b.obj();
+    }
+
+    Lock::CollectionLock clk(opCtx->lockState(), nss.ns(), MODE_IS);
     CollectionOptions options = collection->getCatalogEntry()->getCollectionOptions(opCtx);
 
     // While the UUID is stored as a collection option, from the user's perspective it is an
@@ -197,11 +212,8 @@ BSONObj buildCollectionBson(OperationContext* opCtx,
 
 class CmdListCollections : public BasicCommand {
 public:
-    virtual bool slaveOk() const {
-        return false;
-    }
-    virtual bool slaveOverrideOk() const {
-        return true;
+    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
+        return AllowedOnSecondary::kOptIn;
     }
     virtual bool adminOnly() const {
         return false;
@@ -210,13 +222,13 @@ public:
         return false;
     }
 
-    virtual void help(stringstream& help) const {
-        help << "list collections for this db";
+    std::string help() const override {
+        return "list collections for this db";
     }
 
     virtual Status checkAuthForCommand(Client* client,
                                        const std::string& dbname,
-                                       const BSONObj& cmdObj) {
+                                       const BSONObj& cmdObj) const {
         AuthorizationSession* authzSession = AuthorizationSession::get(client);
 
         if (authzSession->isAuthorizedToListCollections(dbname)) {
@@ -235,11 +247,13 @@ public:
              BSONObjBuilder& result) {
         unique_ptr<MatchExpression> matcher;
 
+        const bool nameOnly = jsobj["nameOnly"].trueValue();
+
         // Check for 'filter' argument.
         BSONElement filterElt = jsobj["filter"];
         if (!filterElt.eoo()) {
             if (filterElt.type() != mongo::Object) {
-                return appendCommandStatus(
+                return CommandHelpers::appendCommandStatus(
                     result, Status(ErrorCodes::BadValue, "\"filter\" must be an object"));
             }
             // The collator is null because collection objects are compared using binary comparison.
@@ -248,7 +262,7 @@ public:
             StatusWithMatchExpression statusWithMatcher =
                 MatchExpressionParser::parse(filterElt.Obj(), std::move(expCtx));
             if (!statusWithMatcher.isOK()) {
-                return appendCommandStatus(result, statusWithMatcher.getStatus());
+                return CommandHelpers::appendCommandStatus(result, statusWithMatcher.getStatus());
             }
             matcher = std::move(statusWithMatcher.getValue());
         }
@@ -258,7 +272,7 @@ public:
         Status parseCursorStatus =
             CursorRequest::parseCommandCursorOptions(jsobj, defaultBatchSize, &batchSize);
         if (!parseCursorStatus.isOK()) {
-            return appendCommandStatus(result, parseCursorStatus);
+            return CommandHelpers::appendCommandStatus(result, parseCursorStatus);
         }
 
         // Check for 'includePendingDrops' flag. The default is to not include drop-pending
@@ -268,10 +282,10 @@ public:
             jsobj, "includePendingDrops", false, &includePendingDrops);
 
         if (!status.isOK()) {
-            return appendCommandStatus(result, status);
+            return CommandHelpers::appendCommandStatus(result, status);
         }
 
-        AutoGetDb autoDb(opCtx, dbname, MODE_S);
+        AutoGetDb autoDb(opCtx, dbname, MODE_IS);
 
         Database* db = autoDb.getDb();
 
@@ -283,14 +297,16 @@ public:
                 for (auto&& collName : *collNames) {
                     auto nss = NamespaceString(db->name(), collName);
                     Collection* collection = db->getCollection(opCtx, nss);
-                    BSONObj collBson = buildCollectionBson(opCtx, collection, includePendingDrops);
+                    BSONObj collBson =
+                        buildCollectionBson(opCtx, collection, includePendingDrops, nameOnly);
                     if (!collBson.isEmpty()) {
                         _addWorkingSetMember(opCtx, collBson, matcher.get(), ws.get(), root.get());
                     }
                 }
             } else {
                 for (auto&& collection : *db) {
-                    BSONObj collBson = buildCollectionBson(opCtx, collection, includePendingDrops);
+                    BSONObj collBson =
+                        buildCollectionBson(opCtx, collection, includePendingDrops, nameOnly);
                     if (!collBson.isEmpty()) {
                         _addWorkingSetMember(opCtx, collBson, matcher.get(), ws.get(), root.get());
                     }
@@ -303,7 +319,7 @@ public:
                     filterElt.Obj() == ListCollectionsFilter::makeTypeCollectionFilter());
             if (!skipViews) {
                 db->getViewCatalog()->iterate(opCtx, [&](const ViewDefinition& view) {
-                    BSONObj viewBson = buildViewBson(view);
+                    BSONObj viewBson = buildViewBson(view, nameOnly);
                     if (!viewBson.isEmpty()) {
                         _addWorkingSetMember(opCtx, viewBson, matcher.get(), ws.get(), root.get());
                     }
@@ -316,7 +332,7 @@ public:
         auto statusWithPlanExecutor = PlanExecutor::make(
             opCtx, std::move(ws), std::move(root), cursorNss, PlanExecutor::NO_YIELD);
         if (!statusWithPlanExecutor.isOK()) {
-            return appendCommandStatus(result, statusWithPlanExecutor.getStatus());
+            return CommandHelpers::appendCommandStatus(result, statusWithPlanExecutor.getStatus());
         }
         auto exec = std::move(statusWithPlanExecutor.getValue());
 
@@ -348,7 +364,7 @@ public:
                 {std::move(exec),
                  cursorNss,
                  AuthorizationSession::get(opCtx->getClient())->getAuthenticatedUserNames(),
-                 opCtx->recoveryUnit()->isReadingFromMajorityCommittedSnapshot(),
+                 opCtx->recoveryUnit()->getReadConcernLevel(),
                  jsobj});
             cursorId = pinnedCursor.getCursor()->cursorid();
         }

@@ -33,6 +33,8 @@
 
 #include "mongo/bson/timestamp.h"
 #include "mongo/db/operation_context_noop.h"
+#include "mongo/db/repl/read_concern_level.h"
+#include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/service_context_noop.h"
 #include "mongo/db/storage/kv/kv_engine.h"
 #include "mongo/db/storage/record_store.h"
@@ -55,7 +57,7 @@ public:
         Operation(ServiceContext::UniqueClient client, RecoveryUnit* ru)
             : _client(std::move(client)), _opCtx(_client->makeOperationContext()) {
             delete _opCtx->releaseRecoveryUnit();
-            _opCtx->setRecoveryUnit(ru, OperationContext::kNotInUnitOfWork);
+            _opCtx->setRecoveryUnit(ru, WriteUnitOfWork::RecoveryUnitState::kNotInUnitOfWork);
         }
 
 
@@ -142,22 +144,53 @@ public:
 
     int itCountCommitted() {
         auto op = makeOperation();
-        ASSERT_OK(op->recoveryUnit()->setReadFromMajorityCommittedSnapshot());
+        op->recoveryUnit()->setReadConcernLevelAndReplicationMode(
+            repl::ReadConcernLevel::kMajorityReadConcern,
+            repl::ReplicationCoordinator::modeReplSet);
+        ASSERT_OK(op->recoveryUnit()->obtainMajorityCommittedSnapshot());
         return itCountOn(op);
     }
 
-    boost::optional<Record> readRecordCommitted(RecordId id) {
+    int itCountLocal() {
         auto op = makeOperation();
-        ASSERT_OK(op->recoveryUnit()->setReadFromMajorityCommittedSnapshot());
+        op->recoveryUnit()->setReadConcernLevelAndReplicationMode(
+            repl::ReadConcernLevel::kLocalReadConcern, repl::ReplicationCoordinator::modeReplSet);
+        op->recoveryUnit()->setShouldReadAtLastAppliedTimestamp(true);
+        return itCountOn(op);
+    }
+
+    boost::optional<Record> readRecordOn(OperationContext* op, RecordId id) {
         auto cursor = rs->getCursor(op);
         auto record = cursor->seekExact(id);
         if (record)
             record->data.makeOwned();
         return record;
     }
+    boost::optional<Record> readRecordCommitted(RecordId id) {
+        auto op = makeOperation();
+        op->recoveryUnit()->setReadConcernLevelAndReplicationMode(
+            repl::ReadConcernLevel::kMajorityReadConcern,
+            repl::ReplicationCoordinator::modeReplSet);
+        ASSERT_OK(op->recoveryUnit()->obtainMajorityCommittedSnapshot());
+        return readRecordOn(op, id);
+    }
 
     std::string readStringCommitted(RecordId id) {
         auto record = readRecordCommitted(id);
+        ASSERT(record);
+        return std::string(record->data.data());
+    }
+
+    boost::optional<Record> readRecordLocal(RecordId id) {
+        auto op = makeOperation();
+        op->recoveryUnit()->setReadConcernLevelAndReplicationMode(
+            repl::ReadConcernLevel::kLocalReadConcern, repl::ReplicationCoordinator::modeReplSet);
+        op->recoveryUnit()->setShouldReadAtLastAppliedTimestamp(true);
+        return readRecordOn(op, id);
+    }
+
+    std::string readStringLocal(RecordId id) {
+        auto record = readRecordLocal(id);
         ASSERT(record);
         return std::string(record->data.data());
     }
@@ -190,50 +223,55 @@ private:
 
 TEST_F(SnapshotManagerTests, ConsistentIfNotSupported) {
     if (snapshotManager)
-        return;  // This test is only for engines that DON'T support SnapshotMangers.
+        return;  // This test is only for engines that DON'T support SnapshotManagers.
 
     auto op = makeOperation();
     auto ru = op->recoveryUnit();
-    ASSERT(!ru->isReadingFromMajorityCommittedSnapshot());
-    ASSERT(!ru->getMajorityCommittedSnapshot());
+    auto readConcernLevel = ru->getReadConcernLevel();
+    ASSERT(readConcernLevel != repl::ReadConcernLevel::kMajorityReadConcern &&
+           readConcernLevel != repl::ReadConcernLevel::kSnapshotReadConcern);
 }
 
 TEST_F(SnapshotManagerTests, FailsWithNoCommittedSnapshot) {
     if (!snapshotManager)
-        return;  // This test is only for engines that DO support SnapshotMangers.
+        return;  // This test is only for engines that DO support SnapshotManagers.
 
     auto op = makeOperation();
     auto ru = op->recoveryUnit();
+    ru->setReadConcernLevelAndReplicationMode(repl::ReadConcernLevel::kMajorityReadConcern,
+                                              repl::ReplicationCoordinator::modeReplSet);
 
     // Before first snapshot is created.
-    ASSERT_EQ(ru->setReadFromMajorityCommittedSnapshot(),
+    ASSERT_EQ(ru->obtainMajorityCommittedSnapshot(),
               ErrorCodes::ReadConcernMajorityNotAvailableYet);
 
     // There is a snapshot but it isn't committed.
     auto snap = fetchAndIncrementTimestamp();
-    ASSERT_EQ(ru->setReadFromMajorityCommittedSnapshot(),
+    ASSERT_EQ(ru->obtainMajorityCommittedSnapshot(),
               ErrorCodes::ReadConcernMajorityNotAvailableYet);
 
     // Now there is a committed snapshot.
     snapshotManager->setCommittedSnapshot(snap);
-    ASSERT_OK(ru->setReadFromMajorityCommittedSnapshot());
+    ASSERT_OK(ru->obtainMajorityCommittedSnapshot());
 
     // Not anymore!
     snapshotManager->dropAllSnapshots();
-    ASSERT_EQ(ru->setReadFromMajorityCommittedSnapshot(),
+    ASSERT_EQ(ru->obtainMajorityCommittedSnapshot(),
               ErrorCodes::ReadConcernMajorityNotAvailableYet);
 }
 
 TEST_F(SnapshotManagerTests, FailsAfterDropAllSnapshotsWhileYielded) {
     if (!snapshotManager)
-        return;  // This test is only for engines that DO support SnapshotMangers.
+        return;  // This test is only for engines that DO support SnapshotManagers.
 
     auto op = makeOperation();
+    op->recoveryUnit()->setReadConcernLevelAndReplicationMode(
+        repl::ReadConcernLevel::kMajorityReadConcern, repl::ReplicationCoordinator::modeReplSet);
 
     // Start an operation using a committed snapshot.
     auto snap = fetchAndIncrementTimestamp();
     snapshotManager->setCommittedSnapshot(snap);
-    ASSERT_OK(op->recoveryUnit()->setReadFromMajorityCommittedSnapshot());
+    ASSERT_OK(op->recoveryUnit()->obtainMajorityCommittedSnapshot());
     ASSERT_EQ(itCountOn(op), 0);  // acquires a snapshot.
 
     // Everything still works until we abandon our snapshot.
@@ -248,7 +286,7 @@ TEST_F(SnapshotManagerTests, FailsAfterDropAllSnapshotsWhileYielded) {
 
 TEST_F(SnapshotManagerTests, BasicFunctionality) {
     if (!snapshotManager)
-        return;  // This test is only for engines that DO support SnapshotMangers.
+        return;  // This test is only for engines that DO support SnapshotManagers.
 
     auto snap0 = fetchAndIncrementTimestamp();
     snapshotManager->setCommittedSnapshot(snap0);
@@ -284,7 +322,9 @@ TEST_F(SnapshotManagerTests, BasicFunctionality) {
 
     // This op should keep its original snapshot until abandoned.
     auto longOp = makeOperation();
-    ASSERT_OK(longOp->recoveryUnit()->setReadFromMajorityCommittedSnapshot());
+    longOp->recoveryUnit()->setReadConcernLevelAndReplicationMode(
+        repl::ReadConcernLevel::kMajorityReadConcern, repl::ReplicationCoordinator::modeReplSet);
+    ASSERT_OK(longOp->recoveryUnit()->obtainMajorityCommittedSnapshot());
     ASSERT_EQ(itCountOn(longOp), 3);
 
     // If this fails, the snapshot contains writes that were rolled back.
@@ -301,7 +341,7 @@ TEST_F(SnapshotManagerTests, BasicFunctionality) {
 
 TEST_F(SnapshotManagerTests, UpdateAndDelete) {
     if (!snapshotManager)
-        return;  // This test is only for engines that DO support SnapshotMangers.
+        return;  // This test is only for engines that DO support SnapshotManagers.
 
     auto snapBeforeInsert = fetchAndIncrementTimestamp();
 
@@ -331,4 +371,76 @@ TEST_F(SnapshotManagerTests, UpdateAndDelete) {
     ASSERT(!readRecordCommitted(id));
 }
 
+TEST_F(SnapshotManagerTests, InsertAndReadOnLocalSnapshot) {
+    if (!snapshotManager)
+        return;  // This test is only for engines that DO support SnapshotManagers.
+
+    auto beforeInsert = fetchAndIncrementTimestamp();
+
+    auto id = insertRecordAndCommit();
+    auto afterInsert = fetchAndIncrementTimestamp();
+
+    // Not reading on the last local timestamp returns the most recent data.
+    auto op = makeOperation();
+    auto ru = op->recoveryUnit();
+    ru->setShouldReadAtLastAppliedTimestamp(false);
+    ASSERT_EQ(itCountOn(op), 1);
+    ASSERT(readRecordOn(op, id));
+
+    deleteRecordAndCommit(id);
+    auto afterDelete = fetchAndIncrementTimestamp();
+
+    // Reading at the local snapshot timestamps returns data in order.
+    snapshotManager->setLocalSnapshot(beforeInsert);
+    ASSERT_EQ(itCountLocal(), 0);
+    ASSERT(!readRecordLocal(id));
+
+    snapshotManager->setLocalSnapshot(afterInsert);
+    ASSERT_EQ(itCountLocal(), 1);
+    ASSERT(readRecordLocal(id));
+
+    snapshotManager->setLocalSnapshot(afterDelete);
+    ASSERT_EQ(itCountLocal(), 0);
+    ASSERT(!readRecordLocal(id));
+}
+
+TEST_F(SnapshotManagerTests, UpdateAndDeleteOnLocalSnapshot) {
+    if (!snapshotManager)
+        return;  // This test is only for engines that DO support SnapshotManagers.
+
+    auto beforeInsert = fetchAndIncrementTimestamp();
+
+    auto id = insertRecordAndCommit("Aardvark");
+    auto afterInsert = fetchAndIncrementTimestamp();
+
+    updateRecordAndCommit(id, "Blue spotted stingray");
+    auto afterUpdate = fetchAndIncrementTimestamp();
+
+    // Not reading on the last local timestamp returns the most recent data.
+    auto op = makeOperation();
+    auto ru = op->recoveryUnit();
+    ru->setShouldReadAtLastAppliedTimestamp(false);
+    ASSERT_EQ(itCountOn(op), 1);
+    auto record = readRecordOn(op, id);
+    ASSERT_EQ(std::string(record->data.data()), "Blue spotted stingray");
+
+    deleteRecordAndCommit(id);
+    auto afterDelete = fetchAndIncrementTimestamp();
+
+    snapshotManager->setLocalSnapshot(beforeInsert);
+    ASSERT_EQ(itCountLocal(), 0);
+    ASSERT(!readRecordLocal(id));
+
+    snapshotManager->setLocalSnapshot(afterInsert);
+    ASSERT_EQ(itCountLocal(), 1);
+    ASSERT_EQ(readStringLocal(id), "Aardvark");
+
+    snapshotManager->setLocalSnapshot(afterUpdate);
+    ASSERT_EQ(itCountLocal(), 1);
+    ASSERT_EQ(readStringLocal(id), "Blue spotted stingray");
+
+    snapshotManager->setLocalSnapshot(afterDelete);
+    ASSERT_EQ(itCountLocal(), 0);
+    ASSERT(!readRecordLocal(id));
+}
 }  // namespace mongo

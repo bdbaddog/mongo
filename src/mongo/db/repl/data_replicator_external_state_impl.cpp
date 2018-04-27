@@ -32,12 +32,43 @@
 
 #include "mongo/db/repl/data_replicator_external_state_impl.h"
 
+#include "mongo/base/init.h"
+#include "mongo/db/repl/oplog_buffer_blocking_queue.h"
+#include "mongo/db/repl/oplog_buffer_collection.h"
+#include "mongo/db/repl/oplog_buffer_proxy.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/repl/replication_coordinator_external_state.h"
+#include "mongo/db/repl/storage_interface.h"
+#include "mongo/db/repl/sync_tail.h"
+#include "mongo/db/server_parameters.h"
 #include "mongo/util/log.h"
 
 namespace mongo {
 namespace repl {
+namespace {
+
+const char kCollectionOplogBufferName[] = "collection";
+const char kBlockingQueueOplogBufferName[] = "inMemoryBlockingQueue";
+
+// Set this to specify whether to use a collection to buffer the oplog on the destination server
+// during initial sync to prevent rolling over the oplog.
+MONGO_EXPORT_STARTUP_SERVER_PARAMETER(initialSyncOplogBuffer,
+                                      std::string,
+                                      kCollectionOplogBufferName);
+
+// Set this to specify size of read ahead buffer in the OplogBufferCollection.
+MONGO_EXPORT_STARTUP_SERVER_PARAMETER(initialSyncOplogBufferPeekCacheSize, int, 10000);
+
+MONGO_INITIALIZER(initialSyncOplogBuffer)(InitializerContext*) {
+    if ((initialSyncOplogBuffer != kCollectionOplogBufferName) &&
+        (initialSyncOplogBuffer != kBlockingQueueOplogBufferName)) {
+        return Status(ErrorCodes::BadValue,
+                      "unsupported initial sync oplog buffer option: " + initialSyncOplogBuffer);
+    }
+    return Status::OK();
+}
+
+}  // namespace
 
 DataReplicatorExternalStateImpl::DataReplicatorExternalStateImpl(
     ReplicationCoordinator* replicationCoordinator,
@@ -47,10 +78,6 @@ DataReplicatorExternalStateImpl::DataReplicatorExternalStateImpl(
 
 executor::TaskExecutor* DataReplicatorExternalStateImpl::getTaskExecutor() const {
     return _replicationCoordinatorExternalState->getTaskExecutor();
-}
-
-OldThreadPool* DataReplicatorExternalStateImpl::getDbWorkThreadPool() const {
-    return _replicationCoordinatorExternalState->getDbWorkThreadPool();
 }
 
 OpTimeWithTerm DataReplicatorExternalStateImpl::getCurrentTermAndLastCommittedOpTime() {
@@ -107,33 +134,29 @@ bool DataReplicatorExternalStateImpl::shouldStopFetching(
 
 std::unique_ptr<OplogBuffer> DataReplicatorExternalStateImpl::makeInitialSyncOplogBuffer(
     OperationContext* opCtx) const {
-    return _replicationCoordinatorExternalState->makeInitialSyncOplogBuffer(opCtx);
-}
-
-std::unique_ptr<OplogBuffer> DataReplicatorExternalStateImpl::makeSteadyStateOplogBuffer(
-    OperationContext* opCtx) const {
-    return _replicationCoordinatorExternalState->makeSteadyStateOplogBuffer(opCtx);
+    if (initialSyncOplogBuffer == kCollectionOplogBufferName) {
+        invariant(initialSyncOplogBufferPeekCacheSize >= 0);
+        OplogBufferCollection::Options options;
+        options.peekCacheSize = std::size_t(initialSyncOplogBufferPeekCacheSize);
+        return stdx::make_unique<OplogBufferProxy>(
+            stdx::make_unique<OplogBufferCollection>(StorageInterface::get(opCtx), options));
+    } else {
+        return stdx::make_unique<OplogBufferBlockingQueue>();
+    }
 }
 
 StatusWith<ReplSetConfig> DataReplicatorExternalStateImpl::getCurrentConfig() const {
     return _replicationCoordinator->getConfig();
 }
 
-StatusWith<OpTime> DataReplicatorExternalStateImpl::_multiApply(
-    OperationContext* opCtx,
-    MultiApplier::Operations ops,
-    MultiApplier::ApplyOperationFn applyOperation) {
-    return _replicationCoordinatorExternalState->multiApply(opCtx, std::move(ops), applyOperation);
-}
-
-Status DataReplicatorExternalStateImpl::_multiSyncApply(MultiApplier::OperationPtrs* ops) {
-    return _replicationCoordinatorExternalState->multiSyncApply(ops);
-}
-
-Status DataReplicatorExternalStateImpl::_multiInitialSyncApply(MultiApplier::OperationPtrs* ops,
-                                                               const HostAndPort& source,
-                                                               AtomicUInt32* fetchCount) {
-    return _replicationCoordinatorExternalState->multiInitialSyncApply(ops, source, fetchCount);
+StatusWith<OpTime> DataReplicatorExternalStateImpl::_multiApply(OperationContext* opCtx,
+                                                                MultiApplier::Operations ops,
+                                                                OplogApplier::Observer* observer,
+                                                                const HostAndPort& source,
+                                                                ThreadPool* writerPool) {
+    SyncTail syncTail(observer, repl::multiInitialSyncApply, writerPool);
+    syncTail.setHostname(source.toString());
+    return syncTail.multiApply(opCtx, std::move(ops));
 }
 
 ReplicationCoordinator* DataReplicatorExternalStateImpl::getReplicationCoordinator() const {

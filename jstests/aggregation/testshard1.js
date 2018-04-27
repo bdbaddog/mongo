@@ -1,3 +1,4 @@
+// @tags: [requires_sharding]
 load('jstests/aggregation/extras/utils.js');
 load('jstests/libs/analyze_plan.js');  // For planHasStage.
 
@@ -9,7 +10,7 @@ jsTestLog("Setting up sharded cluster");
 shardedAggTest.adminCommand({enablesharding: "aggShard"});
 db = shardedAggTest.getDB("aggShard");
 assert.commandWorked(db.adminCommand({setParameter: 1, logComponentVerbosity: {network: 0}}));
-shardedAggTest.ensurePrimaryShard('aggShard', 'shard0000');
+shardedAggTest.ensurePrimaryShard('aggShard', shardedAggTest.shard0.shardName);
 
 /* make sure its cleaned up */
 db.ts1.drop();
@@ -39,7 +40,7 @@ var strings = [
 jsTestLog("Bulk inserting data");
 var nItems = 200000;
 var bulk = db.ts1.initializeUnorderedBulkOp();
-for (i = 1; i <= nItems; ++i) {
+for (i = 0; i < nItems; ++i) {
     bulk.insert({
         _id: i,
         counter: ++count,
@@ -242,7 +243,7 @@ for (var shardName in res.shards) {
     var res = shardDb.ts1.aggregate([{$match: {}}], {explain: true});
     printjson(res);
     assert.commandWorked(res);
-    assert(!planHasStage(res.stages[0].$cursor.queryPlanner.winningPlan, "SHARDING_FILTER"));
+    assert(!planHasStage(db, res.stages[0].$cursor.queryPlanner.winningPlan, "SHARDING_FILTER"));
 }());
 
 (function() {

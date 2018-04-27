@@ -34,10 +34,10 @@
 #include "mongo/db/repl/repl_set_config.h"
 #include "mongo/executor/network_interface_mock.h"
 #include "mongo/executor/thread_pool_task_executor_test_fixture.h"
-#include "mongo/platform/unordered_set.h"
 #include "mongo/stdx/functional.h"
 #include "mongo/stdx/memory.h"
 #include "mongo/stdx/thread.h"
+#include "mongo/stdx/unordered_set.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/mongoutils/str.h"
 
@@ -135,6 +135,8 @@ TEST_F(FreshnessCheckerTest, TwoNodes) {
                                                    << "rs0"
                                                    << "version"
                                                    << 1
+                                                   << "protocolVersion"
+                                                   << 1
                                                    << "members"
                                                    << BSON_ARRAY(BSON("_id" << 1 << "host"
                                                                             << "h0")
@@ -179,6 +181,8 @@ TEST_F(FreshnessCheckerTest, ShuttingDown) {
                                                    << "rs0"
                                                    << "version"
                                                    << 1
+                                                   << "protocolVersion"
+                                                   << 1
                                                    << "members"
                                                    << BSON_ARRAY(BSON("_id" << 1 << "host"
                                                                             << "h0")
@@ -204,6 +208,8 @@ TEST_F(FreshnessCheckerTest, ElectNotElectingSelfWeAreNotFreshest) {
     ReplSetConfig config = assertMakeRSConfig(BSON("_id"
                                                    << "rs0"
                                                    << "version"
+                                                   << 1
+                                                   << "protocolVersion"
                                                    << 1
                                                    << "members"
                                                    << BSON_ARRAY(BSON("_id" << 1 << "host"
@@ -257,6 +263,8 @@ TEST_F(FreshnessCheckerTest, ElectNotElectingSelfWeAreNotFreshestOpTime) {
                                                    << "rs0"
                                                    << "version"
                                                    << 1
+                                                   << "protocolVersion"
+                                                   << 1
                                                    << "members"
                                                    << BSON_ARRAY(BSON("_id" << 1 << "host"
                                                                             << "h0")
@@ -306,6 +314,8 @@ TEST_F(FreshnessCheckerTest, ElectWrongTypeInFreshnessResponse) {
     ReplSetConfig config = assertMakeRSConfig(BSON("_id"
                                                    << "rs0"
                                                    << "version"
+                                                   << 1
+                                                   << "protocolVersion"
                                                    << 1
                                                    << "members"
                                                    << BSON_ARRAY(BSON("_id" << 1 << "host"
@@ -358,6 +368,8 @@ TEST_F(FreshnessCheckerTest, ElectVetoed) {
     ReplSetConfig config = assertMakeRSConfig(BSON("_id"
                                                    << "rs0"
                                                    << "version"
+                                                   << 1
+                                                   << "protocolVersion"
                                                    << 1
                                                    << "members"
                                                    << BSON_ARRAY(BSON("_id" << 1 << "host"
@@ -422,6 +434,8 @@ TEST_F(FreshnessCheckerTest, ElectNotElectingSelfWeAreNotFreshestManyNodes) {
                                                    << "rs0"
                                                    << "version"
                                                    << 1
+                                                   << "protocolVersion"
+                                                   << 1
                                                    << "members"
                                                    << BSON_ARRAY(BSON("_id" << 1 << "host"
                                                                             << "h0")
@@ -444,7 +458,7 @@ TEST_F(FreshnessCheckerTest, ElectNotElectingSelfWeAreNotFreshestManyNodes) {
 
     startTest(Timestamp(10, 0), config, 0, hosts);
     const Date_t startDate = getNet()->now();
-    unordered_set<HostAndPort> seen;
+    stdx::unordered_set<HostAndPort> seen;
     getNet()->enterNetwork();
     for (size_t i = 0; i < hosts.size(); ++i) {
         const NetworkInterfaceMock::NetworkOperationIterator noi = getNet()->getNextReadyRequest();
@@ -482,6 +496,8 @@ TEST_F(FreshnessCheckerTest, ElectNotElectingSelfWeAreNotFreshestOpTimeManyNodes
                                                    << "rs0"
                                                    << "version"
                                                    << 1
+                                                   << "protocolVersion"
+                                                   << 1
                                                    << "members"
                                                    << BSON_ARRAY(BSON("_id" << 1 << "host"
                                                                             << "h0")
@@ -507,7 +523,7 @@ TEST_F(FreshnessCheckerTest, ElectNotElectingSelfWeAreNotFreshestOpTimeManyNodes
 
     startTest(Timestamp(10, 0), config, 0, hosts);
     const Date_t startDate = getNet()->now();
-    unordered_set<HostAndPort> seen;
+    stdx::unordered_set<HostAndPort> seen;
     getNet()->enterNetwork();
 
     for (size_t i = 0; i < hosts.size(); ++i) {
@@ -555,6 +571,8 @@ TEST_F(FreshnessCheckerTest, ElectWrongTypeInFreshnessResponseManyNodes) {
                                                    << "rs0"
                                                    << "version"
                                                    << 1
+                                                   << "protocolVersion"
+                                                   << 1
                                                    << "members"
                                                    << BSON_ARRAY(BSON("_id" << 1 << "host"
                                                                             << "h0")
@@ -577,7 +595,7 @@ TEST_F(FreshnessCheckerTest, ElectWrongTypeInFreshnessResponseManyNodes) {
 
     startTest(Timestamp(10, 0), config, 0, hosts);
     const Date_t startDate = getNet()->now();
-    unordered_set<HostAndPort> seen;
+    stdx::unordered_set<HostAndPort> seen;
     getNet()->enterNetwork();
     for (size_t i = 0; i < hosts.size(); ++i) {
         const NetworkInterfaceMock::NetworkOperationIterator noi = getNet()->getNextReadyRequest();
@@ -617,6 +635,8 @@ TEST_F(FreshnessCheckerTest, ElectVetoedManyNodes) {
                                                    << "rs0"
                                                    << "version"
                                                    << 1
+                                                   << "protocolVersion"
+                                                   << 1
                                                    << "members"
                                                    << BSON_ARRAY(BSON("_id" << 1 << "host"
                                                                             << "h0")
@@ -639,7 +659,7 @@ TEST_F(FreshnessCheckerTest, ElectVetoedManyNodes) {
 
     startTest(Timestamp(10, 0), config, 0, hosts);
     const Date_t startDate = getNet()->now();
-    unordered_set<HostAndPort> seen;
+    stdx::unordered_set<HostAndPort> seen;
     getNet()->enterNetwork();
     for (size_t i = 0; i < hosts.size(); ++i) {
         const NetworkInterfaceMock::NetworkOperationIterator noi = getNet()->getNextReadyRequest();
@@ -679,6 +699,8 @@ TEST_F(FreshnessCheckerTest, ElectVetoedAndTiedFreshnessManyNodes) {
                                                    << "rs0"
                                                    << "version"
                                                    << 1
+                                                   << "protocolVersion"
+                                                   << 1
                                                    << "members"
                                                    << BSON_ARRAY(BSON("_id" << 1 << "host"
                                                                             << "h0")
@@ -704,7 +726,7 @@ TEST_F(FreshnessCheckerTest, ElectVetoedAndTiedFreshnessManyNodes) {
 
     startTest(Timestamp(10, 0), config, 0, hosts);
     const Date_t startDate = getNet()->now();
-    unordered_set<HostAndPort> seen;
+    stdx::unordered_set<HostAndPort> seen;
     getNet()->enterNetwork();
 
     for (size_t i = 0; i < hosts.size(); ++i) {
@@ -757,6 +779,8 @@ TEST_F(FreshnessCheckerTest, ElectManyNodesNotAllRespond) {
                                                    << "rs0"
                                                    << "version"
                                                    << 1
+                                                   << "protocolVersion"
+                                                   << 1
                                                    << "members"
                                                    << BSON_ARRAY(BSON("_id" << 1 << "host"
                                                                             << "h0")
@@ -780,7 +804,7 @@ TEST_F(FreshnessCheckerTest, ElectManyNodesNotAllRespond) {
 
     startTest(Timestamp(10, 0), config, 0, hosts);
     const Date_t startDate = getNet()->now();
-    unordered_set<HostAndPort> seen;
+    stdx::unordered_set<HostAndPort> seen;
     getNet()->enterNetwork();
     for (size_t i = 0; i < hosts.size(); ++i) {
         const NetworkInterfaceMock::NetworkOperationIterator noi = getNet()->getNextReadyRequest();
@@ -822,6 +846,8 @@ public:
             .initialize(BSON("_id"
                              << "rs0"
                              << "version"
+                             << 1
+                             << "protocolVersion"
                              << 1
                              << "members"
                              << BSON_ARRAY(BSON("_id" << 0 << "host"

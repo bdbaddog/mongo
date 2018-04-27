@@ -10,6 +10,17 @@
 (function() {
     "use strict";
 
+    // Skip this test if running with --nojournal and WiredTiger.
+    if (jsTest.options().noJournal &&
+        (!jsTest.options().storageEngine || jsTest.options().storageEngine === "wiredTiger")) {
+        print("Skipping test because running WiredTiger without journaling isn't a valid" +
+              " replica set configuration");
+        return;
+    }
+
+    // Skip db hash check because delayed secondary will not catch up to primary.
+    TestData.skipCheckDBHashes = true;
+
     // Skip this test if not running with the "wiredTiger" storage engine.
     var storageEngine = jsTest.options().storageEngine || "wiredTiger";
     if (storageEngine !== "wiredTiger") {
@@ -34,7 +45,9 @@
         conf.members[1].slaveDelay = 24 * 60 * 60;
 
         rst.startSet();
-        rst.initiateWithAnyNodeAsPrimary(conf);
+        // We cannot wait for a stable checkpoint due to the slaveDelay.
+        rst.initiateWithAnyNodeAsPrimary(
+            conf, "replSetInitiate", {doNotWaitForStableCheckpoint: true});
         var master = rst.getPrimary();  // Waits for PRIMARY state.
 
         // Reconfigure primary with a small cache size so less data needs to be
@@ -57,5 +70,6 @@
             }
             assert.writeOK(batch.execute());
         }
+        rst.stopSet();
     }
 })();

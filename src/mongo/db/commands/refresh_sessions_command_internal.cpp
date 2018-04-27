@@ -46,8 +46,8 @@ class RefreshSessionsCommandInternal final : public BasicCommand {
 public:
     RefreshSessionsCommandInternal() : BasicCommand("refreshSessionsInternal") {}
 
-    bool slaveOk() const override {
-        return true;
+    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
+        return AllowedOnSecondary::kAlways;
     }
     bool adminOnly() const override {
         return false;
@@ -55,12 +55,12 @@ public:
     bool supportsWriteConcern(const BSONObj& cmd) const override {
         return false;
     }
-    void help(std::stringstream& help) const override {
-        help << "renew a set of logical sessions";
+    std::string help() const override {
+        return "renew a set of logical sessions";
     }
     Status checkAuthForOperation(OperationContext* opCtx,
                                  const std::string& dbname,
-                                 const BSONObj& cmdObj) override {
+                                 const BSONObj& cmdObj) const override {
         // Must be authenticated as an internal cluster member.
         auto authSession = AuthorizationSession::get(opCtx->getClient());
         if (!authSession->isAuthorizedForPrivilege(
@@ -79,7 +79,7 @@ public:
         auto res =
             LogicalSessionCache::get(opCtx->getServiceContext())->refreshSessions(opCtx, cmd);
         if (!res.isOK()) {
-            return appendCommandStatus(result, res);
+            return CommandHelpers::appendCommandStatus(result, res);
         }
 
         return true;

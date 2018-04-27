@@ -33,6 +33,8 @@
 #include "mongo/base/status.h"
 #include "mongo/bson/bson_depth.h"
 #include "mongo/crypto/mechanism_scram.h"
+#include "mongo/crypto/sha1_block.h"
+#include "mongo/crypto/sha256_block.h"
 #include "mongo/db/auth/action_type.h"
 #include "mongo/db/auth/authorization_manager.h"
 #include "mongo/db/auth/authorization_session_for_test.h"
@@ -44,7 +46,6 @@
 #include "mongo/db/json.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_context.h"
-#include "mongo/db/server_options.h"
 #include "mongo/db/service_context_noop.h"
 #include "mongo/stdx/memory.h"
 #include "mongo/transport/session.h"
@@ -96,8 +97,6 @@ public:
     BSONObj credentials;
 
     void setUp() {
-        serverGlobalParams.featureCompatibility.setVersion(
-            ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo36);
         session = transportLayer.createSession();
         client = serviceContext.makeClient("testClient", session);
         RestrictionEnvironment::set(
@@ -115,8 +114,12 @@ public:
         authzSession = stdx::make_unique<AuthorizationSessionForTest>(std::move(localSessionState));
         authzManager->setAuthEnabled(true);
 
-        credentials = BSON("SCRAM-SHA-1" << scram::generateCredentials(
-                               "a", saslGlobalParams.scramIterationCount.load()));
+        credentials =
+            BSON("SCRAM-SHA-1" << scram::Secrets<SHA1Block>::generateCredentials(
+                                      "a", saslGlobalParams.scramSHA1IterationCount.load())
+                               << "SCRAM-SHA-256"
+                               << scram::Secrets<SHA256Block>::generateCredentials(
+                                      "a", saslGlobalParams.scramSHA256IterationCount.load()));
     }
 };
 

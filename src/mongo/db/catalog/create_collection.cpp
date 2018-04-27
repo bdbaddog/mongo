@@ -35,6 +35,7 @@
 #include "mongo/bson/bsonobj.h"
 #include "mongo/db/catalog/database_holder.h"
 #include "mongo/db/catalog/uuid_catalog.h"
+#include "mongo/db/command_generic_argument.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/curop.h"
@@ -72,7 +73,7 @@ Status createCollection(OperationContext* opCtx,
     BSONObjBuilder optionsBuilder;
     while (it.more()) {
         const auto elem = it.next();
-        if (!Command::isGenericArgument(elem.fieldNameStringData()))
+        if (!isGenericArgument(elem.fieldNameStringData()))
             optionsBuilder.append(elem);
         if (elem.fieldNameStringData() == "viewOn") {
             // Views don't have UUIDs so it should always be parsed for command.
@@ -119,7 +120,7 @@ Status createCollection(OperationContext* opCtx,
                         const BSONObj& cmdObj,
                         const BSONObj& idIndex) {
     return createCollection(opCtx,
-                            Command::parseNsCollectionRequired(dbName, cmdObj),
+                            CommandHelpers::parseNsCollectionRequired(dbName, cmdObj),
                             cmdObj,
                             idIndex,
                             CollectionOptions::parseForCommand);
@@ -132,7 +133,7 @@ Status createCollectionForApplyOps(OperationContext* opCtx,
                                    const BSONObj& idIndex) {
     invariant(opCtx->lockState()->isDbLockedForMode(dbName, MODE_X));
 
-    const NamespaceString newCollName(Command::parseNsCollectionRequired(dbName, cmdObj));
+    const NamespaceString newCollName(CommandHelpers::parseNsCollectionRequired(dbName, cmdObj));
     auto newCmd = cmdObj;
 
     auto* const serviceContext = opCtx->getServiceContext();
@@ -188,13 +189,11 @@ Status createCollectionForApplyOps(OperationContext* opCtx,
                     auto tmpNameResult =
                         db->makeUniqueCollectionNamespace(opCtx, "tmp%%%%%.create");
                     if (!tmpNameResult.isOK()) {
-                        return Result(Status(tmpNameResult.getStatus().code(),
-                                             str::stream() << "Cannot generate temporary "
-                                                              "collection namespace for applyOps "
-                                                              "create command: collection: "
-                                                           << newCollName.ns()
-                                                           << ". error: "
-                                                           << tmpNameResult.getStatus().reason()));
+                        return Result(tmpNameResult.getStatus().withContext(
+                            str::stream() << "Cannot generate temporary "
+                                             "collection namespace for applyOps "
+                                             "create command: collection: "
+                                          << newCollName.ns()));
                     }
                     const auto& tmpName = tmpNameResult.getValue();
                     // It is ok to log this because this doesn't happen very frequently.
@@ -209,7 +208,6 @@ Status createCollectionForApplyOps(OperationContext* opCtx,
                                                    newCollName,
                                                    tmpName,
                                                    futureColl->uuid(),
-                                                   /*dropTarget*/ false,
                                                    /*dropTargetUUID*/ {},
                                                    stayTemp);
                 }
@@ -230,7 +228,6 @@ Status createCollectionForApplyOps(OperationContext* opCtx,
                                                    currentName,
                                                    newCollName,
                                                    uuid,
-                                                   /*dropTarget*/ false,
                                                    /*dropTargetUUID*/ {},
                                                    stayTemp);
 

@@ -37,8 +37,10 @@
 
 #include "mongo/base/data_range.h"
 #include "mongo/base/data_range_cursor.h"
+#include "mongo/client/embedded/libmongodbcapi.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/shared_buffer.h"
+
 enum RPCState { WaitingForMessageLength, WaitingForMessageContent, HaveOutput };
 
 struct FreeDeleter {
@@ -90,11 +92,11 @@ extern "C" ssize_t mongoc_stream_embedded_writev(mongoc_stream_t* s,
         char* current_loc = static_cast<char*>(iov[i].iov_base);
         u_long remaining_iov = iov[i].iov_len;
 
-        // @TODO for now just not handling vecs of this size
-        invariant(remaining_iov >= 4);
-
         // do we need a new message?
         if (stream->state == RPCState::WaitingForMessageLength) {
+
+            invariant(remaining_iov >= 4);
+
             // message length is the first four bytes
             // Should use dataview from mongo server
             stream->input_length_to_go =
@@ -138,7 +140,7 @@ extern "C" ssize_t mongoc_stream_embedded_writev(mongoc_stream_t* s,
                                                            input_len,
                                                            &(stream->libmongo_output),
                                                            &(stream->libmongo_output_size));
-            if (retVal != LIBMONGODB_CAPI_ERROR_SUCCESS) {
+            if (retVal != LIBMONGODB_CAPI_SUCCESS) {
                 return -1;
             }
 

@@ -31,6 +31,7 @@
 
 #include <algorithm>
 
+#include "mongo/base/checked_cast.h"
 #include "mongo/db/pipeline/document_source_change_stream.h"
 #include "mongo/executor/task_executor_pool.h"
 #include "mongo/s/client/shard_registry.h"
@@ -55,9 +56,11 @@ bool needsUpdate(const StatusWith<ClusterQueryResult>& childResult) {
 RouterStageUpdateOnAddShard::RouterStageUpdateOnAddShard(OperationContext* opCtx,
                                                          executor::TaskExecutor* executor,
                                                          ClusterClientCursorParams* params,
+                                                         std::vector<ShardId> shardIds,
                                                          BSONObj cmdToRunOnNewShards)
     : RouterExecStage(opCtx, stdx::make_unique<RouterStageMerge>(opCtx, executor, params)),
       _params(params),
+      _shardIds(std::move(shardIds)),
       _cmdToRunOnNewShards(cmdToRunOnNewShards) {}
 
 StatusWith<ClusterQueryResult> RouterStageUpdateOnAddShard::next(
@@ -65,35 +68,20 @@ StatusWith<ClusterQueryResult> RouterStageUpdateOnAddShard::next(
     auto childStage = getChildStage();
     auto childResult = childStage->next(execContext);
     while (needsUpdate(childResult)) {
-        auto status = addNewShardCursors(*childResult.getValue().getResult());
-        if (!status.isOK())
-            return status;
+        addNewShardCursors(*childResult.getValue().getResult());
         childResult = childStage->next(execContext);
     }
     return childResult;
 }
 
-Status RouterStageUpdateOnAddShard::addNewShardCursors(BSONObj newShardDetectedObj) {
-    std::vector<ShardId> existingShardIds;
-    for (const auto& remote : _params->remotes) {
-        existingShardIds.push_back(remote.shardId);
-    }
-    auto newRemotes =
-        establishShardCursorsOnNewShards(std::move(existingShardIds), newShardDetectedObj);
-    if (!newRemotes.isOK())
-        return newRemotes.getStatus();
-    static_cast<RouterStageMerge*>(getChildStage())
-        ->addNewShardCursors(std::move(newRemotes.getValue()));
-    return Status::OK();
+void RouterStageUpdateOnAddShard::addNewShardCursors(BSONObj newShardDetectedObj) {
+    checked_cast<RouterStageMerge*>(getChildStage())
+        ->addNewShardCursors(establishShardCursorsOnNewShards(newShardDetectedObj));
 }
 
-StatusWith<std::vector<ClusterClientCursorParams::RemoteCursor>>
-RouterStageUpdateOnAddShard::establishShardCursorsOnNewShards(std::vector<ShardId> existingShardIds,
-                                                              const BSONObj& newShardDetectedObj) {
+std::vector<RemoteCursor> RouterStageUpdateOnAddShard::establishShardCursorsOnNewShards(
+    const BSONObj& newShardDetectedObj) {
     auto* opCtx = getOpCtx();
-    // Temporarily remove any deadline from this operation to avoid timing out while creating new
-    // cursors.
-    OperationContext::DeadlineStash deadlineStash(opCtx);
     // Reload the shard registry.  We need to ensure a reload initiated after calling this method
     // caused the reload, otherwise we aren't guaranteed to get all the new shards.
     auto* shardRegistry = Grid::get(opCtx)->shardRegistry();
@@ -105,13 +93,13 @@ RouterStageUpdateOnAddShard::establishShardCursorsOnNewShards(std::vector<ShardI
     }
 
     std::vector<ShardId> shardIds, newShardIds;
-    shardRegistry->getAllShardIds(&shardIds);
-    std::sort(existingShardIds.begin(), existingShardIds.end());
+    shardRegistry->getAllShardIdsNoReload(&shardIds);
+    std::sort(_shardIds.begin(), _shardIds.end());
     std::sort(shardIds.begin(), shardIds.end());
     std::set_difference(shardIds.begin(),
                         shardIds.end(),
-                        existingShardIds.begin(),
-                        existingShardIds.end(),
+                        _shardIds.begin(),
+                        _shardIds.end(),
                         std::back_inserter(newShardIds));
 
     auto cmdObj = DocumentSourceChangeStream::replaceResumeTokenInCommand(
@@ -120,19 +108,15 @@ RouterStageUpdateOnAddShard::establishShardCursorsOnNewShards(std::vector<ShardI
     std::vector<std::pair<ShardId, BSONObj>> requests;
     for (const auto& shardId : newShardIds) {
         requests.emplace_back(shardId, cmdObj);
+        _shardIds.push_back(shardId);
     }
-    BSONObj* viewDefinitionOut = nullptr;    // Views are not allowed
     const bool allowPartialResults = false;  // partial results are not allowed
-    auto swCursors = establishCursors(opCtx,
-                                      Grid::get(opCtx)->getExecutorPool()->getArbitraryExecutor(),
-                                      _params->nsString,
-                                      _params->readPreference.value_or(ReadPreferenceSetting()),
-                                      requests,
-                                      allowPartialResults,
-                                      viewDefinitionOut);
-    // We aren't using shard routing information, so stale routing info shouldn't be possible and
-    // there is no need to check for stale sharding errors here.
-    return swCursors;
+    return establishCursors(opCtx,
+                            Grid::get(opCtx)->getExecutorPool()->getArbitraryExecutor(),
+                            _params->nsString,
+                            _params->readPreference.value_or(ReadPreferenceSetting()),
+                            requests,
+                            allowPartialResults);
 }
 
 }  // namespace mongo

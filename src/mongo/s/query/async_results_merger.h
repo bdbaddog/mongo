@@ -37,7 +37,7 @@
 #include "mongo/bson/bsonobj.h"
 #include "mongo/db/cursor_id.h"
 #include "mongo/executor/task_executor.h"
-#include "mongo/s/query/cluster_client_cursor_params.h"
+#include "mongo/s/query/async_results_merger_params_gen.h"
 #include "mongo/s/query/cluster_query_result.h"
 #include "mongo/stdx/mutex.h"
 #include "mongo/util/concurrency/with_lock.h"
@@ -75,6 +75,13 @@ class AsyncResultsMerger {
     MONGO_DISALLOW_COPYING(AsyncResultsMerger);
 
 public:
+    // When mongos has to do a merge in order to return results to the client in the correct sort
+    // order, it requests a sortKey meta-projection using this field name.
+    static constexpr StringData kSortKeyField = "$sortKey"_sd;
+
+    // The expected sort key pattern when 'compareWholeSortKey' is true.
+    static const BSONObj kWholeSortKeySortPattern;
+
     /**
      * Takes ownership of the cursors from ClusterClientCursorParams by storing their cursorIds and
      * the hosts on which they exist in _remotes.
@@ -91,13 +98,13 @@ public:
      */
     AsyncResultsMerger(OperationContext* opCtx,
                        executor::TaskExecutor* executor,
-                       ClusterClientCursorParams* params);
+                       AsyncResultsMergerParams params);
 
     /**
      * In order to be destroyed, either the ARM must have been kill()'ed or all cursors must have
      * been exhausted. This is so that any unexhausted cursors are cleaned up by the ARM.
      */
-    virtual ~AsyncResultsMerger();
+    ~AsyncResultsMerger();
 
     /**
      * Returns true if all of the remote cursors are exhausted.
@@ -160,6 +167,12 @@ public:
     StatusWith<ClusterQueryResult> nextReady();
 
     /**
+     * Blocks until the next result is ready, all remote cursors are exhausted, or there is an
+     * error.
+     */
+    StatusWith<ClusterQueryResult> blockingNext();
+
+    /**
      * Schedules remote work as required in order to make further results available. If there is an
      * error in scheduling this work, returns a non-ok status. On success, returns an event handle.
      * The caller can pass this event handle to 'executor' in order to be blocked until further
@@ -182,14 +195,19 @@ public:
      * Adds the specified shard cursors to the set of cursors to be merged.  The results from the
      * new cursors will be returned as normal through nextReady().
      */
-    void addNewShardCursors(const std::vector<ClusterClientCursorParams::RemoteCursor>& newCursors);
+    void addNewShardCursors(std::vector<RemoteCursor>&& newCursors);
+
+    std::size_t getNumRemotes() const {
+        return _remotes.size();
+    }
 
     /**
-     * Starts shutting down this ARM by canceling all pending requests. Returns a handle to an event
-     * that is signaled when this ARM is safe to destroy.
+     * Starts shutting down this ARM by canceling all pending requests and scheduling killCursors
+     * on all of the unexhausted remotes. Returns a handle to an event that is signaled when this
+     * ARM is safe to destroy.
+     *
      * If there are no pending requests, schedules killCursors and signals the event immediately.
-     * Otherwise, the last callback that runs after kill() is called schedules killCursors and
-     * signals the event.
+     * Otherwise, the last callback that runs after kill() is called signals the event.
      *
      * Returns an invalid handle if the underlying task executor is shutting down. In this case,
      * killing is considered complete and the ARM may be destroyed immediately.
@@ -201,6 +219,11 @@ public:
      * operation context.
      */
     executor::TaskExecutor::EventHandle kill(OperationContext* opCtx);
+
+    /**
+     * A blocking version of kill() that will not return until this is safe to destroy.
+     */
+    void blockingKill(OperationContext*);
 
 private:
     /**
@@ -228,11 +251,6 @@ private:
          * its cursor).
          */
         bool exhausted() const;
-
-        /**
-         * Returns the Shard object associated with this remote cursor.
-         */
-        std::shared_ptr<Shard> getShard();
 
         // Used when merging tailable awaitData cursors in sorted order. In order to return any
         // result to the client we have to know that no shard will ever return anything that sorts
@@ -279,7 +297,7 @@ private:
     private:
         const std::vector<RemoteCursorData>& _remotes;
 
-        const BSONObj& _sort;
+        const BSONObj _sort;
 
         // When '_compareWholeSortKey' is true, $sortKey is a scalar value, rather than an object.
         // We extract the sort key {$sortKey: <value>}. The sort key pattern '_sort' is verified to
@@ -387,11 +405,8 @@ private:
 
     OperationContext* _opCtx;
     executor::TaskExecutor* _executor;
-    ClusterClientCursorParams* _params;
-
-    // The metadata obj to pass along with the command request. Used to indicate that the command is
-    // ok to run on secondaries.
-    BSONObj _metadataObj;
+    TailableModeEnum _tailableMode;
+    AsyncResultsMergerParams _params;
 
     // Must be acquired before accessing any data members (other than _params, which is read-only).
     stdx::mutex _mutex;
@@ -423,9 +438,9 @@ private:
 
     LifecycleState _lifecycleState = kAlive;
 
-    // Signaled when all outstanding batch request callbacks have run, and all killCursors commands
-    // have been scheduled. This means that the ARM is safe to delete.
-    executor::TaskExecutor::EventHandle _killCursorsScheduledEvent;
+    // Signaled when all outstanding batch request callbacks have run after kill() has been
+    // called. This means that the ARM is safe to delete.
+    executor::TaskExecutor::EventHandle _killCompleteEvent;
 };
 
 }  // namespace mongo

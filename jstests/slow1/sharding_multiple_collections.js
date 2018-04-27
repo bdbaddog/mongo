@@ -1,10 +1,12 @@
+// @tags: [requires_sharding]
+
 (function() {
     'use strict';
 
     var s = new ShardingTest({shards: 2, mongos: 1, other: {chunkSize: 1, enableBalancer: true}});
 
     assert.commandWorked(s.s0.adminCommand({enablesharding: "test"}));
-    s.ensurePrimaryShard('test', 'shard0001');
+    s.ensurePrimaryShard('test', s.shard1.shardName);
 
     var S = "";
     while (S.length < 500) {

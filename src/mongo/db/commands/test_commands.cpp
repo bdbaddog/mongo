@@ -40,11 +40,11 @@
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/client.h"
 #include "mongo/db/commands.h"
+#include "mongo/db/commands/test_commands_enabled.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/index_builder.h"
 #include "mongo/db/op_observer.h"
 #include "mongo/db/query/internal_plans.h"
-#include "mongo/db/repl/replication_coordinator_global.h"
 #include "mongo/db/service_context.h"
 #include "mongo/util/log.h"
 
@@ -62,8 +62,8 @@ public:
     virtual bool adminOnly() const {
         return false;
     }
-    virtual bool slaveOk() const {
-        return true;
+    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
+        return AllowedOnSecondary::kAlways;
     }
     virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
         return true;
@@ -71,16 +71,16 @@ public:
     // No auth needed because it only works when enabled via command line.
     virtual void addRequiredPrivileges(const std::string& dbname,
                                        const BSONObj& cmdObj,
-                                       std::vector<Privilege>* out) {}
-    virtual void help(stringstream& help) const {
-        help << "internal. for testing only.";
+                                       std::vector<Privilege>* out) const {}
+    std::string help() const override {
+        return "internal. for testing only.";
     }
     virtual bool errmsgRun(OperationContext* opCtx,
                            const string& dbname,
                            const BSONObj& cmdObj,
                            string& errmsg,
                            BSONObjBuilder& result) {
-        const NamespaceString nss(parseNsCollectionRequired(dbname, cmdObj));
+        const NamespaceString nss(CommandHelpers::parseNsCollectionRequired(dbname, cmdObj));
         log() << "test only command godinsert invoked coll:" << nss.coll();
         BSONObj obj = cmdObj["obj"].embeddedObjectUserCheck();
 
@@ -103,7 +103,7 @@ public:
         if (status.isOK()) {
             wunit.commit();
         }
-        return appendCommandStatus(result, status);
+        return CommandHelpers::appendCommandStatus(result, status);
     }
 };
 
@@ -118,25 +118,25 @@ public:
         return true;
     }
 
-    virtual bool slaveOk() const {
-        return true;
+    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
+        return AllowedOnSecondary::kAlways;
     }
 
-    virtual void help(stringstream& help) const {
-        help << "internal testing command. Run a no-op command for an arbitrary amount of time. ";
-        help << "If neither 'secs' nor 'millis' is set, command will sleep for 10 seconds. ";
-        help << "If both are set, command will sleep for the sum of 'secs' and 'millis.'\n";
-        help << "   w:<bool> (deprecated: use 'lock' instead) if true, takes a write lock.\n";
-        help << "   lock: r, w, none. If r or w, db will block under a lock. Defaults to r.";
-        help << " 'lock' and 'w' may not both be set.\n";
-        help << "   secs:<seconds> Amount of time to sleep, in seconds.\n";
-        help << "   millis:<milliseconds> Amount of time to sleep, in ms.\n";
+    std::string help() const override {
+        return "internal testing command. Run a no-op command for an arbitrary amount of time. "
+               "If neither 'secs' nor 'millis' is set, command will sleep for 10 seconds. "
+               "If both are set, command will sleep for the sum of 'secs' and 'millis.'\n"
+               "   w:<bool> (deprecated: use 'lock' instead) if true, takes a write lock.\n"
+               "   lock: r, w, none. If r or w, db will block under a lock. Defaults to r."
+               " 'lock' and 'w' may not both be set.\n"
+               "   secs:<seconds> Amount of time to sleep, in seconds.\n"
+               "   millis:<milliseconds> Amount of time to sleep, in ms.\n";
     }
 
     // No auth needed because it only works when enabled via command line.
     virtual void addRequiredPrivileges(const std::string& dbname,
                                        const BSONObj& cmdObj,
-                                       std::vector<Privilege>* out) {}
+                                       std::vector<Privilege>* out) const {}
 
     void _sleepInReadLock(mongo::OperationContext* opCtx, long long millis) {
         Lock::GlobalRead lk(opCtx);
@@ -201,8 +201,8 @@ public:
 class CapTrunc : public BasicCommand {
 public:
     CapTrunc() : BasicCommand("captrunc") {}
-    virtual bool slaveOk() const {
-        return false;
+    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
+        return AllowedOnSecondary::kNever;
     }
     virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
         return true;
@@ -210,14 +210,14 @@ public:
     // No auth needed because it only works when enabled via command line.
     virtual void addRequiredPrivileges(const std::string& dbname,
                                        const BSONObj& cmdObj,
-                                       std::vector<Privilege>* out) {}
+                                       std::vector<Privilege>* out) const {}
     virtual bool run(OperationContext* opCtx,
                      const string& dbname,
                      const BSONObj& cmdObj,
                      BSONObjBuilder& result) {
-        const NamespaceString fullNs = parseNsCollectionRequired(dbname, cmdObj);
+        const NamespaceString fullNs = CommandHelpers::parseNsCollectionRequired(dbname, cmdObj);
         if (!fullNs.isValid()) {
-            return appendCommandStatus(
+            return CommandHelpers::appendCommandStatus(
                 result,
                 {ErrorCodes::InvalidNamespace,
                  str::stream() << "collection name " << fullNs.ns() << " is not valid"});
@@ -227,23 +227,23 @@ public:
         bool inc = cmdObj.getBoolField("inc");  // inclusive range?
 
         if (n <= 0) {
-            return appendCommandStatus(result,
-                                       {ErrorCodes::BadValue, "n must be a positive integer"});
+            return CommandHelpers::appendCommandStatus(
+                result, {ErrorCodes::BadValue, "n must be a positive integer"});
         }
 
         // Lock the database in mode IX and lock the collection exclusively.
         AutoGetCollection autoColl(opCtx, fullNs, MODE_IX, MODE_X);
         Collection* collection = autoColl.getCollection();
         if (!collection) {
-            return appendCommandStatus(
+            return CommandHelpers::appendCommandStatus(
                 result,
                 {ErrorCodes::NamespaceNotFound,
                  str::stream() << "collection " << fullNs.ns() << " does not exist"});
         }
 
         if (!collection->isCapped()) {
-            return appendCommandStatus(result,
-                                       {ErrorCodes::IllegalOperation, "collection must be capped"});
+            return CommandHelpers::appendCommandStatus(
+                result, {ErrorCodes::IllegalOperation, "collection must be capped"});
         }
 
         RecordId end;
@@ -257,7 +257,7 @@ public:
             for (int i = 0; i < n + 1; ++i) {
                 PlanExecutor::ExecState state = exec->getNext(nullptr, &end);
                 if (PlanExecutor::ADVANCED != state) {
-                    return appendCommandStatus(
+                    return CommandHelpers::appendCommandStatus(
                         result,
                         {ErrorCodes::IllegalOperation,
                          str::stream() << "invalid n, collection contains fewer than " << n
@@ -276,8 +276,8 @@ public:
 class EmptyCapped : public BasicCommand {
 public:
     EmptyCapped() : BasicCommand("emptycapped") {}
-    virtual bool slaveOk() const {
-        return false;
+    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
+        return AllowedOnSecondary::kNever;
     }
     virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
         return true;
@@ -285,22 +285,22 @@ public:
     // No auth needed because it only works when enabled via command line.
     virtual void addRequiredPrivileges(const std::string& dbname,
                                        const BSONObj& cmdObj,
-                                       std::vector<Privilege>* out) {}
+                                       std::vector<Privilege>* out) const {}
 
     virtual bool run(OperationContext* opCtx,
                      const string& dbname,
                      const BSONObj& cmdObj,
                      BSONObjBuilder& result) {
-        const NamespaceString nss = parseNsCollectionRequired(dbname, cmdObj);
+        const NamespaceString nss = CommandHelpers::parseNsCollectionRequired(dbname, cmdObj);
 
-        return appendCommandStatus(result, emptyCapped(opCtx, nss));
+        return CommandHelpers::appendCommandStatus(result, emptyCapped(opCtx, nss));
     }
 };
 
 // ----------------------------
 
 MONGO_INITIALIZER(RegisterEmptyCappedCmd)(InitializerContext* context) {
-    if (Command::testCommandsEnabled) {
+    if (getTestCommandsEnabled()) {
         // Leaked intentionally: a Command registers itself when constructed.
         new CapTrunc();
         new CmdSleep();

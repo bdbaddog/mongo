@@ -84,8 +84,8 @@ class KillSessionsCommand final : public BasicCommand {
 public:
     KillSessionsCommand() : BasicCommand("killSessions") {}
 
-    bool slaveOk() const override {
-        return true;
+    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
+        return AllowedOnSecondary::kAlways;
     }
     bool adminOnly() const override {
         return false;
@@ -93,20 +93,14 @@ public:
     bool supportsWriteConcern(const BSONObj& cmd) const override {
         return false;
     }
-    void help(std::stringstream& help) const override {
-        help << "kill a logical session and its operations";
+    std::string help() const override {
+        return "kill a logical session and its operations";
     }
 
     // Any user can kill their own sessions
     Status checkAuthForOperation(OperationContext* opCtx,
                                  const std::string& dbname,
-                                 const BSONObj& cmdObj) override {
-
-        if (serverGlobalParams.featureCompatibility.getVersion() !=
-            ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo36) {
-            return SessionsCommandFCV34Status(getName());
-        }
-
+                                 const BSONObj& cmdObj) const override {
         return Status::OK();
     }
 
@@ -114,12 +108,6 @@ public:
                      const std::string& db,
                      const BSONObj& cmdObj,
                      BSONObjBuilder& result) override {
-
-        if (serverGlobalParams.featureCompatibility.getVersion() !=
-            ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo36) {
-            return appendCommandStatus(result, SessionsCommandFCV34Status(getName()));
-        }
-
         IDLParserErrorContext ctx("KillSessionsCmd");
         auto ksc = KillSessionsCmdFromClient::parse(ctx, cmdObj);
 
@@ -139,7 +127,8 @@ public:
             }
         }
 
-        return appendCommandStatus(result, killSessionsCmdHelper(opCtx, result, patterns));
+        return CommandHelpers::appendCommandStatus(result,
+                                                   killSessionsCmdHelper(opCtx, result, patterns));
     }
 } killSessionsCommand;
 

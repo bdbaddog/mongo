@@ -54,18 +54,14 @@ protected:
     }
 
     void expectGetDatabase() {
-        expectFindOnConfigSendBSONObjVector([&]() {
-            DatabaseType db;
-            db.setName(kNss.db().toString());
-            db.setPrimary({"0"});
-            db.setSharded(true);
-
+        expectFindSendBSONObjVector(kConfigHostAndPort, [&]() {
+            DatabaseType db(kNss.db().toString(), {"0"}, true);
             return std::vector<BSONObj>{db.toBSON()};
         }());
     }
 
     void expectGetCollection(OID epoch, const ShardKeyPattern& shardKeyPattern) {
-        expectFindOnConfigSendBSONObjVector([&]() {
+        expectFindSendBSONObjVector(kConfigHostAndPort, [&]() {
             CollectionType collType;
             collType.setNs(kNss);
             collType.setEpoch(epoch);
@@ -87,7 +83,7 @@ TEST_F(CatalogCacheRefreshTest, FullLoad) {
     expectGetCollection(epoch, shardKeyPattern);
 
     expectGetCollection(epoch, shardKeyPattern);
-    expectFindOnConfigSendBSONObjVector([&]() {
+    expectFindSendBSONObjVector(kConfigHostAndPort, [&]() {
         ChunkVersion version(1, 0, epoch);
 
         ChunkType chunk1(kNss,
@@ -126,16 +122,16 @@ TEST_F(CatalogCacheRefreshTest, DatabaseNotFound) {
 
     // Return an empty database (need to return it twice because for missing databases, the
     // CatalogClient tries twice)
-    expectFindOnConfigSendBSONObjVector({});
-    expectFindOnConfigSendBSONObjVector({});
+    expectFindSendBSONObjVector(kConfigHostAndPort, {});
+    expectFindSendBSONObjVector(kConfigHostAndPort, {});
 
     try {
         auto routingInfo = future.timed_get(kFutureTimeout);
         auto cm = routingInfo->cm();
-        auto primary = routingInfo->primary();
+        auto primary = routingInfo->db().primary();
 
         FAIL(str::stream() << "Returning no database did not fail and returned "
-                           << (cm ? cm->toString() : routingInfo->primaryId().toString()));
+                           << (cm ? cm->toString() : routingInfo->db().primaryId().toString()));
     } catch (const DBException& ex) {
         ASSERT_EQ(ErrorCodes::NamespaceNotFound, ex.code());
     }
@@ -145,17 +141,18 @@ TEST_F(CatalogCacheRefreshTest, DatabaseBSONCorrupted) {
     auto future = scheduleRoutingInfoRefresh(kNss);
 
     // Return a corrupted database entry
-    expectFindOnConfigSendBSONObjVector(
-        {BSON("BadValue"
-              << "This value should not be in a database config document")});
+    expectFindSendBSONObjVector(kConfigHostAndPort,
+                                {BSON(
+                                    "BadValue"
+                                    << "This value should not be in a database config document")});
 
     try {
         auto routingInfo = future.timed_get(kFutureTimeout);
         auto cm = routingInfo->cm();
-        auto primary = routingInfo->primary();
+        auto primary = routingInfo->db().primary();
 
         FAIL(str::stream() << "Returning corrupted database entry did not fail and returned "
-                           << (cm ? cm->toString() : routingInfo->primaryId().toString()));
+                           << (cm ? cm->toString() : routingInfo->db().primaryId().toString()));
     } catch (const DBException& ex) {
         ASSERT_EQ(ErrorCodes::NoSuchKey, ex.code());
     }
@@ -167,12 +164,12 @@ TEST_F(CatalogCacheRefreshTest, CollectionNotFound) {
     expectGetDatabase();
 
     // Return an empty collection
-    expectFindOnConfigSendBSONObjVector({});
+    expectFindSendBSONObjVector(kConfigHostAndPort, {});
 
     auto routingInfo = future.timed_get(kFutureTimeout);
     ASSERT(!routingInfo->cm());
-    ASSERT(routingInfo->primary());
-    ASSERT_EQ(ShardId{"0"}, routingInfo->primaryId());
+    ASSERT(routingInfo->db().primary());
+    ASSERT_EQ(ShardId{"0"}, routingInfo->db().primaryId());
 }
 
 TEST_F(CatalogCacheRefreshTest, CollectionBSONCorrupted) {
@@ -181,17 +178,18 @@ TEST_F(CatalogCacheRefreshTest, CollectionBSONCorrupted) {
     expectGetDatabase();
 
     // Return a corrupted collection entry
-    expectFindOnConfigSendBSONObjVector(
+    expectFindSendBSONObjVector(
+        kConfigHostAndPort,
         {BSON("BadValue"
               << "This value should not be in a collection config document")});
 
     try {
         auto routingInfo = future.timed_get(kFutureTimeout);
         auto cm = routingInfo->cm();
-        auto primary = routingInfo->primary();
+        auto primary = routingInfo->db().primary();
 
         FAIL(str::stream() << "Returning corrupted collection entry did not fail and returned "
-                           << (cm ? cm->toString() : routingInfo->primaryId().toString()));
+                           << (cm ? cm->toString() : routingInfo->db().primaryId().toString()));
     } catch (const DBException& ex) {
         ASSERT_EQ(ErrorCodes::FailedToParse, ex.code());
     }
@@ -208,21 +206,21 @@ TEST_F(CatalogCacheRefreshTest, NoChunksFoundForCollection) {
 
     // Return no chunks three times, which is how frequently the catalog cache retries
     expectGetCollection(epoch, shardKeyPattern);
-    expectFindOnConfigSendBSONObjVector({});
+    expectFindSendBSONObjVector(kConfigHostAndPort, {});
 
     expectGetCollection(epoch, shardKeyPattern);
-    expectFindOnConfigSendBSONObjVector({});
+    expectFindSendBSONObjVector(kConfigHostAndPort, {});
 
     expectGetCollection(epoch, shardKeyPattern);
-    expectFindOnConfigSendBSONObjVector({});
+    expectFindSendBSONObjVector(kConfigHostAndPort, {});
 
     try {
         auto routingInfo = future.timed_get(kFutureTimeout);
         auto cm = routingInfo->cm();
-        auto primary = routingInfo->primary();
+        auto primary = routingInfo->db().primary();
 
         FAIL(str::stream() << "Returning no chunks for collection did not fail and returned "
-                           << (cm ? cm->toString() : routingInfo->primaryId().toString()));
+                           << (cm ? cm->toString() : routingInfo->db().primaryId().toString()));
     } catch (const DBException& ex) {
         ASSERT_EQ(ErrorCodes::ConflictingOperationInProgress, ex.code());
     }
@@ -239,7 +237,7 @@ TEST_F(CatalogCacheRefreshTest, ChunksBSONCorrupted) {
 
     // Return no chunks three times, which is how frequently the catalog cache retries
     expectGetCollection(epoch, shardKeyPattern);
-    expectFindOnConfigSendBSONObjVector([&] {
+    expectFindSendBSONObjVector(kConfigHostAndPort, [&] {
         return std::vector<BSONObj>{ChunkType(kNss,
                                               {shardKeyPattern.getKeyPattern().globalMin(),
                                                BSON("_id" << 0)},
@@ -253,10 +251,10 @@ TEST_F(CatalogCacheRefreshTest, ChunksBSONCorrupted) {
     try {
         auto routingInfo = future.timed_get(kFutureTimeout);
         auto cm = routingInfo->cm();
-        auto primary = routingInfo->primary();
+        auto primary = routingInfo->db().primary();
 
         FAIL(str::stream() << "Returning no chunks for collection did not fail and returned "
-                           << (cm ? cm->toString() : routingInfo->primaryId().toString()));
+                           << (cm ? cm->toString() : routingInfo->db().primaryId().toString()));
     } catch (const DBException& ex) {
         ASSERT_EQ(ErrorCodes::NoSuchKey, ex.code());
     }
@@ -297,22 +295,22 @@ TEST_F(CatalogCacheRefreshTest, IncompleteChunksFoundForCollection) {
     // Return incomplete set of chunks three times, which is how frequently the catalog cache
     // retries
     expectGetCollection(epoch, shardKeyPattern);
-    expectFindOnConfigSendBSONObjVector(incompleteChunks);
+    expectFindSendBSONObjVector(kConfigHostAndPort, incompleteChunks);
 
     expectGetCollection(epoch, shardKeyPattern);
-    expectFindOnConfigSendBSONObjVector(incompleteChunks);
+    expectFindSendBSONObjVector(kConfigHostAndPort, incompleteChunks);
 
     expectGetCollection(epoch, shardKeyPattern);
-    expectFindOnConfigSendBSONObjVector(incompleteChunks);
+    expectFindSendBSONObjVector(kConfigHostAndPort, incompleteChunks);
 
     try {
         auto routingInfo = future.timed_get(kFutureTimeout);
         auto cm = routingInfo->cm();
-        auto primary = routingInfo->primary();
+        auto primary = routingInfo->db().primary();
 
         FAIL(
             str::stream() << "Returning incomplete chunks for collection did not fail and returned "
-                          << (cm ? cm->toString() : routingInfo->primaryId().toString()));
+                          << (cm ? cm->toString() : routingInfo->db().primaryId().toString()));
     } catch (const DBException& ex) {
         ASSERT_EQ(ErrorCodes::ConflictingOperationInProgress, ex.code());
     }
@@ -344,22 +342,22 @@ TEST_F(CatalogCacheRefreshTest, ChunkEpochChangeDuringIncrementalLoad) {
     // Return set of chunks, one of which has different epoch. Do it three times, which is how
     // frequently the catalog cache retries.
     expectGetCollection(initialRoutingInfo->getVersion().epoch(), shardKeyPattern);
-    expectFindOnConfigSendBSONObjVector(inconsistentChunks);
+    expectFindSendBSONObjVector(kConfigHostAndPort, inconsistentChunks);
 
     expectGetCollection(initialRoutingInfo->getVersion().epoch(), shardKeyPattern);
-    expectFindOnConfigSendBSONObjVector(inconsistentChunks);
+    expectFindSendBSONObjVector(kConfigHostAndPort, inconsistentChunks);
 
     expectGetCollection(initialRoutingInfo->getVersion().epoch(), shardKeyPattern);
-    expectFindOnConfigSendBSONObjVector(inconsistentChunks);
+    expectFindSendBSONObjVector(kConfigHostAndPort, inconsistentChunks);
 
     try {
         auto routingInfo = future.timed_get(kFutureTimeout);
         auto cm = routingInfo->cm();
-        auto primary = routingInfo->primary();
+        auto primary = routingInfo->db().primary();
 
         FAIL(str::stream()
              << "Returning chunks with different epoch for collection did not fail and returned "
-             << (cm ? cm->toString() : routingInfo->primaryId().toString()));
+             << (cm ? cm->toString() : routingInfo->db().primaryId().toString()));
     } catch (const DBException& ex) {
         ASSERT_EQ(ErrorCodes::ConflictingOperationInProgress, ex.code());
     }
@@ -553,7 +551,7 @@ TEST_F(CatalogCacheRefreshTest, IncrementalLoadAfterMove) {
     expectGetCollection(version.epoch(), shardKeyPattern);
 
     // Return set of chunks, which represent a move
-    expectFindOnConfigSendBSONObjVector([&]() {
+    expectFindSendBSONObjVector(kConfigHostAndPort, [&]() {
         version.incMajor();
         expectedDestShardVersion = version;
         ChunkType chunk1(
@@ -591,7 +589,7 @@ TEST_F(CatalogCacheRefreshTest, IncrementalLoadAfterMoveLastChunk) {
     expectGetCollection(version.epoch(), shardKeyPattern);
 
     // Return set of chunks, which represent a move
-    expectFindOnConfigSendBSONObjVector([&]() {
+    expectFindSendBSONObjVector(kConfigHostAndPort, [&]() {
         version.incMajor();
         ChunkType chunk1(kNss,
                          {shardKeyPattern.getKeyPattern().globalMin(),

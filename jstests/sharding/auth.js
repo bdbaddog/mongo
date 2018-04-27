@@ -11,6 +11,15 @@
     'use strict';
     load("jstests/replsets/rslib.js");
 
+    // Replica set nodes started with --shardsvr do not enable key generation until they are added
+    // to a sharded cluster and reject commands with gossiped clusterTime from users without the
+    // advanceClusterTime privilege. This causes ShardingTest setup to fail because the shell
+    // briefly authenticates as __system and recieves clusterTime metadata then will fail trying to
+    // gossip that time later in setup.
+    //
+    // TODO SERVER-32672: remove this flag.
+    TestData.skipGossipingClusterTime = true;
+
     var adminUser = {db: "admin", username: "foo", password: "bar"};
 
     var testUser = {db: "test", username: "bar", password: "baz"};
@@ -194,7 +203,7 @@
         return d1Chunks > 0 && d2Chunks > 0 && (d1Chunks + d2Chunks == totalChunks);
     }, "Chunks failed to balance", 60000, 5000);
 
-    // SERVER-3645
+    // SERVER-33753: count() without predicate can be wrong on sharded collections.
     // assert.eq(s.getDB("test").foo.count(), num+1);
     var numDocs = s.getDB("test").foo.find().itcount();
     if (numDocs != num) {
@@ -345,5 +354,6 @@
     assert.commandFailed(readOnlyDB.killOp(123));
 
     s.stop();
-
+    d1.stopSet();
+    d2.stopSet();
 })();

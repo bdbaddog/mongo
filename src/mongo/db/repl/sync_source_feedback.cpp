@@ -49,11 +49,17 @@ namespace repl {
 
 namespace {
 
+
+const Milliseconds maximumKeepAliveIntervalMS(30 * 1000);
+
+// The network timeout used for replSetUpdatePosition requests made to a node's sync source.
+const Seconds syncSourceFeedbackNetworkTimeoutSecs(30);
+
 /**
  * Calculates the keep alive interval based on the given ReplSetConfig.
  */
 Milliseconds calculateKeepAliveInterval(const ReplSetConfig& rsConfig) {
-    return rsConfig.getElectionTimeoutPeriod() / 2;
+    return std::min((rsConfig.getElectionTimeoutPeriod() / 2), maximumKeepAliveIntervalMS);
 }
 
 /**
@@ -210,7 +216,8 @@ void SyncSourceFeedback::run(executor::TaskExecutor* executor,
         Reporter reporter(executor,
                           makePrepareReplSetUpdatePositionCommandFn(replCoord, syncTarget, bgsync),
                           syncTarget,
-                          keepAliveInterval);
+                          keepAliveInterval,
+                          syncSourceFeedbackNetworkTimeoutSecs);
         {
             stdx::lock_guard<stdx::mutex> lock(_mtx);
             if (_shutdownSignaled) {

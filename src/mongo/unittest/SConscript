@@ -14,12 +14,14 @@ env.Library(target="unittest",
             ],
             LIBDEPS=[
                 '$BUILD_DIR/mongo/base',
+                '$BUILD_DIR/mongo/db/server_options_core',
                 '$BUILD_DIR/mongo/util/options_parser/options_parser',
             ])
 
 env.Library("unittest_main", ['unittest_main.cpp'],
             LIBDEPS=[
                 'unittest',
+                '$BUILD_DIR/mongo/db/service_context',
                  ])
 
 env.Library(target="integration_test_main",
@@ -32,11 +34,38 @@ env.Library(target="integration_test_main",
                 '$BUILD_DIR/mongo/client/connection_string',
                 '$BUILD_DIR/mongo/util/options_parser/options_parser_init',
             ],
+            LIBDEPS_PRIVATE=[
+                '$BUILD_DIR/mongo/transport/transport_layer_egress_init',
+            ],
+)
+
+bmEnv = env.Clone()
+bmEnv.InjectThirdPartyIncludePaths(libraries=['benchmark'])
+bmEnv.Library(
+    target='benchmark_main',
+    source=[
+        'benchmark_main.cpp'
+    ],
+    LIBDEPS=[
+        '$BUILD_DIR/mongo/base',
+        '$BUILD_DIR/mongo/db/service_context',
+        '$BUILD_DIR/third_party/shim_benchmark',
+    ],
 )
 
 env.CppUnitTest('unittest_test', 'unittest_test.cpp')
 env.CppUnitTest('fixture_test', 'fixture_test.cpp')
 env.CppUnitTest('temp_dir_test', 'temp_dir_test.cpp')
+
+env.Benchmark(
+    target='system_resource_canary_bm',
+    source=[
+        'system_resource_canary_bm.cpp'
+    ],
+    LIBDEPS=[
+        '$BUILD_DIR/mongo/util/processinfo',
+    ],
+)
 
 env.Library(
     target='concurrency',

@@ -31,18 +31,18 @@
 #include <vector>
 
 #include "mongo/db/namespace_string.h"
-#include "mongo/s/catalog/sharding_catalog_test_fixture.h"
+#include "mongo/s/catalog_cache.h"
+#include "mongo/s/sharding_router_test_fixture.h"
 #include "mongo/stdx/memory.h"
 
 namespace mongo {
 
 class BSONObj;
-class CachedCollectionRoutingInfo;
 class ChunkManager;
 class CollatorInterface;
 class ShardKeyPattern;
 
-class CatalogCacheTestFixture : public ShardingCatalogTestFixture {
+class CatalogCacheTestFixture : public ShardingTestFixture {
 protected:
     void setUp() override;
 
@@ -74,6 +74,22 @@ protected:
      * generated as "0", "1", etc.
      */
     void setupNShards(int numShards);
+
+    /**
+     * Triggers a refresh for the given namespace and mocks network calls to simulate loading
+     * metadata with two chunks: [minKey, 0) and [0, maxKey) on two shards with ids: "0" and "1".
+     */
+    CachedCollectionRoutingInfo loadRoutingTableWithTwoChunksAndTwoShards(NamespaceString nss);
+
+    /**
+     * Mocks network responses for loading a sharded database and collection from the config server.
+     */
+    void expectGetDatabase(NamespaceString nss);
+    void expectGetCollection(NamespaceString nss,
+                             OID epoch,
+                             const ShardKeyPattern& shardKeyPattern);
+
+    const HostAndPort kConfigHostAndPort{"DummyConfig", 1234};
 };
 
 }  // namespace mongo

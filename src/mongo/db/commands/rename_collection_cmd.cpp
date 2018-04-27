@@ -44,7 +44,7 @@
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/op_observer.h"
 #include "mongo/db/ops/insert.h"
-#include "mongo/db/repl/replication_coordinator_global.h"
+#include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/service_context.h"
 #include "mongo/util/scopeguard.h"
 
@@ -62,19 +62,23 @@ public:
     virtual bool adminOnly() const {
         return true;
     }
-    virtual bool slaveOk() const {
-        return false;
+    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
+        return AllowedOnSecondary::kNever;
     }
     virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
         return true;
     }
     virtual Status checkAuthForCommand(Client* client,
                                        const std::string& dbname,
-                                       const BSONObj& cmdObj) {
+                                       const BSONObj& cmdObj) const {
         return rename_collection::checkAuthForRenameCollectionCommand(client, dbname, cmdObj);
     }
-    virtual void help(stringstream& help) const {
-        help << " example: { renameCollection: foo.a, to: bar.b }";
+    std::string help() const override {
+        return " example: { renameCollection: foo.a, to: bar.b }";
+    }
+
+    std::string parseNs(const std::string& dbname, const BSONObj& cmdObj) const override {
+        return CommandHelpers::parseNsFullyQualified(cmdObj);
     }
 
     static void dropCollection(OperationContext* opCtx, Database* db, StringData collName) {
@@ -110,7 +114,7 @@ public:
                 str::stream() << "Invalid target namespace: " << target.ns(),
                 target.isValid());
 
-        if ((repl::getGlobalReplicationCoordinator()->getReplicationMode() !=
+        if ((repl::ReplicationCoordinator::get(opCtx)->getReplicationMode() !=
              repl::ReplicationCoordinator::modeNone)) {
             if (source.isOplog()) {
                 errmsg = "can't rename live oplog while replicating";
@@ -144,17 +148,20 @@ public:
             return false;
         }
 
-        if (source.isAdminDotSystemDotVersion()) {
-            appendCommandStatus(result,
-                                Status(ErrorCodes::IllegalOperation,
-                                       "renaming admin.system.version is not allowed"));
+        if (source.isServerConfigurationCollection()) {
+            CommandHelpers::appendCommandStatus(result,
+                                                Status(ErrorCodes::IllegalOperation,
+                                                       "renaming the server configuration "
+                                                       "collection (admin.system.version) is not "
+                                                       "allowed"));
             return false;
         }
 
         RenameCollectionOptions options;
         options.dropTarget = cmdObj["dropTarget"].trueValue();
         options.stayTemp = cmdObj["stayTemp"].trueValue();
-        return appendCommandStatus(result, renameCollection(opCtx, source, target, options));
+        return CommandHelpers::appendCommandStatus(
+            result, renameCollection(opCtx, source, target, options));
     }
 
 } cmdrenamecollection;

@@ -30,6 +30,7 @@
 
 #include "mongo/s/commands/pipeline_s.h"
 
+#include "mongo/db/curop.h"
 #include "mongo/db/pipeline/document_source.h"
 #include "mongo/db/query/collation/collation_spec.h"
 #include "mongo/db/repl/read_concern_args.h"
@@ -65,7 +66,7 @@ std::pair<ShardId, ChunkVersion> getSingleTargetedShardForQuery(
         return {*shardIds.begin(), chunkMgr->getVersion(*shardIds.begin())};
     }
 
-    return {routingInfo.primaryId(), ChunkVersion::UNSHARDED()};
+    return {routingInfo.db().primaryId(), ChunkVersion::UNSHARDED()};
 }
 
 /**
@@ -113,10 +114,10 @@ boost::optional<Document> PipelineS::MongoSInterface::lookupSingleDocument(
         cmdBuilder.append(repl::ReadConcernArgs::kReadConcernFieldName, *readConcern);
     }
 
-    auto swShardResult = makeStatusWith<std::vector<ClusterClientCursorParams::RemoteCursor>>();
+    auto shardResult = std::vector<RemoteCursor>();
     auto findCmd = cmdBuilder.obj();
     size_t numAttempts = 0;
-    do {
+    while (++numAttempts <= kMaxNumStaleVersionRetries) {
         // Verify that the collection exists, with the correct UUID.
         auto catalogCache = Grid::get(expCtx->opCtx)->catalogCache();
         auto swRoutingInfo = getCollectionRoutingInfo(foreignExpCtx);
@@ -140,36 +141,36 @@ boost::optional<Document> PipelineS::MongoSInterface::lookupSingleDocument(
         // Dispatch the request. This will only be sent to a single shard and only a single result
         // will be returned. The 'establishCursors' method conveniently prepares the result into a
         // cursor response for us.
-        swShardResult =
-            establishCursors(expCtx->opCtx,
-                             Grid::get(expCtx->opCtx)->getExecutorPool()->getArbitraryExecutor(),
-                             nss,
-                             ReadPreferenceSetting::get(expCtx->opCtx),
-                             {{shardInfo.first, appendShardVersion(findCmd, shardInfo.second)}},
-                             false,
-                             nullptr);
-
-        // If it's an unsharded collection which has been deleted and re-created, we may get a
-        // NamespaceNotFound error when looking up by UUID.
-        if (swShardResult.getStatus().code() == ErrorCodes::NamespaceNotFound) {
+        try {
+            shardResult = establishCursors(
+                expCtx->opCtx,
+                Grid::get(expCtx->opCtx)->getExecutorPool()->getArbitraryExecutor(),
+                nss,
+                ReadPreferenceSetting::get(expCtx->opCtx),
+                {{shardInfo.first, appendShardVersion(findCmd, shardInfo.second)}},
+                false);
+            break;
+        } catch (const ExceptionFor<ErrorCodes::NamespaceNotFound>&) {
+            // If it's an unsharded collection which has been deleted and re-created, we may get a
+            // NamespaceNotFound error when looking up by UUID.
             return boost::none;
+        } catch (const ExceptionForCat<ErrorCategory::StaleShardVersionError>&) {
+            // If we hit a stale shardVersion exception, invalidate the routing table cache.
+            catalogCache->onStaleShardVersion(std::move(routingInfo));
+            continue;  // Try again if allowed.
         }
-        // If we hit a stale shardVersion exception, invalidate the routing table cache.
-        if (ErrorCodes::isStaleShardingError(swShardResult.getStatus().code())) {
-            catalogCache->onStaleConfigError(std::move(routingInfo));
-        }
-    } while (!swShardResult.isOK() && ++numAttempts < kMaxNumStaleVersionRetries);
+        break;  // Success!
+    }
 
-    auto shardResult = uassertStatusOK(std::move(swShardResult));
     invariant(shardResult.size() == 1u);
 
-    auto& cursor = shardResult.front().cursorResponse;
+    auto& cursor = shardResult.front().getCursorResponse();
     auto& batch = cursor.getBatch();
 
     // We should have at most 1 result, and the cursor should be exhausted.
     uassert(ErrorCodes::InternalError,
             str::stream() << "Shard cursor was unexpectedly open after lookup: "
-                          << shardResult.front().hostAndPort
+                          << shardResult.front().getHostAndPort()
                           << ", id: "
                           << cursor.getCursorId(),
             cursor.getCursorId() == 0);
@@ -182,6 +183,16 @@ boost::optional<Document> PipelineS::MongoSInterface::lookupSingleDocument(
             batch.size() <= 1u);
 
     return (!batch.empty() ? Document(batch.front()) : boost::optional<Document>{});
+}
+
+BSONObj PipelineS::MongoSInterface::_reportCurrentOpForClient(
+    OperationContext* opCtx, Client* client, CurrentOpTruncateMode truncateOps) const {
+    BSONObjBuilder builder;
+
+    CurOp::reportCurrentOpForClient(
+        opCtx, client, (truncateOps == CurrentOpTruncateMode::kTruncateOps), &builder);
+
+    return builder.obj();
 }
 
 std::vector<GenericCursor> PipelineS::MongoSInterface::getCursors(

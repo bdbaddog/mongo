@@ -98,36 +98,47 @@ Status::Status(ErrorCodes::Error code, StringData reason, const BSONObj& extraIn
 Status::Status(ErrorCodes::Error code, const mongoutils::str::stream& reason)
     : Status(code, std::string(reason)) {}
 
+Status Status::withReason(StringData newReason) const {
+    return isOK() ? OK() : Status(code(), newReason, _error->extra);
+}
+
 Status Status::withContext(StringData reasonPrefix) const {
-    return isOK() ? OK() : Status(code(), reasonPrefix + causedBy(reason()), _error->extra);
+    return isOK() ? OK() : withReason(reasonPrefix + causedBy(reason()));
 }
 
 std::ostream& operator<<(std::ostream& os, const Status& status) {
     return os << status.codeString() << " " << status.reason();
 }
 
-std::string Status::toString() const {
-    StringBuilder ss;
-    ss << codeString();
-    if (!isOK()) {
+template <typename Allocator>
+StringBuilderImpl<Allocator>& operator<<(StringBuilderImpl<Allocator>& sb, const Status& status) {
+    sb << status.codeString();
+    if (!status.isOK()) {
         try {
-            if (auto extra = extraInfo()) {
+            if (auto extra = status.extraInfo()) {
                 BSONObjBuilder bob;
                 extra->serialize(&bob);
-                ss << bob.obj();
+                sb << bob.obj();
             }
         } catch (const DBException&) {
             // This really shouldn't happen but it would be really annoying if it broke error
             // logging in production.
             if (kDebugBuild) {
-                severe() << "Error serializing extra info for " << code()
+                severe() << "Error serializing extra info for " << status.code()
                          << " in Status::toString()";
                 std::terminate();
             }
         }
-        ss << ": " << reason();
+        sb << ": " << status.reason();
     }
-    return ss.str();
+    return sb;
+}
+template StringBuilder& operator<<(StringBuilder& sb, const Status& status);
+
+std::string Status::toString() const {
+    StringBuilder sb;
+    sb << *this;
+    return sb.str();
 }
 
 }  // namespace mongo

@@ -39,7 +39,7 @@
 #include "mongo/db/client.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/operation_context.h"
-#include "mongo/s/catalog/sharding_catalog_manager.h"
+#include "mongo/db/s/config/sharding_catalog_manager.h"
 #include "mongo/s/catalog/type_database.h"
 #include "mongo/s/catalog_cache.h"
 #include "mongo/s/client/shard_registry.h"
@@ -57,13 +57,13 @@ class ConfigSvrRemoveShardCommand : public BasicCommand {
 public:
     ConfigSvrRemoveShardCommand() : BasicCommand("_configsvrRemoveShard") {}
 
-    void help(std::stringstream& help) const override {
-        help << "Internal command, which is exported by the sharding config server. Do not call "
-                "directly. Removes a shard from the cluster.";
+    std::string help() const override {
+        return "Internal command, which is exported by the sharding config server. Do not call "
+               "directly. Removes a shard from the cluster.";
     }
 
-    bool slaveOk() const override {
-        return false;
+    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
+        return AllowedOnSecondary::kNever;
     }
 
     bool adminOnly() const override {
@@ -76,7 +76,7 @@ public:
 
     Status checkAuthForCommand(Client* client,
                                const std::string& dbname,
-                               const BSONObj& cmdObj) override {
+                               const BSONObj& cmdObj) const override {
         if (!AuthorizationSession::get(client)->isAuthorizedForActionsOnResource(
                 ResourcePattern::forClusterResource(), ActionType::internal)) {
             return Status(ErrorCodes::Unauthorized, "Unauthorized");
@@ -109,7 +109,8 @@ public:
             std::string msg(str::stream() << "Could not drop shard '" << target
                                           << "' because it does not exist");
             log() << msg;
-            return appendCommandStatus(result, Status(ErrorCodes::ShardNotFound, msg));
+            return CommandHelpers::appendCommandStatus(result,
+                                                       Status(ErrorCodes::ShardNotFound, msg));
         }
         const auto& shard = shardStatus.getValue();
 
@@ -156,7 +157,7 @@ public:
                     nullptr,
                     repl::ReadConcernLevel::kMajorityReadConcern);
                 if (!swChunks.isOK()) {
-                    return appendCommandStatus(result, swChunks.getStatus());
+                    return CommandHelpers::appendCommandStatus(result, swChunks.getStatus());
                 }
 
                 const auto& chunks = swChunks.getValue();

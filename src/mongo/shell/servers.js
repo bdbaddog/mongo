@@ -7,7 +7,7 @@ var MongoRunner, _startMongod, startMongoProgram, runMongoProgram, startMongoPro
     var shellVersion = version;
 
     // Record the exit codes of mongod and mongos processes that crashed during startup keyed by
-    // pid. This map is cleared when MongoRunner._startWithArgs and MongoRunner.stopMongod/s are
+    // port. This map is cleared when MongoRunner._startWithArgs and MongoRunner.stopMongod/s are
     // called.
     var serverExitCodeMap = {};
 
@@ -94,6 +94,7 @@ var MongoRunner, _startMongod, startMongoProgram, runMongoProgram, startMongoPro
     var convertVersionStringToArray = function(versionString) {
         assert("" !== versionString, "Version strings must not be empty");
         var versionArray = versionString.split('.');
+
         assert.gt(versionArray.length,
                   1,
                   "MongoDB versions must have at least two components to compare, but \"" +
@@ -150,23 +151,72 @@ var MongoRunner, _startMongod, startMongoProgram, runMongoProgram, startMongoPro
 
     /**
      * Returns true if two version strings could represent the same version. This is true
-     * if, after passing the versions through getBinVersionFor, the the versions have the
+     * if, after passing the versions through getBinVersionFor, the versions have the
      * same value for each version component up through the length of the shorter version.
      *
      * That is, 3.2.4 compares equal to 3.2, but 3.2.4 does not compare equal to 3.2.3.
      */
     MongoRunner.areBinVersionsTheSame = function(versionA, versionB) {
 
+        // Check for invalid version strings first.
+        convertVersionStringToArray(MongoRunner.getBinVersionFor(versionA));
+        convertVersionStringToArray(MongoRunner.getBinVersionFor(versionB));
+
+        try {
+            return (0 === MongoRunner.compareBinVersions(versionA, versionB));
+        } catch (err) {
+            // compareBinVersions() throws an error if two versions differ only by the git hash.
+            return false;
+        }
+    };
+
+    /**
+     * Compares two version strings and returns:
+     *      1, if the first is more recent
+     *      0, if they are equal
+     *     -1, if the first is older
+     *
+     * Note that this function only compares up to the length of the shorter version.
+     * Because of this, minor versions will compare equal to the major versions they stem
+     * from, but major-major and minor-minor version pairs will undergo strict comparison.
+     */
+    MongoRunner.compareBinVersions = function(versionA, versionB) {
+
+        let stringA = versionA;
+        let stringB = versionB;
+
         versionA = convertVersionStringToArray(MongoRunner.getBinVersionFor(versionA));
         versionB = convertVersionStringToArray(MongoRunner.getBinVersionFor(versionB));
 
+        // Treat the githash as a separate element, if it's present.
+        versionA.push(...versionA.pop().split("-"));
+        versionB.push(...versionB.pop().split("-"));
+
         var elementsToCompare = Math.min(versionA.length, versionB.length);
+
         for (var i = 0; i < elementsToCompare; ++i) {
-            if (versionA[i] != versionB[i]) {
-                return false;
+            var elementA = versionA[i];
+            var elementB = versionB[i];
+
+            if (elementA === elementB) {
+                continue;
             }
+
+            var numA = parseInt(elementA);
+            var numB = parseInt(elementB);
+
+            assert(!isNaN(numA) && !isNaN(numB), "Cannot compare non-equal non-numeric versions.");
+
+            if (numA > numB) {
+                return 1;
+            } else if (numA < numB) {
+                return -1;
+            }
+
+            assert(false, `Unreachable case. Provided versions: {${stringA}, ${stringB}}`);
         }
-        return true;
+
+        return 0;
     };
 
     MongoRunner.logicalOptions = {
@@ -839,7 +889,9 @@ var MongoRunner, _startMongod, startMongoProgram, runMongoProgram, startMongoPro
      *      auth: {
      *        user {string}: admin user name
      *        pwd {string}: admin password
-     *      }
+     *      },
+     *      skipValidation: <bool>,
+     *      allowedExitCode: <int>
      *    }
      *
      * Note: The auth option is required in a authenticated mongod running in Windows since
@@ -871,14 +923,20 @@ var MongoRunner, _startMongod, startMongoProgram, runMongoProgram, startMongoPro
         // If the return code is in the serverExitCodeMap, it means the server crashed on startup.
         // We just use the recorded return code instead of stopping the program.
         var returnCode;
-        if (pid in serverExitCodeMap) {
-            returnCode = serverExitCodeMap[pid];
-            delete serverExitCodeMap[pid];
+        if (serverExitCodeMap.hasOwnProperty(port)) {
+            returnCode = serverExitCodeMap[port];
+            delete serverExitCodeMap[port];
         } else {
             // Invoke callback to validate collections and indexes before shutting down mongod.
             // We skip calling the callback function when the expected return code of
             // the mongod process is non-zero since it's likely the process has already exited.
-            if (allowedExitCode === MongoRunner.EXIT_CLEAN) {
+
+            var skipValidation = false;
+            if (opts.skipValidation) {
+                skipValidation = true;
+            }
+
+            if (allowedExitCode === MongoRunner.EXIT_CLEAN && !skipValidation) {
                 MongoRunner.validateCollectionsCallback(port);
             }
 
@@ -1184,10 +1242,11 @@ var MongoRunner, _startMongod, startMongoProgram, runMongoProgram, startMongoPro
             pid = _startMongoProgram({args: argArray, env: env});
         }
 
-        delete serverExitCodeMap[pid];
+        delete serverExitCodeMap[port];
         if (!waitForConnect) {
             return {
                 pid: pid,
+                port: port,
             };
         }
 
@@ -1201,7 +1260,7 @@ var MongoRunner, _startMongod, startMongoProgram, runMongoProgram, startMongoPro
                 var res = checkProgram(pid);
                 if (!res.alive) {
                     print("Could not start mongo program at " + port + ", process ended");
-                    serverExitCodeMap[pid] = res.exitCode;
+                    serverExitCodeMap[port] = res.exitCode;
                     return true;
                 }
             }

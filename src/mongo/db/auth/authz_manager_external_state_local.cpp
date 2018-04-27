@@ -42,6 +42,7 @@
 #include "mongo/db/server_options.h"
 #include "mongo/util/log.h"
 #include "mongo/util/mongoutils/str.h"
+#include "mongo/util/net/ssl_types.h"
 
 namespace mongo {
 
@@ -203,7 +204,7 @@ Status AuthzManagerExternalStateLocal::getUserDescription(OperationContext* opCt
 
 void AuthzManagerExternalStateLocal::resolveUserRoles(mutablebson::Document* userDoc,
                                                       const std::vector<RoleName>& directRoles) {
-    unordered_set<RoleName> indirectRoles;
+    stdx::unordered_set<RoleName> indirectRoles;
     PrivilegeVector allPrivileges;
     std::vector<SharedRestrictionDocument> allAuthenticationRestrictions;
     bool isRoleGraphConsistent = false;

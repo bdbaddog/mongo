@@ -48,6 +48,22 @@ namespace mongo {
 
 namespace {
 
+// This batch size is chosen to ensure that we don't form requests larger than the 16mb limit.
+// Especially for refreshes, the updates we send include the full user name (user@db), and user
+// names can be quite large (we enforce a max 10k limit for usernames used with sessions).
+//
+// At 1000 elements, a 16mb payload gives us a budget of 16000 bytes per user, which we should
+// comfortably be able to stay under, even with 10k user names.
+constexpr size_t kMaxBatchSize = 1000;
+
+// Used to refresh or remove items from the session collection with write
+// concern majority
+const BSONObj kMajorityWriteConcern = WriteConcernOptions(WriteConcernOptions::kMajority,
+                                                          WriteConcernOptions::SyncMode::UNSET,
+                                                          Seconds(15))
+                                          .toBSON();
+
+
 BSONObj lsidQuery(const LogicalSessionId& lsid) {
     return BSON(LogicalSessionRecord::kIdFieldName << lsid.toBSON());
 }
@@ -94,7 +110,7 @@ Status runBulkGeneric(TFactory makeT, AddLineFn addLine, SendFn sendBatch, const
     for (const auto& item : items) {
         addLine(*thing, item);
 
-        if (++i >= write_ops::kMaxWriteBatchSize) {
+        if (++i >= kMaxBatchSize) {
             auto res = sendLocalBatch();
             if (!res.isOK()) {
                 return res;
@@ -206,6 +222,7 @@ Status SessionsCollection::doRefresh(const NamespaceString& ns,
         batch->append("update", ns.coll());
         batch->append("ordered", false);
         batch->append("allowImplicitCollectionCreation", false);
+        batch->append(WriteConcernOptions::kWriteConcernField, kMajorityWriteConcern);
     };
 
     auto add = [](BSONArrayBuilder* entries, const LogicalSessionRecord& record) {
@@ -240,6 +257,7 @@ Status SessionsCollection::doRemove(const NamespaceString& ns,
     auto init = [ns](BSONObjBuilder* batch) {
         batch->append("delete", ns.coll());
         batch->append("ordered", false);
+        batch->append(WriteConcernOptions::kWriteConcernField, kMajorityWriteConcern);
     };
 
     auto add = [](BSONArrayBuilder* builder, const LogicalSessionId& lsid) {
@@ -296,7 +314,6 @@ StatusWith<LogicalSessionIdSet> SessionsCollection::doFetch(const NamespaceStrin
         request.getProjection().set_id(1);
         request.setBatchSize(batch.size());
         request.setLimit(batch.size());
-        request.setAllowPartialResults(true);
         request.setSingleBatch(true);
 
         return wrappedSend(request.toBSON());

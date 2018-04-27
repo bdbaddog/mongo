@@ -4,8 +4,9 @@
 (function() {
     "use strict";
 
-    load("jstests/libs/write_concern_util.js");  // assertWriteConcernError
-    load("jstests/replsets/rslib.js");           // reconfig
+    load("jstests/libs/write_concern_util.js");             // assertWriteConcernError
+    load("jstests/replsets/rslib.js");                      // reconfig
+    load("jstests/libs/feature_compatibility_version.js");  // latestFCV/lastStableFCV
 
     // Start a two node replica set and set its FCV to the given version, then take down one
     // node so majority write concern can no longer be satisfied and verify that a noop setFCV
@@ -23,7 +24,8 @@
         assert.eq(primary, replTest.nodes[0]);
 
         // Set the FCV to the given target version, to ensure calling setFCV below is a no-op.
-        assert.commandWorked(primary.adminCommand({setFeatureCompatibilityVersion: targetVersion}));
+        assert.commandWorkedIgnoringWriteConcernErrors(
+            primary.adminCommand({setFeatureCompatibilityVersion: targetVersion}));
 
         // Stop one node to force commands with "majority" write concern to time out. First increase
         // the election timeout to prevent the primary from stepping down before the test is over.
@@ -56,7 +58,7 @@
             // Verify the command receives a write concern error. If we don't wait for write concern
             // on noop writes then we won't get a write concern error.
             assertWriteConcernError(res);
-            assert.commandWorked(res);
+            assert.commandWorkedIgnoringWriteConcernErrors(res);
         } catch (e) {
             printjson(res);
             throw e;
@@ -65,6 +67,6 @@
         replTest.stopSet();
     }
 
-    testFCVNoop("3.4");
-    testFCVNoop("3.6");
+    testFCVNoop(lastStableFCV);
+    testFCVNoop(latestFCV);
 })();

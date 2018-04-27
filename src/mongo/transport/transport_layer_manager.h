@@ -33,8 +33,6 @@
 #include "mongo/base/status.h"
 #include "mongo/stdx/mutex.h"
 #include "mongo/transport/session.h"
-#include "mongo/transport/ticket.h"
-#include "mongo/transport/ticket_impl.h"
 #include "mongo/transport/transport_layer.h"
 #include "mongo/util/net/message.h"
 #include "mongo/util/time_support.h"
@@ -59,21 +57,18 @@ public:
         : _tls(std::move(tls)) {}
     TransportLayerManager();
 
-    Ticket sourceMessage(const SessionHandle& session,
-                         Message* message,
-                         Date_t expiration = Ticket::kNoExpirationDate) override;
-    Ticket sinkMessage(const SessionHandle& session,
-                       const Message& message,
-                       Date_t expiration = Ticket::kNoExpirationDate) override;
-
-    Status wait(Ticket&& ticket) override;
-    void asyncWait(Ticket&& ticket, TicketCallback callback) override;
-
-    void end(const SessionHandle& session) override;
+    StatusWith<SessionHandle> connect(HostAndPort peer,
+                                      ConnectSSLMode sslMode,
+                                      Milliseconds timeout) override;
+    Future<SessionHandle> asyncConnect(HostAndPort peer,
+                                       ConnectSSLMode sslMode,
+                                       const ReactorHandle& reactor) override;
 
     Status start() override;
     void shutdown() override;
     Status setup() override;
+
+    ReactorHandle getReactor(WhichReactor which) override;
 
     // TODO This method is not called anymore, but may be useful to add new TransportLayers
     // to the manager after it's been created.
@@ -90,6 +85,8 @@ public:
      */
     static std::unique_ptr<TransportLayer> createWithConfig(const ServerGlobalParams* config,
                                                             ServiceContext* ctx);
+
+    static std::unique_ptr<TransportLayer> makeAndStartDefaultEgressTransportLayer();
 
 private:
     template <typename Callable>

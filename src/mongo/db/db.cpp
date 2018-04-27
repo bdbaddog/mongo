@@ -44,6 +44,7 @@
 #include "mongo/base/init.h"
 #include "mongo/base/initializer.h"
 #include "mongo/base/status.h"
+#include "mongo/client/global_conn_pool.h"
 #include "mongo/client/replica_set_monitor.h"
 #include "mongo/config.h"
 #include "mongo/db/audit.h"
@@ -69,7 +70,9 @@
 #include "mongo/db/dbhelpers.h"
 #include "mongo/db/dbmessage.h"
 #include "mongo/db/exec/working_set_common.h"
+#include "mongo/db/free_mon/free_mon_mongod.h"
 #include "mongo/db/ftdc/ftdc_mongod.h"
+#include "mongo/db/global_settings.h"
 #include "mongo/db/index_names.h"
 #include "mongo/db/index_rebuilder.h"
 #include "mongo/db/initialize_server_global_state.h"
@@ -91,29 +94,33 @@
 #include "mongo/db/op_observer_impl.h"
 #include "mongo/db/op_observer_registry.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/db/periodic_runner_job_abort_expired_transactions.h"
 #include "mongo/db/query/internal_plans.h"
-#include "mongo/db/repair_database.h"
+#include "mongo/db/repair_database_and_check_version.h"
 #include "mongo/db/repl/drop_pending_collection_reaper.h"
 #include "mongo/db/repl/oplog.h"
 #include "mongo/db/repl/repl_settings.h"
 #include "mongo/db/repl/replication_consistency_markers_impl.h"
+#include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/repl/replication_coordinator_external_state_impl.h"
-#include "mongo/db/repl/replication_coordinator_global.h"
 #include "mongo/db/repl/replication_coordinator_impl.h"
 #include "mongo/db/repl/replication_process.h"
 #include "mongo/db/repl/replication_recovery.h"
 #include "mongo/db/repl/storage_interface_impl.h"
 #include "mongo/db/repl/topology_coordinator.h"
 #include "mongo/db/s/balancer/balancer.h"
+#include "mongo/db/s/config/sharding_catalog_manager.h"
+#include "mongo/db/s/config_server_op_observer.h"
+#include "mongo/db/s/shard_server_op_observer.h"
 #include "mongo/db/s/sharded_connection_info.h"
 #include "mongo/db/s/sharding_initialization_mongod.h"
 #include "mongo/db/s/sharding_state.h"
 #include "mongo/db/s/sharding_state_recovery.h"
-#include "mongo/db/s/type_shard_identity.h"
 #include "mongo/db/server_options.h"
 #include "mongo/db/server_parameters.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/service_context_d.h"
+#include "mongo/db/service_context_registrar.h"
 #include "mongo/db/service_entry_point_mongod.h"
 #include "mongo/db/session_catalog.h"
 #include "mongo/db/session_killer.h"
@@ -132,7 +139,6 @@
 #include "mongo/executor/thread_pool_task_executor.h"
 #include "mongo/platform/process_id.h"
 #include "mongo/rpc/metadata/egress_metadata_hook_list.h"
-#include "mongo/s/catalog/sharding_catalog_manager.h"
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/sharding_initialization.h"
@@ -152,7 +158,7 @@
 #include "mongo/util/fail_point_service.h"
 #include "mongo/util/fast_clock_source_factory.h"
 #include "mongo/util/log.h"
-#include "mongo/util/net/listen.h"
+#include "mongo/util/net/sock.h"
 #include "mongo/util/net/ssl_manager.h"
 #include "mongo/util/ntservice.h"
 #include "mongo/util/options_parser/startup_options.h"
@@ -178,99 +184,6 @@ using logger::LogComponent;
 using std::endl;
 
 namespace {
-
-constexpr StringData upgradeLink = "http://dochub.mongodb.org/core/3.6-upgrade-fcv"_sd;
-constexpr StringData mustDowngradeErrorMsg =
-    "UPGRADE PROBLEM: The data files need to be fully upgraded to version 3.4 before attempting an upgrade to 3.6; see http://dochub.mongodb.org/core/3.6-upgrade-fcv for more details."_sd;
-
-Status restoreMissingFeatureCompatibilityVersionDocument(OperationContext* opCtx,
-                                                         const std::vector<std::string>& dbNames) {
-    bool isMmapV1 = opCtx->getServiceContext()->getGlobalStorageEngine()->isMmapV1();
-    // Check whether there are any collections with UUIDs.
-    bool collsHaveUuids = false;
-    bool allCollsHaveUuids = true;
-    for (const auto& dbName : dbNames) {
-        Database* db = dbHolder().openDb(opCtx, dbName);
-        invariant(db);
-        for (auto collectionIt = db->begin(); collectionIt != db->end(); ++collectionIt) {
-            Collection* coll = *collectionIt;
-            if (coll->uuid()) {
-                collsHaveUuids = true;
-            } else if (!coll->uuid() && (!isMmapV1 ||
-                                         !(coll->ns().coll() == "system.indexes" ||
-                                           coll->ns().coll() == "system.namespaces"))) {
-                // Exclude system.indexes and system.namespaces from the UUID check until
-                // SERVER-29926 and SERVER-30095 are addressed, respectively.
-                allCollsHaveUuids = false;
-            }
-        }
-    }
-
-    if (!collsHaveUuids) {
-        return {ErrorCodes::MustDowngrade, mustDowngradeErrorMsg};
-    }
-
-    // Restore the featureCompatibilityVersion document if it is missing.
-    NamespaceString nss(FeatureCompatibilityVersion::kCollection);
-
-    Database* db = dbHolder().get(opCtx, nss.db());
-
-    // If the admin database does not exist, create it.
-    if (!db) {
-        log() << "Re-creating admin database that was dropped.";
-    }
-
-    db = dbHolder().openDb(opCtx, nss.db());
-    invariant(db);
-
-    // If admin.system.version does not exist, create it without a UUID.
-    if (!db->getCollection(opCtx, FeatureCompatibilityVersion::kCollection)) {
-        log() << "Re-creating admin.system.version collection that was dropped.";
-        allCollsHaveUuids = false;
-        BSONObjBuilder bob;
-        bob.append("create", nss.coll());
-        BSONObj createObj = bob.done();
-        uassertStatusOK(createCollection(opCtx, nss.db().toString(), createObj));
-    }
-
-    Collection* versionColl = db->getCollection(opCtx, FeatureCompatibilityVersion::kCollection);
-    invariant(versionColl);
-    BSONObj featureCompatibilityVersion;
-    if (!Helpers::findOne(opCtx,
-                          versionColl,
-                          BSON("_id" << FeatureCompatibilityVersion::kParameterName),
-                          featureCompatibilityVersion)) {
-        log() << "Re-creating featureCompatibilityVersion document that was deleted.";
-        BSONObjBuilder bob;
-        bob.append("_id", FeatureCompatibilityVersion::kParameterName);
-        if (allCollsHaveUuids) {
-            // If all collections have UUIDs, create a featureCompatibilityVersion document with
-            // version equal to 3.6.
-            bob.append(FeatureCompatibilityVersion::kVersionField,
-                       FeatureCompatibilityVersionCommandParser::kVersion36);
-        } else {
-            // If some collections do not have UUIDs, create a featureCompatibilityVersion document
-            // with version equal to 3.4 and targetVersion 3.6.
-            bob.append(FeatureCompatibilityVersion::kVersionField,
-                       FeatureCompatibilityVersionCommandParser::kVersion34);
-            bob.append(FeatureCompatibilityVersion::kTargetVersionField,
-                       FeatureCompatibilityVersionCommandParser::kVersion36);
-        }
-        auto fcvObj = bob.done();
-        writeConflictRetry(opCtx, "insertFCVDocument", nss.ns(), [&] {
-            WriteUnitOfWork wunit(opCtx);
-            OpDebug* const nullOpDebug = nullptr;
-            uassertStatusOK(
-                versionColl->insertDocument(opCtx, InsertStatement(fcvObj), nullOpDebug, false));
-            wunit.commit();
-        });
-    }
-    invariant(Helpers::findOne(opCtx,
-                               versionColl,
-                               BSON("_id" << FeatureCompatibilityVersion::kParameterName),
-                               featureCompatibilityVersion));
-    return Status::OK();
-}
 
 const NamespaceString startupLogCollectionName("local.startup_log");
 const NamespaceString kSystemReplSetCollection("local.system.replset");
@@ -320,49 +233,6 @@ void logStartup(OperationContext* opCtx) {
 }
 
 /**
- * If we are in a replset, every replicated collection must have an _id index.
- * As we scan each database, we also gather a list of drop-pending collection namespaces for
- * the DropPendingCollectionReaper to clean up eventually.
- */
-void checkForIdIndexesAndDropPendingCollections(OperationContext* opCtx, Database* db) {
-    if (db->name() == "local") {
-        // Collections in the local database are not replicated, so we do not need an _id index on
-        // any collection. For the same reason, it is not possible for the local database to contain
-        // any drop-pending collections (drops are effective immediately).
-        return;
-    }
-
-    std::list<std::string> collectionNames;
-    db->getDatabaseCatalogEntry()->getCollectionNamespaces(&collectionNames);
-
-    for (const auto& collectionName : collectionNames) {
-        const NamespaceString ns(collectionName);
-
-        if (ns.isDropPendingNamespace()) {
-            auto dropOpTime = fassertStatusOK(40459, ns.getDropPendingNamespaceOpTime());
-            log() << "Found drop-pending namespace " << ns << " with drop optime " << dropOpTime;
-            repl::DropPendingCollectionReaper::get(opCtx)->addDropPendingNamespace(dropOpTime, ns);
-        }
-
-        if (ns.isSystem())
-            continue;
-
-        Collection* coll = db->getCollection(opCtx, collectionName);
-        if (!coll)
-            continue;
-
-        if (coll->getIndexCatalog()->findIdIndex(opCtx))
-            continue;
-
-        log() << "WARNING: the collection '" << collectionName << "' lacks a unique index on _id."
-              << " This index is needed for replication to function properly" << startupWarningsLog;
-        log() << "\t To fix this, you need to create a unique index on _id."
-              << " See http://dochub.mongodb.org/core/build-replica-set-indexes"
-              << startupWarningsLog;
-    }
-}
-
-/**
  * Checks if this server was started without --replset but has a config in local.system.replset
  * (meaning that this is probably a replica set member started in stand-alone mode).
  *
@@ -372,298 +242,11 @@ void checkForIdIndexesAndDropPendingCollections(OperationContext* opCtx, Databas
 unsigned long long checkIfReplMissingFromCommandLine(OperationContext* opCtx) {
     // This is helpful for the query below to work as you can't open files when readlocked
     Lock::GlobalWrite lk(opCtx);
-    if (!repl::getGlobalReplicationCoordinator()->getSettings().usingReplSets()) {
+    if (!repl::ReplicationCoordinator::get(opCtx)->getSettings().usingReplSets()) {
         DBDirectClient c(opCtx);
         return c.count(kSystemReplSetCollection.ns());
     }
     return 0;
-}
-
-/**
- * Check that the oplog is capped, and abort the process if it is not.
- * Caller must lock DB before calling this function.
- */
-void checkForCappedOplog(OperationContext* opCtx, Database* db) {
-    const NamespaceString oplogNss(NamespaceString::kRsOplogNamespace);
-    invariant(opCtx->lockState()->isDbLockedForMode(oplogNss.db(), MODE_IS));
-    Collection* oplogCollection = db->getCollection(opCtx, oplogNss);
-    if (oplogCollection && !oplogCollection->isCapped()) {
-        severe() << "The oplog collection " << oplogNss
-                 << " is not capped; a capped oplog is a requirement for replication to function.";
-        fassertFailedNoTrace(40115);
-    }
-}
-
-/**
- * Return an error status if the wrong mongod version was used for these datafiles. The boolean
- * represents whether there are non-local databases.
- */
-StatusWith<bool> repairDatabasesAndCheckVersion(OperationContext* opCtx) {
-    LOG(1) << "enter repairDatabases (to check pdfile version #)";
-
-    auto const storageEngine = opCtx->getServiceContext()->getGlobalStorageEngine();
-
-    Lock::GlobalWrite lk(opCtx);
-
-    std::vector<std::string> dbNames;
-    storageEngine->listDatabases(&dbNames);
-
-    // Repair all databases first, so that we do not try to open them if they are in bad shape
-    if (storageGlobalParams.repair) {
-        invariant(!storageGlobalParams.readOnly);
-        for (const auto& dbName : dbNames) {
-            LOG(1) << "    Repairing database: " << dbName;
-            fassert(18506, repairDatabase(opCtx, storageEngine, dbName));
-        }
-
-        // Attempt to restore the featureCompatibilityVersion document if it is missing.
-        NamespaceString nss(FeatureCompatibilityVersion::kCollection);
-
-        Database* db = dbHolder().get(opCtx, nss.db());
-        Collection* versionColl;
-        BSONObj featureCompatibilityVersion;
-        if (!db || !(versionColl = db->getCollection(opCtx, nss)) ||
-            !Helpers::findOne(opCtx,
-                              versionColl,
-                              BSON("_id" << FeatureCompatibilityVersion::kParameterName),
-                              featureCompatibilityVersion)) {
-            auto status = restoreMissingFeatureCompatibilityVersionDocument(opCtx, dbNames);
-            if (!status.isOK()) {
-                return status;
-            }
-        }
-    }
-
-    const repl::ReplSettings& replSettings = repl::getGlobalReplicationCoordinator()->getSettings();
-
-    if (!storageGlobalParams.readOnly) {
-        StatusWith<std::vector<StorageEngine::CollectionIndexNamePair>> swIndexesToRebuild =
-            storageEngine->reconcileCatalogAndIdents(opCtx);
-        fassertStatusOK(40593, swIndexesToRebuild);
-        for (auto&& collIndexPair : swIndexesToRebuild.getValue()) {
-            const std::string& coll = collIndexPair.first;
-            const std::string& indexName = collIndexPair.second;
-            DatabaseCatalogEntry* dbce =
-                storageEngine->getDatabaseCatalogEntry(opCtx, NamespaceString(coll).db());
-            invariant(dbce);
-            CollectionCatalogEntry* cce = dbce->getCollectionCatalogEntry(coll);
-            invariant(cce);
-
-            StatusWith<IndexNameObjs> swIndexToRebuild(
-                getIndexNameObjs(opCtx, dbce, cce, [&indexName](const std::string& str) {
-                    return str == indexName;
-                }));
-            if (!swIndexToRebuild.isOK() || swIndexToRebuild.getValue().first.empty()) {
-                severe() << "Unable to get indexes for collection. Collection: " << coll;
-                fassertFailedNoTrace(40590);
-            }
-
-            invariant(swIndexToRebuild.getValue().first.size() == 1 &&
-                      swIndexToRebuild.getValue().second.size() == 1);
-            fassertStatusOK(
-                40592, rebuildIndexesOnCollection(opCtx, dbce, cce, swIndexToRebuild.getValue()));
-        }
-
-        // We open the "local" database before calling checkIfReplMissingFromCommandLine() to
-        // ensure the in-memory catalog entries for the 'kSystemReplSetCollection' collection have
-        // been populated if the collection exists. If the "local" database didn't exist at this
-        // point yet, then it will be created. If the mongod is running in a read-only mode, then
-        // it is fine to not open the "local" database and populate the catalog entries because we
-        // won't attempt to drop the temporary collections anyway.
-        Lock::DBLock dbLock(opCtx, kSystemReplSetCollection.db(), MODE_X);
-        dbHolder().openDb(opCtx, kSystemReplSetCollection.db());
-    }
-
-    // On replica set members we only clear temp collections on DBs other than "local" during
-    // promotion to primary. On pure slaves, they are only cleared when the oplog tells them
-    // to. The local DB is special because it is not replicated.  See SERVER-10927 for more
-    // details.
-    const bool shouldClearNonLocalTmpCollections =
-        !(checkIfReplMissingFromCommandLine(opCtx) || replSettings.usingReplSets() ||
-          replSettings.isSlave());
-
-    // To check whether we are upgrading to 3.6 or have already upgraded to 3.6.
-    bool collsHaveUuids = false;
-
-    // To check whether a featureCompatibilityVersion document exists.
-    bool fcvDocumentExists = false;
-
-    // To check whether we have databases other than local.
-    bool nonLocalDatabases = false;
-
-    // Refresh list of database names to include newly-created admin, if it exists.
-    dbNames.clear();
-    storageEngine->listDatabases(&dbNames);
-    for (const auto& dbName : dbNames) {
-        if (dbName != "local") {
-            nonLocalDatabases = true;
-        }
-        LOG(1) << "    Recovering database: " << dbName;
-
-        Database* db = dbHolder().openDb(opCtx, dbName);
-        invariant(db);
-
-        // First thing after opening the database is to check for file compatibility,
-        // otherwise we might crash if this is a deprecated format.
-        auto status = db->getDatabaseCatalogEntry()->currentFilesCompatible(opCtx);
-        if (!status.isOK()) {
-            if (status.code() == ErrorCodes::CanRepairToDowngrade) {
-                // Convert CanRepairToDowngrade statuses to MustUpgrade statuses to avoid logging a
-                // potentially confusing and inaccurate message.
-                //
-                // TODO SERVER-24097: Log a message informing the user that they can start the
-                // current version of mongod with --repair and then proceed with normal startup.
-                status = {ErrorCodes::MustUpgrade, status.reason()};
-            }
-            severe() << "Unable to start mongod due to an incompatibility with the data files and"
-                        " this version of mongod: "
-                     << redact(status);
-            severe() << "Please consult our documentation when trying to downgrade to a previous"
-                        " major release";
-            quickExit(EXIT_NEED_UPGRADE);
-            MONGO_UNREACHABLE;
-        }
-
-        // Check if admin.system.version contains an invalid featureCompatibilityVersion.
-        // If a valid featureCompatibilityVersion is present, cache it as a server parameter.
-        if (dbName == "admin") {
-            if (Collection* versionColl =
-                    db->getCollection(opCtx, FeatureCompatibilityVersion::kCollection)) {
-                BSONObj featureCompatibilityVersion;
-                if (Helpers::findOne(opCtx,
-                                     versionColl,
-                                     BSON("_id" << FeatureCompatibilityVersion::kParameterName),
-                                     featureCompatibilityVersion)) {
-                    auto swVersion =
-                        FeatureCompatibilityVersion::parse(featureCompatibilityVersion);
-                    if (!swVersion.isOK()) {
-                        severe() << swVersion.getStatus();
-                        // Note this error path captures all cases of an FCV document existing,
-                        // but with any value other than "3.4" or "3.6". This includes unexpected
-                        // cases with no path forward such as the FCV value not being a string.
-                        return {ErrorCodes::MustDowngrade,
-                                str::stream()
-                                    << "UPGRADE PROBLEM: Unable to parse the "
-                                       "featureCompatibilityVersion document. The data files need "
-                                       "to be fully upgraded to version 3.4 before attempting an "
-                                       "upgrade to 3.6. If you are upgrading to 3.6, see "
-                                    << upgradeLink
-                                    << "."};
-                    }
-                    fcvDocumentExists = true;
-                    auto version = swVersion.getValue();
-                    serverGlobalParams.featureCompatibility.setVersion(version);
-                    FeatureCompatibilityVersion::updateMinWireVersion();
-
-                    // On startup, if the version is in an upgrading or downrading state, print a
-                    // warning.
-                    if (version ==
-                        ServerGlobalParams::FeatureCompatibility::Version::kUpgradingTo36) {
-                        log() << "** WARNING: A featureCompatibilityVersion upgrade did not "
-                              << "complete." << startupWarningsLog;
-                        log() << "**          The current featureCompatibilityVersion is "
-                              << FeatureCompatibilityVersion::toString(version) << "."
-                              << startupWarningsLog;
-                        log() << "**          To fix this, use the setFeatureCompatibilityVersion "
-                              << "command to resume upgrade to 3.6." << startupWarningsLog;
-                    } else if (version == ServerGlobalParams::FeatureCompatibility::Version::
-                                              kDowngradingTo34) {
-                        log() << "** WARNING: A featureCompatibilityVersion downgrade did not "
-                              << "complete. " << startupWarningsLog;
-                        log() << "**          The current featureCompatibilityVersion is "
-                              << FeatureCompatibilityVersion::toString(version) << "."
-                              << startupWarningsLog;
-                        log() << "**          To fix this, use the setFeatureCompatibilityVersion "
-                              << "command to resume downgrade to 3.4." << startupWarningsLog;
-                    }
-                }
-            }
-        }
-
-        // Iterate through collections and check for UUIDs.
-        for (auto collectionIt = db->begin(); !collsHaveUuids && collectionIt != db->end();
-             ++collectionIt) {
-            Collection* coll = *collectionIt;
-            if (coll->uuid()) {
-                collsHaveUuids = true;
-            }
-        }
-
-        // Major versions match, check indexes
-        const NamespaceString systemIndexes(db->name(), "system.indexes");
-
-        Collection* coll = db->getCollection(opCtx, systemIndexes);
-        auto exec = InternalPlanner::collectionScan(
-            opCtx, systemIndexes.ns(), coll, PlanExecutor::NO_YIELD);
-
-        BSONObj index;
-        PlanExecutor::ExecState state;
-        while (PlanExecutor::ADVANCED == (state = exec->getNext(&index, NULL))) {
-            const BSONObj key = index.getObjectField("key");
-            const auto plugin = IndexNames::findPluginName(key);
-
-            if (db->getDatabaseCatalogEntry()->isOlderThan24(opCtx)) {
-                if (IndexNames::existedBefore24(plugin)) {
-                    continue;
-                }
-
-                log() << "Index " << index << " claims to be of type '" << plugin << "', "
-                      << "which is either invalid or did not exist before v2.4. "
-                      << "See the upgrade section: "
-                      << "http://dochub.mongodb.org/core/upgrade-2.4" << startupWarningsLog;
-            }
-
-            if (index["v"].isNumber() && index["v"].numberInt() == 0) {
-                log() << "WARNING: The index: " << index << " was created with the deprecated"
-                      << " v:0 format.  This format will not be supported in a future release."
-                      << startupWarningsLog;
-                log() << "\t To fix this, you need to rebuild this index."
-                      << " For instructions, see http://dochub.mongodb.org/core/rebuild-v0-indexes"
-                      << startupWarningsLog;
-            }
-        }
-
-        // Non-yielding collection scans from InternalPlanner will never error.
-        invariant(PlanExecutor::IS_EOF == state);
-
-        if (replSettings.usingReplSets()) {
-            // We only care about _id indexes and drop-pending collections if we are in a replset.
-            checkForIdIndexesAndDropPendingCollections(opCtx, db);
-            // Ensure oplog is capped (mmap does not guarantee order of inserts on noncapped
-            // collections)
-            if (db->name() == "local") {
-                checkForCappedOplog(opCtx, db);
-            }
-        }
-
-        if (!storageGlobalParams.readOnly &&
-            (shouldClearNonLocalTmpCollections || dbName == "local")) {
-            db->clearTmpCollections(opCtx);
-        }
-    }
-
-    // Fail to start up if there is no featureCompatibilityVersion document and there are non-local
-    // databases present.
-    if (!fcvDocumentExists && nonLocalDatabases) {
-        if (collsHaveUuids) {
-            severe()
-                << "Unable to start up mongod due to missing featureCompatibilityVersion document.";
-            if (opCtx->getServiceContext()->getGlobalStorageEngine()->isMmapV1()) {
-                severe()
-                    << "Please run with --journalOptions "
-                    << static_cast<int>(MMAPV1Options::JournalRecoverOnly)
-                    << " to recover the journal. Then run with --repair to restore the document.";
-            } else {
-                severe() << "Please run with --repair to restore the document.";
-            }
-            fassertFailedNoTrace(40652);
-        } else {
-            return {ErrorCodes::MustDowngrade, mustDowngradeErrorMsg};
-        }
-    }
-
-    LOG(1) << "done repairDatabases";
-    return nonLocalDatabases;
 }
 
 void initWireSpec() {
@@ -693,6 +276,13 @@ ExitCode _initAndListen(int listenPort) {
     auto opObserverRegistry = stdx::make_unique<OpObserverRegistry>();
     opObserverRegistry->addObserver(stdx::make_unique<OpObserverImpl>());
     opObserverRegistry->addObserver(stdx::make_unique<UUIDCatalogObserver>());
+
+    if (serverGlobalParams.clusterRole == ClusterRole::ShardServer) {
+        opObserverRegistry->addObserver(stdx::make_unique<ShardServerOpObserver>());
+    } else if (serverGlobalParams.clusterRole == ClusterRole::ConfigServer) {
+        opObserverRegistry->addObserver(stdx::make_unique<ConfigServerOpObserver>());
+    }
+
     serviceContext->setOpObserver(std::move(opObserverRegistry));
 
     DBDirectClientFactory::get(serviceContext).registerImplementation([](OperationContext* opCtx) {
@@ -707,10 +297,6 @@ ExitCode _initAndListen(int listenPort) {
         LogstreamBuilder l = log(LogComponent::kControl);
         l << "MongoDB starting : pid=" << pid << " port=" << serverGlobalParams.port
           << " dbpath=" << storageGlobalParams.dbpath;
-        if (replSettings.isMaster())
-            l << " master=" << replSettings.isMaster();
-        if (replSettings.isSlave())
-            l << " slave=" << (int)replSettings.isSlave();
 
         const bool is32bit = sizeof(int*) == 4;
         l << (is32bit ? " 32" : " 64") << "-bit host=" << getHostNameCached() << endl;
@@ -768,6 +354,15 @@ ExitCode _initAndListen(int listenPort) {
         }
     }
 
+    // Disallow running WiredTiger with --nojournal in a replica set
+    if (storageGlobalParams.engine == "wiredTiger" && !storageGlobalParams.dur &&
+        replSettings.usingReplSets()) {
+        log() << "Running wiredTiger without journaling in a replica set is not "
+              << "supported. Make sure you are not using --nojournal and that "
+              << "storage.journal.enabled is not set to 'false'.";
+        exitCleanly(EXIT_BADOPTIONS);
+    }
+
     logMongodStartupWarnings(storageGlobalParams, serverGlobalParams, serviceContext);
 
     {
@@ -802,8 +397,8 @@ ExitCode _initAndListen(int listenPort) {
 
     auto startupOpCtx = serviceContext->makeOperationContext(&cc());
 
-    bool canCallFCVSetIfCleanStartup = !storageGlobalParams.readOnly &&
-        !(replSettings.isSlave() || storageGlobalParams.engine == "devnull");
+    bool canCallFCVSetIfCleanStartup =
+        !storageGlobalParams.readOnly && (storageGlobalParams.engine != "devnull");
     if (canCallFCVSetIfCleanStartup && !replSettings.usingReplSets()) {
         Lock::GlobalWrite lk(startupOpCtx.get());
         FeatureCompatibilityVersion::setIfCleanStartup(startupOpCtx.get(),
@@ -899,8 +494,6 @@ ExitCode _initAndListen(int listenPort) {
               << startupWarningsLog;
     }
 
-    SessionCatalog::create(serviceContext);
-
     // This function may take the global lock.
     auto shardingInitialized =
         uassertStatusOK(ShardingState::get(startupOpCtx.get())
@@ -914,16 +507,16 @@ ExitCode _initAndListen(int listenPort) {
 
         startMongoDFTDC();
 
+        startFreeMonitoring(serviceContext);
+
         restartInProgressIndexesFromLastShutdown(startupOpCtx.get());
 
         if (serverGlobalParams.clusterRole == ClusterRole::ShardServer) {
             // Note: For replica sets, ShardingStateRecovery happens on transition to primary.
-            if (!repl::getGlobalReplicationCoordinator()->isReplEnabled()) {
+            if (!repl::ReplicationCoordinator::get(startupOpCtx.get())->isReplEnabled()) {
                 uassertStatusOK(ShardingStateRecovery::recover(startupOpCtx.get()));
             }
         } else if (serverGlobalParams.clusterRole == ClusterRole::ConfigServer) {
-            ShardedConnectionInfo::addHook(startupOpCtx->getServiceContext());
-
             uassertStatusOK(
                 initializeGlobalShardingStateForMongod(startupOpCtx.get(),
                                                        ConnectionString::forLocal(),
@@ -952,9 +545,16 @@ ExitCode _initAndListen(int listenPort) {
         if (missingRepl) {
             log() << startupWarningsLog;
             log() << "** WARNING: mongod started without --replSet yet " << missingRepl
-                  << " documents are present in local.system.replset" << startupWarningsLog;
-            log() << "**          Restart with --replSet unless you are doing maintenance and "
-                  << " no other clients are connected." << startupWarningsLog;
+                  << " documents are present in local.system.replset." << startupWarningsLog;
+            log() << "**          Database contents may appear inconsistent with the oplog and may "
+                     "appear to not contain"
+                  << startupWarningsLog;
+            log() << "**          writes that were visible when this node was running as part of a "
+                     "replica set."
+                  << startupWarningsLog;
+            log() << "**          Restart with --replSet unless you are doing maintenance and no "
+                     "other clients are connected."
+                  << startupWarningsLog;
             log() << "**          The TTL collection monitor will not start because of this."
                   << startupWarningsLog;
             log() << "**         ";
@@ -964,8 +564,7 @@ ExitCode _initAndListen(int listenPort) {
             startTTLBackgroundJob();
         }
 
-        if (replSettings.usingReplSets() || (!replSettings.isMaster() && replSettings.isSlave()) ||
-            !internalValidateFeaturesAsMaster) {
+        if (replSettings.usingReplSets() || !internalValidateFeaturesAsMaster) {
             serverGlobalParams.validateFeaturesAsMaster.store(false);
         }
     }
@@ -981,6 +580,15 @@ ExitCode _initAndListen(int listenPort) {
 
     SessionKiller::set(serviceContext,
                        std::make_shared<SessionKiller>(serviceContext, killSessionsLocal));
+
+    // Start up a background task to periodically check for and kill expired transactions.
+    // Only do this on storage engines supporting snapshot reads, which hold resources we wish to
+    // release periodically in order to avoid storage cache pressure build up.
+    auto storageEngine = serviceContext->getGlobalStorageEngine();
+    invariant(storageEngine);
+    if (storageEngine->supportsReadConcernSnapshot()) {
+        startPeriodicThreadToAbortExpiredTransactions(serviceContext);
+    }
 
     // Set up the logical session cache
     LogicalSessionCacheServer kind = LogicalSessionCacheServer::kStandalone;
@@ -1163,8 +771,7 @@ auto makeReplicationExecutor(ServiceContext* serviceContext) {
             "NetworkInterfaceASIO-Replication", nullptr, std::move(hookList)));
 }
 
-MONGO_INITIALIZER_WITH_PREREQUISITES(CreateReplicationManager,
-                                     ("SetGlobalEnvironment", "SSLManager", "default"))
+MONGO_INITIALIZER_WITH_PREREQUISITES(CreateReplicationManager, ("SSLManager", "default"))
 (InitializerContext* context) {
     auto serviceContext = getGlobalServiceContext();
     repl::StorageInterface::set(serviceContext, stdx::make_unique<repl::StorageInterfaceImpl>());
@@ -1202,7 +809,7 @@ MONGO_INITIALIZER_WITH_PREREQUISITES(CreateReplicationManager,
         storageInterface,
         static_cast<int64_t>(curTimeMillis64()));
     repl::ReplicationCoordinator::set(serviceContext, std::move(replCoord));
-    repl::setOplogCollectionName();
+    repl::setOplogCollectionName(serviceContext);
     return Status::OK();
 }
 
@@ -1232,6 +839,9 @@ void shutdownTask() {
         tl->shutdown();
     }
 
+    // Shut down the global dbclient pool so callers stop waiting for connections.
+    globalConnPool.shutdown();
+
     if (serviceContext->getGlobalStorageEngine()) {
         ServiceContext::UniqueOperationContext uniqueOpCtx;
         OperationContext* opCtx = client->getOperationContext();
@@ -1240,33 +850,16 @@ void shutdownTask() {
             opCtx = uniqueOpCtx.get();
         }
 
-        if (serverGlobalParams.featureCompatibility.getVersion() !=
-            ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo36) {
-            log(LogComponent::kReplication) << "shutdown: removing all drop-pending collections...";
-            repl::DropPendingCollectionReaper::get(serviceContext)
-                ->dropCollectionsOlderThan(opCtx, repl::OpTime::max());
-
-            // If we are in fCV 3.4, drop the 'checkpointTimestamp' collection so if we downgrade
-            // and then upgrade again, we do not trust a stale 'checkpointTimestamp'.
-            log(LogComponent::kReplication)
-                << "shutdown: removing checkpointTimestamp collection...";
-            Status status =
-                repl::StorageInterface::get(serviceContext)
-                    ->dropCollection(opCtx,
-                                     NamespaceString(repl::ReplicationConsistencyMarkersImpl::
-                                                         kDefaultCheckpointTimestampNamespace));
-            if (!status.isOK()) {
-                warning(LogComponent::kReplication)
-                    << "shutdown: dropping checkpointTimestamp collection failed: "
-                    << redact(status.toString());
-            }
-        }
-
         // This can wait a long time while we drain the secondary's apply queue, especially if it
         // is building an index.
         repl::ReplicationCoordinator::get(serviceContext)->shutdown(opCtx);
 
         ShardingState::get(serviceContext)->shutDown(opCtx);
+
+        // Destroy all stashed transaction resources, in order to release locks.
+        SessionKiller::Matcher matcherAllSessions(
+            KillAllSessionsByPatternSet{makeKillAllSessionsByPattern(opCtx)});
+        killSessionsLocalKillTransactions(opCtx, matcherAllSessions);
     }
 
     serviceContext->setKillAllOperations();
@@ -1310,6 +903,7 @@ void shutdownTask() {
         }
     }
 #endif
+    stopFreeMonitoring();
 
     // Shutdown Full-Time Data Capture
     stopMongoDFTDC();
@@ -1326,9 +920,9 @@ void shutdownTask() {
     // of this function to prevent any operations from running that need a lock.
     //
     DefaultLockerImpl* globalLocker = new DefaultLockerImpl();
-    LockResult result = globalLocker->lockGlobalBegin(MODE_X, Milliseconds::max());
+    LockResult result = globalLocker->lockGlobalBegin(MODE_X, Date_t::max());
     if (result == LOCK_WAITING) {
-        result = globalLocker->lockGlobalComplete(Milliseconds::max());
+        result = globalLocker->lockGlobalComplete(Date_t::max());
     }
 
     invariant(LOCK_OK == result);
@@ -1358,7 +952,8 @@ int mongoDbMain(int argc, char* argv[], char** envp) {
 
     srand(static_cast<unsigned>(curTimeMicros64()));
 
-    Status status = mongo::runGlobalInitializers(argc, argv, envp);
+    setGlobalServiceContext(createServiceContext());
+    Status status = mongo::runGlobalInitializers(argc, argv, envp, getGlobalServiceContext());
     if (!status.isOK()) {
         severe(LogComponent::kControl) << "Failed global initialization: " << status;
         quickExit(EXIT_FAILURE);

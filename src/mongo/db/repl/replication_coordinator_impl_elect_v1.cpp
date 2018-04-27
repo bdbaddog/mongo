@@ -36,7 +36,6 @@
 #include "mongo/db/repl/replication_coordinator_impl.h"
 #include "mongo/db/repl/topology_coordinator.h"
 #include "mongo/db/repl/vote_requester.h"
-#include "mongo/platform/unordered_set.h"
 #include "mongo/stdx/mutex.h"
 #include "mongo/util/log.h"
 #include "mongo/util/scopeguard.h"
@@ -301,7 +300,7 @@ void ReplicationCoordinatorImpl::_onVoteRequestComplete(long long newTerm) {
         case VoteRequester::Result::kPrimaryRespondedNo:
             // This is impossible because we would only require the primary's
             // vote during a dry run.
-            invariant(false);
+            MONGO_UNREACHABLE;
     }
 
     // Mark all nodes that responded to our vote request as up to avoid immediately

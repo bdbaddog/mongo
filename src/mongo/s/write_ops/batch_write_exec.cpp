@@ -61,9 +61,7 @@ typedef OwnedPointerMap<ShardId, TargetedWriteBatch> OwnedShardBatchMap;
 
 WriteErrorDetail errorFromStatus(const Status& status) {
     WriteErrorDetail error;
-    error.setErrCode(status.code());
-    error.setErrMessage(status.reason());
-
+    error.setStatus(status);
     return error;
 }
 
@@ -171,6 +169,8 @@ void BatchWriteExec::executeBatch(OperationContext* opCtx,
                 if (pendingBatches.count(targetShardId))
                     continue;
 
+                stats->noteTargetedShard(targetShardId);
+
                 const auto request = [&] {
                     const auto shardBatchRequest(batchOp.buildBatchRequest(*nextBatch));
 
@@ -263,6 +263,7 @@ void BatchWriteExec::executeBatch(OperationContext* opCtx,
                 if (responseStatus.isOK()) {
                     TrackedErrors trackedErrors;
                     trackedErrors.startTracking(ErrorCodes::StaleShardVersion);
+                    trackedErrors.startTracking(ErrorCodes::CannotImplicitlyCreateCollection);
 
                     LOG(4) << "Write results received from " << shardHost.toString() << ": "
                            << redact(batchedCommandResponse.toString());
@@ -278,6 +279,14 @@ void BatchWriteExec::executeBatch(OperationContext* opCtx,
                         ++stats->numStaleBatches;
                     }
 
+                    const auto& cannotImplicitlyCreateErrors =
+                        trackedErrors.getErrors(ErrorCodes::CannotImplicitlyCreateCollection);
+                    if (!cannotImplicitlyCreateErrors.empty()) {
+                        // This forces the chunk manager to reload so we can attach the correct
+                        // version on retry and make sure we route to the correct shard.
+                        targeter.noteCouldNotTarget();
+                    }
+
                     // Remember that we successfully wrote to this shard
                     // NOTE: This will record lastOps for shards where we actually didn't update
                     // or delete any documents, which preserves old behavior but is conservative
@@ -290,11 +299,8 @@ void BatchWriteExec::executeBatch(OperationContext* opCtx,
                                            : OID());
                 } else {
                     // Error occurred dispatching, note it
-                    const Status status(responseStatus.code(),
-                                        str::stream() << "Write results unavailable from "
-                                                      << shardHost
-                                                      << " due to "
-                                                      << responseStatus.reason());
+                    const Status status = responseStatus.withContext(
+                        str::stream() << "Write results unavailable from " << shardHost);
 
                     batchOp.noteBatchError(*batch, errorFromStatus(status));
 
@@ -365,10 +371,18 @@ void BatchWriteExec::executeBatch(OperationContext* opCtx,
            << " for " << clientRequest.getNS();
 }
 
+void BatchWriteExecStats::noteTargetedShard(const ShardId& shardId) {
+    _targetedShards.insert(shardId);
+}
+
 void BatchWriteExecStats::noteWriteAt(const HostAndPort& host,
                                       repl::OpTime opTime,
                                       const OID& electionId) {
     _writeOpTimes[ConnectionString(host)] = HostOpTime(opTime, electionId);
+}
+
+const std::set<ShardId>& BatchWriteExecStats::getTargetedShards() const {
+    return _targetedShards;
 }
 
 const HostOpTimeMap& BatchWriteExecStats::getWriteOpTimes() const {

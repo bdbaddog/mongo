@@ -33,6 +33,8 @@
 #include "mongo/base/status.h"
 #include "mongo/bson/mutable/document.h"
 #include "mongo/crypto/mechanism_scram.h"
+#include "mongo/crypto/sha1_block.h"
+#include "mongo/crypto/sha256_block.h"
 #include "mongo/db/auth/action_set.h"
 #include "mongo/db/auth/action_type.h"
 #include "mongo/db/auth/authorization_manager.h"
@@ -49,7 +51,6 @@
 #include "mongo/transport/transport_layer_mock.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/map_util.h"
-#include "mongo/util/net/message_port.h"
 
 #define ASSERT_NULL(EXPR) ASSERT_FALSE(EXPR)
 #define ASSERT_NON_NULL(EXPR) ASSERT_TRUE(EXPR)
@@ -173,13 +174,16 @@ public:
     void setUp() override {
         auto localExternalState = stdx::make_unique<AuthzManagerExternalStateMock>();
         externalState = localExternalState.get();
-        externalState->setAuthzVersion(AuthorizationManager::schemaVersion26Final);
         authzManager = stdx::make_unique<AuthorizationManager>(std::move(localExternalState));
         externalState->setAuthorizationManager(authzManager.get());
         authzManager->setAuthEnabled(true);
 
-        credentials = BSON("SCRAM-SHA-1" << scram::generateCredentials(
-                               "password", saslGlobalParams.scramIterationCount.load()));
+        credentials = BSON("SCRAM-SHA-1"
+                           << scram::Secrets<SHA1Block>::generateCredentials(
+                                  "password", saslGlobalParams.scramSHA1IterationCount.load())
+                           << "SCRAM-SHA-256"
+                           << scram::Secrets<SHA256Block>::generateCredentials(
+                                  "password", saslGlobalParams.scramSHA256IterationCount.load()));
     }
 
     std::unique_ptr<AuthorizationManager> authzManager;
@@ -446,7 +450,7 @@ public:
     };
 
     virtual void setUp() override {
-        opCtx.setRecoveryUnit(recoveryUnit, OperationContext::kNotInUnitOfWork);
+        opCtx.setRecoveryUnit(recoveryUnit, WriteUnitOfWork::RecoveryUnitState::kNotInUnitOfWork);
         AuthorizationManagerTest::setUp();
     }
 

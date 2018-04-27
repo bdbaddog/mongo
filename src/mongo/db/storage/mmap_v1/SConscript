@@ -23,36 +23,38 @@ env.Library(
 )
 
 env.Library(
-    target = 'storage_mmapv1',
-    source = [ "aligned_builder.cpp",
-               "catalog/hashtab.cpp",
-               "catalog/index_details.cpp",
-               "catalog/namespace_details.cpp",
-               "catalog/namespace_details_collection_entry.cpp",
-               "catalog/namespace_details_rsv1_metadata.cpp",
-               "catalog/namespace_index.cpp",
-               "commit_notifier.cpp",
-               "data_file.cpp",
-               "data_file_sync.cpp",
-               "durable_mapped_file.cpp",
-               "dur.cpp",
-               "durop.cpp",
-               "dur_preplogbuffer.cpp",
-               "dur_commitjob.cpp",
-               "dur_recover.cpp",
-               "dur_journal.cpp",
-               "dur_journal_writer.cpp",
-               "dur_recovery_unit.cpp",
-               "journal_latency_test_cmd.cpp",
-               "mmap_v1_database_catalog_entry.cpp",
-               "mmap_v1_engine.cpp",
-               "mmap_v1_extent_manager.cpp",
-               "mmap_v1_init.cpp" if mmapv1 else "mmap_v1_noinit.cpp",
-               "repair_database.cpp",
-             ],
-    LIBDEPS = [
+    target='storage_mmapv1',
+    source=[ 
+        "aligned_builder.cpp",
+        "catalog/hashtab.cpp",
+        "catalog/index_details.cpp",
+        "catalog/namespace_details.cpp",
+        "catalog/namespace_details_collection_entry.cpp",
+        "catalog/namespace_details_rsv1_metadata.cpp",
+        "catalog/namespace_index.cpp",
+        "commit_notifier.cpp",
+        "data_file.cpp",
+        "data_file_sync.cpp",
+        "durable_mapped_file.cpp",
+        "dur.cpp",
+        "durop.cpp",
+        "dur_preplogbuffer.cpp",
+        "dur_commitjob.cpp",
+        "dur_recover.cpp",
+        "dur_journal.cpp",
+        "dur_journal_writer.cpp",
+        "dur_recovery_unit.cpp",
+        "journal_latency_test_cmd.cpp",
+        "mmap_v1_database_catalog_entry.cpp",
+        "mmap_v1_engine.cpp",
+        "mmap_v1_extent_manager.cpp",
+        "mmap_v1_init.cpp" if mmapv1 else "mmap_v1_noinit.cpp",
+        "repair_database.cpp",
+    ],
+    LIBDEPS=[
         'record_store_v1',
         'record_access_tracker',
+        'repair_database_interface',
         'btree',
         'file_allocator',
         'logfile',
@@ -64,9 +66,7 @@ env.Library(
         '$BUILD_DIR/mongo/db/catalog/database_holder',
         '$BUILD_DIR/mongo/db/catalog/index_catalog',
         '$BUILD_DIR/mongo/db/catalog/index_create',
-        '$BUILD_DIR/mongo/db/clientcursor',
         '$BUILD_DIR/mongo/db/commands',
-        '$BUILD_DIR/mongo/db/commands/server_status',
         '$BUILD_DIR/mongo/db/concurrency/lock_manager',
         '$BUILD_DIR/mongo/db/index_names',
         '$BUILD_DIR/mongo/db/index/index_descriptor',
@@ -76,6 +76,19 @@ env.Library(
         '$BUILD_DIR/mongo/db/storage/storage_engine_metadata',
         '$BUILD_DIR/mongo/db/index/index_access_methods',
         '$BUILD_DIR/mongo/db/write_ops',
+    ],
+    LIBDEPS_PRIVATE=[
+        '$BUILD_DIR/mongo/db/commands/server_status',
+        '$BUILD_DIR/mongo/db/commands/test_commands_enabled',
+    ],
+)
+
+env.Library(
+    target = 'repair_database_interface',
+    source = [ 
+        "repair_database_interface.cpp",
+    ],
+    LIBDEPS = [
     ],
 )
 
@@ -208,6 +221,7 @@ if mmapv1:
         LIBDEPS=[
             '$BUILD_DIR/mongo/db/serveronly',
             '$BUILD_DIR/mongo/db/service_context',
+            '$BUILD_DIR/mongo/db/service_context_d',
             '$BUILD_DIR/mongo/db/storage/storage_engine_metadata',
             '$BUILD_DIR/mongo/db/storage/storage_options',
             ],
@@ -229,7 +243,6 @@ if mmapv1:
         source=['record_store_v1_simple_test.cpp',
                 ],
         LIBDEPS=[
-            '$BUILD_DIR/mongo/util/decorable',
             'record_store_v1_test_help'
             ]
         )
@@ -239,7 +252,6 @@ if mmapv1:
         source=['record_store_v1_capped_test.cpp',
                 ],
         LIBDEPS=[
-            '$BUILD_DIR/mongo/util/decorable',
             'record_store_v1_test_help'
             ]
         )
@@ -272,7 +284,6 @@ if mmapv1:
         source=['btree/btree_logic_test.cpp'
                 ],
         LIBDEPS=[
-            '$BUILD_DIR/mongo/util/decorable',
             'btree_test_help'
             ]
         )

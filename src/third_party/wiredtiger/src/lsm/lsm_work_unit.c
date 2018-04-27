@@ -313,6 +313,26 @@ __wt_lsm_chunk_visible_all(
 }
 
 /*
+ * __lsm_checkpoint_chunk --
+ *	Checkpoint an LSM chunk, separated out to make locking easier.
+ */
+static int
+__lsm_checkpoint_chunk(WT_SESSION_IMPL *session)
+{
+	WT_DECL_RET;
+
+	/*
+	 * Turn on metadata tracking to ensure the checkpoint gets the
+	 * necessary handle locks.
+	 */
+	WT_RET(__wt_meta_track_on(session));
+	ret = __wt_checkpoint(session, NULL);
+	WT_TRET(__wt_meta_track_off(session, false, ret != 0));
+
+	return (ret);
+}
+
+/*
  * __wt_lsm_checkpoint_chunk --
  *	Flush a single LSM chunk to disk.
  */
@@ -325,8 +345,8 @@ __wt_lsm_checkpoint_chunk(WT_SESSION_IMPL *session,
 	WT_TXN_ISOLATION saved_isolation;
 	bool flush_set, release_dhandle;
 
-	flush_set = release_dhandle = false;
-	WT_NOT_READ(flush_set);
+	WT_NOT_READ(flush_set, false);
+	release_dhandle = false;
 
 	/*
 	 * If the chunk is already checkpointed, make sure it is also evicted.
@@ -340,8 +360,7 @@ __wt_lsm_checkpoint_chunk(WT_SESSION_IMPL *session,
 		if (ret == 0)
 			chunk->evicted = 1;
 		else if (ret == EBUSY) {
-			ret = 0;
-			WT_NOT_READ(ret);
+			WT_NOT_READ(ret, 0);
 		} else
 			WT_RET_MSG(session, ret, "discard handle");
 	}
@@ -394,19 +413,13 @@ __wt_lsm_checkpoint_chunk(WT_SESSION_IMPL *session,
 	    chunk->uri);
 
 	/*
-	 * Turn on metadata tracking to ensure the checkpoint gets the
-	 * necessary handle locks.
-	 *
-	 * Ensure that we don't race with a running checkpoint: the checkpoint
-	 * lock protects against us racing with an application checkpoint in
-	 * this chunk.  Don't wait for it, though: checkpoints can take a long
-	 * time, and our checkpoint operation should be very quick.
+	 * Ensure we don't race with a running checkpoint: the checkpoint lock
+	 * protects against us racing with an application checkpoint in this
+	 * chunk.
 	 */
-	WT_ERR(__wt_meta_track_on(session));
 	WT_WITH_CHECKPOINT_LOCK(session,
 	    WT_WITH_SCHEMA_LOCK(session,
-		ret = __wt_checkpoint(session, NULL)));
-	WT_TRET(__wt_meta_track_off(session, false, ret != 0));
+		ret = __lsm_checkpoint_chunk(session)));
 	if (ret != 0)
 		WT_ERR_MSG(session, ret, "LSM checkpoint");
 

@@ -1,4 +1,10 @@
-// @tags: [requires_non_retryable_commands]
+// @tags: [
+//     requires_non_retryable_commands,
+//     requires_fastcount,
+//
+//     # applyOps uses the oplog that require replication support
+//     requires_replication,
+// ]
 
 (function() {
     "use strict";
@@ -291,7 +297,8 @@
 
     /**
      * Test function for running CRUD operations on non-existent namespaces using various
-     * combinations of invalid namespaces (collection/database), allowAtomic and alwaysUpsert.
+     * combinations of invalid namespaces (collection/database), allowAtomic and alwaysUpsert,
+     * and nesting.
      *
      * Leave 'expectedErrorCode' undefined if this command is expected to run successfully.
      */
@@ -300,19 +307,23 @@
         const t2 = db.getSiblingDB('apply_ops1_no_such_db').getCollection('t');
         [t, t2].forEach(coll => {
             const op = {op: optype, ns: coll.getFullName(), o: o, o2: o2};
-            [false, true].forEach(allowAtomic => {
-                [false, true].forEach(alwaysUpsert => {
-                    const cmd = {
-                        applyOps: [op],
-                        allowAtomic: allowAtomic,
-                        alwaysUpsert: alwaysUpsert
-                    };
-                    jsTestLog('Testing applyOps on non-existent namespace: ' + tojson(cmd));
-                    if (expectedErrorCode === ErrorCodes.OK) {
-                        assert.commandWorked(db.adminCommand(cmd));
-                    } else {
-                        assert.commandFailedWithCode(db.adminCommand(cmd), expectedErrorCode);
-                    }
+            [false, true].forEach(nested => {
+                const opToRun =
+                    nested ? {op: 'c', ns: 'test.$cmd', o: {applyOps: [op]}, o2: {}} : op;
+                [false, true].forEach(allowAtomic => {
+                    [false, true].forEach(alwaysUpsert => {
+                        const cmd = {
+                            applyOps: [opToRun],
+                            allowAtomic: allowAtomic,
+                            alwaysUpsert: alwaysUpsert
+                        };
+                        jsTestLog('Testing applyOps on non-existent namespace: ' + tojson(cmd));
+                        if (expectedErrorCode === ErrorCodes.OK) {
+                            assert.commandWorked(db.adminCommand(cmd));
+                        } else {
+                            assert.commandFailedWithCode(db.adminCommand(cmd), expectedErrorCode);
+                        }
+                    });
                 });
             });
         });
@@ -546,7 +557,7 @@
             }
         ]
     }));
-    assert.eq(res.code, 50659);
+    assert.eq(res.code, 40682);
 
     // When we explicitly specify {$v: 1}, we should get 'UpdateNode' update semantics, and $set
     // operations get performed in lexicographic order.

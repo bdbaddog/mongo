@@ -73,6 +73,7 @@ void CursorResponseBuilder::abandon() {
     _batch.doneFast();
     _cursorObject.doneFast();
     _commandResponse->bb().setlen(_responseInitialLen);  // Removes everything we've added.
+    _numDocs = 0;
     _active = false;
 }
 
@@ -114,7 +115,7 @@ CursorResponse::CursorResponse(NamespaceString nss,
 StatusWith<CursorResponse> CursorResponse::parseFromBSON(const BSONObj& cmdResponse) {
     Status cmdStatus = getStatusFromCommandResult(cmdResponse);
     if (!cmdStatus.isOK()) {
-        if (ErrorCodes::isStaleShardingError(cmdStatus.code())) {
+        if (ErrorCodes::isStaleShardVersionError(cmdStatus.code())) {
             auto vWanted = ChunkVersion::fromBSON(cmdResponse, "vWanted");
             auto vReceived = ChunkVersion::fromBSON(cmdResponse, "vReceived");
             if (!vWanted.hasEqualEpoch(vReceived)) {

@@ -59,6 +59,7 @@
 #include "mongo/db/repl/oplog.h"
 #include "mongo/db/repl/read_concern_args.h"
 #include "mongo/db/service_context.h"
+#include "mongo/db/session_catalog.h"
 #include "mongo/db/storage/storage_options.h"
 #include "mongo/db/views/view.h"
 #include "mongo/db/views/view_catalog.h"
@@ -122,10 +123,8 @@ bool handleCursorCommand(OperationContext* opCtx,
         }
 
         if (PlanExecutor::ADVANCED != state) {
-            auto status = WorkingSetCommon::getMemberObjectStatus(next);
-            uasserted(status.code(),
-                      "PlanExecutor error during aggregation: " +
-                          WorkingSetCommon::toStatusString(next));
+            uassertStatusOK(WorkingSetCommon::getMemberObjectStatus(next).withContext(
+                "PlanExecutor error during aggregation"));
         }
 
         // If adding this object will cause us to exceed the message size limit, then we stash it
@@ -289,25 +288,6 @@ Status collatorCompatibleWithPipeline(OperationContext* opCtx,
     return Status::OK();
 }
 
-Status waitForMajorityReadConcern(OperationContext* opCtx) {
-    const repl::ReadConcernArgs& originalRC = repl::ReadConcernArgs::get(opCtx);
-    if (!originalRC.hasLevel()) {
-        // If the read concern level is not specified, upgrade it to "majority".
-        const repl::ReadConcernArgs readConcern(repl::ReadConcernLevel::kMajorityReadConcern);
-        auto rcStatus = waitForReadConcern(opCtx, readConcern, true);
-        if (!rcStatus.isOK()) {
-            return rcStatus;
-        }
-    } else if (originalRC.getLevel() != repl::ReadConcernLevel::kMajorityReadConcern) {
-        // Otherwise, only "majority" is allowed for change streams.
-        return {ErrorCodes::InvalidOptions,
-                str::stream() << "Read concern " << originalRC.toString()
-                              << " is not supported for change streams. "
-                                 "Only read concern level \"majority\" is supported."};
-    }
-    return Status::OK();
-}
-
 /**
  * Resolves the collator to either the user-specified collation or, if none was specified, to the
  * collection-default collation.
@@ -334,14 +314,6 @@ Status runAggregate(OperationContext* opCtx,
     // For operations on views, this will be the underlying namespace.
     NamespaceString nss = request.getNamespaceString();
 
-    if (request.getExplain() &&
-        repl::ReadConcernArgs::get(opCtx).getLevel() != repl::ReadConcernLevel::kLocalReadConcern) {
-        return {ErrorCodes::InvalidOptions,
-                str::stream() << "Explain for the aggregate command "
-                                 "does not support non-local "
-                                 "readConcern levels"};
-    }
-
     // The collation to use for this aggregation. boost::optional to distinguish between the case
     // where the collation has not yet been resolved, and where it has been resolved to nullptr.
     boost::optional<std::unique_ptr<CollatorInterface>> collatorToUse;
@@ -352,36 +324,46 @@ Status runAggregate(OperationContext* opCtx,
     auto curOp = CurOp::get(opCtx);
     {
         const LiteParsedPipeline liteParsedPipeline(request);
+
+        // Check whether the parsed pipeline supports the given read concern.
+        liteParsedPipeline.assertSupportsReadConcern(opCtx, request.getExplain());
+
         if (liteParsedPipeline.hasChangeStream()) {
             nss = NamespaceString::kRsOplogNamespace;
 
-            // Require $changeNotification to run with readConcern:majority.
-            uassertStatusOK(waitForMajorityReadConcern(opCtx));
+            // If the read concern is not specified, upgrade to 'majority' and wait to make sure we
+            // have a snapshot available.
+            if (!repl::ReadConcernArgs::get(opCtx).hasLevel()) {
+                const repl::ReadConcernArgs readConcern(
+                    repl::ReadConcernLevel::kMajorityReadConcern);
+                uassertStatusOK(waitForReadConcern(opCtx, readConcern, true));
+            }
 
-            // Resolve the collator to either the user-specified collation or the default collation
-            // of the collection on which $changeStream was invoked, so that we do not end up
-            // resolving the collation on the oplog.
-            invariant(!collatorToUse);
-            // Change streams can only be run against collections; AutoGetCollection will raise an
-            // error if the given namespace is a view. A change stream may be opened on a namespace
-            // before the associated collection is created, but only if the database already exists.
-            // If the $changeStream was sent from mongoS then the database exists at the cluster
-            // level even if not yet present on this shard, so we allow the $changeStream to run.
-            AutoGetCollection origNssCtx(opCtx, origNss, MODE_IS);
-            uassert(ErrorCodes::NamespaceNotFound,
-                    str::stream() << "cannot open $changeStream for non-existent database: "
-                                  << origNss.db(),
-                    origNssCtx.getDb() || request.isFromMongos());
-            Collection* origColl = origNssCtx.getCollection();
-            collatorToUse.emplace(resolveCollator(opCtx, request, origColl));
+            // If the change stream is opened against a database which does not exist yet, go ahead
+            // and create it. Use MODE_IX since the AutoGetOrCreateDb helper will automatically
+            // reacquire as MODE_X if the database does not exist.
+            AutoGetOrCreateDb dbLock(opCtx, origNss.db(), MODE_IX);
+            invariant(dbLock.getDb());
+            if (!origNss.isCollectionlessAggregateNS()) {
+                // AutoGetCollectionForReadCommand will raise an error if the given namespace is a
+                // view.
+                AutoGetCollectionForReadCommand origNssCtx(opCtx, origNss);
+
+                // Resolve the collator to either the user-specified collation or the default
+                // collation of the collection on which $changeStream was invoked, so that we do not
+                // end up resolving the collation on the oplog.
+                invariant(!collatorToUse);
+                Collection* origColl = origNssCtx.getCollection();
+                collatorToUse.emplace(resolveCollator(opCtx, request, origColl));
+            }
         }
 
         const auto& pipelineInvolvedNamespaces = liteParsedPipeline.getInvolvedNamespaces();
 
-        // If emplaced, AutoGetCollectionOrViewForReadCommand will throw if the sharding version for
-        // this connection is out of date. If the namespace is a view, the lock will be released
-        // before re-running the expanded aggregation.
-        boost::optional<AutoGetCollectionOrViewForReadCommand> ctx;
+        // If emplaced, AutoGetCollectionForReadCommand will throw if the sharding version for this
+        // connection is out of date. If the namespace is a view, the lock will be released before
+        // re-running the expanded aggregation.
+        boost::optional<AutoGetCollectionForReadCommand> ctx;
 
         // If this is a collectionless aggregation, we won't create 'ctx' but will still need an
         // AutoStatsTracker to record CurOp and Top entries.
@@ -392,7 +374,7 @@ Status runAggregate(OperationContext* opCtx,
         if (nss.isCollectionlessAggregateNS() && pipelineInvolvedNamespaces.empty()) {
             statsTracker.emplace(opCtx, nss, Top::LockType::NotLocked, 0);
         } else {
-            ctx.emplace(opCtx, nss);
+            ctx.emplace(opCtx, nss, AutoGetCollection::ViewMode::kViewsPermitted);
         }
 
         Collection* collection = ctx ? ctx->getCollection() : nullptr;
@@ -422,16 +404,7 @@ Status runAggregate(OperationContext* opCtx,
                 }
             }
 
-            auto viewDefinition =
-                ViewShardingCheck::getResolvedViewIfSharded(opCtx, ctx->getDb(), ctx->getView());
-            if (!viewDefinition.isOK()) {
-                return viewDefinition.getStatus();
-            }
-
-            if (!viewDefinition.getValue().isEmpty()) {
-                return ViewShardingCheck::appendShardedViewResponse(viewDefinition.getValue(),
-                                                                    &result);
-            }
+            ViewShardingCheck::throwResolvedViewIfSharded(opCtx, ctx->getDb(), ctx->getView());
 
             auto resolvedView = ctx->getDb()->getViewCatalog()->resolveView(opCtx, nss);
             if (!resolvedView.isOK()) {
@@ -439,7 +412,7 @@ Status runAggregate(OperationContext* opCtx,
             }
 
             // With the view & collation resolved, we can relinquish locks.
-            ctx->releaseLocksForView();
+            ctx.reset();
 
             // Parse the resolved view into a new aggregation request.
             auto newRequest = resolvedView.getValue().asExpandedViewAggregation(request);
@@ -463,6 +436,9 @@ Status runAggregate(OperationContext* opCtx,
                                   std::make_shared<PipelineD::MongoDInterface>(opCtx),
                                   uassertStatusOK(resolveInvolvedNamespaces(opCtx, request))));
         expCtx->tempDir = storageGlobalParams.dbpath + "/_tmp";
+        auto session = OperationContextSession::get(opCtx);
+        expCtx->inSnapshotReadOrMultiDocumentTransaction =
+            session && session->inSnapshotReadOrMultiDocumentTransaction();
 
         auto pipeline = uassertStatusOK(Pipeline::parse(request.getPipeline(), expCtx));
 
@@ -532,9 +508,9 @@ Status runAggregate(OperationContext* opCtx,
         std::move(exec),
         origNss,
         AuthorizationSession::get(opCtx->getClient())->getAuthenticatedUserNames(),
-        opCtx->recoveryUnit()->isReadingFromMajorityCommittedSnapshot(),
+        opCtx->recoveryUnit()->getReadConcernLevel(),
         cmdObj);
-    if (expCtx->tailableMode == TailableMode::kTailableAndAwaitData) {
+    if (expCtx->tailableMode == TailableModeEnum::kTailableAndAwaitData) {
         cursorParams.setTailable(true);
         cursorParams.setAwaitData(true);
     }
@@ -546,7 +522,8 @@ Status runAggregate(OperationContext* opCtx,
 
     // If both explain and cursor are specified, explain wins.
     if (expCtx->explain) {
-        result << "stages" << Value(unownedPipeline->writeExplainOps(*expCtx->explain));
+        Explain::explainPipelineExecutor(
+            pin.getCursor()->getExecutor(), *(expCtx->explain), &result);
     } else {
         // Cursor must be specified, if explain is not.
         const bool keepCursor =

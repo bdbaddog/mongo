@@ -31,6 +31,7 @@
 #include "mongo/base/init.h"
 #include "mongo/db/client.h"
 #include "mongo/db/commands.h"
+#include "mongo/db/commands/test_commands_enabled.h"
 #include "mongo/db/logical_session_cache.h"
 #include "mongo/db/logical_session_id_helpers.h"
 #include "mongo/db/operation_context.h"
@@ -45,8 +46,8 @@ class RefreshLogicalSessionCacheNowCommand final : public BasicCommand {
 public:
     RefreshLogicalSessionCacheNowCommand() : BasicCommand("refreshLogicalSessionCacheNow") {}
 
-    bool slaveOk() const override {
-        return true;
+    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
+        return AllowedOnSecondary::kAlways;
     }
 
     bool adminOnly() const override {
@@ -57,20 +58,14 @@ public:
         return false;
     }
 
-    void help(std::stringstream& help) const override {
-        help << "force the logical session cache to refresh. Test command only.";
+    std::string help() const override {
+        return "force the logical session cache to refresh. Test command only.";
     }
 
     // No auth needed because it only works when enabled via command line.
     Status checkAuthForOperation(OperationContext* opCtx,
                                  const std::string& dbname,
-                                 const BSONObj& cmdObj) override {
-
-        if (serverGlobalParams.featureCompatibility.getVersion() !=
-            ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo36) {
-            return SessionsCommandFCV34Status(getName());
-        }
-
+                                 const BSONObj& cmdObj) const override {
         return Status::OK();
     }
 
@@ -78,18 +73,12 @@ public:
                      const std::string& db,
                      const BSONObj& cmdObj,
                      BSONObjBuilder& result) override {
-
-        if (serverGlobalParams.featureCompatibility.getVersion() !=
-            ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo36) {
-            return appendCommandStatus(result, SessionsCommandFCV34Status(getName()));
-        }
-
         auto cache = LogicalSessionCache::get(opCtx);
         auto client = opCtx->getClient();
 
         auto res = cache->refreshNow(client);
         if (!res.isOK()) {
-            return appendCommandStatus(result, res);
+            return CommandHelpers::appendCommandStatus(result, res);
         }
 
         return true;
@@ -97,7 +86,7 @@ public:
 };
 
 MONGO_INITIALIZER(RegisterRefreshLogicalSessionCacheNowCommand)(InitializerContext* context) {
-    if (Command::testCommandsEnabled) {
+    if (getTestCommandsEnabled()) {
         // Leaked intentionally: a Command registers itself when constructed.
         new RefreshLogicalSessionCacheNowCommand();
     }

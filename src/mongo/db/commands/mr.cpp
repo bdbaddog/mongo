@@ -59,7 +59,7 @@
 #include "mongo/db/query/get_executor.h"
 #include "mongo/db/query/plan_summary_stats.h"
 #include "mongo/db/query/query_planner.h"
-#include "mongo/db/repl/replication_coordinator_global.h"
+#include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/s/collection_metadata.h"
 #include "mongo/db/s/collection_sharding_state.h"
 #include "mongo/db/s/sharding_state.h"
@@ -364,16 +364,22 @@ Config::Config(const string& _dbname, const BSONObj& cmdObj) {
  * Clean up the temporary and incremental collections
  */
 void State::dropTempCollections() {
+    // The cleanup handler should not be interruptible.
+    UninterruptibleLockGuard noInterrupt(_opCtx->lockState());
+
     if (!_config.tempNamespace.isEmpty()) {
         writeConflictRetry(_opCtx, "M/R dropTempCollections", _config.tempNamespace.ns(), [this] {
             AutoGetDb autoDb(_opCtx, _config.tempNamespace.db(), MODE_X);
             if (auto db = autoDb.getDb()) {
                 WriteUnitOfWork wunit(_opCtx);
-                uassert(ErrorCodes::PrimarySteppedDown,
-                        "no longer primary",
-                        repl::getGlobalReplicationCoordinator()->canAcceptWritesFor(
-                            _opCtx, _config.tempNamespace));
-                db->dropCollection(_opCtx, _config.tempNamespace.ns()).transitional_ignore();
+                uassert(
+                    ErrorCodes::PrimarySteppedDown,
+                    str::stream()
+                        << "no longer primary while dropping temporary collection for mapReduce: "
+                        << _config.tempNamespace.ns(),
+                    repl::ReplicationCoordinator::get(_opCtx)->canAcceptWritesFor(
+                        _opCtx, _config.tempNamespace));
+                uassertStatusOK(db->dropCollection(_opCtx, _config.tempNamespace.ns()));
                 wunit.commit();
             }
         });
@@ -389,7 +395,7 @@ void State::dropTempCollections() {
             Lock::DBLock lk(_opCtx, _config.incLong.db(), MODE_X);
             if (Database* db = dbHolder().get(_opCtx, _config.incLong.ns())) {
                 WriteUnitOfWork wunit(_opCtx);
-                db->dropCollection(_opCtx, _config.incLong.ns()).transitional_ignore();
+                uassertStatusOK(db->dropCollection(_opCtx, _config.incLong.ns()));
                 wunit.commit();
             }
         });
@@ -420,11 +426,10 @@ void State::prepTempCollection() {
             CollectionOptions options;
             options.setNoIdIndex();
             options.temp = true;
-            if (enableCollectionUUIDs &&
-                serverGlobalParams.featureCompatibility.isSchemaVersion36()) {
-                options.uuid.emplace(UUID::gen());
-            }
-            incColl = incCtx.db()->createCollection(_opCtx, _config.incLong.ns(), options);
+            options.uuid.emplace(UUID::gen());
+
+            incColl = incCtx.db()->createCollection(
+                _opCtx, _config.incLong.ns(), options, false /* force no _id index */);
             invariant(incColl);
 
             auto rawIndexSpec =
@@ -456,7 +461,6 @@ void State::prepTempCollection() {
         Collection* const finalColl = finalCtx.getCollection();
         if (finalColl) {
             finalOptions = finalColl->getCatalogEntry()->getCollectionOptions(_opCtx);
-
             if (_config.finalOutputCollUUID) {
                 // The final output collection's UUID is passed from mongos if the final output
                 // collection is sharded. If a UUID was sent, ensure it matches what's on this
@@ -467,8 +471,7 @@ void State::prepTempCollection() {
                             << _config.outputOptions.finalNamespace.ns()
                             << " does not match UUID for the existing collection with that "
                                "name on this shard",
-                        finalColl->getCatalogEntry()->isEqualToMetadataUUID(
-                            _opCtx, _config.finalOutputCollUUID));
+                        finalColl->uuid() == _config.finalOutputCollUUID);
             }
 
             IndexCatalog::IndexIterator ii =
@@ -496,24 +499,31 @@ void State::prepTempCollection() {
         // create temp collection and insert the indexes from temporary storage
         OldClientWriteContext tempCtx(_opCtx, _config.tempNamespace.ns());
         WriteUnitOfWork wuow(_opCtx);
-        uassert(ErrorCodes::PrimarySteppedDown,
-                "no longer primary",
-                repl::getGlobalReplicationCoordinator()->canAcceptWritesFor(_opCtx,
-                                                                            _config.tempNamespace));
+        uassert(
+            ErrorCodes::PrimarySteppedDown,
+            str::stream() << "no longer primary while creating temporary collection for mapReduce: "
+                          << _config.tempNamespace.ns(),
+            repl::ReplicationCoordinator::get(_opCtx)->canAcceptWritesFor(_opCtx,
+                                                                          _config.tempNamespace));
         Collection* tempColl = tempCtx.getCollection();
         invariant(!tempColl);
 
         CollectionOptions options = finalOptions;
         options.temp = true;
-        if (enableCollectionUUIDs && serverGlobalParams.featureCompatibility.isSchemaVersion36()) {
-            // If a UUID for the final output collection was sent by mongos (i.e., the final output
-            // collection is sharded), use the UUID mongos sent when creating the temp collection.
-            // When the temp collection is renamed to the final output collection, the UUID will be
-            // preserved.
-            options.uuid.emplace(_config.finalOutputCollUUID ? *_config.finalOutputCollUUID
-                                                             : UUID::gen());
-        }
-        tempColl = tempCtx.db()->createCollection(_opCtx, _config.tempNamespace.ns(), options);
+        // If a UUID for the final output collection was sent by mongos (i.e., the final output
+        // collection is sharded), use the UUID mongos sent when creating the temp collection.
+        // When the temp collection is renamed to the final output collection, the UUID will be
+        // preserved.
+        options.uuid.emplace(_config.finalOutputCollUUID ? *_config.finalOutputCollUUID
+                                                         : UUID::gen());
+
+        // Override createCollection's prohibition on creating new replicated collections without an
+        // _id index.
+        bool buildIdIndex = (options.autoIndexId == CollectionOptions::YES ||
+                             options.autoIndexId == CollectionOptions::DEFAULT);
+
+        tempColl = tempCtx.db()->createCollection(
+            _opCtx, _config.tempNamespace.ns(), options, buildIdIndex);
 
         for (vector<BSONObj>::iterator it = indexesToInsert.begin(); it != indexesToInsert.end();
              ++it) {
@@ -754,9 +764,13 @@ void State::insert(const NamespaceString& nss, const BSONObj& o) {
     writeConflictRetry(_opCtx, "M/R insert", nss.ns(), [this, &nss, &o] {
         OldClientWriteContext ctx(_opCtx, nss.ns());
         WriteUnitOfWork wuow(_opCtx);
-        uassert(ErrorCodes::PrimarySteppedDown,
-                "no longer primary",
-                repl::getGlobalReplicationCoordinator()->canAcceptWritesFor(_opCtx, nss));
+        uassert(
+            ErrorCodes::PrimarySteppedDown,
+            str::stream() << "no longer primary while inserting mapReduce result into collection: "
+                          << nss.ns()
+                          << ": "
+                          << redact(o),
+            repl::ReplicationCoordinator::get(_opCtx)->canAcceptWritesFor(_opCtx, nss));
         Collection* coll = getCollectionOrUassert(_opCtx, ctx.db(), nss);
 
         BSONObjBuilder b;
@@ -831,8 +845,11 @@ State::~State() {
     if (_onDisk) {
         try {
             dropTempCollections();
-        } catch (std::exception& e) {
-            error() << "couldn't cleanup after map reduce: " << e.what();
+        } catch (...) {
+            error() << "Unable to drop temporary collection created by mapReduce: "
+                    << _config.tempNamespace << ". This collection will be removed automatically "
+                                                "the next time the server starts up. "
+                    << exceptionToStatus();
         }
     }
     if (_scope && !_scope->isKillPending() && _scope->getError().empty()) {
@@ -1000,6 +1017,7 @@ void State::bailFromJS() {
 Collection* State::getCollectionOrUassert(OperationContext* opCtx,
                                           Database* db,
                                           const NamespaceString& nss) {
+    UninterruptibleLockGuard noInterrupt(opCtx->lockState());
     Collection* out = db ? db->getCollection(opCtx, nss) : NULL;
     uassert(18697, "Collection unexpectedly disappeared: " + nss.ns(), out);
     return out;
@@ -1122,8 +1140,7 @@ void State::finalReduce(OperationContext* opCtx, CurOp* curOp, ProgressMeterHold
                                      std::move(qr),
                                      expCtx,
                                      extensionsCallback,
-                                     MatchExpressionParser::kAllowAllSpecialFeatures &
-                                         ~MatchExpressionParser::AllowedFeatures::kIsolated);
+                                     MatchExpressionParser::kAllowAllSpecialFeatures);
     verify(statusWithCQ.isOK());
     std::unique_ptr<CanonicalQuery> cq = std::move(statusWithCQ.getValue());
 
@@ -1351,23 +1368,22 @@ class MapReduceCommand : public ErrmsgCommandDeprecated {
 public:
     MapReduceCommand() : ErrmsgCommandDeprecated("mapReduce", "mapreduce") {}
 
-    virtual bool slaveOk() const {
-        return repl::getGlobalReplicationCoordinator()->getReplicationMode() !=
-            repl::ReplicationCoordinator::modeReplSet;
-    }
-
-    virtual bool slaveOverrideOk() const {
-        return true;
+    AllowedOnSecondary secondaryAllowed(ServiceContext* serviceContext) const override {
+        if (repl::ReplicationCoordinator::get(serviceContext)->getReplicationMode() !=
+            repl::ReplicationCoordinator::modeReplSet) {
+            return AllowedOnSecondary::kAlways;
+        }
+        return AllowedOnSecondary::kOptIn;
     }
 
     std::size_t reserveBytesForReply() const override {
         return FindCommon::kInitReplyBufferSize;
     }
 
-    virtual void help(stringstream& help) const {
-        help << "Run a map/reduce operation on the server.\n";
-        help << "Note this is used for aggregation, not querying, in MongoDB.\n";
-        help << "http://dochub.mongodb.org/core/mapreduce";
+    std::string help() const override {
+        return "Run a map/reduce operation on the server.\n"
+               "Note this is used for aggregation, not querying, in MongoDB.\n"
+               "http://dochub.mongodb.org/core/mapreduce";
     }
 
 
@@ -1377,7 +1393,7 @@ public:
 
     virtual void addRequiredPrivileges(const std::string& dbname,
                                        const BSONObj& cmdObj,
-                                       std::vector<Privilege>* out) {
+                                       std::vector<Privilege>* out) const {
         addPrivilegesRequiredForMapReduce(this, dbname, cmdObj, out);
     }
 
@@ -1387,6 +1403,8 @@ public:
                    string& errmsg,
                    BSONObjBuilder& result) {
         Timer t;
+        // Don't let a lock acquisition in map-reduce get interrupted.
+        UninterruptibleLockGuard noInterrupt(opCtx->lockState());
 
         boost::optional<DisableDocumentValidation> maybeDisableValidation;
         if (shouldBypassDocumentValidationForCommand(cmd))
@@ -1395,7 +1413,7 @@ public:
         auto client = opCtx->getClient();
 
         if (client->isInDirectClient()) {
-            return appendCommandStatus(
+            return CommandHelpers::appendCommandStatus(
                 result,
                 Status(ErrorCodes::IllegalOperation, "Cannot run mapReduce command from eval()"));
         }
@@ -1413,33 +1431,34 @@ public:
             // Get metadata before we check our version, to make sure it doesn't increment in the
             // meantime
             AutoGetCollectionForReadCommand autoColl(opCtx, config.nss);
-            return CollectionShardingState::get(opCtx, config.nss)->getMetadata();
+            return CollectionShardingState::get(opCtx, config.nss)->getMetadata(opCtx);
         }();
 
         bool shouldHaveData = false;
 
         BSONObjBuilder countsBuilder;
         BSONObjBuilder timingBuilder;
-        State state(opCtx, config);
-        if (!state.sourceExists()) {
-            return appendCommandStatus(
-                result,
-                Status(ErrorCodes::NamespaceNotFound,
-                       str::stream() << "namespace does not exist: " << config.nss.ns()));
-        }
-
         try {
+            State state(opCtx, config);
+            if (!state.sourceExists()) {
+                return CommandHelpers::appendCommandStatus(
+                    result,
+                    Status(ErrorCodes::NamespaceNotFound,
+                           str::stream() << "namespace does not exist: " << config.nss.ns()));
+            }
+
             state.init();
             state.prepTempCollection();
-            ON_BLOCK_EXIT_OBJ(state, &State::dropTempCollections);
 
-            int progressTotal = 0;
+            int64_t progressTotal = 0;
             bool showTotal = true;
             if (state.config().filter.isEmpty()) {
                 const bool holdingGlobalLock = false;
                 const auto count = _collectionCount(opCtx, config.nss, holdingGlobalLock);
                 progressTotal =
-                    (config.limit && (unsigned)config.limit < count) ? config.limit : count;
+                    (config.limit && static_cast<unsigned long long>(config.limit) < count)
+                    ? config.limit
+                    : count;
             } else {
                 showTotal = false;
                 // Set an arbitrary total > 0 so the meter will be activated.
@@ -1452,9 +1471,6 @@ public:
             lk.unlock();
             progress.showTotal(showTotal);
             ProgressMeterHolder pm(progress);
-
-            // See cast on next line to 32 bit unsigned
-            wassert(config.limit < 0x4000000);
 
             long long mapTime = 0;
             long long reduceTime = 0;
@@ -1470,8 +1486,8 @@ public:
                 if (state.isOnDisk()) {
                     // this means that it will be doing a write operation, make sure it is safe to
                     // do so.
-                    if (!repl::getGlobalReplicationCoordinator()->canAcceptWritesFor(opCtx,
-                                                                                     config.nss)) {
+                    if (!repl::ReplicationCoordinator::get(opCtx)->canAcceptWritesFor(opCtx,
+                                                                                      config.nss)) {
                         uasserted(ErrorCodes::NotMaster, "not master");
                         return false;
                     }
@@ -1485,13 +1501,12 @@ public:
                 const ExtensionsCallbackReal extensionsCallback(opCtx, &config.nss);
 
                 const boost::intrusive_ptr<ExpressionContext> expCtx;
-                auto statusWithCQ = CanonicalQuery::canonicalize(
-                    opCtx,
-                    std::move(qr),
-                    expCtx,
-                    extensionsCallback,
-                    MatchExpressionParser::kAllowAllSpecialFeatures &
-                        ~MatchExpressionParser::AllowedFeatures::kIsolated);
+                auto statusWithCQ =
+                    CanonicalQuery::canonicalize(opCtx,
+                                                 std::move(qr),
+                                                 expCtx,
+                                                 extensionsCallback,
+                                                 MatchExpressionParser::kAllowAllSpecialFeatures);
                 if (!statusWithCQ.isOK()) {
                     uasserted(17238, "Can't canonicalize query " + config.filter.toString());
                     return 0;
@@ -1565,7 +1580,7 @@ public:
 
                         auto restoreStatus = exec->restoreState();
                         if (!restoreStatus.isOK()) {
-                            return appendCommandStatus(result, restoreStatus);
+                            return CommandHelpers::appendCommandStatus(result, restoreStatus);
                         }
 
                         reduceTime += t.micros();
@@ -1580,7 +1595,7 @@ public:
                 }
 
                 if (PlanExecutor::DEAD == execState || PlanExecutor::FAILURE == execState) {
-                    return appendCommandStatus(
+                    return CommandHelpers::appendCommandStatus(
                         result,
                         Status(ErrorCodes::OperationFailed,
                                str::stream() << "Executor error during mapReduce command: "
@@ -1661,7 +1676,7 @@ public:
             }
         } catch (StaleConfigException& e) {
             log() << "mr detected stale config, should retry" << redact(e);
-            throw e;
+            throw;
         }
         // TODO:  The error handling code for queries is v. fragile,
         // *requires* rethrow AssertionExceptions - should probably fix.
@@ -1686,23 +1701,25 @@ public:
  */
 class MapReduceFinishCommand : public BasicCommand {
 public:
-    void help(stringstream& h) const {
-        h << "internal";
+    std::string help() const override {
+        return "internal";
     }
     MapReduceFinishCommand() : BasicCommand("mapreduce.shardedfinish") {}
-    virtual bool slaveOk() const {
-        return repl::getGlobalReplicationCoordinator()->getReplicationMode() !=
-            repl::ReplicationCoordinator::modeReplSet;
+
+    AllowedOnSecondary secondaryAllowed(ServiceContext* serviceContext) const override {
+        if (repl::ReplicationCoordinator::get(serviceContext)->getReplicationMode() !=
+            repl::ReplicationCoordinator::modeReplSet) {
+            return AllowedOnSecondary::kAlways;
+        }
+        return AllowedOnSecondary::kOptIn;
     }
-    virtual bool slaveOverrideOk() const {
-        return true;
-    }
+
     virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
         return true;
     }
     virtual void addRequiredPrivileges(const std::string& dbname,
                                        const BSONObj& cmdObj,
-                                       std::vector<Privilege>* out) {
+                                       std::vector<Privilege>* out) const {
         ActionSet actions;
         actions.addAction(ActionType::internal);
         out->push_back(Privilege(ResourcePattern::forClusterResource(), actions));
@@ -1712,12 +1729,15 @@ public:
              const BSONObj& cmdObj,
              BSONObjBuilder& result) {
         if (serverGlobalParams.clusterRole == ClusterRole::ConfigServer) {
-            return appendCommandStatus(
+            return CommandHelpers::appendCommandStatus(
                 result,
                 Status(ErrorCodes::CommandNotSupported,
                        str::stream() << "Can not execute mapReduce with output database " << dbname
                                      << " which lives on config servers"));
         }
+
+        // Don't let any lock acquisitions get interrupted.
+        UninterruptibleLockGuard noInterrupt(opCtx->lockState());
 
         boost::optional<DisableDocumentValidation> maybeDisableValidation;
         if (shouldBypassDocumentValidationForCommand(cmdObj))
@@ -1743,8 +1763,7 @@ public:
 
         Config config(dbname, cmdObj.firstElement().embeddedObjectUserCheck());
 
-        if (cmdObj["finalOutputCollIsSharded"].trueValue() &&
-            serverGlobalParams.featureCompatibility.isSchemaVersion36()) {
+        if (cmdObj["finalOutputCollIsSharded"].trueValue()) {
             uassert(ErrorCodes::InvalidOptions,
                     "This shard has feature compatibility version 3.6, so it expects mongos to "
                     "send the UUID to use for the sharded output collection. Was the mapReduce "
@@ -1783,15 +1802,15 @@ public:
         }
 
         state.prepTempCollection();
-        ON_BLOCK_EXIT_OBJ(state, &State::dropTempCollections);
 
-        std::vector<std::shared_ptr<Chunk>> chunks;
+        std::vector<Chunk> chunks;
 
         if (config.outputOptions.outType != Config::OutputType::INMEMORY) {
             auto outRoutingInfoStatus = Grid::get(opCtx)->catalogCache()->getCollectionRoutingInfo(
                 opCtx, config.outputOptions.finalNamespace);
             if (!outRoutingInfoStatus.isOK()) {
-                return appendCommandStatus(result, outRoutingInfoStatus.getStatus());
+                return CommandHelpers::appendCommandStatus(result,
+                                                           outRoutingInfoStatus.getStatus());
             }
 
             if (auto cm = outRoutingInfoStatus.getValue().cm()) {
@@ -1800,7 +1819,7 @@ public:
                 const string shardName = ShardingState::get(opCtx)->getShardName();
 
                 for (const auto& chunk : cm->chunks()) {
-                    if (chunk->getShardId() == shardName) {
+                    if (chunk.getShardId() == shardName) {
                         chunks.push_back(chunk);
                     }
                 }
@@ -1814,12 +1833,11 @@ public:
         BSONList values;
 
         while (true) {
-            shared_ptr<Chunk> chunk;
             if (chunks.size() > 0) {
-                chunk = chunks[index];
+                const auto& chunk = chunks[index];
                 BSONObjBuilder b;
-                b.appendAs(chunk->getMin().firstElement(), "$gte");
-                b.appendAs(chunk->getMax().firstElement(), "$lt");
+                b.appendAs(chunk.getMin().firstElement(), "$gte");
+                b.appendAs(chunk.getMax().firstElement(), "$lt");
                 query = BSON("_id" << b.obj());
                 //                        chunkSizes.append(min);
             }
@@ -1862,8 +1880,9 @@ public:
                     values.push_back(t);
             }
 
-            if (chunk) {
-                chunkSizes.append(chunk->getMin());
+            if (chunks.size() > 0) {
+                const auto& chunk = chunks[index];
+                chunkSizes.append(chunk.getMin());
                 chunkSizes.append(chunkSize);
             }
 

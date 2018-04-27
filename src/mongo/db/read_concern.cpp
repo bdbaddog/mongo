@@ -47,6 +47,7 @@
 #include "mongo/db/s/sharding_state.h"
 #include "mongo/db/server_options.h"
 #include "mongo/db/server_parameters.h"
+#include "mongo/db/session_catalog.h"
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/grid.h"
 #include "mongo/util/log.h"
@@ -207,9 +208,16 @@ Status waitForReadConcern(OperationContext* opCtx,
     repl::ReplicationCoordinator* const replCoord = repl::ReplicationCoordinator::get(opCtx);
     invariant(replCoord);
 
+    opCtx->recoveryUnit()->setReadConcernLevelAndReplicationMode(readConcernArgs.getLevel(),
+                                                                 replCoord->getReplicationMode());
+
+    auto session = OperationContextSession::get(opCtx);
+    // Currently speculative read concern is used only for transactions and snapshot reads.
+    const bool speculative = session && session->inSnapshotReadOrMultiDocumentTransaction();
+
     if (readConcernArgs.getLevel() == repl::ReadConcernLevel::kLinearizableReadConcern) {
         if (replCoord->getReplicationMode() != repl::ReplicationCoordinator::modeReplSet) {
-            // For master/slave and standalone nodes, Linearizable Read is not supported.
+            // For standalone nodes, Linearizable Read is not supported.
             return {ErrorCodes::NotAReplicaSet,
                     "node needs to be a replica set member to use read concern"};
         }
@@ -233,37 +241,59 @@ Status waitForReadConcern(OperationContext* opCtx,
         }
     }
 
-    auto afterClusterTime = readConcernArgs.getArgsClusterTime();
+    if (readConcernArgs.getLevel() == repl::ReadConcernLevel::kSnapshotReadConcern) {
+        if (replCoord->getReplicationMode() != repl::ReplicationCoordinator::modeReplSet) {
+            return {ErrorCodes::NotAReplicaSet,
+                    "node needs to be a replica set member to use readConcern: snapshot"};
+        }
+
+        if (!replCoord->isV1ElectionProtocol()) {
+            return {ErrorCodes::IncompatibleElectionProtocol,
+                    "Replica sets running protocol version 0 do not support readConcern: snapshot"};
+        }
+        if (speculative) {
+            fassert(50807,
+                    opCtx->recoveryUnit()->setPointInTimeReadTimestamp(
+                        replCoord->getMyLastAppliedOpTime().getTimestamp()));
+        }
+    }
+
+    auto afterClusterTime = readConcernArgs.getArgsAfterClusterTime();
+    auto atClusterTime = readConcernArgs.getArgsAtClusterTime();
+
     if (afterClusterTime) {
         if (!allowAfterClusterTime) {
             return {ErrorCodes::InvalidOptions, "afterClusterTime is not allowed for this command"};
         }
-
-        if ((serverGlobalParams.featureCompatibility.getVersion() !=
-             ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo36) &&
-            ShardingState::get(opCtx)->enabled()) {
-            return {ErrorCodes::InvalidOptions,
-                    "readConcern afterClusterTime is not available in featureCompatibilityVersion "
-                    "3.4 in a sharded cluster"};
-        }
-
-        auto currentTime = LogicalClock::get(opCtx)->getClusterTime();
-        if (currentTime < *afterClusterTime) {
-            return {ErrorCodes::InvalidOptions,
-                    "readConcern afterClusterTime must not be greater than clusterTime value"};
-        }
-    }
-
-    auto pointInTime = readConcernArgs.getArgsPointInTime();
-    if (pointInTime) {
-        fassertStatusOK(39345, opCtx->recoveryUnit()->selectSnapshot(pointInTime->asTimestamp()));
     }
 
     if (!readConcernArgs.isEmpty()) {
-        if (replCoord->isReplEnabled() && afterClusterTime) {
-            auto status = makeNoopWriteIfNeeded(opCtx, *afterClusterTime);
+        invariant(!afterClusterTime || !atClusterTime);
+        auto targetClusterTime = afterClusterTime ? afterClusterTime : atClusterTime;
+
+        if (targetClusterTime) {
+            std::string readConcernName = afterClusterTime ? "afterClusterTime" : "atClusterTime";
+
+            if (!replCoord->isReplEnabled()) {
+                return {ErrorCodes::IllegalOperation,
+                        str::stream() << "Cannot specify " << readConcernName
+                                      << " readConcern without replication enabled"};
+            }
+
+            auto currentTime = LogicalClock::get(opCtx)->getClusterTime();
+            if (currentTime < *targetClusterTime) {
+                return {ErrorCodes::InvalidOptions,
+                        str::stream() << "readConcern " << readConcernName
+                                      << " value must not be greater than the current clusterTime. "
+                                         "Requested clusterTime: "
+                                      << targetClusterTime->toString()
+                                      << "; current clusterTime: "
+                                      << currentTime.toString()};
+            }
+
+            auto status = makeNoopWriteIfNeeded(opCtx, *targetClusterTime);
             if (!status.isOK()) {
-                LOG(0) << "Failed noop write at clusterTime: " << afterClusterTime->toString()
+                LOG(0) << "Failed noop write at clusterTime: " << targetClusterTime->toString()
                        << " due to " << status.toString();
             }
         }
@@ -276,13 +306,21 @@ Status waitForReadConcern(OperationContext* opCtx,
         }
     }
 
-    if (readConcernArgs.getLevel() == repl::ReadConcernLevel::kMajorityReadConcern &&
+
+    if (atClusterTime) {
+        fassert(39345,
+                opCtx->recoveryUnit()->setPointInTimeReadTimestamp(atClusterTime->asTimestamp()));
+        return Status::OK();
+    }
+
+    if ((readConcernArgs.getLevel() == repl::ReadConcernLevel::kMajorityReadConcern ||
+         readConcernArgs.getLevel() == repl::ReadConcernLevel::kSnapshotReadConcern) &&
+        !speculative &&
         replCoord->getReplicationMode() == repl::ReplicationCoordinator::Mode::modeReplSet) {
-        // ReadConcern Majority is not supported in ProtocolVersion 0.
         if (!replCoord->isV1ElectionProtocol()) {
-            return {ErrorCodes::ReadConcernMajorityNotEnabled,
+            return {ErrorCodes::IncompatibleElectionProtocol,
                     str::stream() << "Replica sets running protocol version 0 do not support "
-                                     "readConcern: majority"};
+                                     "majority committed reads"};
         }
 
         const int debugLevel = serverGlobalParams.clusterRole == ClusterRole::ConfigServer ? 1 : 2;
@@ -290,13 +328,13 @@ Status waitForReadConcern(OperationContext* opCtx,
         LOG(debugLevel) << "Waiting for 'committed' snapshot to be available for reading: "
                         << readConcernArgs;
 
-        Status status = opCtx->recoveryUnit()->setReadFromMajorityCommittedSnapshot();
+        Status status = opCtx->recoveryUnit()->obtainMajorityCommittedSnapshot();
 
         // Wait until a snapshot is available.
         while (status == ErrorCodes::ReadConcernMajorityNotAvailableYet) {
             LOG(debugLevel) << "Snapshot not available yet.";
             replCoord->waitUntilSnapshotCommitted(opCtx, Timestamp());
-            status = opCtx->recoveryUnit()->setReadFromMajorityCommittedSnapshot();
+            status = opCtx->recoveryUnit()->obtainMajorityCommittedSnapshot();
         }
 
         if (!status.isOK()) {

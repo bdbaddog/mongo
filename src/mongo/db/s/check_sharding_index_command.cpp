@@ -35,8 +35,8 @@
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/auth/privilege.h"
 #include "mongo/db/bson/dotted_path_support.h"
-#include "mongo/db/catalog/catalog_raii.h"
 #include "mongo/db/catalog/index_catalog.h"
+#include "mongo/db/catalog_raii.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/dbhelpers.h"
 #include "mongo/db/exec/working_set_common.h"
@@ -59,28 +59,28 @@ class CheckShardingIndex : public ErrmsgCommandDeprecated {
 public:
     CheckShardingIndex() : ErrmsgCommandDeprecated("checkShardingIndex") {}
 
-    virtual void help(std::stringstream& help) const {
-        help << "Internal command.\n";
+    std::string help() const override {
+        return "Internal command.\n";
     }
 
     virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
         return false;
     }
 
-    virtual bool slaveOk() const {
-        return false;
+    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
+        return AllowedOnSecondary::kNever;
     }
 
     virtual void addRequiredPrivileges(const std::string& dbname,
                                        const BSONObj& cmdObj,
-                                       std::vector<Privilege>* out) {
+                                       std::vector<Privilege>* out) const {
         ActionSet actions;
         actions.addAction(ActionType::find);
         out->push_back(Privilege(parseResourcePattern(dbname, cmdObj), actions));
     }
 
     virtual std::string parseNs(const std::string& dbname, const BSONObj& cmdObj) const {
-        return parseNsFullyQualified(dbname, cmdObj);
+        return CommandHelpers::parseNsFullyQualified(cmdObj);
     }
 
     bool errmsgRun(OperationContext* opCtx,
@@ -200,11 +200,10 @@ public:
         }
 
         if (PlanExecutor::DEAD == state || PlanExecutor::FAILURE == state) {
-            return appendCommandStatus(
+            return CommandHelpers::appendCommandStatus(
                 result,
-                Status(ErrorCodes::OperationFailed,
-                       str::stream() << "Executor error while checking sharding index: "
-                                     << WorkingSetCommon::toStatusString(currKey)));
+                WorkingSetCommon::getMemberObjectStatus(currKey).withContext(
+                    "Executor error while checking sharding index"));
         }
 
         return true;

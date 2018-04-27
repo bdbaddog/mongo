@@ -37,14 +37,15 @@
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/repl/repl_client_info.h"
+#include "mongo/db/s/active_migrations_registry.h"
 #include "mongo/db/s/chunk_move_write_concern_options.h"
 #include "mongo/db/s/migration_source_manager.h"
 #include "mongo/db/s/move_timing_helper.h"
 #include "mongo/db/s/sharding_state.h"
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/grid.h"
-#include "mongo/s/migration_secondary_throttle_options.h"
-#include "mongo/s/move_chunk_request.h"
+#include "mongo/s/request_types/migration_secondary_throttle_options.h"
+#include "mongo/s/request_types/move_chunk_request.h"
 #include "mongo/util/concurrency/notification.h"
 #include "mongo/util/fail_point_service.h"
 #include "mongo/util/log.h"
@@ -76,12 +77,12 @@ class MoveChunkCommand : public BasicCommand {
 public:
     MoveChunkCommand() : BasicCommand("moveChunk") {}
 
-    void help(std::stringstream& help) const override {
-        help << "should not be calling this directly";
+    std::string help() const override {
+        return "should not be calling this directly";
     }
 
-    bool slaveOk() const override {
-        return false;
+    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
+        return AllowedOnSecondary::kNever;
     }
 
     bool adminOnly() const override {
@@ -94,7 +95,7 @@ public:
 
     Status checkAuthForCommand(Client* client,
                                const std::string& dbname,
-                               const BSONObj& cmdObj) override {
+                               const BSONObj& cmdObj) const override {
         if (!AuthorizationSession::get(client)->isAuthorizedForActionsOnResource(
                 ResourcePattern::forClusterResource(), ActionType::internal)) {
             return Status(ErrorCodes::Unauthorized, "Unauthorized");
@@ -103,7 +104,7 @@ public:
     }
 
     std::string parseNs(const std::string& dbname, const BSONObj& cmdObj) const override {
-        return parseNsFullyQualified(dbname, cmdObj);
+        return CommandHelpers::parseNsFullyQualified(cmdObj);
     }
 
     bool run(OperationContext* opCtx,
@@ -120,29 +121,29 @@ public:
         // where we might have changed a shard's host by removing/adding a shard with the same name.
         Grid::get(opCtx)->shardRegistry()->reload(opCtx);
 
-        auto scopedRegisterMigration =
-            uassertStatusOK(shardingState->registerDonateChunk(moveChunkRequest));
+        auto scopedMigration = uassertStatusOK(
+            ActiveMigrationsRegistry::get(opCtx).registerDonateChunk(moveChunkRequest));
 
         Status status = {ErrorCodes::InternalError, "Uninitialized value"};
 
         // Check if there is an existing migration running and if so, join it
-        if (scopedRegisterMigration.mustExecute()) {
+        if (scopedMigration.mustExecute()) {
             try {
                 _runImpl(opCtx, moveChunkRequest);
                 status = Status::OK();
             } catch (const DBException& e) {
                 status = e.toStatus();
             } catch (const std::exception& e) {
-                scopedRegisterMigration.complete(
+                scopedMigration.signalComplete(
                     {ErrorCodes::InternalError,
                      str::stream() << "Severe error occurred while running moveChunk command: "
                                    << e.what()});
                 throw;
             }
 
-            scopedRegisterMigration.complete(status);
+            scopedMigration.signalComplete(status);
         } else {
-            status = scopedRegisterMigration.waitForCompletion(opCtx);
+            status = scopedMigration.waitForCompletion(opCtx);
         }
 
         if (status == ErrorCodes::ChunkTooBig) {
@@ -151,7 +152,7 @@ public:
             // and the 3.4 shard, which failed to set the ChunkTooBig status code.
             // TODO: Remove after 3.6 is released.
             result.appendBool("chunkTooBig", true);
-            return appendCommandStatus(result, status);
+            return CommandHelpers::appendCommandStatus(result, status);
         }
 
         uassertStatusOK(status);

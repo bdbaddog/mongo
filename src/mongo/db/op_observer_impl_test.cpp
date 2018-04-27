@@ -28,23 +28,29 @@
 
 
 #include "mongo/db/op_observer_impl.h"
+#include "keys_collection_client_sharded.h"
+#include "mongo/db/auth/authorization_manager.h"
 #include "mongo/db/client.h"
 #include "mongo/db/concurrency/locker_noop.h"
 #include "mongo/db/db_raii.h"
-#include "mongo/db/field_parser.h"
+#include "mongo/db/keys_collection_manager.h"
+#include "mongo/db/logical_clock.h"
+#include "mongo/db/logical_time_validator.h"
 #include "mongo/db/repl/oplog.h"
 #include "mongo/db/repl/oplog_interface_local.h"
 #include "mongo/db/repl/repl_client_info.h"
 #include "mongo/db/repl/replication_coordinator_mock.h"
 #include "mongo/db/service_context_d_test_fixture.h"
+#include "mongo/db/session_catalog.h"
+#include "mongo/s/config_server_test_fixture.h"
 #include "mongo/unittest/death_test.h"
+#include "mongo/util/clock_source_mock.h"
 
 namespace mongo {
 namespace {
 
 class OpObserverTest : public ServiceContextMongoDTest {
-
-private:
+public:
     void setUp() override {
         // Set up mongod.
         ServiceContextMongoDTest::setUp();
@@ -54,8 +60,9 @@ private:
 
         // Set up ReplicationCoordinator and create oplog.
         repl::ReplicationCoordinator::set(
-            service, stdx::make_unique<repl::ReplicationCoordinatorMock>(service));
-        repl::setOplogCollectionName();
+            service,
+            stdx::make_unique<repl::ReplicationCoordinatorMock>(service, createReplSettings()));
+        repl::setOplogCollectionName(service);
         repl::createOplog(opCtx.get());
 
         // Ensure that we are primary.
@@ -71,6 +78,16 @@ protected:
         auto opEntry = unittest::assertGet(oplogIter->next());
         ASSERT_EQUALS(ErrorCodes::CollectionIsEmpty, oplogIter->next().getStatus());
         return opEntry.first;
+    }
+
+private:
+    // Creates a reasonable set of ReplSettings for most tests.  We need to be able to
+    // override this to create a larger oplog.
+    virtual repl::ReplSettings createReplSettings() {
+        repl::ReplSettings settings;
+        settings.setOplogSizeBytes(5 * 1024 * 1024);
+        settings.setReplSetString("mySet/node1:12345");
+        return settings;
     }
 };
 
@@ -189,7 +206,8 @@ TEST_F(OpObserverTest, OnDropCollectionReturnsDropOpTime) {
     {
         AutoGetDb autoDb(opCtx.get(), nss.db(), MODE_X);
         WriteUnitOfWork wunit(opCtx.get());
-        dropOpTime = opObserver.onDropCollection(opCtx.get(), nss, uuid);
+        opObserver.onDropCollection(opCtx.get(), nss, uuid);
+        dropOpTime = OpObserver::Times::get(opCtx.get()).reservedOpTimes.front();
         wunit.commit();
     }
 
@@ -208,35 +226,246 @@ TEST_F(OpObserverTest, OnRenameCollectionReturnsRenameOpTime) {
     OpObserverImpl opObserver;
     auto opCtx = cc().makeOperationContext();
 
-    // Create 'renameCollection' command.
-    auto dropTarget = false;
+    auto uuid = CollectionUUID::gen();
+    auto dropTargetUuid = CollectionUUID::gen();
     auto stayTemp = false;
     NamespaceString sourceNss("test.foo");
     NamespaceString targetNss("test.bar");
-    auto renameCmd = BSON(
-        "renameCollection" << sourceNss.ns() << "to" << targetNss.ns() << "stayTemp" << stayTemp
-                           << "dropTarget"
-                           << dropTarget);
 
     // Write to the oplog.
     repl::OpTime renameOpTime;
     {
         AutoGetDb autoDb(opCtx.get(), sourceNss.db(), MODE_X);
         WriteUnitOfWork wunit(opCtx.get());
-        renameOpTime = opObserver.onRenameCollection(
-            opCtx.get(), sourceNss, targetNss, {}, dropTarget, {}, stayTemp);
+        opObserver.onRenameCollection(
+            opCtx.get(), sourceNss, targetNss, uuid, dropTargetUuid, stayTemp);
+        renameOpTime = OpObserver::Times::get(opCtx.get()).reservedOpTimes.front();
         wunit.commit();
     }
 
     auto oplogEntry = getSingleOplogEntry(opCtx.get());
 
     // Ensure that renameCollection fields were properly added to oplog entry.
+    ASSERT_EQUALS(uuid, unittest::assertGet(UUID::parse(oplogEntry["ui"])));
     auto o = oplogEntry.getObjectField("o");
-    auto oExpected = renameCmd;
+    auto oExpected = BSON(
+        "renameCollection" << sourceNss.ns() << "to" << targetNss.ns() << "stayTemp" << stayTemp
+                           << "dropTarget"
+                           << dropTargetUuid);
     ASSERT_BSONOBJ_EQ(oExpected, o);
 
     // Ensure that the rename optime returned is the same as the last optime in the ReplClientInfo.
     ASSERT_EQUALS(repl::ReplClientInfo::forClient(&cc()).getLastOp(), renameOpTime);
+}
+
+TEST_F(OpObserverTest, OnRenameCollectionOmitsDropTargetFieldIfDropTargetUuidIsNull) {
+    OpObserverImpl opObserver;
+    auto opCtx = cc().makeOperationContext();
+
+    auto uuid = CollectionUUID::gen();
+    auto stayTemp = true;
+    NamespaceString sourceNss("test.foo");
+    NamespaceString targetNss("test.bar");
+
+    // Write to the oplog.
+    {
+        AutoGetDb autoDb(opCtx.get(), sourceNss.db(), MODE_X);
+        WriteUnitOfWork wunit(opCtx.get());
+        opObserver.onRenameCollection(opCtx.get(), sourceNss, targetNss, uuid, {}, stayTemp);
+        wunit.commit();
+    }
+
+    auto oplogEntry = getSingleOplogEntry(opCtx.get());
+
+    // Ensure that renameCollection fields were properly added to oplog entry.
+    ASSERT_EQUALS(uuid, unittest::assertGet(UUID::parse(oplogEntry["ui"])));
+    auto o = oplogEntry.getObjectField("o");
+    auto oExpected = BSON(
+        "renameCollection" << sourceNss.ns() << "to" << targetNss.ns() << "stayTemp" << stayTemp);
+    ASSERT_BSONOBJ_EQ(oExpected, o);
+}
+
+/**
+ * Test fixture for testing OpObserver behavior specific to the SessionCatalog.
+ */
+class OpObserverSessionCatalogTest : public OpObserverTest {
+public:
+    void setUp() override {
+        OpObserverTest::setUp();
+        auto opCtx = cc().makeOperationContext();
+        auto sessionCatalog = SessionCatalog::get(getServiceContext());
+        sessionCatalog->reset_forTest();
+        sessionCatalog->onStepUp(opCtx.get());
+    }
+
+    /**
+     * Simulate a new write occurring on given session with the given transaction number and
+     * statement id.
+     */
+    void simulateSessionWrite(OperationContext* opCtx,
+                              ScopedSession session,
+                              NamespaceString nss,
+                              TxnNumber txnNum,
+                              StmtId stmtId) {
+        session->beginOrContinueTxn(opCtx, txnNum, boost::none, boost::none);
+
+        {
+            AutoGetCollection autoColl(opCtx, nss, MODE_IX);
+            WriteUnitOfWork wuow(opCtx);
+            auto opTime = repl::OpTime(Timestamp(10, 1), 1);  // Dummy timestamp.
+            session->onWriteOpCompletedOnPrimary(opCtx, txnNum, {stmtId}, opTime, Date_t::now());
+            wuow.commit();
+        }
+    }
+};
+
+TEST_F(OpObserverSessionCatalogTest, OnRollbackInvalidatesSessionCatalogIfSessionOpsRolledBack) {
+    OpObserverImpl opObserver;
+    auto opCtx = cc().makeOperationContext();
+    const NamespaceString nss("testDB", "testColl");
+
+    // Create a session.
+    auto sessionCatalog = SessionCatalog::get(getServiceContext());
+    auto sessionId = makeLogicalSessionIdForTest();
+    auto session = sessionCatalog->getOrCreateSession(opCtx.get(), sessionId);
+
+    // Simulate a write occurring on that session.
+    const TxnNumber txnNum = 0;
+    const StmtId stmtId = 1000;
+    simulateSessionWrite(opCtx.get(), session, nss, txnNum, stmtId);
+
+    // Check that the statement executed.
+    ASSERT(session->checkStatementExecutedNoOplogEntryFetch(txnNum, stmtId));
+
+    // The OpObserver should invalidate in-memory session state, so the check after this should
+    // fail.
+    OpObserver::RollbackObserverInfo rbInfo;
+    rbInfo.rollbackSessionIds = {UUID::gen()};
+    opObserver.onReplicationRollback(opCtx.get(), rbInfo);
+    ASSERT_THROWS_CODE(session->checkStatementExecutedNoOplogEntryFetch(txnNum, stmtId),
+                       DBException,
+                       ErrorCodes::ConflictingOperationInProgress);
+}
+
+TEST_F(OpObserverSessionCatalogTest,
+       OnRollbackDoesntInvalidateSessionCatalogIfNoSessionOpsRolledBack) {
+    OpObserverImpl opObserver;
+    auto opCtx = cc().makeOperationContext();
+    const NamespaceString nss("testDB", "testColl");
+
+    // Create a session.
+    auto sessionCatalog = SessionCatalog::get(getServiceContext());
+    auto sessionId = makeLogicalSessionIdForTest();
+    auto session = sessionCatalog->getOrCreateSession(opCtx.get(), sessionId);
+
+    // Simulate a write occurring on that session.
+    const TxnNumber txnNum = 0;
+    const StmtId stmtId = 1000;
+    simulateSessionWrite(opCtx.get(), session, nss, txnNum, stmtId);
+
+    // Check that the statement executed.
+    ASSERT(session->checkStatementExecutedNoOplogEntryFetch(txnNum, stmtId));
+
+    // The OpObserver should not invalidate the in-memory session state, so the check after this
+    // should still succeed.
+    OpObserver::RollbackObserverInfo rbInfo;
+    opObserver.onReplicationRollback(opCtx.get(), rbInfo);
+    ASSERT(session->checkStatementExecutedNoOplogEntryFetch(txnNum, stmtId));
+}
+
+/**
+ * Test fixture with sessions and an extra-large oplog for testing large transactions.
+ */
+class OpObserverLargeTransactionTest : public OpObserverSessionCatalogTest {
+private:
+    repl::ReplSettings createReplSettings() override {
+        repl::ReplSettings settings;
+        // We need an oplog comfortably large enough to hold an oplog entry that exceeds the BSON
+        // size limit.  Otherwise we will get the wrong error code when trying to write one.
+        settings.setOplogSizeBytes(BSONObjMaxInternalSize + 2 * 1024 * 1024);
+        settings.setReplSetString("mySet/node1:12345");
+        return settings;
+    }
+};
+
+// Tests that a transaction aborts if it becomes too large only during the commit.
+TEST_F(OpObserverLargeTransactionTest, TransactionTooLargeWhileCommitting) {
+    OpObserverImpl opObserver;
+    auto opCtx = cc().makeOperationContext();
+    const NamespaceString nss("testDB", "testColl");
+
+    // Create a session.
+    auto sessionCatalog = SessionCatalog::get(getServiceContext());
+    auto sessionId = makeLogicalSessionIdForTest();
+    auto session = sessionCatalog->getOrCreateSession(opCtx.get(), sessionId);
+    auto uuid = CollectionUUID::gen();
+
+    // Simulate adding transaction data to a session.
+    const TxnNumber txnNum = 0;
+    opCtx->setLogicalSessionId(sessionId);
+    opCtx->setTxnNumber(txnNum);
+    OperationContextSession opSession(opCtx.get(),
+                                      true /* checkOutSession */,
+                                      false /* autocommit */,
+                                      true /* startTransaction*/);
+
+    session->unstashTransactionResources(opCtx.get(), "insert");
+
+    // This size is crafted such that two operations of this size are not too big to fit in a single
+    // oplog entry, but two operations plus oplog overhead are too big to fit in a single oplog
+    // entry.
+    constexpr size_t kHalfTransactionSize = BSONObjMaxInternalSize / 2 - 175;
+    std::unique_ptr<uint8_t[]> halfTransactionData(new uint8_t[kHalfTransactionSize]());
+    auto operation = repl::OplogEntry::makeInsertOperation(
+        nss,
+        uuid,
+        BSON(
+            "_id" << 0 << "data"
+                  << BSONBinData(halfTransactionData.get(), kHalfTransactionSize, BinDataGeneral)));
+    session->addTransactionOperation(opCtx.get(), operation);
+    session->addTransactionOperation(opCtx.get(), operation);
+    ASSERT_THROWS_CODE(opObserver.onTransactionCommit(opCtx.get()),
+                       AssertionException,
+                       ErrorCodes::TransactionTooLarge);
+}
+
+TEST_F(OpObserverTest, OnRollbackInvalidatesAuthCacheWhenAuthNamespaceRolledBack) {
+    OpObserverImpl opObserver;
+    auto opCtx = cc().makeOperationContext();
+    auto authMgr = AuthorizationManager::get(getServiceContext());
+    auto initCacheGen = authMgr->getCacheGeneration();
+
+    // Verify that the rollback op observer invalidates the user cache for each auth namespace by
+    // checking that the cache generation changes after a call to the rollback observer method.
+    auto nss = AuthorizationManager::rolesCollectionNamespace;
+    OpObserver::RollbackObserverInfo rbInfo;
+    rbInfo.rollbackNamespaces = {AuthorizationManager::rolesCollectionNamespace};
+    opObserver.onReplicationRollback(opCtx.get(), rbInfo);
+    ASSERT_NE(initCacheGen, authMgr->getCacheGeneration());
+
+    initCacheGen = authMgr->getCacheGeneration();
+    rbInfo.rollbackNamespaces = {AuthorizationManager::usersCollectionNamespace};
+    opObserver.onReplicationRollback(opCtx.get(), rbInfo);
+    ASSERT_NE(initCacheGen, authMgr->getCacheGeneration());
+
+    initCacheGen = authMgr->getCacheGeneration();
+    rbInfo.rollbackNamespaces = {AuthorizationManager::versionCollectionNamespace};
+    opObserver.onReplicationRollback(opCtx.get(), rbInfo);
+    ASSERT_NE(initCacheGen, authMgr->getCacheGeneration());
+}
+
+TEST_F(OpObserverTest, OnRollbackDoesntInvalidateAuthCacheWhenNoAuthNamespaceRolledBack) {
+    OpObserverImpl opObserver;
+    auto opCtx = cc().makeOperationContext();
+    auto authMgr = AuthorizationManager::get(getServiceContext());
+    auto initCacheGen = authMgr->getCacheGeneration();
+
+    // Verify that the rollback op observer doesn't invalidate the user cache.
+    auto nss = AuthorizationManager::rolesCollectionNamespace;
+    OpObserver::RollbackObserverInfo rbInfo;
+    opObserver.onReplicationRollback(opCtx.get(), rbInfo);
+    auto newCacheGen = authMgr->getCacheGeneration();
+    ASSERT_EQ(newCacheGen, initCacheGen);
 }
 
 TEST_F(OpObserverTest, MultipleAboutToDeleteAndOnDelete) {
@@ -254,8 +483,7 @@ TEST_F(OpObserverTest, MultipleAboutToDeleteAndOnDelete) {
 DEATH_TEST_F(OpObserverTest, AboutToDeleteMustPreceedOnDelete, "invariant") {
     OpObserverImpl opObserver;
     auto opCtx = cc().makeOperationContext();
-    opCtx->releaseLockState();
-    opCtx->setLockState(stdx::make_unique<LockerNoop>());
+    opCtx->swapLockState(stdx::make_unique<LockerNoop>());
     NamespaceString nss = {"test", "coll"};
     opObserver.onDelete(opCtx.get(), nss, {}, {}, false, {});
 }
@@ -263,12 +491,22 @@ DEATH_TEST_F(OpObserverTest, AboutToDeleteMustPreceedOnDelete, "invariant") {
 DEATH_TEST_F(OpObserverTest, EachOnDeleteRequiresAboutToDelete, "invariant") {
     OpObserverImpl opObserver;
     auto opCtx = cc().makeOperationContext();
-    opCtx->releaseLockState();
-    opCtx->setLockState(stdx::make_unique<LockerNoop>());
+    opCtx->swapLockState(stdx::make_unique<LockerNoop>());
     NamespaceString nss = {"test", "coll"};
     opObserver.aboutToDelete(opCtx.get(), nss, {});
     opObserver.onDelete(opCtx.get(), nss, {}, {}, false, {});
     opObserver.onDelete(opCtx.get(), nss, {}, {}, false, {});
+}
+
+DEATH_TEST_F(OpObserverTest,
+             NodeCrashesIfShardIdentityDocumentRolledBack,
+             "Fatal Assertion 50712") {
+    OpObserverImpl opObserver;
+    auto opCtx = cc().makeOperationContext();
+
+    OpObserver::RollbackObserverInfo rbInfo;
+    rbInfo.shardIdentityRolledBack = true;
+    opObserver.onReplicationRollback(opCtx.get(), rbInfo);
 }
 
 }  // namespace

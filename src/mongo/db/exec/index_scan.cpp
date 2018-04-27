@@ -94,7 +94,6 @@ boost::optional<IndexKeyEntry> IndexScan::initIndexScan() {
     if (_params.doNotDedup) {
         _shouldDedup = false;
     } else {
-        // TODO it is incorrect to rely on this not changing. SERVER-17678
         _shouldDedup = _params.descriptor->isMultikey(getOpCtx());
     }
 
@@ -277,7 +276,7 @@ void IndexScan::doInvalidate(OperationContext* opCtx, const RecordId& dl, Invali
 
     // If we see this RecordId again, it may not be the same document it was before, so we want
     // to return it if we see it again.
-    unordered_set<RecordId, RecordId::Hasher>::iterator it = _returned.find(dl);
+    stdx::unordered_set<RecordId, RecordId::Hasher>::iterator it = _returned.find(dl);
     if (it != _returned.end()) {
         ++_specificStats.seenInvalidated;
         _returned.erase(it);

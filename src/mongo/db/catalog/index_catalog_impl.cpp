@@ -60,7 +60,8 @@
 #include "mongo/db/query/collation/collation_spec.h"
 #include "mongo/db/query/collation/collator_factory_interface.h"
 #include "mongo/db/query/internal_plans.h"
-#include "mongo/db/repl/replication_coordinator_global.h"
+#include "mongo/db/repl/replication_coordinator.h"
+#include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/server_options.h"
 #include "mongo/db/service_context.h"
 #include "mongo/util/assert_util.h"
@@ -335,7 +336,12 @@ StatusWith<BSONObj> IndexCatalogImpl::prepareSpecForCreate(OperationContext* opC
 StatusWith<BSONObj> IndexCatalogImpl::createIndexOnEmptyCollection(OperationContext* opCtx,
                                                                    BSONObj spec) {
     invariant(opCtx->lockState()->isCollectionLockedForMode(_collection->ns().toString(), MODE_X));
-    invariant(_collection->numRecords(opCtx) == 0);
+    invariant(_collection->numRecords(opCtx) == 0,
+              str::stream() << "Collection must be empty. Collection: " << _collection->ns().ns()
+                            << " UUID: "
+                            << _collection->uuid()
+                            << " Count: "
+                            << _collection->numRecords(opCtx));
 
     _checkMagic();
     Status status = checkUnfinished();
@@ -392,6 +398,9 @@ IndexCatalogImpl::IndexBuildBlock::IndexBuildBlock(OperationContext* opCtx,
 }
 
 Status IndexCatalogImpl::IndexBuildBlock::init() {
+    // Being in a WUOW means all timestamping responsibility can be pushed up to the caller.
+    invariant(_opCtx->lockState()->inAWriteUnitOfWork());
+
     // need this first for names, etc...
     BSONObj keyPattern = _spec.getObjectField("key");
     auto descriptor = stdx::make_unique<IndexDescriptor>(
@@ -400,14 +409,31 @@ Status IndexCatalogImpl::IndexBuildBlock::init() {
     _indexName = descriptor->indexName();
     _indexNamespace = descriptor->indexNamespace();
 
-    /// ----------   setup on disk structures ----------------
+    bool isBackgroundIndex = _spec["background"].trueValue();
+    bool isBackgroundSecondaryBuild = false;
+    if (auto replCoord = repl::ReplicationCoordinator::get(_opCtx)) {
+        isBackgroundSecondaryBuild =
+            replCoord->getReplicationMode() == repl::ReplicationCoordinator::Mode::modeReplSet &&
+            replCoord->getMemberState().secondary() && isBackgroundIndex;
+    }
 
-    Status status = _collection->getCatalogEntry()->prepareForIndexBuild(_opCtx, descriptor.get());
+    // Setup on-disk structures.
+    Status status = _collection->getCatalogEntry()->prepareForIndexBuild(
+        _opCtx, descriptor.get(), isBackgroundSecondaryBuild);
     if (!status.isOK())
         return status;
 
+    if (isBackgroundIndex) {
+        _opCtx->recoveryUnit()->onCommit([&] {
+            // This will prevent the unfinished index from being visible on index iterators.
+            auto minVisible =
+                repl::ReplicationCoordinator::get(_opCtx)->getMinimumVisibleSnapshot(_opCtx);
+            _entry->setMinimumVisibleSnapshot(minVisible);
+            _collection->setMinimumVisibleSnapshot(minVisible);
+        });
+    }
+
     auto* const descriptorPtr = descriptor.get();
-    /// ----------   setup in memory structures  ----------------
     const bool initFromDisk = false;
     _entry = IndexCatalogImpl::_setupInMemoryStructures(
         _catalog, _opCtx, std::move(descriptor), initFromDisk);
@@ -425,6 +451,8 @@ IndexCatalogImpl::IndexBuildBlock::~IndexBuildBlock() {
 }
 
 void IndexCatalogImpl::IndexBuildBlock::fail() {
+    // Being in a WUOW means all timestamping responsibility can be pushed up to the caller.
+    invariant(_opCtx->lockState()->inAWriteUnitOfWork());
     fassert(17204, _catalog->_getCollection()->ok());  // defensive
 
     IndexCatalogEntry* entry = IndexCatalog::_getEntries(_catalog).find(_indexName);
@@ -438,7 +466,11 @@ void IndexCatalogImpl::IndexBuildBlock::fail() {
 }
 
 void IndexCatalogImpl::IndexBuildBlock::success() {
+    // Being in a WUOW means all timestamping responsibility can be pushed up to the caller.
+    invariant(_opCtx->lockState()->inAWriteUnitOfWork());
+
     Collection* collection = _catalog->_getCollection();
+
     fassert(17207, collection->ok());
     NamespaceString ns(_indexNamespace);
     invariant(_opCtx->lockState()->isDbLockedForMode(ns.db(), MODE_X));
@@ -458,7 +490,7 @@ void IndexCatalogImpl::IndexBuildBlock::success() {
         // collection. This means that any snapshot created after this must include the full index,
         // and no one can try to read this index before we set the visibility.
         auto replCoord = repl::ReplicationCoordinator::get(opCtx);
-        auto snapshotName = replCoord->reserveSnapshotName(opCtx);
+        auto snapshotName = replCoord->getMinimumVisibleSnapshot(opCtx);
         entry->setMinimumVisibleSnapshot(snapshotName);
 
         // TODO remove this once SERVER-20439 is implemented. It is a stopgap solution for
@@ -669,15 +701,12 @@ Status IndexCatalogImpl::_isSpecOk(OperationContext* opCtx, const BSONObj& spec)
             new ExpressionContext(opCtx, collator.get()));
 
         // Parsing the partial filter expression is not expected to fail here since the
-        // expression would have been successfully parsed upstream during index creation. However,
-        // filters that were allowed in partial filter expressions prior to 3.6 may be present in
-        // the index catalog and must also successfully parse (e.g., partial index filters with the
-        // $isolated/$atomic option).
+        // expression would have been successfully parsed upstream during index creation.
         StatusWithMatchExpression statusWithMatcher =
             MatchExpressionParser::parse(filterElement.Obj(),
                                          std::move(expCtx),
                                          ExtensionsCallbackNoop(),
-                                         MatchExpressionParser::kIsolated);
+                                         MatchExpressionParser::kBanAllSpecialFeatures);
         if (!statusWithMatcher.isOK()) {
             return statusWithMatcher.getStatus();
         }
@@ -711,7 +740,7 @@ Status IndexCatalogImpl::_isSpecOk(OperationContext* opCtx, const BSONObj& spec)
     } else {
         // for non _id indexes, we check to see if replication has turned off all indexes
         // we _always_ created _id index
-        if (!repl::getGlobalReplicationCoordinator()->buildsIndexes()) {
+        if (!repl::ReplicationCoordinator::get(opCtx)->buildsIndexes()) {
             // this is not exactly the right error code, but I think will make the most sense
             return Status(ErrorCodes::IndexAlreadyExists, "no indexes per repl");
         }
@@ -843,11 +872,10 @@ Status IndexCatalogImpl::_doesSpecConflictWithExisting(OperationContext* opCtx,
     return Status::OK();
 }
 
-BSONObj IndexCatalogImpl::getDefaultIdIndexSpec(
-    ServerGlobalParams::FeatureCompatibility::Version featureCompatibilityVersion) const {
+BSONObj IndexCatalogImpl::getDefaultIdIndexSpec() const {
     dassert(_idObj["_id"].type() == NumberInt);
 
-    const auto indexVersion = IndexDescriptor::getDefaultIndexVersion(featureCompatibilityVersion);
+    const auto indexVersion = IndexDescriptor::getDefaultIndexVersion();
 
     BSONObjBuilder b;
     b.append("v", static_cast<int>(indexVersion));
@@ -962,7 +990,7 @@ public:
     void commit() final {
         // Ban reading from this collection on committed reads on snapshots before now.
         auto replCoord = repl::ReplicationCoordinator::get(_opCtx);
-        auto snapshotName = replCoord->reserveSnapshotName(_opCtx);
+        auto snapshotName = replCoord->getMinimumVisibleSnapshot(_opCtx);
         _collection->setMinimumVisibleSnapshot(snapshotName);
 
         delete _entry;
@@ -1080,14 +1108,34 @@ int IndexCatalogImpl::numIndexesTotal(OperationContext* opCtx) const {
 }
 
 int IndexCatalogImpl::numIndexesReady(OperationContext* opCtx) const {
-    int count = 0;
+    std::vector<IndexDescriptor*> itIndexes;
     IndexIterator ii = _this->getIndexIterator(opCtx, /*includeUnfinished*/ false);
     while (ii.more()) {
-        ii.next();
-        count++;
+        itIndexes.push_back(ii.next());
     }
-    dassert(_collection->getCatalogEntry()->getCompletedIndexCount(opCtx) == count);
-    return count;
+    DEV {
+        std::vector<std::string> completedIndexes;
+        _collection->getCatalogEntry()->getReadyIndexes(opCtx, &completedIndexes);
+
+        // There is a potential inconistency where the index information in the collection catalog
+        // entry and the index catalog differ. Log as much information as possible here.
+        if (itIndexes.size() != completedIndexes.size()) {
+            log() << "index catalog reports: ";
+            for (IndexDescriptor* i : itIndexes) {
+                log() << "  index: " << i->toString();
+            }
+
+            log() << "collection catalog reports: ";
+            for (auto const& i : completedIndexes) {
+                log() << "  index: " << i;
+            }
+
+            invariant(itIndexes.size() == completedIndexes.size(),
+                      "The number of ready indexes reported in the collection metadata catalog did "
+                      "not match the number of ready indexes reported by the index catalog.");
+        }
+    }
+    return itIndexes.size();
 }
 
 bool IndexCatalogImpl::haveIdIndex(OperationContext* opCtx) const {
@@ -1144,7 +1192,7 @@ void IndexCatalogImpl::IndexIteratorImpl::_advance() {
 
         if (!_includeUnfinishedIndexes) {
             if (auto minSnapshot = entry->getMinimumVisibleSnapshot()) {
-                if (auto mySnapshot = _opCtx->recoveryUnit()->getMajorityCommittedSnapshot()) {
+                if (auto mySnapshot = _opCtx->recoveryUnit()->getPointInTimeReadTimestamp()) {
                     if (mySnapshot < minSnapshot) {
                         // This index isn't finished in my snapshot.
                         continue;

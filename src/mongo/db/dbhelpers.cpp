@@ -35,9 +35,7 @@
 #include <boost/filesystem/operations.hpp>
 #include <fstream>
 
-#include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/index_create.h"
-#include "mongo/db/db.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/exec/working_set_common.h"
 #include "mongo/db/index/btree_access_method.h"
@@ -54,19 +52,14 @@
 #include "mongo/db/query/get_executor.h"
 #include "mongo/db/query/internal_plans.h"
 #include "mongo/db/query/query_planner.h"
-#include "mongo/db/range_arithmetic.h"
 #include "mongo/db/repl/repl_client_info.h"
-#include "mongo/db/repl/replication_coordinator_global.h"
-#include "mongo/db/s/collection_metadata.h"
-#include "mongo/db/s/collection_sharding_state.h"
-#include "mongo/db/s/sharding_state.h"
+#include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/storage/data_protector.h"
 #include "mongo/db/storage/encryption_hooks.h"
 #include "mongo/db/storage/storage_options.h"
 #include "mongo/db/write_concern.h"
 #include "mongo/db/write_concern_options.h"
-#include "mongo/s/shard_key_pattern.h"
 #include "mongo/util/log.h"
 #include "mongo/util/mongoutils/str.h"
 #include "mongo/util/scopeguard.h"
@@ -74,14 +67,11 @@
 namespace mongo {
 
 using std::unique_ptr;
-using std::endl;
 using std::ios_base;
 using std::ofstream;
 using std::set;
 using std::string;
 using std::stringstream;
-
-using logger::LogComponent;
 
 /* fetch a single object from collection ns that matches query
    set your db SavedContext first
@@ -108,10 +98,19 @@ RecordId Helpers::findOne(OperationContext* opCtx,
     if (!collection)
         return RecordId();
 
-    const ExtensionsCallbackReal extensionsCallback(opCtx, &collection->ns());
-
     auto qr = stdx::make_unique<QueryRequest>(collection->ns());
     qr->setFilter(query);
+    return findOne(opCtx, collection, std::move(qr), requireIndex);
+}
+
+RecordId Helpers::findOne(OperationContext* opCtx,
+                          Collection* collection,
+                          std::unique_ptr<QueryRequest> qr,
+                          bool requireIndex) {
+    if (!collection)
+        return RecordId();
+
+    const ExtensionsCallbackReal extensionsCallback(opCtx, &collection->ns());
 
     const boost::intrusive_ptr<ExpressionContext> expCtx;
     auto statusWithCQ =
@@ -119,9 +118,9 @@ RecordId Helpers::findOne(OperationContext* opCtx,
                                      std::move(qr),
                                      expCtx,
                                      extensionsCallback,
-                                     MatchExpressionParser::kAllowAllSpecialFeatures &
-                                         ~MatchExpressionParser::AllowedFeatures::kIsolated);
-    massert(17244, "Could not canonicalize " + query.toString(), statusWithCQ.isOK());
+                                     MatchExpressionParser::kAllowAllSpecialFeatures);
+
+    massertStatusOK(statusWithCQ.getStatus());
     unique_ptr<CanonicalQuery> cq = std::move(statusWithCQ.getValue());
 
     size_t options = requireIndex ? QueryPlannerParams::NO_TABLE_SCAN : QueryPlannerParams::DEFAULT;

@@ -45,18 +45,8 @@ namespace mongo {
 struct WriteResult {
     /**
      * Maps 1-to-1 to single ops in request. May be shorter than input if there are errors.
-     *
-     * staleConfigException should be considered appended to this if it is non-null.
      */
     std::vector<StatusWith<SingleWriteResult>> results;
-
-    /**
-     * If non-null, the StaleConfigException that was encountered while processing the op after
-     * the last op reported in results. Processing always stops at the first SCE and nothing is
-     * placed in results for the op that triggered it. The whole exception is copied here because it
-     * contains additional data not included in the Status.
-     */
-    std::unique_ptr<StaleConfigException> staleConfigException;
 };
 
 

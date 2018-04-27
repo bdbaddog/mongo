@@ -7,6 +7,9 @@
 (function() {
     "use strict";
 
+    // Skip db hash check because secondary restarted as standalone.
+    TestData.skipCheckDBHashes = true;
+
     var rst = new ReplSetTest({
         name: "name",
         nodes: 2,
@@ -54,6 +57,12 @@
     var options = slave.savedOptions;
     options.noCleanData = true;
     delete options.replSet;
+
+    var storageEngine = jsTest.options().storageEngine || "wiredTiger";
+    if (storageEngine === "wiredTiger") {
+        options.recoverFromOplogAsStandalone = "";
+    }
+
     var conn = MongoRunner.runMongod(options);
     assert.neq(null, conn, "secondary failed to start");
 
@@ -79,7 +88,9 @@
     try {
         assert.eq(collDoc._id, oplogDoc.o._id);
         assert(!('begin' in minValidDoc), 'begin in minValidDoc');
-        assert.eq(minValidDoc.ts, oplogDoc.ts);
+        if (storageEngine !== "wiredTiger") {
+            assert.eq(minValidDoc.ts, oplogDoc.ts);
+        }
         assert.eq(oplogTruncateAfterPointDoc.oplogTruncateAfterPoint, Timestamp());
     } catch (e) {
         // TODO remove once SERVER-25777 is resolved.

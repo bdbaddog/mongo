@@ -55,7 +55,13 @@
     var secondaryNodeId = rst.getNodeId(secondaryDB.getMongo());
     rst.stop(secondaryNodeId);
 
-    secondaryConn = MongoRunner.runMongod({dbpath: secondaryConn.dbpath, noCleanData: true});
+    var storageEngine = jsTest.options().storageEngine || "wiredTiger";
+    if (storageEngine === "wiredTiger") {
+        secondaryConn = MongoRunner.runMongod(
+            {dbpath: secondaryConn.dbpath, noCleanData: true, recoverFromOplogAsStandalone: ""});
+    } else {
+        secondaryConn = MongoRunner.runMongod({dbpath: secondaryConn.dbpath, noCleanData: true});
+    }
     assert.neq(null, secondaryConn, "secondary failed to start up as a stand-alone mongod");
     secondaryDB = secondaryConn.getDB("test");
 

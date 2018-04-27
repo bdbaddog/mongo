@@ -1,3 +1,4 @@
+// @tags: [requires_replication]
 (function() {
     // SERVER-28285 When renameCollection drops the target collection, it should just generate
     // a single oplog entry, so we cannot end up in a state where the drop has succeeded, but
@@ -21,7 +22,9 @@
         {
           source: first.x,
           target: second.x,
-          expectedOplogEntries: 4,
+          // Index builds on primaries now log a no-op when starting, bringing the total count
+          // from 4 to 5.
+          expectedOplogEntries: 5,
         }
     ];
     tests.forEach((test) => {
@@ -42,4 +45,5 @@
                   "renameCollection was supposed to only generate " + test.expectedOplogEntries +
                       " oplog entries: " + tojson(ops));
     });
+    rs.stopSet();
 })();

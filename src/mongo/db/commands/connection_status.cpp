@@ -41,18 +41,18 @@ using std::stringstream;
 class CmdConnectionStatus : public BasicCommand {
 public:
     CmdConnectionStatus() : BasicCommand("connectionStatus") {}
-    virtual bool slaveOk() const {
-        return true;
+    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
+        return AllowedOnSecondary::kAlways;
     }
     virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
         return false;
     }
     virtual void addRequiredPrivileges(const std::string& dbname,
                                        const BSONObj& cmdObj,
-                                       std::vector<Privilege>* out) {}  // No auth required
+                                       std::vector<Privilege>* out) const {}  // No auth required
 
-    void help(stringstream& h) const {
-        h << "Returns connection-specific information such as logged-in users and their roles";
+    std::string help() const override {
+        return "Returns connection-specific information such as logged-in users and their roles";
     }
 
     bool run(OperationContext* opCtx,
@@ -65,7 +65,7 @@ public:
         Status status =
             bsonExtractBooleanFieldWithDefault(cmdObj, "showPrivileges", false, &showPrivileges);
         if (!status.isOK()) {
-            return appendCommandStatus(result, status);
+            return CommandHelpers::appendCommandStatus(result, status);
         }
 
         BSONObjBuilder authInfo(result.subobjStart("authInfo"));

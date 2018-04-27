@@ -156,7 +156,7 @@ Status enforceLegacyWriteConcern(OperationContext* opCtx,
         wcResponse.shardHost = response.shardHostAndPort->toString();
         wcResponse.gleResponse = gleResponse;
         if (errors.wcError.get()) {
-            wcResponse.errToReport = errors.wcError->getErrMessage();
+            wcResponse.errToReport = errors.wcError->toString();
         }
 
         legacyWCResponses->push_back(wcResponse);
@@ -179,9 +179,11 @@ Status enforceLegacyWriteConcern(OperationContext* opCtx,
         }
     }
 
-    return Status(failedStatuses.size() == 1u ? failedStatuses.front().code()
-                                              : ErrorCodes::MultipleErrorsOccurred,
-                  builder.str());
+    if (failedStatuses.size() == 1u) {
+        return failedStatuses.front();
+    } else {
+        return Status(ErrorCodes::MultipleErrorsOccurred, builder.str());
+    }
 }
 
 
@@ -193,17 +195,17 @@ public:
         return false;
     }
 
-    virtual bool slaveOk() const {
-        return true;
+    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
+        return AllowedOnSecondary::kAlways;
     }
 
-    virtual void help(std::stringstream& help) const {
-        help << "check for an error on the last command executed";
+    std::string help() const override {
+        return "check for an error on the last command executed";
     }
 
     virtual void addRequiredPrivileges(const std::string& dbname,
                                        const BSONObj& cmdObj,
-                                       std::vector<Privilege>* out) {
+                                       std::vector<Privilege>* out) const {
         // No auth required for getlasterror
     }
 
@@ -247,8 +249,12 @@ public:
         const HostOpTimeMap hostOpTimes(ClusterLastErrorInfo::get(cc())->getPrevHostOpTimes());
 
         std::vector<LegacyWCResponse> wcResponses;
-        auto status = enforceLegacyWriteConcern(
-            opCtx, dbname, filterCommandRequestForPassthrough(cmdObj), hostOpTimes, &wcResponses);
+        auto status =
+            enforceLegacyWriteConcern(opCtx,
+                                      dbname,
+                                      CommandHelpers::filterCommandRequestForPassthrough(cmdObj),
+                                      hostOpTimes,
+                                      &wcResponses);
 
         // Don't forget about our last hosts, reset the client info
         ClusterLastErrorInfo::get(cc())->disableForCommand();
@@ -308,7 +314,7 @@ public:
         if (numWCErrors == 1) {
             // Return the single write concern error we found, err should be set or not
             // from gle response
-            filterCommandReplyForPassthrough(lastErrResponse->gleResponse, &result);
+            CommandHelpers::filterCommandReplyForPassthrough(lastErrResponse->gleResponse, &result);
             return lastErrResponse->gleResponse["ok"].trueValue();
         } else {
             // Return a generic combined WC error message
@@ -318,7 +324,7 @@ public:
             // Need to always return err
             result.appendNull("err");
 
-            return appendCommandStatus(
+            return CommandHelpers::appendCommandStatus(
                 result,
                 Status(ErrorCodes::WriteConcernFailed, "multiple write concern errors occurred"));
         }

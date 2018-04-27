@@ -5,8 +5,12 @@ selector:
   - jstests/disk/*.js
   exclude_with_any_tags:
   - requires_mmapv1
+  - requires_mobile_se
 
 executor:
+  archive:
+    hooks:
+      - ValidateCollections
   config:
     shell_options:
       global_vars:

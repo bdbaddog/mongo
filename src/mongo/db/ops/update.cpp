@@ -49,7 +49,7 @@
 #include "mongo/db/query/get_executor.h"
 #include "mongo/db/query/plan_summary_stats.h"
 #include "mongo/db/repl/repl_client_info.h"
-#include "mongo/db/repl/replication_coordinator_global.h"
+#include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/update/update_driver.h"
 #include "mongo/db/update_index_data.h"
 #include "mongo/util/log.h"
@@ -79,7 +79,7 @@ UpdateResult update(OperationContext* opCtx, Database* db, const UpdateRequest& 
             Lock::DBLock lk(opCtx, nsString.db(), MODE_X);
 
             const bool userInitiatedWritesAndNotPrimary = opCtx->writesAreReplicated() &&
-                !repl::getGlobalReplicationCoordinator()->canAcceptWritesFor(opCtx, nsString);
+                !repl::ReplicationCoordinator::get(opCtx)->canAcceptWritesFor(opCtx, nsString);
 
             if (userInitiatedWritesAndNotPrimary) {
                 uassertStatusOK(Status(ErrorCodes::PrimarySteppedDown,

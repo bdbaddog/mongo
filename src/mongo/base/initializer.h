@@ -65,8 +65,11 @@ public:
      * Returns Status::OK on success.  All other returns constitute initialization failures,
      * and the thing being initialized should be considered dead in the water.
      */
-    Status execute(const InitializerContext::ArgumentVector& args,
-                   const InitializerContext::EnvironmentMap& env) const;
+    Status executeInitializers(const InitializerContext::ArgumentVector& args,
+                               const InitializerContext::EnvironmentMap& env,
+                               ServiceContext* serviceContext);
+
+    Status executeDeinitializers(ServiceContext* serviceContext);
 
 private:
     InitializerDependencyGraph _graph;
@@ -82,14 +85,32 @@ private:
  * should probably arrange to terminate the process themselves.
  */
 Status runGlobalInitializers(const InitializerContext::ArgumentVector& args,
-                             const InitializerContext::EnvironmentMap& env);
+                             const InitializerContext::EnvironmentMap& env,
+                             ServiceContext* serviceContext);
 
-Status runGlobalInitializers(int argc, const char* const* argv, const char* const* envp);
+Status runGlobalInitializers(int argc,
+                             const char* const* argv,
+                             const char* const* envp,
+                             ServiceContext* serviceContext);
 
 /**
  * Same as runGlobalInitializers(), except prints a brief message to std::cerr
  * and terminates the process on failure.
  */
-void runGlobalInitializersOrDie(int argc, const char* const* argv, const char* const* envp);
+void runGlobalInitializersOrDie(int argc,
+                                const char* const* argv,
+                                const char* const* envp,
+                                ServiceContext* serviceContext);
+
+/**
+* Run the global deinitializers. They will execute in reverse order from initialization.
+*
+* It's a programming error for this to fail, but if it does it will return a status other
+* than Status::OK.
+*
+* This means that the few initializers that might want to terminate the program by failing
+* should probably arrange to terminate the process themselves.
+*/
+Status runGlobalDeinitializers(ServiceContext* serviceContext);
 
 }  // namespace mongo

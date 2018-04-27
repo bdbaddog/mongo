@@ -6,12 +6,6 @@
  * See the file LICENSE for redistribution information.
  */
 
-/*
- * Default hash table size; we don't need a prime number of buckets
- * because we always use a good hash function.
- */
-#define	WT_HASH_ARRAY_SIZE	512
-
 /*******************************************
  * Global per-process structure.
  *******************************************/
@@ -193,7 +187,6 @@ struct __wt_connection_impl {
 	WT_FH *optrack_map_fh;		/* Name to id translation file. */
 	WT_SPINLOCK optrack_map_spinlock; /* Translation file spinlock. */
 	uintmax_t optrack_pid;		/* Cache the process ID. */
-	uint16_t  optrack_uid;		/* Unique function ID */
 
 	void  **foc;			/* Free-on-close array */
 	size_t  foc_cnt;		/* Array entries */
@@ -449,9 +442,14 @@ struct __wt_connection_impl {
 	 * delays have been requested.
 	 */
 /* AUTOMATIC FLAG VALUE GENERATION START */
-#define	WT_TIMING_STRESS_CHECKPOINT_SLOW		0x1u
-#define	WT_TIMING_STRESS_INTERNAL_PAGE_SPLIT_RACE	0x2u
-#define	WT_TIMING_STRESS_PAGE_SPLIT_RACE		0x4u
+#define	WT_TIMING_STRESS_CHECKPOINT_SLOW	0x01u
+#define	WT_TIMING_STRESS_SPLIT_RACE_1		0x02u
+#define	WT_TIMING_STRESS_SPLIT_RACE_2		0x04u
+#define	WT_TIMING_STRESS_SPLIT_RACE_3		0x08u
+#define	WT_TIMING_STRESS_SPLIT_RACE_4		0x10u
+#define	WT_TIMING_STRESS_SPLIT_RACE_5		0x20u
+#define	WT_TIMING_STRESS_SPLIT_RACE_6		0x40u
+#define	WT_TIMING_STRESS_SPLIT_RACE_7		0x80u
 /* AUTOMATIC FLAG VALUE GENERATION STOP */
 	uint64_t timing_stress_flags;
 
@@ -466,27 +464,29 @@ struct __wt_connection_impl {
 	WT_FILE_SYSTEM *file_system;
 
 /* AUTOMATIC FLAG VALUE GENERATION START */
-#define	WT_CONN_CACHE_POOL		0x000001u
-#define	WT_CONN_CKPT_SYNC		0x000002u
-#define	WT_CONN_CLOSING			0x000004u
-#define	WT_CONN_CLOSING_NO_MORE_OPENS	0x000008u
-#define	WT_CONN_EVICTION_NO_LOOKASIDE	0x000010u
-#define	WT_CONN_EVICTION_RUN		0x000020u
-#define	WT_CONN_IN_MEMORY		0x000040u
-#define	WT_CONN_LEAK_MEMORY		0x000080u
-#define	WT_CONN_LOOKASIDE_OPEN		0x000100u
-#define	WT_CONN_LSM_MERGE		0x000200u
-#define	WT_CONN_OPTRACK			0x000400u
-#define	WT_CONN_PANIC			0x000800u
-#define	WT_CONN_READONLY		0x001000u
-#define	WT_CONN_RECOVERING		0x002000u
-#define	WT_CONN_SERVER_ASYNC		0x004000u
-#define	WT_CONN_SERVER_CHECKPOINT	0x008000u
-#define	WT_CONN_SERVER_LOG		0x010000u
-#define	WT_CONN_SERVER_LSM		0x020000u
-#define	WT_CONN_SERVER_STATISTICS	0x040000u
-#define	WT_CONN_SERVER_SWEEP		0x080000u
-#define	WT_CONN_WAS_BACKUP		0x100000u
+#define	WT_CONN_CACHE_CURSORS		0x000001u
+#define	WT_CONN_CACHE_POOL		0x000002u
+#define	WT_CONN_CKPT_SYNC		0x000004u
+#define	WT_CONN_CLOSING			0x000008u
+#define	WT_CONN_CLOSING_NO_MORE_OPENS	0x000010u
+#define	WT_CONN_CLOSING_TIMESTAMP	0x000020u
+#define	WT_CONN_EVICTION_NO_LOOKASIDE	0x000040u
+#define	WT_CONN_EVICTION_RUN		0x000080u
+#define	WT_CONN_IN_MEMORY		0x000100u
+#define	WT_CONN_LEAK_MEMORY		0x000200u
+#define	WT_CONN_LOOKASIDE_OPEN		0x000400u
+#define	WT_CONN_LSM_MERGE		0x000800u
+#define	WT_CONN_OPTRACK			0x001000u
+#define	WT_CONN_PANIC			0x002000u
+#define	WT_CONN_READONLY		0x004000u
+#define	WT_CONN_RECOVERING		0x008000u
+#define	WT_CONN_SERVER_ASYNC		0x010000u
+#define	WT_CONN_SERVER_CHECKPOINT	0x020000u
+#define	WT_CONN_SERVER_LOG		0x040000u
+#define	WT_CONN_SERVER_LSM		0x080000u
+#define	WT_CONN_SERVER_STATISTICS	0x100000u
+#define	WT_CONN_SERVER_SWEEP		0x200000u
+#define	WT_CONN_WAS_BACKUP		0x400000u
 /* AUTOMATIC FLAG VALUE GENERATION STOP */
 	uint32_t flags;
 };

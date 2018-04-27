@@ -36,7 +36,7 @@
 #include "mongo/db/invalidation_type.h"
 #include "mongo/db/query/query_solution.h"
 #include "mongo/db/storage/snapshot.h"
-#include "mongo/platform/unordered_set.h"
+#include "mongo/stdx/unordered_set.h"
 
 namespace mongo {
 
@@ -121,6 +121,9 @@ public:
         //    locked during execution. For example, a PlanExecutor containing a PipelineProxyStage
         //    which is being used to execute an aggregation pipeline.
         NO_YIELD,
+
+        // Will not yield locks or storage engine resources, but will check for interrupt.
+        INTERRUPT_ONLY,
 
         // Used for testing, this yield policy will cause the PlanExecutor to time out on the first
         // yield, returning DEAD with an error object encoding a ErrorCodes::ExceededTimeLimit
@@ -269,7 +272,8 @@ public:
      * Generates a tree of stats objects with a separate lifetime from the execution
      * stage tree wrapped by this PlanExecutor.
      *
-     * This is OK even if we were killed.
+     * This may be called without holding any locks. It also may be called on a PlanExecutor that
+     * has been killed or has produced an error.
      */
     std::unique_ptr<PlanStageStats> getStats() const;
 
@@ -370,10 +374,12 @@ public:
     /**
      * If we're yielding locks, the database we're operating over or any collection we're relying on
      * may be dropped. Plan executors are notified of such events by calling markAsKilled().
-     * Callers must specify the 'reason' for why this executor is being killed. Subsequent calls to
-     * getNext() will return DEAD, and fill 'objOut' with an error detail including 'reason'.
+     * Callers must specify the reason for why this executor is being killed. Subsequent calls to
+     * getNext() will return DEAD, and fill 'objOut' with an error reflecting 'killStatus'. If this
+     * method is called multiple times, only the first 'killStatus' will be retained. It is an error
+     * to call this method with Status::OK.
      */
-    void markAsKilled(std::string reason);
+    void markAsKilled(Status killStatus);
 
     /**
      * Cleans up any state associated with this PlanExecutor. Must be called before deleting this
@@ -430,24 +436,29 @@ public:
         _registrationToken.reset();
     }
 
-    boost::optional<Partitioned<unordered_set<PlanExecutor*>>::PartitionId> getRegistrationToken()
-        const& {
+    boost::optional<Partitioned<stdx::unordered_set<PlanExecutor*>>::PartitionId>
+    getRegistrationToken() const& {
         return _registrationToken;
     }
     void getRegistrationToken() && = delete;
 
-    void setRegistrationToken(Partitioned<unordered_set<PlanExecutor*>>::PartitionId token) & {
+    void setRegistrationToken(
+        Partitioned<stdx::unordered_set<PlanExecutor*>>::PartitionId token) & {
         invariant(!_registrationToken);
         _registrationToken = token;
     }
 
     bool isMarkedAsKilled() const {
-        return static_cast<bool>(_killReason);
+        return !_killStatus.isOK();
     }
 
-    const std::string& getKillReason() {
+    Status getKillStatus() {
         invariant(isMarkedAsKilled());
-        return *_killReason;
+        return _killStatus;
+    }
+
+    bool isDisposed() const {
+        return _currentState == kDisposed;
     }
 
     /**
@@ -542,9 +553,9 @@ private:
     std::unique_ptr<QuerySolution> _qs;
     std::unique_ptr<PlanStage> _root;
 
-    // If _killReason has a value, then we have been killed and the value represents the reason for
-    // the kill.
-    boost::optional<std::string> _killReason;
+    // If _killStatus has a non-OK value, then we have been killed and the value represents the
+    // reason for the kill.
+    Status _killStatus = Status::OK();
 
     // What namespace are we operating over?
     NamespaceString _nss;
@@ -562,7 +573,8 @@ private:
     enum { kUsable, kSaved, kDetached, kDisposed } _currentState = kUsable;
 
     // Set if this PlanExecutor is registered with the CursorManager.
-    boost::optional<Partitioned<unordered_set<PlanExecutor*>>::PartitionId> _registrationToken;
+    boost::optional<Partitioned<stdx::unordered_set<PlanExecutor*>>::PartitionId>
+        _registrationToken;
 
     bool _everDetachedFromOperationContext = false;
 };

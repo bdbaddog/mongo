@@ -88,7 +88,7 @@ protected:
      * Tests handling of two batches of operations returned from query.
      * Returns getMore request.
      */
-    RemoteCommandRequest testTwoBatchHandling(bool isV1ElectionProtocol);
+    RemoteCommandRequest testTwoBatchHandling();
 
     OpTime remoteNewerOpTime;
     OpTime staleOpTime;
@@ -137,13 +137,11 @@ BSONObj OplogFetcherTest::makeOplogQueryMetadataObject(OpTime lastAppliedOpTime,
 HostAndPort source("localhost:12345");
 NamespaceString nss("local.oplog.rs");
 
-ReplSetConfig _createConfig(bool isV1ElectionProtocol) {
+ReplSetConfig _createConfig() {
     BSONObjBuilder bob;
     bob.append("_id", "myset");
     bob.append("version", 1);
-    if (isV1ElectionProtocol) {
-        bob.append("protocolVersion", 1);
-    }
+    bob.append("protocolVersion", 1);
     {
         BSONArrayBuilder membersBob(bob.subarrayStart("members"));
         BSONObjBuilder(membersBob.subobjStart())
@@ -168,7 +166,7 @@ std::unique_ptr<ShutdownState> OplogFetcherTest::processSingleBatch(RemoteComman
                               lastFetched,
                               source,
                               nss,
-                              _createConfig(true),
+                              _createConfig(),
                               0,
                               rbid,
                               requireFresherSyncSource,
@@ -224,7 +222,7 @@ std::unique_ptr<OplogFetcher> OplogFetcherTest::makeOplogFetcher(ReplSetConfig c
 TEST_F(
     OplogFetcherTest,
     FindQueryContainsTermAndStartTimestampIfGetCurrentTermAndLastCommittedOpTimeReturnsValidTerm) {
-    auto cmdObj = makeOplogFetcher(_createConfig(true))->getFindQuery_forTest();
+    auto cmdObj = makeOplogFetcher(_createConfig())->getFindQuery_forTest();
     ASSERT_EQUALS(mongo::BSONType::Object, cmdObj["filter"].type());
     ASSERT_BSONOBJ_EQ(BSON("ts" << BSON("$gte" << lastFetched.opTime.getTimestamp())),
                       cmdObj["filter"].Obj());
@@ -235,7 +233,7 @@ TEST_F(
 TEST_F(OplogFetcherTest,
        FindQueryDoesNotContainTermIfGetCurrentTermAndLastCommittedOpTimeReturnsUninitializedTerm) {
     dataReplicatorExternalState->currentTerm = OpTime::kUninitializedTerm;
-    auto cmdObj = makeOplogFetcher(_createConfig(true))->getFindQuery_forTest();
+    auto cmdObj = makeOplogFetcher(_createConfig())->getFindQuery_forTest();
     ASSERT_EQUALS(mongo::BSONType::Object, cmdObj["filter"].type());
     ASSERT_BSONOBJ_EQ(BSON("ts" << BSON("$gte" << lastFetched.opTime.getTimestamp())),
                       cmdObj["filter"].Obj());
@@ -244,67 +242,16 @@ TEST_F(OplogFetcherTest,
 }
 
 TEST_F(OplogFetcherTest, MetadataObjectContainsMetadataFieldsUnderProtocolVersion1) {
-    auto metadataObj = makeOplogFetcher(_createConfig(true))->getMetadataObject_forTest();
+    auto metadataObj = makeOplogFetcher(_createConfig())->getMetadataObject_forTest();
     ASSERT_EQUALS(3, metadataObj.nFields());
     ASSERT_EQUALS(1, metadataObj[rpc::kReplSetMetadataFieldName].numberInt());
     ASSERT_EQUALS(1, metadataObj[rpc::kOplogQueryMetadataFieldName].numberInt());
 }
 
-TEST_F(OplogFetcherTest, MetadataObjectIsEmptyUnderProtocolVersion0) {
-    auto metadataObj = makeOplogFetcher(_createConfig(false))->getMetadataObject_forTest();
-    ASSERT_BSONOBJ_EQ(ReadPreferenceSetting::secondaryPreferredMetadata(), metadataObj);
-}
-
 TEST_F(OplogFetcherTest, AwaitDataTimeoutShouldEqualHalfElectionTimeoutUnderProtocolVersion1) {
-    auto config = _createConfig(true);
+    auto config = _createConfig();
     auto timeout = makeOplogFetcher(config)->getAwaitDataTimeout_forTest();
     ASSERT_EQUALS(config.getElectionTimeoutPeriod() / 2, timeout);
-}
-
-TEST_F(OplogFetcherTest, AwaitDataTimeoutShouldBeAConstantUnderProtocolVersion0) {
-    auto timeout = makeOplogFetcher(_createConfig(false))->getAwaitDataTimeout_forTest();
-    ASSERT_EQUALS(OplogFetcher::kDefaultProtocolZeroAwaitDataTimeout, timeout);
-}
-
-TEST_F(OplogFetcherTest, FindQueryHasNoReadconcernIfTermNotLastFetched) {
-    auto uninitializedTerm = OpTime::kUninitializedTerm;
-    ASSERT_NOT_EQUALS(dataReplicatorExternalState->currentTerm, uninitializedTerm);
-    dataReplicatorExternalState->currentTerm++;
-    auto cmdObj = makeOplogFetcher(_createConfig(true))->getFindQuery_forTest();
-    ASSERT_FALSE(cmdObj.hasField("readConcern"));
-}
-
-TEST_F(OplogFetcherTest, FindQueryHasNoReadconcernIfTermUninitialized) {
-    dataReplicatorExternalState->currentTerm = OpTime::kUninitializedTerm;
-    auto cmdObj = makeOplogFetcher(_createConfig(true))->getFindQuery_forTest();
-    ASSERT_FALSE(cmdObj.hasField("readConcern"));
-}
-
-TEST_F(OplogFetcherTest, FindQueryHasAfterOpTimeWithFeatureCompatibilityVersion34) {
-    EnsureFCV ensureFCV(EnsureFCV::Version::kFullyDowngradedTo34);
-    ASSERT(serverGlobalParams.featureCompatibility.getVersion() !=
-           ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo36);
-    auto cmdObj = makeOplogFetcher(_createConfig(true))->getFindQuery_forTest();
-    auto readConcernElem = cmdObj["readConcern"];
-    ASSERT_EQUALS(mongo::BSONType::Object, readConcernElem.type());
-    ASSERT_FALSE(readConcernElem.Obj().hasField("afterClusterTime"));
-    ASSERT_BSONOBJ_EQ(readConcernElem.Obj(), BSON("afterOpTime" << lastFetched.opTime));
-
-    _checkDefaultCommandObjectFields(cmdObj);
-}
-
-TEST_F(OplogFetcherTest, FindQueryHasAfterOpTimeWithFeatureCompatibilityVersion36) {
-    EnsureFCV ensureFCV(EnsureFCV::Version::kFullyUpgradedTo36);
-    ASSERT(serverGlobalParams.featureCompatibility.getVersion() ==
-           ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo36);
-    auto cmdObj = makeOplogFetcher(_createConfig(true))->getFindQuery_forTest();
-    auto readConcernElem = cmdObj["readConcern"];
-    ASSERT_EQUALS(mongo::BSONType::Object, readConcernElem.type());
-    ASSERT_FALSE(readConcernElem.Obj().hasField("afterOpTime"));
-    ASSERT_BSONOBJ_EQ(readConcernElem.Obj(),
-                      BSON("afterClusterTime" << lastFetched.opTime.getTimestamp()));
-
-    _checkDefaultCommandObjectFields(cmdObj);
 }
 
 TEST_F(OplogFetcherTest, InvalidReplSetMetadataInResponseStopsTheOplogFetcher) {
@@ -420,9 +367,10 @@ TEST_F(OplogFetcherTest,
     ASSERT_OK(oqMetadata.writeToMetadata(&bob));
     auto metadataObj = bob.obj();
 
+    auto entry = makeNoopOplogEntry({123LL, staleOpTime});
     ASSERT_EQUALS(
         ErrorCodes::InvalidSyncSource,
-        processSingleBatch({makeCursorResponse(0, {}), metadataObj, Milliseconds(0)}, false)
+        processSingleBatch({makeCursorResponse(0, {entry}), metadataObj, Milliseconds(0)}, false)
             ->getStatus());
     ASSERT_FALSE(dataReplicatorExternalState->metadataWasProcessed);
     ASSERT(lastEnqueuedDocuments.empty());
@@ -723,18 +671,14 @@ TEST_F(OplogFetcherTest,
     ASSERT_FALSE(dataReplicatorExternalState->syncSourceHasSyncSource);
 }
 
-RemoteCommandRequest OplogFetcherTest::testTwoBatchHandling(bool isV1ElectionProtocol) {
+RemoteCommandRequest OplogFetcherTest::testTwoBatchHandling() {
     ShutdownState shutdownState;
-
-    if (!isV1ElectionProtocol) {
-        dataReplicatorExternalState->currentTerm = OpTime::kUninitializedTerm;
-    }
 
     OplogFetcher oplogFetcher(&getExecutor(),
                               lastFetched,
                               source,
                               nss,
-                              _createConfig(isV1ElectionProtocol),
+                              _createConfig(),
                               0,
                               rbid,
                               true,
@@ -784,18 +728,11 @@ RemoteCommandRequest OplogFetcherTest::testTwoBatchHandling(bool isV1ElectionPro
 TEST_F(
     OplogFetcherTest,
     NoDataAvailableAfterFirstTwoBatchesShouldCauseTheOplogFetcherToShutDownWithSuccessfulStatus) {
-    auto request = testTwoBatchHandling(true);
+    auto request = testTwoBatchHandling();
     ASSERT_EQUALS(dataReplicatorExternalState->currentTerm, request.cmdObj["term"].numberLong());
     ASSERT_EQUALS(dataReplicatorExternalState->lastCommittedOpTime,
                   unittest::assertGet(OpTime::parseFromOplogEntry(
                       request.cmdObj["lastKnownCommittedOpTime"].Obj())));
-}
-
-TEST_F(OplogFetcherTest,
-       GetMoreRequestUnderProtocolVersionZeroDoesNotIncludeTermOrLastKnownCommittedOpTime) {
-    auto request = testTwoBatchHandling(false);
-    ASSERT_FALSE(request.cmdObj.hasField("term"));
-    ASSERT_FALSE(request.cmdObj.hasField("lastKnownCommittedOpTime"));
 }
 
 TEST_F(OplogFetcherTest, ValidateDocumentsReturnsNoSuchKeyIfTimestampIsNotFoundInAnyDocument) {

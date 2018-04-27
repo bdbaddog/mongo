@@ -29,6 +29,7 @@
 #include "mongo/platform/basic.h"
 
 #include "mongo/bson/bsonmisc.h"
+#include "mongo/db/command_generic_argument.h"
 #include "mongo/db/commands.h"
 #include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/s/client/shard_registry.h"
@@ -118,7 +119,7 @@ std::vector<Strategy::CommandResult> ClusterExplain::downconvert(
         }
         // Convert the error status back into the format of a command result.
         BSONObjBuilder statusObjBob;
-        Command::appendCommandStatus(statusObjBob, status);
+        CommandHelpers::appendCommandStatus(statusObjBob, status);
 
         // Get the Shard object in order to get the ConnectionString.
         auto shard =
@@ -130,7 +131,7 @@ std::vector<Strategy::CommandResult> ClusterExplain::downconvert(
 
 // static
 BSONObj ClusterExplain::wrapAsExplain(const BSONObj& cmdObj, ExplainOptions::Verbosity verbosity) {
-    auto filtered = Command::filterCommandRequestForPassthrough(cmdObj);
+    auto filtered = CommandHelpers::filterCommandRequestForPassthrough(cmdObj);
     BSONObjBuilder out;
     out.append("explain", filtered);
     out.append("verbosity", ExplainOptions::verbosityString(verbosity));
@@ -138,7 +139,7 @@ BSONObj ClusterExplain::wrapAsExplain(const BSONObj& cmdObj, ExplainOptions::Ver
     // Propagate all generic arguments out of the inner command since the shards will only process
     // them at the top level.
     for (auto elem : filtered) {
-        if (Command::isGenericArgument(elem.fieldNameStringData())) {
+        if (isGenericArgument(elem.fieldNameStringData())) {
             out.append(elem);
         }
     }
@@ -161,18 +162,11 @@ Status ClusterExplain::validateShardResults(const vector<Strategy::CommandResult
     // Check that the result from each shard has a true value for "ok" and has
     // the expected "queryPlanner" field.
     for (size_t i = 0; i < shardResults.size(); i++) {
-        if (!shardResults[i].result["ok"].trueValue()) {
-            // Try to pass up the error code from the shard.
-            ErrorCodes::Error error = ErrorCodes::OperationFailed;
-            if (shardResults[i].result["code"].isNumber()) {
-                error = ErrorCodes::Error(shardResults[i].result["code"].numberInt());
-            }
-
-            return Status(error,
-                          str::stream() << "Explain command on shard "
-                                        << shardResults[i].target.toString()
-                                        << " failed, caused by: "
-                                        << shardResults[i].result);
+        auto status = getStatusFromCommandResult(shardResults[i].result);
+        if (!status.isOK()) {
+            return status.withContext(str::stream() << "Explain command on shard "
+                                                    << shardResults[i].target.toString()
+                                                    << " failed");
         }
 
         if (Object != shardResults[i].result["queryPlanner"].type()) {

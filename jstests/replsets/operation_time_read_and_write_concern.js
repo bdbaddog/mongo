@@ -5,6 +5,9 @@
 (function() {
     "use strict";
 
+    // Skip db hash check because replication is stopped on secondaries.
+    TestData.skipCheckDBHashes = true;
+
     load("jstests/replsets/rslib.js");           // For startSetIfSupportsReadMajority.
     load("jstests/libs/write_concern_util.js");  // For stopReplicationOnSecondaries,
                                                  // restartReplicationOnSecondaries
@@ -15,6 +18,7 @@
 
     if (!startSetIfSupportsReadMajority(replTest)) {
         jsTestLog("Skipping test since storage engine doesn't support majority read concern.");
+        replTest.stopSet();
         return;
     }
     replTest.initiate();

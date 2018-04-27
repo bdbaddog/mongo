@@ -31,15 +31,17 @@
 #include <boost/filesystem/path.hpp>
 #include <memory>
 
-#include "mongo/db/db.h"
+#include "mongo/db/namespace_string.h"
 #include "mongo/db/record_id.h"
 #include "mongo/db/storage/data_protector.h"
 
 namespace mongo {
 
 class Collection;
+class Database;
 class DataProtector;
 class OperationContext;
+class QueryRequest;
 
 /**
  * db helpers are helper functions and classes that let us easily manipulate the local
@@ -70,6 +72,11 @@ struct Helpers {
     static RecordId findOne(OperationContext* opCtx,
                             Collection* collection,
                             const BSONObj& query,
+                            bool requireIndex);
+
+    static RecordId findOne(OperationContext* opCtx,
+                            Collection* collection,
+                            std::unique_ptr<QueryRequest> qr,
                             bool requireIndex);
 
     /**
@@ -158,6 +165,22 @@ struct Helpers {
          * to the file.
          */
         Status goingToDelete(const BSONObj& o);
+
+        /**
+         * A path object describing the directory containing the file with deleted documents.
+         */
+        const auto& root() const& {
+            return _root;
+        }
+        void root() && = delete;
+
+        /**
+         * A path object describing the actual file containing BSON documents.
+         */
+        const auto& file() const& {
+            return _file;
+        }
+        void file() && = delete;
 
     private:
         boost::filesystem::path _root;

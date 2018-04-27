@@ -40,7 +40,7 @@
 #include "mongo/db/op_observer.h"
 #include "mongo/db/query/find.h"
 #include "mongo/db/query/internal_plans.h"
-#include "mongo/db/repl/replication_coordinator_global.h"
+#include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/service_context.h"
 
 namespace mongo {
@@ -52,18 +52,18 @@ using std::stringstream;
 class CmdCloneCollectionAsCapped : public ErrmsgCommandDeprecated {
 public:
     CmdCloneCollectionAsCapped() : ErrmsgCommandDeprecated("cloneCollectionAsCapped") {}
-    virtual bool slaveOk() const {
-        return false;
+    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
+        return AllowedOnSecondary::kNever;
     }
     virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
         return true;
     }
-    virtual void help(stringstream& help) const {
-        help << "{ cloneCollectionAsCapped:<fromName>, toCollection:<toName>, size:<sizeInBytes> }";
+    std::string help() const override {
+        return "{ cloneCollectionAsCapped:<fromName>, toCollection:<toName>, size:<sizeInBytes> }";
     }
     virtual void addRequiredPrivileges(const std::string& dbname,
                                        const BSONObj& cmdObj,
-                                       std::vector<Privilege>* out) {
+                                       std::vector<Privilege>* out) const {
         ActionSet sourceActions;
         sourceActions.addAction(ActionType::find);
         out->push_back(Privilege(parseResourcePattern(dbname, cmdObj), sourceActions));
@@ -120,8 +120,8 @@ public:
         AutoGetDb autoDb(opCtx, dbname, MODE_X);
 
         NamespaceString nss(dbname, to);
-        if (!repl::getGlobalReplicationCoordinator()->canAcceptWritesFor(opCtx, nss)) {
-            return appendCommandStatus(
+        if (!repl::ReplicationCoordinator::get(opCtx)->canAcceptWritesFor(opCtx, nss)) {
+            return CommandHelpers::appendCommandStatus(
                 result,
                 Status(ErrorCodes::NotMaster,
                        str::stream() << "Not primary while cloning collection " << from << " to "
@@ -131,7 +131,7 @@ public:
 
         Database* const db = autoDb.getDb();
         if (!db) {
-            return appendCommandStatus(
+            return CommandHelpers::appendCommandStatus(
                 result,
                 Status(ErrorCodes::NamespaceNotFound,
                        str::stream() << "database " << dbname << " not found"));
@@ -139,7 +139,7 @@ public:
 
         Status status =
             cloneCollectionAsCapped(opCtx, db, from.toString(), to.toString(), size, temp);
-        return appendCommandStatus(result, status);
+        return CommandHelpers::appendCommandStatus(result, status);
     }
 } cmdCloneCollectionAsCapped;
 
@@ -151,18 +151,18 @@ public:
 class CmdConvertToCapped : public ErrmsgCommandDeprecated {
 public:
     CmdConvertToCapped() : ErrmsgCommandDeprecated("convertToCapped") {}
-    virtual bool slaveOk() const {
-        return false;
+    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
+        return AllowedOnSecondary::kNever;
     }
     virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
         return true;
     }
-    virtual void help(stringstream& help) const {
-        help << "{ convertToCapped:<fromCollectionName>, size:<sizeInBytes> }";
+    std::string help() const override {
+        return "{ convertToCapped:<fromCollectionName>, size:<sizeInBytes> }";
     }
     virtual void addRequiredPrivileges(const std::string& dbname,
                                        const BSONObj& cmdObj,
-                                       std::vector<Privilege>* out) {
+                                       std::vector<Privilege>* out) const {
         ActionSet actions;
         actions.addAction(ActionType::convertToCapped);
         out->push_back(Privilege(parseResourcePattern(dbname, cmdObj), actions));
@@ -173,7 +173,7 @@ public:
                    const BSONObj& jsobj,
                    string& errmsg,
                    BSONObjBuilder& result) {
-        const NamespaceString nss(parseNsCollectionRequired(dbname, jsobj));
+        const NamespaceString nss(CommandHelpers::parseNsCollectionRequired(dbname, jsobj));
         double size = jsobj.getField("size").number();
 
         if (size == 0) {
@@ -181,7 +181,7 @@ public:
             return false;
         }
 
-        return appendCommandStatus(result, convertToCapped(opCtx, nss, size));
+        return CommandHelpers::appendCommandStatus(result, convertToCapped(opCtx, nss, size));
     }
 
 } cmdConvertToCapped;

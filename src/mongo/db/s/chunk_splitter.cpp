@@ -37,12 +37,11 @@
 #include "mongo/db/client.h"
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/namespace_string.h"
-#include "mongo/db/operation_context.h"
 #include "mongo/db/s/sharding_state.h"
 #include "mongo/db/s/split_chunk.h"
 #include "mongo/db/s/split_vector.h"
+#include "mongo/db/service_context.h"
 #include "mongo/s/balancer_configuration.h"
-#include "mongo/s/catalog/sharding_catalog_client.h"
 #include "mongo/s/catalog/type_chunk.h"
 #include "mongo/s/catalog_cache.h"
 #include "mongo/s/chunk_manager.h"
@@ -99,12 +98,7 @@ Status splitChunkAtMultiplePoints(OperationContext* opCtx,
                                    shardId.toString(),
                                    collectionVersion.epoch());
 
-    if (!status.isOK()) {
-        return {status.getStatus().code(),
-                str::stream() << "split failed due to " << status.getStatus().reason()};
-    }
-
-    return status.getStatus();
+    return status.getStatus().withContext("split failed");
 }
 
 /**
@@ -122,11 +116,11 @@ void moveChunk(OperationContext* opCtx, const NamespaceString& nss, const BSONOb
     const auto suggestedChunk = routingInfo.cm()->findIntersectingChunkWithSimpleCollation(minKey);
 
     ChunkType chunkToMove;
-    chunkToMove.setNS(nss.ns());
-    chunkToMove.setShard(suggestedChunk->getShardId());
-    chunkToMove.setMin(suggestedChunk->getMin());
-    chunkToMove.setMax(suggestedChunk->getMax());
-    chunkToMove.setVersion(suggestedChunk->getLastmod());
+    chunkToMove.setNS(nss);
+    chunkToMove.setShard(suggestedChunk.getShardId());
+    chunkToMove.setMin(suggestedChunk.getMin());
+    chunkToMove.setMax(suggestedChunk.getMax());
+    chunkToMove.setVersion(suggestedChunk.getLastmod());
 
     uassertStatusOK(configsvr_client::rebalanceChunk(opCtx, chunkToMove));
 }
@@ -206,7 +200,7 @@ bool isAutoBalanceEnabled(OperationContext* opCtx,
     if (!balancerConfig->shouldBalanceForAutoSplit())
         return false;
 
-    auto collStatus = Grid::get(opCtx)->catalogClient()->getCollection(opCtx, nss.ns());
+    auto collStatus = Grid::get(opCtx)->catalogClient()->getCollection(opCtx, nss);
     if (!collStatus.isOK()) {
         log() << "Auto-split for " << nss << " failed to load collection metadata"
               << causedBy(redact(collStatus.getStatus()));
@@ -216,9 +210,11 @@ bool isAutoBalanceEnabled(OperationContext* opCtx,
     return collStatus.getValue().value.getAllowBalance();
 }
 
+const auto getChunkSplitter = ServiceContext::declareDecoration<ChunkSplitter>();
+
 }  // namespace
 
-ChunkSplitter::ChunkSplitter() : _isPrimary(false), _threadPool(makeDefaultThreadPoolOptions()) {
+ChunkSplitter::ChunkSplitter() : _threadPool(makeDefaultThreadPoolOptions()) {
     _threadPool.startup();
 }
 
@@ -227,13 +223,21 @@ ChunkSplitter::~ChunkSplitter() {
     _threadPool.join();
 }
 
+ChunkSplitter& ChunkSplitter::get(OperationContext* opCtx) {
+    return get(opCtx->getServiceContext());
+}
+
+ChunkSplitter& ChunkSplitter::get(ServiceContext* serviceContext) {
+    return getChunkSplitter(serviceContext);
+}
+
 void ChunkSplitter::setReplicaSetMode(bool isPrimary) {
     stdx::lock_guard<stdx::mutex> scopedLock(_mutex);
     _isPrimary = isPrimary;
 }
 
-void ChunkSplitter::initiateChunkSplitter() {
-    stdx::lock_guard<stdx::mutex> scopedLock(_mutex);
+void ChunkSplitter::onStepUp() {
+    stdx::lock_guard<stdx::mutex> lg(_mutex);
     if (_isPrimary) {
         return;
     }
@@ -243,8 +247,8 @@ void ChunkSplitter::initiateChunkSplitter() {
     // TODO: Re-enable this log line when auto split is actively running on shards.
 }
 
-void ChunkSplitter::interruptChunkSplitter() {
-    stdx::lock_guard<stdx::mutex> scopedLock(_mutex);
+void ChunkSplitter::onStepDown() {
+    stdx::lock_guard<stdx::mutex> lg(_mutex);
     if (!_isPrimary) {
         return;
     }
@@ -288,17 +292,17 @@ void ChunkSplitter::_runAutosplit(const NamespaceString& nss,
         const auto chunk = cm->findIntersectingChunkWithSimpleCollation(min);
 
         // Stop if chunk's range differs from the range we were expecting to split.
-        if ((0 != chunk->getMin().woCompare(min)) || (0 != chunk->getMax().woCompare(max)) ||
-            (chunk->getShardId() != ShardingState::get(opCtx.get())->getShardName())) {
+        if ((0 != chunk.getMin().woCompare(min)) || (0 != chunk.getMax().woCompare(max)) ||
+            (chunk.getShardId() != ShardingState::get(opCtx.get())->getShardName())) {
             LOG(1) << "Cannot auto-split chunk with range '"
                    << redact(ChunkRange(min, max).toString()) << "' for nss '" << nss
                    << "' on shard '" << ShardingState::get(opCtx.get())->getShardName()
                    << "' because since scheduling auto-split the chunk has been changed to '"
-                   << redact(chunk->toString()) << "'";
+                   << redact(chunk.toString()) << "'";
             return;
         }
 
-        const ChunkRange chunkRange(chunk->getMin(), chunk->getMax());
+        const ChunkRange chunkRange(chunk.getMin(), chunk.getMax());
 
         const auto balancerConfig = Grid::get(opCtx.get())->getBalancerConfiguration();
         // Ensure we have the most up-to-date balancer configuration
@@ -310,15 +314,15 @@ void ChunkSplitter::_runAutosplit(const NamespaceString& nss,
 
         const uint64_t maxChunkSizeBytes = balancerConfig->getMaxChunkSizeBytes();
 
-        LOG(1) << "about to initiate autosplit: " << redact(chunk->toString())
+        LOG(1) << "about to initiate autosplit: " << redact(chunk.toString())
                << " dataWritten since last check: " << dataWritten
                << " maxChunkSizeBytes: " << maxChunkSizeBytes;
 
         auto splitPoints = uassertStatusOK(splitVector(opCtx.get(),
                                                        nss,
                                                        cm->getShardKeyPattern().toBSON(),
-                                                       chunk->getMin(),
-                                                       chunk->getMax(),
+                                                       chunk.getMin(),
+                                                       chunk.getMax(),
                                                        false,
                                                        boost::none,
                                                        boost::none,
@@ -343,7 +347,7 @@ void ChunkSplitter::_runAutosplit(const NamespaceString& nss,
 
         if (KeyPattern::isOrderedKeyPattern(cm->getShardKeyPattern().toBSON())) {
             if (0 ==
-                cm->getShardKeyPattern().getKeyPattern().globalMin().woCompare(chunk->getMin())) {
+                cm->getShardKeyPattern().getKeyPattern().globalMin().woCompare(chunk.getMin())) {
                 // MinKey is infinity (This is the first chunk on the collection)
                 BSONObj key =
                     findExtremeKeyForShard(opCtx.get(), nss, cm->getShardKeyPattern(), true);
@@ -353,7 +357,7 @@ void ChunkSplitter::_runAutosplit(const NamespaceString& nss,
                 }
             } else if (0 ==
                        cm->getShardKeyPattern().getKeyPattern().globalMax().woCompare(
-                           chunk->getMax())) {
+                           chunk.getMax())) {
                 // MaxKey is infinity (This is the last chunk on the collection)
                 BSONObj key =
                     findExtremeKeyForShard(opCtx.get(), nss, cm->getShardKeyPattern(), false);
@@ -365,7 +369,7 @@ void ChunkSplitter::_runAutosplit(const NamespaceString& nss,
         }
 
         uassertStatusOK(splitChunkAtMultiplePoints(opCtx.get(),
-                                                   chunk->getShardId(),
+                                                   chunk.getShardId(),
                                                    nss,
                                                    cm->getShardKeyPattern(),
                                                    cm->getVersion(),
@@ -374,7 +378,7 @@ void ChunkSplitter::_runAutosplit(const NamespaceString& nss,
 
         const bool shouldBalance = isAutoBalanceEnabled(opCtx.get(), nss, balancerConfig);
 
-        log() << "autosplitted " << nss << " chunk: " << redact(chunk->toString()) << " into "
+        log() << "autosplitted " << nss << " chunk: " << redact(chunk.toString()) << " into "
               << (splitPoints.size() + 1) << " parts (maxChunkSizeBytes " << maxChunkSizeBytes
               << ")"
               << (topChunkMinKey.isEmpty() ? "" : " (top chunk migration suggested" +

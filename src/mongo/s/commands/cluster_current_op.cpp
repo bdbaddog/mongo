@@ -50,7 +50,7 @@ public:
 
     Status checkAuthForCommand(Client* client,
                                const std::string& dbName,
-                               const BSONObj& cmdObj) final {
+                               const BSONObj& cmdObj) const final {
         bool isAuthorized = AuthorizationSession::get(client)->isAuthorizedForActionsOnResource(
             ResourcePattern::forClusterResource(), ActionType::inprog);
 
@@ -85,7 +85,7 @@ private:
             return status;
         }
 
-        appendCommandStatus(responseBuilder, Status::OK());
+        CommandHelpers::appendCommandStatus(responseBuilder, Status::OK());
 
         return CursorResponse::parseFromBSON(responseBuilder.obj());
     }

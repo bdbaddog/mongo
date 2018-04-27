@@ -27,17 +27,24 @@
  */
 
 #define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kStorage
+#define LOG_FOR_RECOVERY(level) \
+    MONGO_LOG_COMPONENT(level, ::mongo::logger::LogComponent::kStorageRecovery)
 
 #include "mongo/db/storage/kv/kv_storage_engine.h"
 
 #include <algorithm>
 
+#include "mongo/db/catalog/catalog_control.h"
+#include "mongo/db/logical_clock.h"
 #include "mongo/db/operation_context_noop.h"
+#include "mongo/db/storage/kv/kv_catalog_feature_tracker.h"
 #include "mongo/db/storage/kv/kv_database_catalog_entry.h"
 #include "mongo/db/storage/kv/kv_engine.h"
+#include "mongo/db/unclean_shutdown.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/log.h"
 #include "mongo/util/mongoutils/str.h"
+#include "mongo/util/scopeguard.h"
 
 namespace mongo {
 
@@ -46,6 +53,7 @@ using std::vector;
 
 namespace {
 const std::string catalogInfo = "_mdb_catalog";
+const auto kCatalogLogLevel = logger::LogSeverity::Debug(2);
 }
 
 class KVStorageEngine::RemoveDBChange : public RecoveryUnit::Change {
@@ -81,20 +89,23 @@ KVStorageEngine::KVStorageEngine(
             !(options.directoryPerDB && !engine->supportsDirectoryPerDB()));
 
     OperationContextNoop opCtx(_engine->newRecoveryUnit());
+    loadCatalog(&opCtx);
+}
 
-    bool catalogExists = engine->hasIdent(&opCtx, catalogInfo);
-
-    if (options.forRepair && catalogExists) {
+void KVStorageEngine::loadCatalog(OperationContext* opCtx) {
+    bool catalogExists = _engine->hasIdent(opCtx, catalogInfo);
+    if (_options.forRepair && catalogExists) {
         log() << "Repairing catalog metadata";
         // TODO should also validate all BSON in the catalog.
-        engine->repairIdent(&opCtx, catalogInfo).transitional_ignore();
+        _engine->repairIdent(opCtx, catalogInfo).transitional_ignore();
     }
 
     if (!catalogExists) {
-        WriteUnitOfWork uow(&opCtx);
+        WriteUnitOfWork uow(opCtx);
 
-        Status status = _engine->createGroupedRecordStore(
-            &opCtx, catalogInfo, catalogInfo, CollectionOptions(), KVPrefix::kNotPrefixed);
+        auto status = _engine->createGroupedRecordStore(
+            opCtx, catalogInfo, catalogInfo, CollectionOptions(), KVPrefix::kNotPrefixed);
+
         // BadValue is usually caused by invalid configuration string.
         // We still fassert() but without a stack trace.
         if (status.code() == ErrorCodes::BadValue) {
@@ -105,19 +116,50 @@ KVStorageEngine::KVStorageEngine(
     }
 
     _catalogRecordStore = _engine->getGroupedRecordStore(
-        &opCtx, catalogInfo, catalogInfo, CollectionOptions(), KVPrefix::kNotPrefixed);
+        opCtx, catalogInfo, catalogInfo, CollectionOptions(), KVPrefix::kNotPrefixed);
+    if (shouldLog(::mongo::logger::LogComponent::kStorageRecovery, kCatalogLogLevel)) {
+        LOG_FOR_RECOVERY(kCatalogLogLevel) << "loadCatalog:";
+        _dumpCatalog(opCtx);
+    }
+
     _catalog.reset(new KVCatalog(
         _catalogRecordStore.get(), _options.directoryPerDB, _options.directoryForIndexes));
-    _catalog->init(&opCtx);
+    _catalog->init(opCtx);
 
-    std::vector<std::string> collections;
-    _catalog->getAllCollections(&collections);
+    // We populate 'identsKnownToStorageEngine' only if we are loading after an unclean shutdown.
+    std::vector<std::string> identsKnownToStorageEngine;
+    const bool loadingFromUncleanShutdown = startingAfterUncleanShutdown(getGlobalServiceContext());
+    if (loadingFromUncleanShutdown) {
+        identsKnownToStorageEngine = _engine->getAllIdents(opCtx);
+        std::sort(identsKnownToStorageEngine.begin(), identsKnownToStorageEngine.end());
+    }
+
+    std::vector<std::string> collectionsKnownToCatalog;
+    _catalog->getAllCollections(&collectionsKnownToCatalog);
 
     KVPrefix maxSeenPrefix = KVPrefix::kNotPrefixed;
-    for (size_t i = 0; i < collections.size(); i++) {
-        std::string coll = collections[i];
+    for (const auto& coll : collectionsKnownToCatalog) {
         NamespaceString nss(coll);
-        string dbName = nss.db().toString();
+        std::string dbName = nss.db().toString();
+
+        if (loadingFromUncleanShutdown) {
+            // If we are loading the catalog after an unclean shutdown, it's possible that there are
+            // collections in the catalog that are unknown to the storage engine. If we can't find
+            // it in the list of storage engine idents, remove the collection and move on to the
+            // next one.
+            const auto collectionIdent = _catalog->getCollectionIdent(coll);
+            if (!std::binary_search(identsKnownToStorageEngine.begin(),
+                                    identsKnownToStorageEngine.end(),
+                                    collectionIdent)) {
+                log() << "Dropping collection " << coll
+                      << " unknown to storage engine after unclean shutdown";
+
+                WriteUnitOfWork wuow(opCtx);
+                fassert(50716, _catalog->dropCollection(opCtx, coll));
+                wuow.commit();
+                continue;
+            }
+        }
 
         // No rollback since this is only for committed dbs.
         KVDatabaseCatalogEntryBase*& db = _dbs[dbName];
@@ -125,13 +167,34 @@ KVStorageEngine::KVStorageEngine(
             db = _databaseCatalogEntryFactory(dbName, this).release();
         }
 
-        db->initCollection(&opCtx, coll, options.forRepair);
-        auto maxPrefixForCollection = _catalog->getMetaData(&opCtx, coll).getMaxPrefix();
+        db->initCollection(opCtx, coll, _options.forRepair);
+        auto maxPrefixForCollection = _catalog->getMetaData(opCtx, coll).getMaxPrefix();
         maxSeenPrefix = std::max(maxSeenPrefix, maxPrefixForCollection);
     }
 
     KVPrefix::setLargestPrefix(maxSeenPrefix);
-    opCtx.recoveryUnit()->abandonSnapshot();
+    opCtx->recoveryUnit()->abandonSnapshot();
+
+    // Unset the unclean shutdown flag to avoid executing special behavior if this method is called
+    // after startup.
+    startingAfterUncleanShutdown(getGlobalServiceContext()) = false;
+}
+
+void KVStorageEngine::closeCatalog(OperationContext* opCtx) {
+    dassert(opCtx->lockState()->isLocked());
+    if (shouldLog(::mongo::logger::LogComponent::kStorageRecovery, kCatalogLogLevel)) {
+        LOG_FOR_RECOVERY(kCatalogLogLevel) << "loadCatalog:";
+        _dumpCatalog(opCtx);
+    }
+
+    stdx::lock_guard<stdx::mutex> lock(_dbsLock);
+    for (auto entry : _dbs) {
+        delete entry.second;
+    }
+    _dbs.clear();
+
+    _catalog.reset(nullptr);
+    _catalogRecordStore.reset(nullptr);
 }
 
 /**
@@ -168,6 +231,7 @@ KVStorageEngine::reconcileCatalogAndIdents(OperationContext* opCtx) {
         engineIdents.erase(catalogInfo);
     }
 
+    LOG_FOR_RECOVERY(2) << "Reconciling collection and index idents.";
     std::set<std::string> catalogIdents;
     {
         std::vector<std::string> vec = _catalog->getAllIdents(opCtx);
@@ -188,7 +252,7 @@ KVStorageEngine::reconcileCatalogAndIdents(OperationContext* opCtx) {
         const auto& toRemove = it;
         log() << "Dropping unknown ident: " << toRemove;
         WriteUnitOfWork wuow(opCtx);
-        fassertStatusOK(40591, _engine->dropIdent(opCtx, toRemove));
+        fassert(40591, _engine->dropIdent(opCtx, toRemove));
         wuow.commit();
     }
 
@@ -202,7 +266,7 @@ KVStorageEngine::reconcileCatalogAndIdents(OperationContext* opCtx) {
         const auto& identForColl = _catalog->getCollectionIdent(coll);
         if (engineIdents.find(identForColl) == engineIdents.end()) {
             return {ErrorCodes::UnrecoverableRollbackError,
-                    str::stream() << "Expected collection does not exist. NS: " << coll
+                    str::stream() << "Expected collection does not exist. Collection: " << coll
                                   << " Ident: "
                                   << identForColl};
         }
@@ -210,20 +274,68 @@ KVStorageEngine::reconcileCatalogAndIdents(OperationContext* opCtx) {
 
     // Scan all indexes and return those in the catalog where the storage engine does not have the
     // corresponding ident. The caller is expected to rebuild these indexes.
+    //
+    // Also, remove unfinished builds except those that were background index builds started on a
+    // secondary.
     std::vector<CollectionIndexNamePair> ret;
     for (const auto& coll : collections) {
-        const BSONCollectionCatalogEntry::MetaData metaData = _catalog->getMetaData(opCtx, coll);
+        BSONCollectionCatalogEntry::MetaData metaData = _catalog->getMetaData(opCtx, coll);
+
+        // Batch up the indexes to remove them from `metaData` outside of the iterator.
+        std::vector<std::string> indexesToDrop;
         for (const auto& indexMetaData : metaData.indexes) {
             const std::string& indexName = indexMetaData.name();
             std::string indexIdent = _catalog->getIndexIdent(opCtx, coll, indexName);
-            if (engineIdents.find(indexIdent) != engineIdents.end()) {
+
+            const bool foundIdent = engineIdents.find(indexIdent) != engineIdents.end();
+            // An index drop will immediately remove the ident, but the `indexMetaData` catalog
+            // entry still exists implying the drop hasn't necessarily been replicated to a
+            // majority of nodes. The code will rebuild the index, despite potentially
+            // encountering another `dropIndex` command.
+            if (indexMetaData.ready && !foundIdent) {
+                log() << "Expected index data is missing, rebuilding. Collection: " << coll
+                      << " Index: " << indexName;
+                ret.emplace_back(coll, indexName);
                 continue;
             }
 
-            log() << "Expected index data is missing, rebuilding. NS: " << coll
-                  << " Index: " << indexName << " Ident: " << indexIdent;
+            // If the index was kicked off as a background secondary index build, replication
+            // recovery will not run into the oplog entry to recreate the index. If the index
+            // table is not found, or the index build did not successfully complete, this code
+            // will return the index to be rebuilt.
+            if (indexMetaData.isBackgroundSecondaryBuild && (!foundIdent || !indexMetaData.ready)) {
+                log()
+                    << "Expected background index build did not complete, rebuilding. Collection: "
+                    << coll << " Index: " << indexName;
+                ret.emplace_back(coll, indexName);
+                continue;
+            }
 
-            ret.push_back(CollectionIndexNamePair(coll, indexName));
+            // The last anomaly is when the index build did not complete, nor was the index build
+            // a secondary background index build. This implies the index build was on a primary
+            // and the `createIndexes` command never successfully returned, or the index build was
+            // a foreground secondary index build, meaning replication recovery will build the
+            // index when it replays the oplog. In these cases the index entry in the catalog
+            // should be dropped.
+            if (!indexMetaData.ready && !indexMetaData.isBackgroundSecondaryBuild) {
+                log() << "Dropping unfinished index. Collection: " << coll
+                      << " Index: " << indexName;
+                // Ensure the `ident` is dropped while we have the `indexIdent` value.
+                fassert(50713, _engine->dropIdent(opCtx, indexIdent));
+                indexesToDrop.push_back(indexName);
+                continue;
+            }
+        }
+
+        for (auto&& indexName : indexesToDrop) {
+            invariant(metaData.eraseIndex(indexName),
+                      str::stream() << "Index is missing. Collection: " << coll << " Index: "
+                                    << indexName);
+        }
+        if (indexesToDrop.size() > 0) {
+            WriteUnitOfWork wuow(opCtx);
+            _catalog->putMetaData(opCtx, coll, metaData);
+            wuow.commit();
         }
     }
 
@@ -290,6 +402,99 @@ Status KVStorageEngine::dropDatabase(OperationContext* opCtx, StringData db) {
         entry = it->second;
     }
 
+    std::list<std::string> toDrop;
+    entry->getCollectionNamespaces(&toDrop);
+
+    // Partition `toDrop` into ranges of `[untimestampedCollections...,
+    // timestampedCollections...]`. All timestamped collections must have already been renamed to
+    // a drop-pending namespace. Running without replication treats all collections as not
+    // timestamped.
+    auto untimestampedDropsEnd =
+        std::partition(toDrop.begin(), toDrop.end(), [](const std::string& dropNs) {
+            return !NamespaceString(dropNs).isDropPendingNamespace();
+        });
+
+    // The primary caller (`DatabaseImpl::dropDatabase`) of this method currently
+    // `transitional_ignore`s the result. To minimize the impact of that, while also returning a
+    // correct status, attempt to drop every collection, and if there were any errors, return the
+    // first one.
+    Status firstError = Status::OK();
+
+    // First drop the "non-timestamped" collections. "Non-timestamped" collections such as user
+    // collections in `local` or `system.profile` do not get rolled back. This means we also
+    // should not rollback their creation or deletion. To achieve that, the code takes care to
+    // suppress any timestamping state.
+    firstError = _dropCollectionsNoTimestamp(opCtx, entry, toDrop.begin(), untimestampedDropsEnd);
+
+    // Now drop any leftover timestamped collections (i.e: not already dropped by the reaper).  On
+    // secondaries there is already a `commit timestamp` set and these drops inherit the timestamp
+    // of the `dropDatabase` oplog entry. On primaries, these writes are allowed to be processed
+    // without a timestamp as these are, logically, behind the majority commit point. This method
+    // will enforce that all remaining collections were moved to a drop-pending namespace.
+    //
+    // Additionally, before returning, this method will remove the `KVDatabaseCatalogEntry` from
+    // the `_dbs` map. This action creates a new constraint that this "timestamped drop" method
+    // must happen after the "non-timestamped drops".
+    auto status =
+        _dropCollectionsWithTimestamp(opCtx, entry, toDrop, untimestampedDropsEnd, toDrop.end());
+    if (firstError.isOK()) {
+        firstError = status;
+    }
+
+    return firstError;
+}
+
+/**
+ * Returns the first `dropCollection` error that this method encounters. This method will attempt
+ * to drop all collections, regardless of the error status.
+ */
+Status KVStorageEngine::_dropCollectionsNoTimestamp(OperationContext* opCtx,
+                                                    KVDatabaseCatalogEntryBase* dbce,
+                                                    CollIter begin,
+                                                    CollIter end) {
+    // On primaries, this method will be called outside of any `TimestampBlock` state meaning the
+    // "commit timestamp" will not be set. For this case, this method needs no special logic to
+    // avoid timestamping the upcoming writes.
+    //
+    // On secondaries, there will be a wrapping `TimestampBlock` and the "commit timestamp" will
+    // be set. Carefully save that to the side so the following writes can go through without that
+    // context.
+    const Timestamp commitTs = opCtx->recoveryUnit()->getCommitTimestamp();
+    if (!commitTs.isNull()) {
+        opCtx->recoveryUnit()->clearCommitTimestamp();
+    }
+
+    // Ensure the method exits with the same "commit timestamp" state that it was called with.
+    auto addCommitTimestamp = MakeGuard([&opCtx, commitTs] {
+        if (!commitTs.isNull()) {
+            opCtx->recoveryUnit()->setCommitTimestamp(commitTs);
+        }
+    });
+
+    Status firstError = Status::OK();
+    WriteUnitOfWork untimestampedDropWuow(opCtx);
+    for (auto toDrop = begin; toDrop != end; ++toDrop) {
+        std::string coll = *toDrop;
+        NamespaceString nss(coll);
+
+        Status result = dbce->dropCollection(opCtx, coll);
+        if (!result.isOK() && firstError.isOK()) {
+            firstError = result;
+        }
+    }
+
+    untimestampedDropWuow.commit();
+    return firstError;
+}
+
+Status KVStorageEngine::_dropCollectionsWithTimestamp(OperationContext* opCtx,
+                                                      KVDatabaseCatalogEntryBase* dbce,
+                                                      std::list<std::string>& toDrop,
+                                                      CollIter begin,
+                                                      CollIter end) {
+    // This method does not enforce any timestamping rules for the writes that remove collections
+    // from the catalog.
+    //
     // This is called outside of a WUOW since MMAPv1 has unfortunate behavior around dropping
     // databases. We need to create one here since we want db dropping to all-or-nothing
     // wherever possible. Eventually we want to move this up so that it can include the logOp
@@ -297,25 +502,29 @@ Status KVStorageEngine::dropDatabase(OperationContext* opCtx, StringData db) {
     // system for MMAPv1.
     WriteUnitOfWork wuow(opCtx);
 
-    std::list<std::string> toDrop;
-    entry->getCollectionNamespaces(&toDrop);
+    Status firstError = Status::OK();
+    for (auto toDropStr = begin; toDropStr != toDrop.end(); ++toDropStr) {
+        std::string coll = *toDropStr;
+        NamespaceString nss(coll);
 
-    for (std::list<std::string>::iterator it = toDrop.begin(); it != toDrop.end(); ++it) {
-        string coll = *it;
-        entry->dropCollection(opCtx, coll).transitional_ignore();
+        Status result = dbce->dropCollection(opCtx, coll);
+        if (!result.isOK() && firstError.isOK()) {
+            firstError = result;
+        }
     }
+
     toDrop.clear();
-    entry->getCollectionNamespaces(&toDrop);
+    dbce->getCollectionNamespaces(&toDrop);
     invariant(toDrop.empty());
 
     {
         stdx::lock_guard<stdx::mutex> lk(_dbsLock);
-        opCtx->recoveryUnit()->registerChange(new RemoveDBChange(this, db, entry));
-        _dbs.erase(db.toString());
+        opCtx->recoveryUnit()->registerChange(new RemoveDBChange(this, dbce->name(), dbce));
+        _dbs.erase(dbce->name());
     }
 
     wuow.commit();
-    return Status::OK();
+    return firstError;
 }
 
 int KVStorageEngine::flushAllFiles(OperationContext* opCtx, bool sync) {
@@ -369,6 +578,7 @@ void KVStorageEngine::setStableTimestamp(Timestamp stableTimestamp) {
 }
 
 void KVStorageEngine::setInitialDataTimestamp(Timestamp initialDataTimestamp) {
+    _initialDataTimestamp = initialDataTimestamp;
     _engine->setInitialDataTimestamp(initialDataTimestamp);
 }
 
@@ -380,7 +590,64 @@ bool KVStorageEngine::supportsRecoverToStableTimestamp() const {
     return _engine->supportsRecoverToStableTimestamp();
 }
 
+StatusWith<Timestamp> KVStorageEngine::recoverToStableTimestamp(OperationContext* opCtx) {
+    invariant(opCtx->lockState()->isW());
+
+    // The "feature document" should not be rolled back. Perform a non-timestamped update to the
+    // feature document to lock in the current state.
+    KVCatalog::FeatureTracker::FeatureBits featureInfo;
+    {
+        WriteUnitOfWork wuow(opCtx);
+        featureInfo = _catalog->getFeatureTracker()->getInfo(opCtx);
+        _catalog->getFeatureTracker()->putInfo(opCtx, featureInfo);
+        wuow.commit();
+    }
+
+    catalog::closeCatalog(opCtx);
+
+    StatusWith<Timestamp> swTimestamp = _engine->recoverToStableTimestamp(opCtx);
+    if (!swTimestamp.isOK()) {
+        return swTimestamp;
+    }
+
+    catalog::openCatalog(opCtx);
+
+    log() << "recoverToStableTimestamp successful. Stable Timestamp: " << swTimestamp.getValue();
+    return {swTimestamp.getValue()};
+}
+
+boost::optional<Timestamp> KVStorageEngine::getRecoveryTimestamp() const {
+    return _engine->getRecoveryTimestamp();
+}
+
+boost::optional<Timestamp> KVStorageEngine::getLastStableCheckpointTimestamp() const {
+    return _engine->getLastStableCheckpointTimestamp();
+}
+
+bool KVStorageEngine::supportsReadConcernSnapshot() const {
+    return _engine->supportsReadConcernSnapshot();
+}
+
 void KVStorageEngine::replicationBatchIsComplete() const {
     return _engine->replicationBatchIsComplete();
 }
+
+Timestamp KVStorageEngine::getAllCommittedTimestamp(OperationContext* opCtx) const {
+    return _engine->getAllCommittedTimestamp(opCtx);
+}
+
+void KVStorageEngine::_dumpCatalog(OperationContext* opCtx) {
+    auto catalogRs = _catalogRecordStore.get();
+    auto cursor = catalogRs->getCursor(opCtx);
+    boost::optional<Record> rec = cursor->next();
+    while (rec) {
+        // This should only be called by a parent that's done an appropriate `shouldLog` check. Do
+        // not duplicate the log level policy.
+        LOG_FOR_RECOVERY(kCatalogLogLevel) << "\tId: " << rec->id
+                                           << " Value: " << rec->data.toBson();
+        rec = cursor->next();
+    }
+    opCtx->recoveryUnit()->abandonSnapshot();
+}
+
 }  // namespace mongo

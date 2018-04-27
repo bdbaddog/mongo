@@ -63,15 +63,18 @@ ServerStatusMetricField<Counter64> displayOpsRead("repl.network.ops", &opsReadSt
 Counter64 networkByteStats;
 ServerStatusMetricField<Counter64> displayBytesRead("repl.network.bytes", &networkByteStats);
 
+const Milliseconds maximumAwaitDataTimeoutMS(30 * 1000);
+
 /**
  * Calculates await data timeout based on the current replica set configuration.
  */
 Milliseconds calculateAwaitDataTimeout(const ReplSetConfig& config) {
     // Under protocol version 1, make the awaitData timeout (maxTimeMS) dependent on the election
     // timeout. This enables the sync source to communicate liveness of the primary to secondaries.
+    // We never wait longer than 30 seconds.
     // Under protocol version 0, use a default timeout of 2 seconds for awaitData.
     if (config.getProtocolVersion() == 1LL) {
-        return config.getElectionTimeoutPeriod() / 2;
+        return std::min((config.getElectionTimeoutPeriod() / 2), maximumAwaitDataTimeoutMS);
     }
     return OplogFetcher::kDefaultProtocolZeroAwaitDataTimeout;
 }
@@ -245,7 +248,7 @@ StatusWith<boost::optional<rpc::OplogQueryMetadata>> parseOplogQueryMetadata(
         if (!metadataResult.isOK()) {
             return metadataResult.getStatus();
         }
-        oqMetadata = boost::make_optional<rpc::OplogQueryMetadata>(metadataResult.getValue());
+        oqMetadata = boost::make_optional(metadataResult.getValue());
     }
     return oqMetadata;
 }
@@ -364,14 +367,9 @@ BSONObj OplogFetcher::_makeFindCommandObject(const NamespaceString& nss,
         cmdBob.append("term", term);
     }
 
-    // TODO(SERVER-30977): Remove the term comparison when this ticket is fixed.
-    if (term == lastOpTimeFetched.getTerm()) {
-        cmdBob.append("readConcern",
-                      (serverGlobalParams.featureCompatibility.getVersion() !=
-                       ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo36)
-                          ? BSON("afterOpTime" << lastOpTimeFetched)
-                          : BSON("afterClusterTime" << lastOpTimeFetched.getTimestamp()));
-    }
+    // This ensures that the sync source never returns an empty batch of documents for the first set
+    // of results.
+    cmdBob.append("readConcern", BSON("afterClusterTime" << lastOpTimeFetched.getTimestamp()));
 
     return cmdBob.obj();
 }

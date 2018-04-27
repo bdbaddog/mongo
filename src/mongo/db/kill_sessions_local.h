@@ -28,17 +28,36 @@
 
 #pragma once
 
-#include "mongo/db/kill_sessions.h"
-
 #include "mongo/db/session_killer.h"
 
+/**
+ * Mongod local kill session / transaction functionality library.
+ */
 namespace mongo {
 
+/**
+ * Kills all cursors, ops, and transactions on mongod for sessions matching 'matcher'.
+ */
 SessionKiller::Result killSessionsLocal(OperationContext* opCtx,
                                         const SessionKiller::Matcher& matcher,
                                         SessionKiller::UniformRandomBitGenerator* urbg);
 
-SessionKiller::Result killSessionsLocalKillCursors(OperationContext* opCtx,
-                                                   const SessionKiller::Matcher& matcher);
+/**
+ * Kills all transactions on mongod for sessions matching 'matcher'.
+ */
+void killSessionsLocalKillTransactions(OperationContext* opCtx,
+                                       const SessionKiller::Matcher& matcher,
+                                       bool shouldKillClientCursors = true);
+
+/**
+ * Kills all transactions cursors on mongod for sessions matching 'matcher'.
+ */
+void killSessionsLocalKillTransactionCursors(OperationContext* opCtx,
+                                             const SessionKiller::Matcher& matcher);
+
+/**
+ * Aborts any expired transactions.
+ */
+void killAllExpiredTransactions(OperationContext* opCtx);
 
 }  // namespace mongo

@@ -43,10 +43,11 @@
 #include "mongo/base/status.h"
 #include "mongo/client/dbclientinterface.h"
 #include "mongo/client/mongo_uri.h"
-#include "mongo/client/sasl_client_authenticate.h"
+#include "mongo/db/auth/sasl_command_constants.h"
 #include "mongo/db/client.h"
 #include "mongo/db/log_process_details.h"
 #include "mongo/db/server_options.h"
+#include "mongo/db/service_context_registrar.h"
 #include "mongo/logger/console_appender.h"
 #include "mongo/logger/logger.h"
 #include "mongo/logger/message_event_utf8_encoder.h"
@@ -57,6 +58,7 @@
 #include "mongo/shell/shell_utils.h"
 #include "mongo/shell/shell_utils_launcher.h"
 #include "mongo/stdx/utility.h"
+#include "mongo/transport/transport_layer_asio.h"
 #include "mongo/util/exit.h"
 #include "mongo/util/file.h"
 #include "mongo/util/log.h"
@@ -92,12 +94,15 @@ static AtomicBool atPrompt(false);  // can eval before getting to prompt
 namespace {
 const auto kDefaultMongoURL = "mongodb://127.0.0.1:27017"_sd;
 
-// We set the featureCompatibilityVersion to 3.6 in the mongo shell and rely on the server to reject
-// usages of new features if its featureCompatibilityVersion is lower.
-MONGO_INITIALIZER_WITH_PREREQUISITES(SetFeatureCompatibilityVersion36, ("EndStartupOptionSetup"))
+// Initialize the featureCompatibilityVersion server parameter since the mongo shell does not have a
+// featureCompatibilityVersion document from which to initialize the parameter. The parameter is set
+// to the latest version because there is no feature gating that currently occurs at the mongo shell
+// level. The server is responsible for rejecting usages of new features if its
+// featureCompatibilityVersion is lower.
+MONGO_INITIALIZER_WITH_PREREQUISITES(SetFeatureCompatibilityVersion40, ("EndStartupOptionSetup"))
 (InitializerContext* context) {
     mongo::serverGlobalParams.featureCompatibility.setVersion(
-        ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo36);
+        ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo40);
     return Status::OK();
 }
 const auto kAuthParam = "authSource"s;
@@ -736,7 +741,20 @@ int _main(int argc, char* argv[], char** envp) {
 
     mongo::shell_utils::RecordMyLocation(argv[0]);
 
-    mongo::runGlobalInitializersOrDie(argc, argv, envp);
+    setGlobalServiceContext(createServiceContext());
+    mongo::runGlobalInitializersOrDie(argc, argv, envp, getGlobalServiceContext());
+
+    // TODO This should use a TransportLayerManager or TransportLayerFactory
+    auto serviceContext = getGlobalServiceContext();
+    transport::TransportLayerASIO::Options opts;
+    opts.enableIPv6 = shellGlobalParams.enableIPv6;
+    opts.mode = transport::TransportLayerASIO::Options::kEgress;
+
+    serviceContext->setTransportLayer(
+        std::make_unique<transport::TransportLayerASIO>(opts, nullptr));
+    auto tlPtr = serviceContext->getTransportLayer();
+    uassertStatusOK(tlPtr->setup());
+    uassertStatusOK(tlPtr->start());
 
     // hide password from ps output
     for (int i = 0; i < (argc - 1); ++i) {
@@ -755,9 +773,8 @@ int _main(int argc, char* argv[], char** envp) {
 
     logger::globalLogManager()
         ->getNamedDomain("javascriptOutput")
-        ->attachAppender(logger::MessageLogDomain::AppenderAutoPtr(
-            new logger::ConsoleAppender<logger::MessageEventEphemeral>(
-                new logger::MessageEventUnadornedEncoder)));
+        ->attachAppender(std::make_unique<logger::ConsoleAppender<logger::MessageEventEphemeral>>(
+            std::make_unique<logger::MessageEventUnadornedEncoder>()));
 
     std::string& cmdlineURI = shellGlobalParams.url;
     MongoURI parsedURI;
@@ -784,10 +801,11 @@ int _main(int argc, char* argv[], char** envp) {
            << getURIFromArgs(processedURI, shellGlobalParams.dbhost, shellGlobalParams.port)
            << "\");";
 
-        if (shellGlobalParams.shouldRetryWrites) {
-            // If the user specified --retryWrites to the mongo shell, then we replace the global
-            // `db` object with a DB object that has retryable writes enabled.
-            ss << "db = db.getMongo().startSession({retryWrites: true}).getDatabase(db.getName());";
+        if (shellGlobalParams.shouldRetryWrites || parsedURI.getRetryWrites()) {
+            // If the --retryWrites cmdline argument or retryWrites URI param was specified, then
+            // replace the global `db` object with a DB object started in a session. The resulting
+            // Mongo connection checks its _retryWrites property.
+            ss << "db = db.getMongo().startSession().getDatabase(db.getName());";
         }
 
         mongo::shell_utils::_dbConnect = ss.str();
@@ -929,10 +947,37 @@ int _main(int argc, char* argv[], char** envp) {
             cout << "failed to load: " << shellGlobalParams.files[i] << endl;
             return -3;
         }
-        if (mongo::shell_utils::KillMongoProgramInstances() != EXIT_SUCCESS) {
-            cout << "one more more child processes exited with an error during "
-                 << shellGlobalParams.files[i] << endl;
-            return -3;
+
+        // Check if the process left any running child processes.
+        std::vector<ProcessId> pids = mongo::shell_utils::getRunningMongoChildProcessIds();
+
+        if (!pids.empty()) {
+            cout << "terminating the following processes started by " << shellGlobalParams.files[i]
+                 << ": ";
+            std::copy(pids.begin(), pids.end(), std::ostream_iterator<ProcessId>(cout, " "));
+            cout << endl;
+
+            if (mongo::shell_utils::KillMongoProgramInstances() != EXIT_SUCCESS) {
+                cout << "one more more child processes exited with an error during "
+                     << shellGlobalParams.files[i] << endl;
+                return -3;
+            }
+
+            bool failIfUnterminatedProcesses = false;
+            const StringData code =
+                "function() { return typeof TestData === 'object' && TestData !== null && "
+                "TestData.hasOwnProperty('failIfUnterminatedProcesses') && "
+                "TestData.failIfUnterminatedProcesses; }"_sd;
+            shellMainScope->invokeSafe(code.rawData(), 0, 0);
+            failIfUnterminatedProcesses = shellMainScope->getBoolean("__returnValue");
+
+            if (failIfUnterminatedProcesses) {
+                cout << "exiting with a failure due to unterminated processes" << endl
+                     << "a call to MongoRunner.stopMongod(), ReplSetTest#stopSet(), or "
+                        "ShardingTest#stop() may be missing from the test"
+                     << endl;
+                return -6;
+            }
         }
     }
 
