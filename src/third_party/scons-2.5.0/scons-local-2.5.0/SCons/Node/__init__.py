@@ -1142,21 +1142,14 @@ class Node(object):
         binfo.bsources = bsources
         binfo.bsourcesigs = bsourcesigs
 
-        depends = self.depends
-        dependsigs = []
-        for d in depends:
-            if d not in ignore_set:
-                dependsigs.append(d.get_ninfo())
-        binfo.bdepends = depends
-        binfo.bdependsigs = dependsigs
+        # Fixes so length of bdepends and bdependsigs won't be different if one file matches
+        # any one in the ignore_set.
+        binfo.bdepends = [d for d in self.depends if d not in ignore_set]
+        binfo.bdependsigs = [d.get_ninfo() for d in self.depends]
 
-        implicit = self.implicit or []
-        implicitsigs = []
-        for i in implicit:
-            if i not in ignore_set:
-                implicitsigs.append(i.get_ninfo())
-        binfo.bimplicit = implicit
-        binfo.bimplicitsigs = implicitsigs
+        binfo.bimplicit = [i for i in self.implicit or [] if i not in ignore_set]
+        binfo.bimplicitsigs = [i.get_ninfo() for i in binfo.bimplicit]
+
 
         return binfo
 
@@ -1411,6 +1404,84 @@ class Node(object):
             return None
         return self._tags.get(key, None)
 
+    def _build_dependency_map(self, binfo):
+        """
+        Build mapping from file -> signature
+
+        Args:
+            self - self
+            binfo - buildinfo from node being considered
+
+        Returns: 
+            dictionary of file->signature mappings
+        """
+
+        # For an "empty" binfo properties like bsources
+        # do not exist: check this to avoid exception.
+        if (len(binfo.bsourcesigs) + len(binfo.bdependsigs) + \
+                len(binfo.bimplicitsigs)) == 0:
+            return{}
+
+        pairs = [
+            (binfo.bsources, binfo.bsourcesigs),
+            (binfo.bdepends, binfo.bdependsigs),
+            (binfo.bimplicit, binfo.bimplicitsigs)
+           ]
+
+        m = {}
+        for children, signatures in pairs:
+            for child, signature in zip(children, signatures):
+                schild = str(child)
+                m[schild] = signature
+        return m
+
+    def _get_previous_signatures(self, dmap, children):
+        """
+        Return a list of corresponding csigs from previous
+        build in order of the node/files in children.
+
+        Args:
+            self - self
+            dmap - Dictionary of file -> csig
+            children - List of children
+        
+        Returns:
+            List of csigs for provided list of children
+        """
+        prev = []
+        # for c in map(str, children):
+        #     # If there is no previous signature,
+        #     # we place None in the corresponding position.
+        #     prev.append(dmap.get(c))
+
+        for c in children:
+            c_str = str(c)
+            df = dmap.get(c_str)
+            if df:
+                prev.append(df)
+                continue
+
+            try:
+                # We're not finding the file as listed in the
+                # current childrens list in the list loaded from
+                # Sconsign. So let's see if it was previously
+                # retrieved from the repo.
+                # Also since we only have find_repo_file() on File objects
+                # Handle if we have any other Node type not having that method
+                for rf in c.find_repo_file():
+                    rfs = str(rf)
+                    df = dmap.get(rfs)
+                    if df:
+                        prev.append(df)
+                        break
+                else:
+                    prev.append(None)
+            except AttributeError as e:
+                prev.append(None)
+
+        # prev = [dmap.get(str(c), dmap.get(str(c.find_repo_file()[0]))) for c in children]
+        return prev
+
     def changed(self, node=None, allowcache=False):
         """
         Returns if the node is up-to-date with respect to the BuildInfo
@@ -1424,14 +1495,14 @@ class Node(object):
         any difference, but we now rely on checking every dependency
         to make sure that any necessary Node information (for example,
         the content signature of an #included .h file) is updated.
-        
+
         The allowcache option was added for supporting the early
         release of the executor/builder structures, right after
         a File target was built. When set to true, the return
         value of this changed method gets cached for File nodes.
         Like this, the executor isn't needed any longer for subsequent
         calls to changed().
-        
+
         @see: FS.File.changed(), FS.File.release_target_info()
         """
         t = 0
@@ -1442,28 +1513,38 @@ class Node(object):
         result = False
 
         bi = node.get_stored_info().binfo
-        then = bi.bsourcesigs + bi.bdependsigs + bi.bimplicitsigs
+        previous_children = bi.bsourcesigs + bi.bdependsigs + bi.bimplicitsigs
+        dmap = self._build_dependency_map(bi)
+        
         children = self.children()
 
-        diff = len(children) - len(then)
+        diff = len(children) - len(dmap)
         if diff:
             # The old and new dependency lists are different lengths.
             # This always indicates that the Node must be rebuilt.
-            # We also extend the old dependency list with enough None
-            # entries to equal the new dependency list, for the benefit
-            # of the loop below that updates node information.
-            then.extend([None] * diff)
-            if t: Trace(': old %s new %s' % (len(then), len(children)))
+
+            # TODO: Below is from new logic
+            # # We also extend the old dependency list with enough None
+            # # entries to equal the new dependency list, for the benefit
+            # # of the loop below that updates node information.
+            # then.extend([None] * diff)
+            
+            if t: Trace(': old %s new %s' % (len(previous_children), len(children)))
+            
             result = True
 
-        for child, prev_ni in zip(children, then):
+        # Now build new then based on map built above.
+        previous_children = self._get_previous_signatures(dmap, children)
+
+            
+        for child, prev_ni in zip(children, previous_children):
             if _decider_map[child.changed_since_last_build](child, self, prev_ni):
                 if t: Trace(': %s changed' % child)
                 result = True
 
-        contents = self.get_executor().get_contents()
         if self.has_builder():
-            import SCons.Util
+            contents = self.get_executor().get_contents()
+
             newsig = SCons.Util.MD5signature(contents)
             if bi.bactsig != newsig:
                 if t: Trace(': bactsig %s != newsig %s' % (bi.bactsig, newsig))
@@ -1475,6 +1556,7 @@ class Node(object):
         if t: Trace('\n')
 
         return result
+
 
     def is_up_to_date(self):
         """Default check for whether the Node is current: unknown Node

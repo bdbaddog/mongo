@@ -3265,6 +3265,8 @@ class File(Base):
     def changed_timestamp_then_content(self, target, prev_ni):
         if not self.changed_timestamp_match(target, prev_ni):
             try:
+                # Propagate previously calculated csig if we've determined the file didn't change
+                # by using timestamp only. So that we can use the MD5 in later builds if needed
                 self.get_ninfo().csig = prev_ni.csig
             except AttributeError:
                 pass
@@ -3346,6 +3348,28 @@ class File(Base):
 
     def rstr(self):
         return str(self.rfile())
+
+    def find_repo_file(self):
+        """
+        For this node, find if there exists a corresponding file in one or more repositories
+        :return: list of corresponding files in repositories
+        """
+        retvals = []
+
+        norm_name = _my_normcase(self.name)
+        for repo_dir in self.dir.get_all_rdirs():
+            try:
+                node = repo_dir.entries[norm_name]
+            except KeyError:
+                node = repo_dir.file_on_disk(self.name)
+
+            if node and node.exists() and \
+                    (isinstance(node, File) or isinstance(node, Entry) \
+                     or not node.is_derived()):
+                retvals.append(node)
+
+        return retvals
+
 
     def get_cachedir_csig(self):
         """
