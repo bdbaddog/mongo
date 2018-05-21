@@ -1475,8 +1475,10 @@ class Node(object):
                         prev.append(df)
                         break
                 else:
+                    print "CHANGE_DEBUG: file:%s prev_build_files:%s"%(c_str,",".join(dmap.keys()))
                     prev.append(None)
             except AttributeError as e:
+                print "CHANGE_DEBUG: Exception :%s"%e
                 prev.append(None)
 
         # prev = [dmap.get(str(c), dmap.get(str(c.find_repo_file()[0]))) for c in children]
