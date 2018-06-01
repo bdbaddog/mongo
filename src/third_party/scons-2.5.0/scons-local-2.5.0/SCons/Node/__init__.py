@@ -1476,7 +1476,13 @@ class Node(object):
                         break
                 else:
                     print "CHANGE_DEBUG: file:%s prev_build_files:%s"%(c_str,",".join(dmap.keys()))
-                    prev.append(None)
+                    # TODO: may want to use c.fs.File(...,create=0). Though that doesn't resolve
+                    #  test/Repository/JavaH.py failure while below does.
+                    possibles = [(f,v) for f,v in dmap.items() if c.File('#/%s'%f).rfile() == c]
+                    if len(possibles) == 1:
+                        prev.append(possibles[0][1])
+                    else:
+                        prev.append(None)
             except AttributeError as e:
                 print "CHANGE_DEBUG: Exception :%s"%e
                 prev.append(None)
