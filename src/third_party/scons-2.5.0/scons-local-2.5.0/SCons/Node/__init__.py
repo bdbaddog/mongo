@@ -43,6 +43,7 @@ be able to depend on any other type of "thing."
 
 __revision__ = "src/engine/SCons/Node/__init__.py rel_2.5.1:3735:9dc6cee5c168 2016/11/03 14:02:02 bdbaddog"
 
+import os
 import collections
 import copy
 from itertools import chain
@@ -1432,6 +1433,9 @@ class Node(object):
         for children, signatures in pairs:
             for child, signature in zip(children, signatures):
                 schild = str(child)
+                # TODO: Really need to make sure the child is a filepath and not some string content (for example something output by configure context to be tried)
+                if os.altsep:
+                    schild = schild.replace(os.altsep, os.sep)
                 m[schild] = signature
         return m
 
@@ -1475,7 +1479,12 @@ class Node(object):
                         prev.append(df)
                         break
                 else:
-                    print "CHANGE_DEBUG: file:%s prev_build_files:%s"%(c_str,",".join(dmap.keys()))
+                    if c_str == 'src\mongo\base\generate_error_codes.py':
+
+                    p = c_str.split(os.sep)[-1]
+                    matches = [f for f in dmap.keys() if f.endswith(p)]
+                    print "CHANGE_DEBUG: file:%s prev_build_files:%s"%(c_str,",".join(matches))
+                    # print "CHANGE_DEBUG: file:%s prev_build_files:%s"%(c_str,",".join(dmap.keys()))
                     # TODO: may want to use c.fs.File(...,create=0). Though that doesn't resolve
                     #  test/Repository/JavaH.py failure while below does.
                     possibles = [(f,v) for f,v in dmap.items() if c.File('#/%s'%f).rfile() == c]
