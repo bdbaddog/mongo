@@ -1479,8 +1479,6 @@ class Node(object):
                         prev.append(df)
                         break
                 else:
-                    if c_str == 'src\mongo\base\generate_error_codes.py':
-
                     p = c_str.split(os.sep)[-1]
                     matches = [f for f in dmap.keys() if f.endswith(p)]
                     print "CHANGE_DEBUG: file:%s prev_build_files:%s"%(c_str,",".join(matches))
