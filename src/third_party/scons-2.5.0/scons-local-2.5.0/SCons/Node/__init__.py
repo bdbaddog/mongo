@@ -1453,13 +1453,14 @@ class Node(object):
             List of csigs for provided list of children
         """
         prev = []
-        # for c in map(str, children):
-        #     # If there is no previous signature,
-        #     # we place None in the corresponding position.
-        #     prev.append(dmap.get(c))
 
         for c in children:
-            c_str = str(c)
+            try:
+                # This should yield a patch which matches what is in the sconsign
+                c_str = c.get_path()
+            except AttributeError as e:
+                # For non filesystem node types
+                c_str = str(c)
             df = dmap.get(c_str)
             if df:
                 prev.append(df)
