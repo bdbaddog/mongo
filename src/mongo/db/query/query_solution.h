@@ -144,7 +144,23 @@ struct QuerySolutionNode {
         }
     }
 
+    /**
+     * Adds a vector of query solution nodes to the list of children of this node.
+     *
+     * TODO SERVER-35512: Once 'children' are held by unique_ptr, this method should no longer be
+     * necessary.
+     */
+    void addChildren(std::vector<std::unique_ptr<QuerySolutionNode>> newChildren) {
+        children.reserve(children.size() + newChildren.size());
+        std::transform(newChildren.begin(),
+                       newChildren.end(),
+                       std::back_inserter(children),
+                       [](auto& child) { return child.release(); });
+    }
+
     // These are owned here.
+    //
+    // TODO SERVER-35512: Make this a vector of unique_ptr.
     std::vector<QuerySolutionNode*> children;
 
     // If a stage has a non-NULL filter all values outputted from that stage must pass that
@@ -302,9 +318,6 @@ struct CollectionScanNode : public QuerySolutionNode {
     bool shouldTrackLatestOplogTimestamp = false;
 
     int direction;
-
-    // maxScan option to .find() limits how many docs we look at.
-    int maxScan;
 
     // Whether or not to wait for oplog visibility on oplog collection scans.
     bool shouldWaitForOplogVisibility = false;
@@ -488,9 +501,6 @@ struct IndexScanNode : public QuerySolutionNode {
     IndexEntry index;
 
     int direction;
-
-    // maxScan option to .find() limits how many docs we look at.
-    int maxScan;
 
     // If there's a 'returnKey' projection we add key metadata.
     bool addKeyMetadata;

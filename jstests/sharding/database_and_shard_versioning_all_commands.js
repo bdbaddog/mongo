@@ -227,21 +227,6 @@
         },
         flushRouterConfig: {skip: "executes locally on mongos (not sent to any remote node)"},
         fsync: {skip: "broadcast to all shards"},
-        geoNear: {
-            sendsDbVersion: true,
-            sendsShardVersion: true,
-            setUp: function(mongosConn) {
-                // Expects the collection to exist with a geo index, and does not implicitly create
-                // the collection or index.
-                assert.commandWorked(mongosConn.getCollection(ns).runCommand(
-                    {createIndexes: collName, indexes: [{key: {loc: "2d"}, name: "loc_2d"}]}));
-                assert.writeOK(mongosConn.getCollection(ns).insert({x: 1, loc: [1, 1]}));
-            },
-            command: {geoNear: collName, near: [1, 1]},
-            cleanUp: function(mongosConn) {
-                assert(mongosConn.getDB(dbName).getCollection(collName).drop());
-            }
-        },
         getCmdLineOpts: {skip: "executes locally on mongos (not sent to any remote node)"},
         getDiagnosticData: {skip: "executes locally on mongos (not sent to any remote node)"},
         getLastError: {skip: "does not forward command to primary shard"},
@@ -255,14 +240,6 @@
         grantPrivilegesToRole: {skip: "always targets the config server"},
         grantRolesToRole: {skip: "always targets the config server"},
         grantRolesToUser: {skip: "always targets the config server"},
-        group: {
-            sendsDbVersion: false,
-            sendsShardVersion: true,
-            command: {
-                group:
-                    {ns: collName, key: {x: 1}, $reduce: function(curr, result) {}, initial: {}}
-            },
-        },
         hostInfo: {skip: "executes locally on mongos (not sent to any remote node)"},
         insert: {
             sendsDbVersion: false,

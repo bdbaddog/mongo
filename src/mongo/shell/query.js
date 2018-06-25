@@ -40,7 +40,6 @@ DBQuery.prototype.help = function() {
         "\t.explain(<verbosity>) - accepted verbosities are {'queryPlanner', 'executionStats', 'allPlansExecution'}");
     print("\t.min({...})");
     print("\t.max({...})");
-    print("\t.maxScan(<n>)");
     print("\t.maxTimeMS(<n>)");
     print("\t.comment(<comment>)");
     print("\t.tailable(<isAwaitData>)");
@@ -112,6 +111,14 @@ DBQuery.prototype._exec = function() {
             var cmdRes = this._db.runReadCommand(findCmd, null, this._options);
             this._cursor = new DBCommandCursor(this._db, cmdRes, this._batchSize);
         } else {
+            // The exhaust cursor option is disallowed under a session because it doesn't work as
+            // expected, but all requests from the shell use implicit sessions, so to allow users
+            // to continue using exhaust cursors through the shell, they are only disallowed with
+            // explicit sessions.
+            if (this._db.getSession()._isExplicit) {
+                throw new Error("Cannot run a legacy query on a session.");
+            }
+
             if (this._special && this._query.readConcern) {
                 throw new Error("readConcern requires use of read commands");
             }
@@ -188,10 +195,6 @@ DBQuery.prototype._convertToCommand = function(canAttachReadPref) {
 
     if ("$comment" in this._query) {
         cmd["comment"] = this._query.$comment;
-    }
-
-    if ("$maxScan" in this._query) {
-        cmd["maxScan"] = this._query.$maxScan;
     }
 
     if ("$maxTimeMS" in this._query) {
@@ -517,10 +520,6 @@ DBQuery.prototype.returnKey = function() {
     return this._addSpecial("$returnKey", true);
 };
 
-DBQuery.prototype.maxScan = function(n) {
-    return this._addSpecial("$maxScan", n);
-};
-
 DBQuery.prototype.pretty = function() {
     this._prettyShell = true;
     return this;
@@ -647,7 +646,7 @@ DBQuery.prototype.modifiers = function(document) {
 
     for (var name in document) {
         if (name[0] != '$') {
-            throw new Error('All modifiers must start with a $ such as $maxScan or $returnKey');
+            throw new Error('All modifiers must start with a $ such as $returnKey');
         }
     }
 
@@ -659,7 +658,9 @@ DBQuery.prototype.modifiers = function(document) {
 };
 
 DBQuery.prototype.close = function() {
-    this._cursor.close();
+    if (this._cursor) {
+        this._cursor.close();
+    }
 };
 
 DBQuery.prototype.isClosed = function() {

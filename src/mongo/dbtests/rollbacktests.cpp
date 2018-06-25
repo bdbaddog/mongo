@@ -72,8 +72,9 @@ void createCollection(OperationContext* opCtx, const NamespaceString& nss) {
     {
         WriteUnitOfWork uow(opCtx);
         ASSERT(!collectionExists(&ctx, nss.ns()));
-        ASSERT_OK(Database::userCreateNS(
-            opCtx, ctx.db(), nss.ns(), BSONObj(), CollectionOptions::parseForCommand, false));
+        CollectionOptions collectionOptions;
+        ASSERT_OK(collectionOptions.parse(BSONObj(), CollectionOptions::parseForCommand));
+        ASSERT_OK(Database::userCreateNS(opCtx, ctx.db(), nss.ns(), collectionOptions, false));
         ASSERT(collectionExists(&ctx, nss.ns()));
         uow.commit();
     }
@@ -156,6 +157,11 @@ template <bool rollback, bool defaultIndexes, bool capped>
 class CreateCollection {
 public:
     void run() {
+        // Skip the test if the storage engine doesn't support capped collections.
+        if (!getGlobalServiceContext()->getStorageEngine()->supportsCappedCollections()) {
+            return;
+        }
+
         string ns = "unittests.rollback_create_collection";
         const ServiceContext::UniqueOperationContext opCtxPtr = cc().makeOperationContext();
         OperationContext& opCtx = *opCtxPtr;
@@ -168,8 +174,10 @@ public:
             WriteUnitOfWork uow(&opCtx);
             ASSERT(!collectionExists(&ctx, ns));
             auto options = capped ? BSON("capped" << true << "size" << 1000) : BSONObj();
-            ASSERT_OK(Database::userCreateNS(
-                &opCtx, ctx.db(), ns, options, CollectionOptions::parseForCommand, defaultIndexes));
+            CollectionOptions collectionOptions;
+            ASSERT_OK(collectionOptions.parse(options, CollectionOptions::parseForCommand));
+            ASSERT_OK(
+                Database::userCreateNS(&opCtx, ctx.db(), ns, collectionOptions, defaultIndexes));
             ASSERT(collectionExists(&ctx, ns));
             if (!rollback) {
                 uow.commit();
@@ -187,6 +195,11 @@ template <bool rollback, bool defaultIndexes, bool capped>
 class DropCollection {
 public:
     void run() {
+        // Skip the test if the storage engine doesn't support capped collections.
+        if (!getGlobalServiceContext()->getStorageEngine()->supportsCappedCollections()) {
+            return;
+        }
+
         string ns = "unittests.rollback_drop_collection";
         const ServiceContext::UniqueOperationContext opCtxPtr = cc().makeOperationContext();
         OperationContext& opCtx = *opCtxPtr;
@@ -199,8 +212,10 @@ public:
             WriteUnitOfWork uow(&opCtx);
             ASSERT(!collectionExists(&ctx, ns));
             auto options = capped ? BSON("capped" << true << "size" << 1000) : BSONObj();
-            ASSERT_OK(Database::userCreateNS(
-                &opCtx, ctx.db(), ns, options, CollectionOptions::parseForCommand, defaultIndexes));
+            CollectionOptions collectionOptions;
+            ASSERT_OK(collectionOptions.parse(options, CollectionOptions::parseForCommand));
+            ASSERT_OK(
+                Database::userCreateNS(&opCtx, ctx.db(), ns, collectionOptions, defaultIndexes));
             uow.commit();
         }
         ASSERT(collectionExists(&ctx, ns));
@@ -228,6 +243,11 @@ template <bool rollback, bool defaultIndexes, bool capped>
 class RenameCollection {
 public:
     void run() {
+        // Skip the test if the storage engine doesn't support capped collections.
+        if (!getGlobalServiceContext()->getStorageEngine()->supportsCappedCollections()) {
+            return;
+        }
+
         NamespaceString source("unittests.rollback_rename_collection_src");
         NamespaceString target("unittests.rollback_rename_collection_dest");
         const ServiceContext::UniqueOperationContext opCtxPtr = cc().makeOperationContext();
@@ -244,12 +264,10 @@ public:
             ASSERT(!collectionExists(&ctx, source.ns()));
             ASSERT(!collectionExists(&ctx, target.ns()));
             auto options = capped ? BSON("capped" << true << "size" << 1000) : BSONObj();
-            ASSERT_OK(Database::userCreateNS(&opCtx,
-                                             ctx.db(),
-                                             source.ns(),
-                                             options,
-                                             CollectionOptions::parseForCommand,
-                                             defaultIndexes));
+            CollectionOptions collectionOptions;
+            ASSERT_OK(collectionOptions.parse(options, CollectionOptions::parseForCommand));
+            ASSERT_OK(Database::userCreateNS(
+                &opCtx, ctx.db(), source.ns(), collectionOptions, defaultIndexes));
             uow.commit();
         }
         ASSERT(collectionExists(&ctx, source.ns()));
@@ -280,6 +298,11 @@ template <bool rollback, bool defaultIndexes, bool capped>
 class RenameDropTargetCollection {
 public:
     void run() {
+        // Skip the test if the storage engine doesn't support capped collections.
+        if (!getGlobalServiceContext()->getStorageEngine()->supportsCappedCollections()) {
+            return;
+        }
+
         NamespaceString source("unittests.rollback_rename_droptarget_collection_src");
         NamespaceString target("unittests.rollback_rename_droptarget_collection_dest");
         const ServiceContext::UniqueOperationContext opCtxPtr = cc().makeOperationContext();
@@ -301,18 +324,12 @@ public:
             ASSERT(!collectionExists(&ctx, source.ns()));
             ASSERT(!collectionExists(&ctx, target.ns()));
             auto options = capped ? BSON("capped" << true << "size" << 1000) : BSONObj();
-            ASSERT_OK(Database::userCreateNS(&opCtx,
-                                             ctx.db(),
-                                             source.ns(),
-                                             options,
-                                             CollectionOptions::parseForCommand,
-                                             defaultIndexes));
-            ASSERT_OK(Database::userCreateNS(&opCtx,
-                                             ctx.db(),
-                                             target.ns(),
-                                             options,
-                                             CollectionOptions::parseForCommand,
-                                             defaultIndexes));
+            CollectionOptions collectionOptions;
+            ASSERT_OK(collectionOptions.parse(options, CollectionOptions::parseForCommand));
+            ASSERT_OK(Database::userCreateNS(
+                &opCtx, ctx.db(), source.ns(), collectionOptions, defaultIndexes));
+            ASSERT_OK(Database::userCreateNS(
+                &opCtx, ctx.db(), target.ns(), collectionOptions, defaultIndexes));
 
             insertRecord(&opCtx, source, sourceDoc);
             insertRecord(&opCtx, target, targetDoc);
@@ -376,12 +393,10 @@ public:
         {
             WriteUnitOfWork uow(&opCtx);
             ASSERT(!collectionExists(&ctx, nss.ns()));
-            ASSERT_OK(Database::userCreateNS(&opCtx,
-                                             ctx.db(),
-                                             nss.ns(),
-                                             BSONObj(),
-                                             CollectionOptions::parseForCommand,
-                                             defaultIndexes));
+            CollectionOptions collectionOptions;
+            ASSERT_OK(collectionOptions.parse(BSONObj(), CollectionOptions::parseForCommand));
+            ASSERT_OK(Database::userCreateNS(
+                &opCtx, ctx.db(), nss.ns(), collectionOptions, defaultIndexes));
             insertRecord(&opCtx, nss, oldDoc);
             uow.commit();
         }
@@ -400,12 +415,10 @@ public:
                                {},
                                DropCollectionSystemCollectionMode::kDisallowSystemCollectionDrops));
             ASSERT(!collectionExists(&ctx, nss.ns()));
-            ASSERT_OK(Database::userCreateNS(&opCtx,
-                                             ctx.db(),
-                                             nss.ns(),
-                                             BSONObj(),
-                                             CollectionOptions::parseForCommand,
-                                             defaultIndexes));
+            CollectionOptions collectionOptions;
+            ASSERT_OK(collectionOptions.parse(BSONObj(), CollectionOptions::parseForCommand));
+            ASSERT_OK(Database::userCreateNS(
+                &opCtx, ctx.db(), nss.ns(), collectionOptions, defaultIndexes));
             ASSERT(collectionExists(&ctx, nss.ns()));
             insertRecord(&opCtx, nss, newDoc);
             assertOnlyRecord(&opCtx, nss, newDoc);
@@ -441,12 +454,10 @@ public:
         {
             WriteUnitOfWork uow(&opCtx);
 
-            ASSERT_OK(Database::userCreateNS(&opCtx,
-                                             ctx.db(),
-                                             nss.ns(),
-                                             BSONObj(),
-                                             CollectionOptions::parseForCommand,
-                                             defaultIndexes));
+            CollectionOptions collectionOptions;
+            ASSERT_OK(collectionOptions.parse(BSONObj(), CollectionOptions::parseForCommand));
+            ASSERT_OK(Database::userCreateNS(
+                &opCtx, ctx.db(), nss.ns(), collectionOptions, defaultIndexes));
             ASSERT(collectionExists(&ctx, nss.ns()));
             insertRecord(&opCtx, nss, doc);
             assertOnlyRecord(&opCtx, nss, doc);
@@ -487,12 +498,10 @@ public:
         {
             WriteUnitOfWork uow(&opCtx);
 
-            ASSERT_OK(Database::userCreateNS(&opCtx,
-                                             ctx.db(),
-                                             nss.ns(),
-                                             BSONObj(),
-                                             CollectionOptions::parseForCommand,
-                                             defaultIndexes));
+            CollectionOptions collectionOptions;
+            ASSERT_OK(collectionOptions.parse(BSONObj(), CollectionOptions::parseForCommand));
+            ASSERT_OK(Database::userCreateNS(
+                &opCtx, ctx.db(), nss.ns(), collectionOptions, defaultIndexes));
             ASSERT(collectionExists(&ctx, nss.ns()));
             insertRecord(&opCtx, nss, doc);
             assertOnlyRecord(&opCtx, nss, doc);
@@ -751,8 +760,9 @@ public:
         {
             WriteUnitOfWork uow(&opCtx);
             ASSERT(!collectionExists(&ctx, nss.ns()));
-            ASSERT_OK(Database::userCreateNS(
-                &opCtx, ctx.db(), nss.ns(), BSONObj(), CollectionOptions::parseForCommand, false));
+            CollectionOptions collectionOptions;
+            ASSERT_OK(collectionOptions.parse(BSONObj(), CollectionOptions::parseForCommand));
+            ASSERT_OK(Database::userCreateNS(&opCtx, ctx.db(), nss.ns(), collectionOptions, false));
             ASSERT(collectionExists(&ctx, nss.ns()));
             Collection* coll = ctx.db()->getCollection(&opCtx, nss);
             IndexCatalog* catalog = coll->getIndexCatalog();

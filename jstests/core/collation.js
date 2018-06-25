@@ -692,18 +692,21 @@
     assert.neq(null, planStage);
 
     // Find with oplog replay should return correct results when no collation specified and
-    // collection has a default collation.
-    coll.drop();
-    assert.commandWorked(db.createCollection(
-        coll.getName(),
-        {collation: {locale: "en_US", strength: 2}, capped: true, size: 16 * 1024}));
-    assert.writeOK(coll.insert({str: "FOO", ts: Timestamp(1000, 0)}));
-    assert.writeOK(coll.insert({str: "FOO", ts: Timestamp(1000, 1)}));
-    assert.writeOK(coll.insert({str: "FOO", ts: Timestamp(1000, 2)}));
-    assert.eq(2,
-              coll.find({str: "foo", ts: {$gte: Timestamp(1000, 1)}})
-                  .addOption(DBQuery.Option.oplogReplay)
-                  .itcount());
+    // collection has a default collation. Skip this test for the mobile SE because it doesn't
+    // support capped collections which are needed for oplog replay.
+    if (jsTest.options().storageEngine !== "mobile") {
+        coll.drop();
+        assert.commandWorked(db.createCollection(
+            coll.getName(),
+            {collation: {locale: "en_US", strength: 2}, capped: true, size: 16 * 1024}));
+        assert.writeOK(coll.insert({str: "FOO", ts: Timestamp(1000, 0)}));
+        assert.writeOK(coll.insert({str: "FOO", ts: Timestamp(1000, 1)}));
+        assert.writeOK(coll.insert({str: "FOO", ts: Timestamp(1000, 2)}));
+        assert.eq(2,
+                  coll.find({str: "foo", ts: {$gte: Timestamp(1000, 1)}})
+                      .addOption(DBQuery.Option.oplogReplay)
+                      .itcount());
+    }
 
     // Find should return correct results for query containing $expr when no collation specified and
     // collection has a default collation.
@@ -759,22 +762,25 @@
         assert.eq(null, planStage);
 
         // Find with oplog replay should return correct results when "simple" collation specified
-        // and collection has a default collation.
-        coll.drop();
-        assert.commandWorked(db.createCollection(
-            coll.getName(),
-            {collation: {locale: "en_US", strength: 2}, capped: true, size: 16 * 1024}));
-        const t0 = Timestamp(1000, 0);
-        const t1 = Timestamp(1000, 1);
-        const t2 = Timestamp(1000, 2);
-        assert.writeOK(coll.insert({str: "FOO", ts: Timestamp(1000, 0)}));
-        assert.writeOK(coll.insert({str: "FOO", ts: Timestamp(1000, 1)}));
-        assert.writeOK(coll.insert({str: "FOO", ts: Timestamp(1000, 2)}));
-        assert.eq(0,
-                  coll.find({str: "foo", ts: {$gte: Timestamp(1000, 1)}})
-                      .addOption(DBQuery.Option.oplogReplay)
-                      .collation({locale: "simple"})
-                      .itcount());
+        // and collection has a default collation. Skip this test for the mobile SE because it
+        // doesn't support capped collections which are needed for oplog replay.
+        if (jsTest.options().storageEngine !== "mobile") {
+            coll.drop();
+            assert.commandWorked(db.createCollection(
+                coll.getName(),
+                {collation: {locale: "en_US", strength: 2}, capped: true, size: 16 * 1024}));
+            const t0 = Timestamp(1000, 0);
+            const t1 = Timestamp(1000, 1);
+            const t2 = Timestamp(1000, 2);
+            assert.writeOK(coll.insert({str: "FOO", ts: Timestamp(1000, 0)}));
+            assert.writeOK(coll.insert({str: "FOO", ts: Timestamp(1000, 1)}));
+            assert.writeOK(coll.insert({str: "FOO", ts: Timestamp(1000, 2)}));
+            assert.eq(0,
+                      coll.find({str: "foo", ts: {$gte: Timestamp(1000, 1)}})
+                          .addOption(DBQuery.Option.oplogReplay)
+                          .collation({locale: "simple"})
+                          .itcount());
+        }
     }
 
     // Find should select compatible index when no collation specified and collection has a default
@@ -991,84 +997,6 @@
     assert.eq(
         null,
         coll.findAndModify({query: {str: "FOO"}, remove: true, collation: {locale: "simple"}}));
-
-    //
-    // Collation tests for group.
-    //
-
-    // Group should return correct results when collation specified and collection does not exist.
-    coll.drop();
-    assert.eq([], coll.group({
-        key: {str: 1},
-        initial: {count: 0},
-        reduce: function(curr, result) {
-            result.count += 1;
-        },
-        collation: {locale: "fr"}
-    }));
-
-    // Group should return correct results when collation specified and no indexes exist.
-    coll.drop();
-    assert.writeOK(coll.insert({_id: 1, str: "foo"}));
-    assert.writeOK(coll.insert({_id: 2, str: "bar"}));
-    assert.eq([{str: "foo", count: 1}], coll.group({
-        cond: {str: "FOO"},
-        key: {str: 1},
-        initial: {count: 0},
-        reduce: function(curr, result) {
-            result.count += 1;
-        },
-        collation: {locale: "en_US", strength: 2}
-    }));
-
-    // Group should return correct results when no collation specified and collection has a default
-    // collation.
-    coll.drop();
-    assert.commandWorked(
-        db.createCollection(coll.getName(), {collation: {locale: "en_US", strength: 2}}));
-    assert.writeOK(coll.insert({_id: 1, str: "foo"}));
-    assert.eq([{str: "foo", count: 1}], coll.group({
-        cond: {str: "FOO"},
-        key: {str: 1},
-        initial: {count: 0},
-        reduce: function(curr, result) {
-            result.count += 1;
-        }
-    }));
-
-    // Group should return correct results when "simple" collation specified and collection has a
-    // default collation.
-    coll.drop();
-    assert.commandWorked(
-        db.createCollection(coll.getName(), {collation: {locale: "en_US", strength: 2}}));
-    assert.writeOK(coll.insert({_id: 1, str: "foo"}));
-    assert.eq([], coll.group({
-        cond: {str: "FOO"},
-        key: {str: 1},
-        initial: {count: 0},
-        reduce: function(curr, result) {
-            result.count += 1;
-        },
-        collation: {locale: "simple"}
-    }));
-
-    // Explain of group should return correct results when collation specified.
-    coll.drop();
-    assert.writeOK(coll.insert({_id: 1, str: "foo"}));
-    assert.writeOK(coll.insert({_id: 2, str: "bar"}));
-    explainRes = coll.explain("executionStats").group({
-        cond: {str: "FOO"},
-        key: {str: 1},
-        initial: {count: 0},
-        reduce: function(curr, result) {
-            result.count += 1;
-        },
-        collation: {locale: "en_US", strength: 2}
-    });
-    assert.commandWorked(explainRes);
-    planStage = getPlanStage(explainRes.executionStats.executionStages, "GROUP");
-    assert.neq(null, planStage);
-    assert.eq(planStage.nGroups, 1);
 
     //
     // Collation tests for mapReduce.
@@ -1378,153 +1306,99 @@
     }
 
     //
-    // Collation tests for geoNear.
+    // Collation tests for the $geoNear aggregation stage.
     //
 
-    // geoNear should return "collection doesn't exist" error when collation specified and
-    // collection does not exist.
+    // $geoNear should fail when collation is specified but the collection does not exist.
     coll.drop();
-    assert.commandFailed(db.runCommand({
-        geoNear: coll.getName(),
-        near: {type: "Point", coordinates: [0, 0]},
-        spherical: true,
-        query: {str: "ABC"},
+    assert.commandFailedWithCode(db.runCommand({
+        aggregate: coll.getName(),
+        cursor: {},
+        pipeline: [{
+            $geoNear: {
+                near: {type: "Point", coordinates: [0, 0]},
+                distanceField: "dist",
+            }
+        }],
         collation: {locale: "en_US", strength: 2}
-    }));
+    }),
+                                 ErrorCodes.NamespaceNotFound);
 
-    // geoNear should return correct results when collation specified and string predicate not
-    // indexed.
+    // $geoNear rejects the now-deprecated "collation" option.
     coll.drop();
     assert.writeOK(coll.insert({geo: {type: "Point", coordinates: [0, 0]}, str: "abc"}));
-    assert.commandWorked(coll.ensureIndex({geo: "2dsphere"}));
-    assert.eq(0,
-              assert
-                  .commandWorked(db.runCommand({
-                      geoNear: coll.getName(),
-                      near: {type: "Point", coordinates: [0, 0]},
-                      spherical: true,
-                      query: {str: "ABC"}
-                  }))
-                  .results.length);
-    assert.eq(1,
-              assert
-                  .commandWorked(db.runCommand({
-                      geoNear: coll.getName(),
-                      near: {type: "Point", coordinates: [0, 0]},
-                      spherical: true,
-                      query: {str: "ABC"},
-                      collation: {locale: "en_US", strength: 2}
-                  }))
-                  .results.length);
+    assert.commandFailedWithCode(db.runCommand({
+        aggregate: coll.getName(),
+        cursor: {},
+        pipeline: [{
+            $geoNear: {
+                near: {type: "Point", coordinates: [0, 0]},
+                distanceField: "dist",
+                collation: {locale: "en_US"},
+            }
+        }],
+    }),
+                                 40227);
 
-    // geoNear should return correct results when no collation specified and string predicate
+    const geoNearStage = {
+        $geoNear: {
+            near: {type: "Point", coordinates: [0, 0]},
+            distanceField: "dist",
+            spherical: true,
+            query: {str: "ABC"}
+        }
+    };
+
+    // $geoNear should return correct results when collation specified and string predicate not
+    // indexed.
+    assert.commandWorked(coll.ensureIndex({geo: "2dsphere"}));
+    assert.eq(0, coll.aggregate([geoNearStage]).itcount());
+    assert.eq(
+        1, coll.aggregate([geoNearStage], {collation: {locale: "en_US", strength: 2}}).itcount());
+
+    // $geoNear should return correct results when no collation specified and string predicate
     // indexed.
     assert.commandWorked(coll.dropIndexes());
     assert.commandWorked(coll.ensureIndex({geo: "2dsphere", str: 1}));
-    assert.eq(0,
-              assert
-                  .commandWorked(db.runCommand({
-                      geoNear: coll.getName(),
-                      near: {type: "Point", coordinates: [0, 0]},
-                      spherical: true,
-                      query: {str: "ABC"}
-                  }))
-                  .results.length);
-    assert.eq(1,
-              assert
-                  .commandWorked(db.runCommand({
-                      geoNear: coll.getName(),
-                      near: {type: "Point", coordinates: [0, 0]},
-                      spherical: true,
-                      query: {str: "ABC"},
-                      collation: {locale: "en_US", strength: 2}
-                  }))
-                  .results.length);
+    assert.eq(0, coll.aggregate([geoNearStage]).itcount());
+    assert.eq(
+        1, coll.aggregate([geoNearStage], {collation: {locale: "en_US", strength: 2}}).itcount());
 
-    // geoNear should return correct results when collation specified and collation on index is
+    // $geoNear should return correct results when collation specified and collation on index is
     // incompatible with string predicate.
     assert.commandWorked(coll.dropIndexes());
     assert.commandWorked(
         coll.ensureIndex({geo: "2dsphere", str: 1}, {collation: {locale: "en_US", strength: 3}}));
-    assert.eq(0,
-              assert
-                  .commandWorked(db.runCommand({
-                      geoNear: coll.getName(),
-                      near: {type: "Point", coordinates: [0, 0]},
-                      spherical: true,
-                      query: {str: "ABC"}
-                  }))
-                  .results.length);
-    assert.eq(1,
-              assert
-                  .commandWorked(db.runCommand({
-                      geoNear: coll.getName(),
-                      near: {type: "Point", coordinates: [0, 0]},
-                      spherical: true,
-                      query: {str: "ABC"},
-                      collation: {locale: "en_US", strength: 2}
-                  }))
-                  .results.length);
+    assert.eq(0, coll.aggregate([geoNearStage]).itcount());
+    assert.eq(
+        1, coll.aggregate([geoNearStage], {collation: {locale: "en_US", strength: 2}}).itcount());
 
-    // geoNear should return correct results when collation specified and collation on index is
+    // $geoNear should return correct results when collation specified and collation on index is
     // compatible with string predicate.
     assert.commandWorked(coll.dropIndexes());
     assert.commandWorked(
         coll.ensureIndex({geo: "2dsphere", str: 1}, {collation: {locale: "en_US", strength: 2}}));
-    assert.eq(0,
-              assert
-                  .commandWorked(db.runCommand({
-                      geoNear: coll.getName(),
-                      near: {type: "Point", coordinates: [0, 0]},
-                      spherical: true,
-                      query: {str: "ABC"}
-                  }))
-                  .results.length);
-    assert.eq(1,
-              assert
-                  .commandWorked(db.runCommand({
-                      geoNear: coll.getName(),
-                      near: {type: "Point", coordinates: [0, 0]},
-                      spherical: true,
-                      query: {str: "ABC"},
-                      collation: {locale: "en_US", strength: 2}
-                  }))
-                  .results.length);
+    assert.eq(0, coll.aggregate([geoNearStage]).itcount());
+    assert.eq(
+        1, coll.aggregate([geoNearStage], {collation: {locale: "en_US", strength: 2}}).itcount());
 
-    // geoNear should return correct results when no collation specified and collection has a
+    // $geoNear should return correct results when no collation specified and collection has a
     // default collation.
     coll.drop();
     assert.commandWorked(
         db.createCollection(coll.getName(), {collation: {locale: "en_US", strength: 2}}));
     assert.commandWorked(coll.ensureIndex({geo: "2dsphere"}));
     assert.writeOK(coll.insert({geo: {type: "Point", coordinates: [0, 0]}, str: "abc"}));
-    assert.eq(1,
-              assert
-                  .commandWorked(db.runCommand({
-                      geoNear: coll.getName(),
-                      near: {type: "Point", coordinates: [0, 0]},
-                      spherical: true,
-                      query: {str: "ABC"}
-                  }))
-                  .results.length);
+    assert.eq(1, coll.aggregate([geoNearStage]).itcount());
 
-    // geoNear should return correct results when "simple" collation specified and collection has
+    // $geoNear should return correct results when "simple" collation specified and collection has
     // a default collation.
     coll.drop();
     assert.commandWorked(
         db.createCollection(coll.getName(), {collation: {locale: "en_US", strength: 2}}));
     assert.commandWorked(coll.ensureIndex({geo: "2dsphere"}));
     assert.writeOK(coll.insert({geo: {type: "Point", coordinates: [0, 0]}, str: "abc"}));
-    assert.eq(0,
-              assert
-                  .commandWorked(db.runCommand({
-                      geoNear: coll.getName(),
-                      near: {type: "Point", coordinates: [0, 0]},
-                      spherical: true,
-                      query: {str: "ABC"},
-                      collation: {locale: "simple"}
-                  }))
-                  .results.length);
+    assert.eq(0, coll.aggregate([geoNearStage], {collation: {locale: "simple"}}).itcount());
 
     //
     // Collation tests for find with $nearSphere.
@@ -1978,7 +1852,11 @@
     if (FixtureHelpers.isReplSet(db) && !isMongos && isWiredTiger(db)) {
         const session = db.getMongo().startSession();
         const sessionDb = session.getDatabase(db.getName());
-        coll.drop();
+
+        // Use majority write concern to clear the drop-pending that can cause lock conflicts with
+        // transactions.
+        coll.drop({writeConcern: {w: "majority"}});
+
         assert.commandWorked(
             db.createCollection("collation", {collation: {locale: "en_US", strength: 2}}));
         assert.writeOK(coll.insert({_id: "foo", x: 5, str: "bar"}));
@@ -2075,16 +1953,22 @@
                   coll.find({_id: "foo"}).toArray(),
                   "query should have performed a case-insensitive match");
 
-        assert.commandWorked(db.runCommand({
+        var cloneCollOutput = db.runCommand({
             cloneCollectionAsCapped: coll.getName(),
             toCollection: clonedColl.getName(),
             size: 4096
-        }));
-        const clonedCollectionInfos = db.getCollectionInfos({name: clonedColl.getName()});
-        assert.eq(clonedCollectionInfos.length, 1, tojson(clonedCollectionInfos));
-        assert.eq(originalCollectionInfos[0].options.collation,
-                  clonedCollectionInfos[0].options.collation);
-        assert.eq([{_id: "FOO"}], clonedColl.find({_id: "foo"}).toArray());
+        });
+        if (jsTest.options().storageEngine === "mobile") {
+            // Capped collections are not supported by the mobile storage engine
+            assert.commandFailedWithCode(cloneCollOutput, ErrorCodes.InvalidOptions);
+        } else {
+            assert.commandWorked(cloneCollOutput);
+            const clonedCollectionInfos = db.getCollectionInfos({name: clonedColl.getName()});
+            assert.eq(clonedCollectionInfos.length, 1, tojson(clonedCollectionInfos));
+            assert.eq(originalCollectionInfos[0].options.collation,
+                      clonedCollectionInfos[0].options.collation);
+            assert.eq([{_id: "FOO"}], clonedColl.find({_id: "foo"}).toArray());
+        }
     }
 
     // Test that the find command's min/max options respect the collation.

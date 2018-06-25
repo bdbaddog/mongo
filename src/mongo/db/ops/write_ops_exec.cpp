@@ -82,10 +82,10 @@ namespace mongo {
 // single type of operation are static functions defined above their caller.
 namespace {
 
-MONGO_FP_DECLARE(failAllInserts);
-MONGO_FP_DECLARE(failAllUpdates);
-MONGO_FP_DECLARE(failAllRemoves);
-MONGO_FP_DECLARE(hangDuringBatchInsert);
+MONGO_FAIL_POINT_DEFINE(failAllInserts);
+MONGO_FAIL_POINT_DEFINE(failAllUpdates);
+MONGO_FAIL_POINT_DEFINE(failAllRemoves);
+MONGO_FAIL_POINT_DEFINE(hangDuringBatchInsert);
 
 void updateRetryStats(OperationContext* opCtx, bool containsRetry) {
     if (containsRetry) {
@@ -120,24 +120,10 @@ void finishCurOp(OperationContext* opCtx, CurOp* curOp) {
         const bool shouldSample =
             curOp->completeAndLogOperation(opCtx, MONGO_LOG_DEFAULT_COMPONENT);
 
-        auto session = OperationContextSession::get(opCtx);
         if (curOp->shouldDBProfile(shouldSample)) {
-            boost::optional<Session::TxnResources> txnResources;
-            if (session && session->inSnapshotReadOrMultiDocumentTransaction()) {
-                // Stash the current transaction so that writes to the profile collection are not
-                // done as part of the transaction. This must be done under the client lock, since
-                // we are modifying 'opCtx'.
-                stdx::lock_guard<Client> clientLock(*opCtx->getClient());
-                txnResources = Session::TxnResources(opCtx);
-            }
-            ON_BLOCK_EXIT([&] {
-                if (txnResources) {
-                    // Restore the transaction state onto 'opCtx'. This must be done under the
-                    // client lock, since we are modifying 'opCtx'.
-                    stdx::lock_guard<Client> clientLock(*opCtx->getClient());
-                    txnResources->release(opCtx);
-                }
-            });
+            // Stash the current transaction so that writes to the profile collection are not
+            // done as part of the transaction.
+            Session::SideTransactionBlock sideTxn(opCtx);
             profile(opCtx, CurOp::get(opCtx)->getNetworkOp());
         }
     } catch (const DBException& ex) {
@@ -200,7 +186,7 @@ void assertCanWrite_inlock(OperationContext* opCtx, const NamespaceString& ns) {
 
 void makeCollection(OperationContext* opCtx, const NamespaceString& ns) {
     auto session = OperationContextSession::get(opCtx);
-    auto inTransaction = session && session->inSnapshotReadOrMultiDocumentTransaction();
+    auto inTransaction = session && session->inMultiDocumentTransaction();
     uassert(ErrorCodes::NamespaceNotFound,
             str::stream() << "Cannot create namespace " << ns.ns()
                           << " in multi-document transaction.",
@@ -212,7 +198,10 @@ void makeCollection(OperationContext* opCtx, const NamespaceString& ns) {
         if (!db.getDb()->getCollection(opCtx, ns)) {  // someone else may have beat us to it.
             uassertStatusOK(userAllowedCreateNS(ns.db(), ns.coll()));
             WriteUnitOfWork wuow(opCtx);
-            uassertStatusOK(Database::userCreateNS(opCtx, db.getDb(), ns.ns(), BSONObj()));
+            CollectionOptions collectionOptions;
+            uassertStatusOK(
+                collectionOptions.parse(BSONObj(), CollectionOptions::ParseKind::parseForCommand));
+            uassertStatusOK(Database::userCreateNS(opCtx, db.getDb(), ns.ns(), collectionOptions));
             wuow.commit();
         }
     });
@@ -235,7 +224,7 @@ bool handleError(OperationContext* opCtx,
     }
 
     auto session = OperationContextSession::get(opCtx);
-    if (session && session->inSnapshotReadOrMultiDocumentTransaction()) {
+    if (session && session->inMultiDocumentTransaction()) {
         // If we are in a transaction, we must fail the whole batch.
         throw;
     }
@@ -252,10 +241,6 @@ bool handleError(OperationContext* opCtx,
         return false;
     } else if (auto cannotImplicitCreateCollInfo =
                    ex.extraInfo<CannotImplicitlyCreateCollectionInfo>()) {
-        // Don't try doing more ops since they will fail with the same error.
-        // Command reply serializer will handle repeating this error if needed.
-        out->results.emplace_back(ex.toStatus());
-
         if (ShardingState::get(opCtx)->enabled()) {
             // Ignore status since we already put the cannot implicitly create error as the
             // result of the write.
@@ -263,6 +248,9 @@ bool handleError(OperationContext* opCtx,
                 .ignore();
         }
 
+        // Don't try doing more ops since they will fail with the same error.
+        // Command reply serializer will handle repeating this error if needed.
+        out->results.emplace_back(ex.toStatus());
         return false;
     }
 
@@ -422,10 +410,16 @@ bool insertBatchAndHandleErrors(OperationContext* opCtx,
             return true;
         }
     } catch (const DBException&) {
-        collection.reset();
 
-        // Ignore this failure and behave as-if we never tried to do the combined batch insert.
-        // The loop below will handle reporting any non-transient errors.
+        // If we cannot abandon the current snapshot, we give up and rethrow the exception.
+        // No WCE retrying is attempted.  This code path is intended for snapshot read concern.
+        if (opCtx->lockState()->inAWriteUnitOfWork()) {
+            throw;
+        }
+
+        // Otherwise, ignore this failure and behave as-if we never tried to do the combined batch
+        // insert.  The loop below will handle reporting any non-transient errors.
+        collection.reset();
     }
 
     // Try to insert the batch one-at-a-time. This path is executed both for singular batches, and
@@ -481,11 +475,11 @@ SingleWriteResult makeWriteResultForInsertOrDeleteRetry() {
 }  // namespace
 
 WriteResult performInserts(OperationContext* opCtx, const write_ops::Insert& wholeOp) {
-    // Insert performs its own retries, so we should only be within a WriteUnitOfWork when run under
-    // snapshot read concern or in a transaction.
+    // Insert performs its own retries, so we should only be within a WriteUnitOfWork when run in a
+    // transaction.
     auto session = OperationContextSession::get(opCtx);
     invariant(!opCtx->lockState()->inAWriteUnitOfWork() ||
-              (session && session->inSnapshotReadOrMultiDocumentTransaction()));
+              (session && session->inMultiDocumentTransaction()));
     auto& curOp = *CurOp::get(opCtx);
     ON_BLOCK_EXIT([&] {
         // This is the only part of finishCurOp we need to do for inserts because they reuse the
@@ -686,11 +680,11 @@ static SingleWriteResult performSingleUpdateOp(OperationContext* opCtx,
 }
 
 WriteResult performUpdates(OperationContext* opCtx, const write_ops::Update& wholeOp) {
-    // Update performs its own retries, so we should not be in a WriteUnitOfWork unless run under
-    // snapshot read concern or in a transaction.
+    // Update performs its own retries, so we should not be in a WriteUnitOfWork unless run in a
+    // transaction.
     auto session = OperationContextSession::get(opCtx);
     invariant(!opCtx->lockState()->inAWriteUnitOfWork() ||
-              (session && session->inSnapshotReadOrMultiDocumentTransaction()));
+              (session && session->inMultiDocumentTransaction()));
     uassertStatusOK(userAllowedWriteNS(wholeOp.getNamespace()));
 
     DisableDocumentValidationIfTrue docValidationDisabler(
@@ -831,7 +825,7 @@ WriteResult performDeletes(OperationContext* opCtx, const write_ops::Delete& who
     // transaction.
     auto session = OperationContextSession::get(opCtx);
     invariant(!opCtx->lockState()->inAWriteUnitOfWork() ||
-              (session && session->inSnapshotReadOrMultiDocumentTransaction()));
+              (session && session->inMultiDocumentTransaction()));
     uassertStatusOK(userAllowedWriteNS(wholeOp.getNamespace()));
 
     DisableDocumentValidationIfTrue docValidationDisabler(

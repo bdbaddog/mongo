@@ -170,7 +170,6 @@ Status NetworkInterfaceTL::startCommand(const TaskExecutor::CallbackHandle& cbHa
     }
 
     auto state = std::make_shared<CommandState>(request, cbHandle);
-    state->mergedFuture = state->promise.getFuture();
     {
         stdx::lock_guard<stdx::mutex> lk(_inProgressMutex);
         _inProgress.insert({state->cbHandle, state});
@@ -344,6 +343,7 @@ Future<RemoteCommandResponse> NetworkInterfaceTL::_onAcquireConn(
             } else if (!swr.getValue().isOK()) {
                 state->conn->indicateFailure(swr.getValue().status);
             } else {
+                state->conn->indicateUsed();
                 state->conn->indicateSuccess();
             }
 

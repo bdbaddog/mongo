@@ -44,7 +44,6 @@
 #include "mongo/db/exec/count.h"
 #include "mongo/db/exec/delete.h"
 #include "mongo/db/exec/eof.h"
-#include "mongo/db/exec/group.h"
 #include "mongo/db/exec/idhack.h"
 #include "mongo/db/exec/multi_plan.h"
 #include "mongo/db/exec/oplogstart.h"
@@ -120,7 +119,6 @@ void filterAllowedIndexEntries(const AllowedIndicesFilter& allowedIndicesFilter,
 namespace {
 // The body is below in the "count hack" section but getExecutor calls it.
 bool turnIxscanIntoCount(QuerySolution* soln);
-
 }  // namespace
 
 
@@ -361,11 +359,9 @@ StatusWith<PrepareExecutionResult> prepareExecution(OperationContext* opCtx,
     }
 
     // Try to look up a cached solution for the query.
-    CachedSolution* rawCS;
-    if (PlanCache::shouldCacheQuery(*canonicalQuery) &&
-        collection->infoCache()->getPlanCache()->get(*canonicalQuery, &rawCS).isOK()) {
+    if (auto cs =
+            collection->infoCache()->getPlanCache()->getCacheEntryIfCacheable(*canonicalQuery)) {
         // We have a CachedSolution.  Have the planner turn it into a QuerySolution.
-        unique_ptr<CachedSolution> cs(rawCS);
         auto statusWithQs = QueryPlanner::planFromCache(*canonicalQuery, plannerParams, *cs);
 
         if (statusWithQs.isOK()) {
@@ -676,11 +672,6 @@ StatusWith<unique_ptr<PlanExecutor, PlanExecutor::Deleter>> _getExecutorFind(
     unique_ptr<CanonicalQuery> canonicalQuery,
     PlanExecutor::YieldPolicy yieldPolicy,
     size_t plannerOptions) {
-    if (canonicalQuery->getQueryRequest().getMaxScan()) {
-        RARELY log() << "Support for the maxScan option has been deprecated. Instead, use "
-                        "maxTimeMS. See http://dochub.mongodb.org/core/4.0-deprecate-maxScan.";
-    }
-
     if (NULL != collection && canonicalQuery->getQueryRequest().isOplogReplay()) {
         return getOplogStartHack(opCtx, collection, std::move(canonicalQuery), plannerOptions);
     }
@@ -1046,77 +1037,6 @@ StatusWith<unique_ptr<PlanExecutor, PlanExecutor::Deleter>> getExecutorUpdate(
                               std::move(cq),
                               collection,
                               policy);
-}
-
-//
-// Group
-//
-
-StatusWith<unique_ptr<PlanExecutor, PlanExecutor::Deleter>> getExecutorGroup(
-    OperationContext* opCtx, Collection* collection, const GroupRequest& request) {
-    if (!getGlobalScriptEngine()) {
-        return Status(ErrorCodes::BadValue, "server-side JavaScript execution is disabled");
-    }
-
-    unique_ptr<WorkingSet> ws = make_unique<WorkingSet>();
-    const auto readConcernArgs = repl::ReadConcernArgs::get(opCtx);
-    const auto yieldPolicy =
-        readConcernArgs.getLevel() == repl::ReadConcernLevel::kSnapshotReadConcern
-        ? PlanExecutor::INTERRUPT_ONLY
-        : PlanExecutor::YIELD_AUTO;
-
-    if (!collection) {
-        // Treat collections that do not exist as empty collections.  Note that the explain
-        // reporting machinery always assumes that the root stage for a group operation is a
-        // GroupStage, so in this case we put a GroupStage on top of an EOFStage.
-        unique_ptr<PlanStage> root =
-            make_unique<GroupStage>(opCtx, request, ws.get(), new EOFStage(opCtx));
-
-        return PlanExecutor::make(opCtx, std::move(ws), std::move(root), request.ns, yieldPolicy);
-    }
-
-    const NamespaceString nss(request.ns);
-    auto qr = stdx::make_unique<QueryRequest>(nss);
-    qr->setFilter(request.query);
-    qr->setCollation(request.collation);
-    qr->setExplain(request.explain);
-
-    const ExtensionsCallbackReal extensionsCallback(opCtx, &nss);
-
-    const boost::intrusive_ptr<ExpressionContext> expCtx;
-    auto statusWithCQ =
-        CanonicalQuery::canonicalize(opCtx,
-                                     std::move(qr),
-                                     expCtx,
-                                     extensionsCallback,
-                                     MatchExpressionParser::kAllowAllSpecialFeatures);
-    if (!statusWithCQ.isOK()) {
-        return statusWithCQ.getStatus();
-    }
-    unique_ptr<CanonicalQuery> canonicalQuery = std::move(statusWithCQ.getValue());
-
-    const size_t defaultPlannerOptions = 0;
-    StatusWith<PrepareExecutionResult> executionResult = prepareExecution(
-        opCtx, collection, ws.get(), std::move(canonicalQuery), defaultPlannerOptions);
-    if (!executionResult.isOK()) {
-        return executionResult.getStatus();
-    }
-    canonicalQuery = std::move(executionResult.getValue().canonicalQuery);
-    unique_ptr<QuerySolution> querySolution = std::move(executionResult.getValue().querySolution);
-    unique_ptr<PlanStage> root = std::move(executionResult.getValue().root);
-
-    invariant(root);
-
-    root = make_unique<GroupStage>(opCtx, request, ws.get(), root.release());
-    // We must have a tree of stages in order to have a valid plan executor, but the query
-    // solution may be null. Takes ownership of all args other than 'collection'.
-    return PlanExecutor::make(opCtx,
-                              std::move(ws),
-                              std::move(root),
-                              std::move(querySolution),
-                              std::move(canonicalQuery),
-                              collection,
-                              yieldPolicy);
 }
 
 //

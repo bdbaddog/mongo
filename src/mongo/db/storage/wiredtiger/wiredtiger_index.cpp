@@ -75,7 +75,7 @@
 namespace mongo {
 namespace {
 
-MONGO_FP_DECLARE(WTEmulateOutOfOrderNextIndexKey);
+MONGO_FAIL_POINT_DEFINE(WTEmulateOutOfOrderNextIndexKey);
 
 using std::string;
 using std::vector;
@@ -170,12 +170,10 @@ std::string WiredTigerIndex::generateAppMetadataString(const IndexDescriptor& de
 
     int keyStringVersion;
 
-    // This gating variable controls the creation between timestamp safe and timestamp unsafe
-    // unique indexes. The gating condition will be enhanced to check for FCV 4.2 by SERVER-32825
+    // The gating variable controls the creation between timestamp safe and timestamp unsafe
+    // unique indexes. The gating condition will be enhanced to check for FCV 4.2 by SERVER-34489
     // and the gating variable will be removed when FCV 4.2 becomes available.
-    bool createNewStyleUniqueIdx = false;
-
-    if (createNewStyleUniqueIdx && desc.unique() && !desc.isIdIndex()) {
+    if (createTimestampSafeUniqueIndex && desc.unique() && !desc.isIdIndex()) {
         keyStringVersion = desc.version() >= IndexDescriptor::IndexVersion::kV2
             ? kDataFormatV4KeyStringV1UniqueIndexVersionV2
             : kDataFormatV3KeyStringV0UniqueIndexVersionV1;
@@ -303,21 +301,13 @@ WiredTigerIndex::WiredTigerIndex(OperationContext* ctx,
                          _dataFormatVersion == kDataFormatV4KeyStringV1UniqueIndexVersionV2)
         ? KeyString::Version::V1
         : KeyString::Version::V0;
-
-    if (!isReadOnly) {
-        bool replicatedWrites = getGlobalReplSettings().usingReplSets() ||
-            repl::ReplSettings::shouldRecoverFromOplogAsStandalone();
-        uassertStatusOK(WiredTigerUtil::setTableLogging(
-            ctx,
-            uri,
-            WiredTigerUtil::useTableLogging(NamespaceString(desc->parentNS()), replicatedWrites)));
-    }
 }
 
 Status WiredTigerIndex::insert(OperationContext* opCtx,
                                const BSONObj& key,
                                const RecordId& id,
                                bool dupsAllowed) {
+    dassert(opCtx->lockState()->isWriteLocked());
     invariant(id.isNormal());
     dassert(!hasFieldNames(key));
 
@@ -336,6 +326,7 @@ void WiredTigerIndex::unindex(OperationContext* opCtx,
                               const BSONObj& key,
                               const RecordId& id,
                               bool dupsAllowed) {
+    dassert(opCtx->lockState()->isWriteLocked());
     invariant(id.isNormal());
     dassert(!hasFieldNames(key));
 
@@ -350,6 +341,7 @@ void WiredTigerIndex::unindex(OperationContext* opCtx,
 void WiredTigerIndex::fullValidate(OperationContext* opCtx,
                                    long long* numKeysOut,
                                    ValidateResults* fullResults) const {
+    dassert(opCtx->lockState()->isReadLocked());
     if (fullResults && !WiredTigerRecoveryUnit::get(opCtx)->getSessionCache()->isEphemeral()) {
         int err = WiredTigerUtil::verifyTable(opCtx, _uri, &(fullResults->errors));
         if (err == EBUSY) {
@@ -389,6 +381,7 @@ void WiredTigerIndex::fullValidate(OperationContext* opCtx,
 bool WiredTigerIndex::appendCustomStats(OperationContext* opCtx,
                                         BSONObjBuilder* output,
                                         double scale) const {
+    dassert(opCtx->lockState()->isReadLocked());
     {
         BSONObjBuilder metadata(output->subobjStart("metadata"));
         Status status = WiredTigerUtil::getApplicationMetadata(opCtx, uri(), &metadata);
@@ -469,6 +462,7 @@ Status WiredTigerIndex::touch(OperationContext* opCtx) const {
 
 
 long long WiredTigerIndex::getSpaceUsedBytes(OperationContext* opCtx) const {
+    dassert(opCtx->lockState()->isReadLocked());
     auto ru = WiredTigerRecoveryUnit::get(opCtx);
     WiredTigerSession* session = ru->getSession();
 
@@ -511,6 +505,7 @@ bool WiredTigerIndex::isDup(OperationContext* opCtx,
                             WT_CURSOR* c,
                             const BSONObj& key,
                             const RecordId& id) {
+    dassert(opCtx->lockState()->isReadLocked());
     invariant(unique());
 
     // First check whether the key exists.
@@ -544,6 +539,7 @@ Status WiredTigerIndex::initAsEmpty(OperationContext* opCtx) {
 }
 
 Status WiredTigerIndex::compact(OperationContext* opCtx) {
+    dassert(opCtx->lockState()->isWriteLocked());
     WiredTigerSessionCache* cache = WiredTigerRecoveryUnit::get(opCtx)->getSessionCache();
     if (!cache->isEphemeral()) {
         WT_SESSION* s = WiredTigerRecoveryUnit::get(opCtx)->getSession()->getSession();
@@ -847,6 +843,7 @@ public:
     boost::optional<IndexKeyEntry> seek(const BSONObj& key,
                                         bool inclusive,
                                         RequestedInfo parts) override {
+        dassert(_opCtx->lockState()->isReadLocked());
         const BSONObj finalKey = stripFieldNames(key);
         const auto discriminator =
             _forward == inclusive ? KeyString::kExclusiveBefore : KeyString::kExclusiveAfter;
@@ -861,6 +858,7 @@ public:
 
     boost::optional<IndexKeyEntry> seek(const IndexSeekPoint& seekPoint,
                                         RequestedInfo parts) override {
+        dassert(_opCtx->lockState()->isReadLocked());
         // TODO: don't go to a bson obj then to a KeyString, go straight
         BSONObj key = IndexEntryComparison::makeQueryObject(seekPoint, _forward);
 
@@ -1179,6 +1177,7 @@ public:
     }
 
     boost::optional<IndexKeyEntry> seekExact(const BSONObj& key, RequestedInfo parts) override {
+        dassert(_opCtx->lockState()->isReadLocked());
         _query.resetToKey(stripFieldNames(key), _idx.ordering());
         const WiredTigerItem keyItem(_query.getBuffer(), _query.getSize());
 

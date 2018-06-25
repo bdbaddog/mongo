@@ -637,7 +637,13 @@ public:
      *  @param descriptor Configuration object describing the index to create. The
      *  descriptor must describe at least one key and index type.
      */
-    virtual void createIndex(StringData ns, const IndexSpec& descriptor);
+    virtual void createIndex(StringData ns, const IndexSpec& descriptor) {
+        std::vector<const IndexSpec*> toBuild;
+        toBuild.push_back(&descriptor);
+        createIndexes(ns, toBuild);
+    }
+
+    virtual void createIndexes(StringData ns, const std::vector<const IndexSpec*>& descriptor);
 
     virtual std::list<BSONObj> getIndexSpecs(const std::string& ns, int options = 0);
 
@@ -803,6 +809,9 @@ public:
      */
     virtual rpc::UniqueReply parseCommandReplyMessage(const std::string& host,
                                                       const Message& replyMsg);
+
+    // This is only for DBClientCursor.
+    static void (*withConnection_do_not_use)(std::string host, std::function<void(DBClientBase*)>);
 
 protected:
     /** if the result of a command is ok*/

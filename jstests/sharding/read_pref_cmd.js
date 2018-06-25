@@ -158,17 +158,12 @@ var testReadPreference = function(conn, hostList, isMongos, mode, tagSets, secEx
 
     // Test other commands that can be sent to secondary.
     cmdTest({count: 'user'}, true, formatProfileQuery({count: 'user'}));
-    cmdTest({group: {key: {x: true}, '$reduce': function(a, b) {}, ns: 'mrIn', initial: {x: 0}}},
-            true,
-            formatProfileQuery({'group.ns': 'mrIn'}));
-
     cmdTest({collStats: 'user'}, true, formatProfileQuery({count: 'user'}));
     cmdTest({dbStats: 1}, true, formatProfileQuery({dbStats: 1}));
 
     testDB.user.ensureIndex({loc: '2d'});
     testDB.user.ensureIndex({position: 'geoHaystack', type: 1}, {bucketSize: 10});
     testDB.runCommand({getLastError: 1, w: NODE_COUNT});
-    cmdTest({geoNear: 'user', near: [1, 1]}, true, formatProfileQuery({geoNear: 'user'}));
 
     // Mongos doesn't implement geoSearch; test it only with ReplicaSetConnection.
     if (!isMongos) {

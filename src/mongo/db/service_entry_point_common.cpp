@@ -70,6 +70,7 @@
 #include "mongo/db/s/sharding_state.h"
 #include "mongo/db/service_entry_point_common.h"
 #include "mongo/db/session_catalog.h"
+#include "mongo/db/snapshot_window_util.h"
 #include "mongo/db/stats/counters.h"
 #include "mongo/db/stats/top.h"
 #include "mongo/rpc/factory.h"
@@ -93,10 +94,10 @@
 
 namespace mongo {
 
-MONGO_FP_DECLARE(failCommand);
-MONGO_FP_DECLARE(rsStopGetMore);
-MONGO_FP_DECLARE(respondWithNotPrimaryInCommandDispatch);
-MONGO_FP_DECLARE(skipCheckingForNotMasterInCommandDispatch);
+MONGO_FAIL_POINT_DEFINE(failCommand);
+MONGO_FAIL_POINT_DEFINE(rsStopGetMore);
+MONGO_FAIL_POINT_DEFINE(respondWithNotPrimaryInCommandDispatch);
+MONGO_FAIL_POINT_DEFINE(skipCheckingForNotMasterInCommandDispatch);
 
 namespace {
 using logger::LogComponent;
@@ -111,6 +112,7 @@ const StringMap<int> sessionCheckoutWhitelist = {{"abortTransaction", 1},
                                                  {"applyOps", 1},
                                                  {"commitTransaction", 1},
                                                  {"count", 1},
+                                                 {"dbHash", 1},
                                                  {"delete", 1},
                                                  {"distinct", 1},
                                                  {"doTxn", 1},
@@ -133,9 +135,18 @@ const StringMap<int> sessionCheckoutWhitelist = {{"abortTransaction", 1},
                                                  {"refreshLogicalSessionCacheNow", 1},
                                                  {"update", 1}};
 
-// The command names that are ignored by the 'failCommand' failpoint.
-const StringMap<int> failCommandIgnoreList = {
-    {"buildInfo", 1}, {"configureFailPoint", 1}, {"isMaster", 1}, {"ping", 1}};
+bool shouldActivateFailCommandFailPoint(const BSONObj& data, StringData cmdName) {
+    if (cmdName == "configureFailPoint"_sd)  // Banned even if in failCommands.
+        return false;
+
+    for (auto&& failCommand : data.getObjectField("failCommands")) {
+        if (failCommand.type() == String && failCommand.valueStringData() == cmdName) {
+            return true;
+        }
+    }
+
+    return false;
+}
 
 void generateLegacyQueryErrorResponse(const AssertionException* exception,
                                       const QueryMessage& queryMessage,
@@ -159,7 +170,7 @@ void generateLegacyQueryErrorResponse(const AssertionException* exception,
     err.append("code", exception->code());
     if (scex) {
         err.append("ok", 0.0);
-        err.append("ns", scex->getns());
+        err.append("ns", scex->getNss().ns());
         scex->getVersionReceived().addToBSON(err, "vReceived");
         scex->getVersionWanted().addToBSON(err, "vWanted");
     }
@@ -219,6 +230,7 @@ BSONObj getErrorLabels(const boost::optional<OperationSessionInfoFromClient>& se
     bool isTransientTransactionError = code == ErrorCodes::WriteConflict  //
         || code == ErrorCodes::SnapshotUnavailable                        //
         || code == ErrorCodes::NoSuchTransaction                          //
+        || code == ErrorCodes::LockTimeout                                //
         // Clients can retry a single commitTransaction command, but cannot retry the whole
         // transaction if commitTransaction fails due to NotMaster.
         || (isRetryable && (commandName != "commitTransaction"));
@@ -365,8 +377,13 @@ LogicalTime getClientOperationTime(OperationContext* opCtx) {
  * The latest in-memory clusterTime is returned if the start operationTime is uninitialized.
  */
 LogicalTime computeOperationTime(OperationContext* opCtx, LogicalTime startOperationTime) {
+    auto const replCoord = repl::ReplicationCoordinator::get(opCtx);
+    const bool isReplSet =
+        replCoord->getReplicationMode() == repl::ReplicationCoordinator::modeReplSet;
+    invariant(isReplSet);
+
     if (startOperationTime == LogicalTime::kUninitialized) {
-        return LogicalClock::get(opCtx)->getClusterTime();
+        return LogicalTime(replCoord->getMyLastAppliedOpTime().getTimestamp());
     }
 
     auto operationTime = getClientOperationTime(opCtx);
@@ -375,7 +392,6 @@ LogicalTime computeOperationTime(OperationContext* opCtx, LogicalTime startOpera
     // If the last operationTime has not changed, consider this command a read, and, for replica set
     // members, construct the operationTime with the proper optime for its read concern level.
     if (operationTime == startOperationTime) {
-        auto const replCoord = repl::ReplicationCoordinator::get(opCtx);
         auto& readConcernArgs = repl::ReadConcernArgs::get(opCtx);
 
         // Note: ReadConcernArgs::getLevel returns kLocal if none was set.
@@ -412,7 +428,7 @@ void appendClusterAndOperationTime(OperationContext* opCtx,
         auto signedTime = SignedLogicalTime(
             LogicalClock::get(opCtx)->getClusterTime(), TimeProofService::TimeProof(), 0);
 
-        invariant(signedTime.getTime() >= operationTime);
+        // TODO SERVER-35663: invariant that signedTime.getTime() >= operationTime.
         rpc::LogicalTimeMetadata(signedTime).writeToMetadata(metadataBob);
         operationTime.appendAsOperationTime(commandBodyFieldsBob);
 
@@ -434,7 +450,7 @@ void appendClusterAndOperationTime(OperationContext* opCtx,
         return;
     }
 
-    invariant(signedTime.getTime() >= operationTime);
+    // TODO SERVER-35663: invariant that signedTime.getTime() >= operationTime.
     rpc::LogicalTimeMetadata(signedTime).writeToMetadata(metadataBob);
     operationTime.appendAsOperationTime(commandBodyFieldsBob);
 }
@@ -507,15 +523,26 @@ bool runCommandImpl(OperationContext* opCtx,
         ON_BLOCK_EXIT([&] { opCtx->setWriteConcern(oldWC); });
         opCtx->setWriteConcern(wcResult);
 
+        auto waitForWriteConcern = [&](auto&& bb) {
+            MONGO_FAIL_POINT_BLOCK_IF(failCommand, data, [&](const BSONObj& data) {
+                return shouldActivateFailCommandFailPoint(data, request.getCommandName()) &&
+                    data.hasField("writeConcernError");
+            }) {
+                bb.append(data.getData()["writeConcernError"]);
+                return;  // Don't do normal waiting.
+            }
+
+            behaviors.waitForWriteConcern(opCtx, invocation, lastOpBeforeRun, bb);
+        };
+
         try {
             invokeInTransaction(opCtx, invocation, &crb);
         } catch (const DBException&) {
-            behaviors.waitForWriteConcern(opCtx, invocation, lastOpBeforeRun, *extraFieldsBuilder);
+            waitForWriteConcern(*extraFieldsBuilder);
             throw;
         }
 
-        auto bb = crb.getBodyBuilder();
-        behaviors.waitForWriteConcern(opCtx, invocation, lastOpBeforeRun, bb);
+        waitForWriteConcern(crb.getBodyBuilder());
 
         // Nothing in run() should change the writeConcern.
         dassert(SimpleBSONObjComparator::kInstance.evaluate(opCtx->getWriteConcern().toBSON() ==
@@ -559,17 +586,23 @@ bool runCommandImpl(OperationContext* opCtx,
  */
 void evaluateFailCommandFailPoint(OperationContext* opCtx, StringData commandName) {
     MONGO_FAIL_POINT_BLOCK_IF(failCommand, data, [&](const BSONObj& data) {
-        return failCommandIgnoreList.find(commandName) == failCommandIgnoreList.cend();
+        return shouldActivateFailCommandFailPoint(data, commandName) &&
+            (data.hasField("closeConnection") || data.hasField("errorCode"));
     }) {
         bool closeConnection;
         if (bsonExtractBooleanField(data.getData(), "closeConnection", &closeConnection).isOK() &&
             closeConnection) {
             opCtx->getClient()->session()->end();
+            log() << "Failing command '" << commandName
+                  << "' via 'failCommand' failpoint. Action: closing connection.";
             uasserted(50838, "Failing command due to 'failCommand' failpoint");
         }
 
         long long errorCode;
         if (bsonExtractIntegerField(data.getData(), "errorCode", &errorCode).isOK()) {
+            log() << "Failing command '" << commandName
+                  << "' via 'failCommand' failpoint. Action: returning error code " << errorCode
+                  << ".";
             uasserted(ErrorCodes::Error(errorCode),
                       "Failing command due to 'failCommand' failpoint");
         }
@@ -588,6 +621,7 @@ void execCommandDatabase(OperationContext* opCtx,
                          const OpMsgRequest& request,
                          rpc::ReplyBuilderInterface* replyBuilder,
                          const ServiceEntryPointCommon::Hooks& behaviors) {
+    CommandHelpers::uassertShouldAttemptParse(opCtx, command, request);
     BSONObjBuilder extraFieldsBuilder;
     auto startOperationTime = getClientOperationTime(opCtx);
     auto invocation = command->parse(opCtx, request);
@@ -609,7 +643,8 @@ void execCommandDatabase(OperationContext* opCtx,
             request.body,
             command->requiresAuth(),
             replCoord->getReplicationMode() == repl::ReplicationCoordinator::modeReplSet,
-            opCtx->getServiceContext()->getStorageEngine()->supportsDocLocking());
+            opCtx->getServiceContext()->getStorageEngine()->supportsDocLocking(),
+            opCtx->getServiceContext()->getStorageEngine()->supportsRecoverToStableTimestamp());
 
         evaluateFailCommandFailPoint(opCtx, command->getName());
 
@@ -769,11 +804,9 @@ void execCommandDatabase(OperationContext* opCtx,
         }
 
         auto& readConcernArgs = repl::ReadConcernArgs::get(opCtx);
-        // TODO(SERVER-34113) replace below txnNumber/logicalSessionId checks with
-        // Session::inMultiDocumentTransaction().
-        if (!opCtx->getClient()->isInDirectClient() || !opCtx->getTxnNumber() ||
-            !opCtx->getLogicalSessionId()) {
-            auto session = OperationContextSession::get(opCtx);
+        auto session = OperationContextSession::get(opCtx);
+        if (!opCtx->getClient()->isInDirectClient() || !session ||
+            !session->inMultiDocumentTransaction()) {
             const bool upconvertToSnapshot = session && session->inMultiDocumentTransaction() &&
                 sessionOptions &&
                 (sessionOptions->getStartTransaction() == boost::optional<bool>(true));
@@ -788,14 +821,10 @@ void execCommandDatabase(OperationContext* opCtx,
         }
 
         if (readConcernArgs.getLevel() == repl::ReadConcernLevel::kSnapshotReadConcern) {
+            auto session = OperationContextSession::get(opCtx);
             uassert(ErrorCodes::InvalidOptions,
                     "readConcern level snapshot is only valid in multi-statement transactions",
-                    // With test commands enabled, a read command with readConcern snapshot is
-                    // a valid snapshot read.
-                    (getTestCommandsEnabled() &&
-                     invocation->definition()->getReadWriteType() ==
-                         BasicCommand::ReadWriteType::kRead) ||
-                        (autocommitVal != boost::none && *autocommitVal == false));
+                    session && session->inMultiDocumentTransaction());
             uassert(ErrorCodes::InvalidOptions,
                     "readConcern level snapshot requires a session ID",
                     opCtx->getLogicalSessionId());
@@ -863,9 +892,7 @@ void execCommandDatabase(OperationContext* opCtx,
             if (!opCtx->getClient()->isInDirectClient()) {
                 // We already have the StaleConfig exception, so just swallow any errors due to
                 // refresh
-                onShardVersionMismatch(
-                    opCtx, NamespaceString(sce->getns()), sce->getVersionReceived())
-                    .ignore();
+                onShardVersionMismatch(opCtx, sce->getNss(), sce->getVersionReceived()).ignore();
             }
         } else if (auto sce = e.extraInfo<StaleDbRoutingVersion>()) {
             if (!opCtx->getClient()->isInDirectClient()) {
@@ -877,6 +904,15 @@ void execCommandDatabase(OperationContext* opCtx,
             if (ShardingState::get(opCtx)->enabled()) {
                 onCannotImplicitlyCreateCollection(opCtx, cannotImplicitCreateCollInfo->getNss())
                     .ignore();
+            }
+        } else if (e.code() == ErrorCodes::SnapshotTooOld) {
+            // SnapshotTooOld errors indicate that PIT ops are failing to find an available snapshot
+            // at their specified atClusterTime. Therefore, we'll try to increase the snapshot
+            // history window that the storage engine maintains in order to increase the likelihood
+            // of successful future PIT atClusterTime requests.
+            auto engine = opCtx->getServiceContext()->getStorageEngine();
+            if (engine && engine->supportsReadConcernSnapshot()) {
+                SnapshotWindowUtil::increaseTargetSnapshotWindowSize(opCtx);
             }
         }
 
@@ -1040,9 +1076,7 @@ DbResponse receivedQuery(OperationContext* opCtx,
             if (!opCtx->getClient()->isInDirectClient()) {
                 // We already have the StaleConfig exception, so just swallow any errors due to
                 // refresh
-                onShardVersionMismatch(
-                    opCtx, NamespaceString(sce->getns()), sce->getVersionReceived())
-                    .ignore();
+                onShardVersionMismatch(opCtx, sce->getNss(), sce->getVersionReceived()).ignore();
             }
         }
 

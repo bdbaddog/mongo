@@ -66,10 +66,12 @@ using std::unique_ptr;
 using std::string;
 using std::endl;
 
-MONGO_FP_DECLARE(crashAfterStartingIndexBuild);
-MONGO_FP_DECLARE(hangAfterStartingIndexBuild);
-MONGO_FP_DECLARE(hangAfterStartingIndexBuildUnlocked);
-MONGO_FP_DECLARE(slowBackgroundIndexBuild);
+MONGO_FAIL_POINT_DEFINE(crashAfterStartingIndexBuild);
+MONGO_FAIL_POINT_DEFINE(hangAfterStartingIndexBuild);
+MONGO_FAIL_POINT_DEFINE(hangAfterStartingIndexBuildUnlocked);
+MONGO_FAIL_POINT_DEFINE(slowBackgroundIndexBuild);
+MONGO_FAIL_POINT_DEFINE(hangBeforeIndexBuildOf);
+MONGO_FAIL_POINT_DEFINE(hangAfterIndexBuildOf);
 
 AtomicInt32 maxIndexBuildMemoryUsageMegabytes(500);
 
@@ -145,9 +147,8 @@ MultiIndexBlockImpl::~MultiIndexBlockImpl() {
     if (!_needToCleanup || _indexes.empty())
         return;
 
-    // Make lock acquisition uninterruptible because onOpMessage() and WUOW.commit() could take
-    // locks.
-    UninterruptibleLockGuard(_opCtx->lockState());
+    // Make lock acquisition uninterruptible because onOpMessage() can take locks.
+    UninterruptibleLockGuard noInterrupt(_opCtx->lockState());
 
     while (true) {
         try {
@@ -166,8 +167,6 @@ MultiIndexBlockImpl::~MultiIndexBlockImpl() {
             // timestamp already set.
             if (_opCtx->recoveryUnit()->getCommitTimestamp().isNull() &&
                 replCoord->canAcceptWritesForDatabase(_opCtx, "admin")) {
-
-                // Make lock acquisition uninterruptible because writing an op message takes a lock.
                 _opCtx->getServiceContext()->getOpObserver()->onOpMessage(
                     _opCtx,
                     BSON("msg" << std::string(str::stream() << "Failing index builds. Coll: "
@@ -322,6 +321,16 @@ StatusWith<std::vector<BSONObj>> MultiIndexBlockImpl::init(const std::vector<BSO
     return indexInfoObjs;
 }
 
+void failPointHangDuringBuild(FailPoint* fp, StringData where, const BSONObj& doc) {
+    MONGO_FAIL_POINT_BLOCK(*fp, data) {
+        int i = doc.getIntField("i");
+        if (data.getData()["i"].numberInt() == i) {
+            log() << "Hanging " << where << " index build of i=" << i;
+            MONGO_FAIL_POINT_PAUSE_WHILE_SET((*fp));
+        }
+    }
+}
+
 Status MultiIndexBlockImpl::insertAllDocumentsInCollection(std::set<RecordId>* dupsOut) {
     invariant(!_opCtx->lockState()->inAWriteUnitOfWork());
 
@@ -386,6 +395,8 @@ Status MultiIndexBlockImpl::insertAllDocumentsInCollection(std::set<RecordId>* d
             // Done before insert so we can retry document if it WCEs.
             progress->setTotalWhileRunning(_collection->numRecords(_opCtx));
 
+            failPointHangDuringBuild(&hangBeforeIndexBuildOf, "before", objToIndex.value());
+
             WriteUnitOfWork wunit(_opCtx);
             Status ret = insert(objToIndex.value(), loc);
             if (_buildInBackground)
@@ -406,6 +417,8 @@ Status MultiIndexBlockImpl::insertAllDocumentsInCollection(std::set<RecordId>* d
                     return restoreStatus;
                 }
             }
+
+            failPointHangDuringBuild(&hangAfterIndexBuildOf, "after", objToIndex.value());
 
             // Go to the next document
             progress->hit();
@@ -509,7 +522,7 @@ void MultiIndexBlockImpl::abortWithoutCleanup() {
     _needToCleanup = false;
 }
 
-void MultiIndexBlockImpl::commit() {
+void MultiIndexBlockImpl::commit(stdx::function<void(const BSONObj& spec)> onCreateFn) {
     // Do not interfere with writing multikey information when committing index builds.
     auto restartTracker =
         MakeGuard([this] { MultikeyPathTracker::get(_opCtx).startTrackingMultikeyPathInfo(); });
@@ -519,6 +532,10 @@ void MultiIndexBlockImpl::commit() {
     MultikeyPathTracker::get(_opCtx).stopTrackingMultikeyPathInfo();
 
     for (size_t i = 0; i < _indexes.size(); i++) {
+        if (onCreateFn) {
+            onCreateFn(_indexes[i].block->getSpec());
+        }
+
         _indexes[i].block->success();
 
         // The bulk builder will track multikey information itself. Non-bulk builders re-use the

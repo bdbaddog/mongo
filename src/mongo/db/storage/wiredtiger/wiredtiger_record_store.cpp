@@ -57,7 +57,6 @@
 #include "mongo/db/storage/wiredtiger/wiredtiger_record_store_oplog_stones.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_recovery_unit.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_session_cache.h"
-#include "mongo/db/storage/wiredtiger/wiredtiger_size_storer.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_util.h"
 #include "mongo/stdx/memory.h"
 #include "mongo/util/assert_util.h"
@@ -67,6 +66,7 @@
 #include "mongo/util/mongoutils/str.h"
 #include "mongo/util/scopeguard.h"
 #include "mongo/util/time_support.h"
+#include "mongo/util/timer.h"
 
 namespace mongo {
 
@@ -89,10 +89,22 @@ void checkOplogFormatVersion(OperationContext* opCtx, const std::string& uri) {
 }
 }  // namespace
 
-MONGO_FP_DECLARE(WTWriteConflictException);
-MONGO_FP_DECLARE(WTWriteConflictExceptionForReads);
+MONGO_FAIL_POINT_DEFINE(WTWriteConflictException);
+MONGO_FAIL_POINT_DEFINE(WTWriteConflictExceptionForReads);
 
 const std::string kWiredTigerEngineName = "wiredTiger";
+
+// For a capped collection, the number of documents that can be removed directly, rather than via a
+// truncate.  The value has been determined somewhat by experimentation, but there's no clear win
+// for all situations.  Setting it to a lower number makes individual remove calls happen, rather
+// than truncate, only when small numbers of documents are inserted at a time. Making it larger
+// makes larger chunks of documents inserted at time follow the remove path in preference to the
+// truncate path.  Using direct removes is more likely to be a benefit when inserts are spread over
+// many capped collections, since avoiding a truncate avoids having to get a second cursor, which
+// may not be already cached in the current session. The benefit becomes less pronounced if the
+// capped collections are more actively used, or are used in small number of sessions, as multiple
+// cursors will be available in the needed session caches.
+static int kCappedDocumentRemoveLimit = 3;
 
 class WiredTigerRecordStore::OplogStones::InsertChange final : public RecoveryUnit::Change {
 public:
@@ -625,7 +637,6 @@ WiredTigerRecordStore::WiredTigerRecordStore(WiredTigerKVEngine* kvEngine,
       _shuttingDown(false),
       _cappedDeleteCheckCount(0),
       _sizeStorer(params.sizeStorer),
-      _sizeStorerCounter(0),
       _kvEngine(kvEngine) {
     Status versionStatus = WiredTigerUtil::checkApplicationMetadataFormatVersion(
                                ctx, _uri, kMinimumRecordStoreVersion, kMaximumRecordStoreVersion)
@@ -647,26 +658,12 @@ WiredTigerRecordStore::WiredTigerRecordStore(WiredTigerKVEngine* kvEngine,
         invariant(_cappedMaxDocs == -1);
     }
 
-    if (!params.isReadOnly) {
-        bool replicatedWrites = getGlobalReplSettings().usingReplSets() ||
-            repl::ReplSettings::shouldRecoverFromOplogAsStandalone();
-        uassertStatusOK(WiredTigerUtil::setTableLogging(
-            ctx, _uri, WiredTigerUtil::useTableLogging(NamespaceString(ns()), replicatedWrites)));
-    }
-
     if (_isOplog) {
         checkOplogFormatVersion(ctx, _uri);
-    }
-
-    // Most record stores will not have their size metadata adjusted during replication recovery.
-    // However, if this record store was created during the recovery process, we will need to keep
-    // track of size adjustments for any writes applied to it during recovery.
-    const auto serviceCtx = getGlobalServiceContext();
-    if (inReplicationRecovery(serviceCtx)) {
-        LOG_FOR_RECOVERY(2)
-            << "Marking newly-created record store as needing size adjustment during recovery. ns: "
-            << ns() << ", ident: " << _uri;
-        sizeRecoveryState(serviceCtx).markCollectionAsAlwaysNeedsSizeAdjustment(ns());
+        // The oplog always needs to be marked for size adjustment since it is journaled and also
+        // may change during replication recovery (if truncated).
+        sizeRecoveryState(getGlobalServiceContext())
+            .markCollectionAsAlwaysNeedsSizeAdjustment(_uri);
     }
 }
 
@@ -677,9 +674,6 @@ WiredTigerRecordStore::~WiredTigerRecordStore() {
     }
 
     LOG(1) << "~WiredTigerRecordStore for: " << ns();
-    if (_sizeStorer) {
-        _sizeStorer->onDestroy(this);
-    }
 
     if (_oplogStones) {
         _oplogStones->kill();
@@ -694,46 +688,51 @@ WiredTigerRecordStore::~WiredTigerRecordStore() {
 void WiredTigerRecordStore::postConstructorInit(OperationContext* opCtx) {
     // Find the largest RecordId currently in use and estimate the number of records.
     std::unique_ptr<SeekableRecordCursor> cursor = getCursor(opCtx, /*forward=*/false);
+    _sizeInfo =
+        _sizeStorer ? _sizeStorer->load(_uri) : std::make_shared<WiredTigerSizeStorer::SizeInfo>();
+
     if (auto record = cursor->next()) {
         int64_t max = record->id.repr();
         _nextIdNum.store(1 + max);
 
-        if (_sizeStorer) {
-            long long numRecords;
-            long long dataSize;
-            _sizeStorer->loadFromCache(_uri, &numRecords, &dataSize);
-            _numRecords.store(numRecords);
-            _dataSize.store(dataSize);
-            _sizeStorer->onCreate(this, numRecords, dataSize);
-        } else {
+        if (!_sizeStorer) {
             LOG(1) << "Doing scan of collection " << ns() << " to get size and count info";
 
-            _numRecords.store(0);
-            _dataSize.store(0);
-
+            int64_t numRecords = 0;
+            int64_t dataSize = 0;
             do {
-                _numRecords.fetchAndAdd(1);
-                _dataSize.fetchAndAdd(record->data.size());
+                numRecords++;
+                dataSize += record->data.size();
             } while ((record = cursor->next()));
+            _sizeInfo->numRecords.store(numRecords);
+            _sizeInfo->dataSize.store(dataSize);
         }
     } else {
         // We found no records in this collection; however, there may actually be documents present
         // if writes to this collection were not included in the stable checkpoint the last time
         // this node shut down. We set the data size and the record count to zero, but will adjust
         // these if writes are played during startup recovery.
+        // Alternatively, this may be a collection we are creating during replication recovery.
+        // In that case the collection will be given a new ident and a new SizeStorer entry. The
+        // collection size from before we recovered to stable timestamp is not associated with this
+        // record store and so we must keep track of the count throughout recovery.
+        //
+        // We mark a RecordStore as needing size adjustment iff its size is accurate at the current
+        // time but not as of the top of the oplog.
         LOG_FOR_RECOVERY(2) << "Record store was empty; setting count metadata to zero but marking "
                                "record store as needing size adjustment during recovery. ns: "
                             << ns() << ", ident: " << _uri;
         sizeRecoveryState(getGlobalServiceContext())
-            .markCollectionAsAlwaysNeedsSizeAdjustment(ns());
-        _dataSize.store(0);
-        _numRecords.store(0);
+            .markCollectionAsAlwaysNeedsSizeAdjustment(_uri);
+        _sizeInfo->dataSize.store(0);
+        _sizeInfo->numRecords.store(0);
 
         // Need to start at 1 so we are always higher than RecordId::min()
         _nextIdNum.store(1);
-        if (_sizeStorer)
-            _sizeStorer->onCreate(this, 0, 0);
     }
+
+    if (_sizeStorer)
+        _sizeStorer->store(_uri, _sizeInfo);
 
     if (WiredTigerKVEngine::initRsOplogBackgroundThread(ns())) {
         _oplogStones = std::make_shared<OplogStones>(opCtx, this);
@@ -755,11 +754,11 @@ bool WiredTigerRecordStore::inShutdown() const {
 }
 
 long long WiredTigerRecordStore::dataSize(OperationContext* opCtx) const {
-    return _dataSize.load();
+    return _sizeInfo->dataSize.load();
 }
 
 long long WiredTigerRecordStore::numRecords(OperationContext* opCtx) const {
-    return _numRecords.load();
+    return _sizeInfo->numRecords.load();
 }
 
 bool WiredTigerRecordStore::isCapped() const {
@@ -779,6 +778,8 @@ int64_t WiredTigerRecordStore::cappedMaxSize() const {
 int64_t WiredTigerRecordStore::storageSize(OperationContext* opCtx,
                                            BSONObjBuilder* extraInfo,
                                            int infoLevel) const {
+    dassert(opCtx->lockState()->isReadLocked());
+
     if (_isEphemeral) {
         return dataSize(opCtx);
     }
@@ -808,6 +809,8 @@ RecordData WiredTigerRecordStore::_getData(const WiredTigerCursor& cursor) const
 }
 
 RecordData WiredTigerRecordStore::dataFor(OperationContext* opCtx, const RecordId& id) const {
+    dassert(opCtx->lockState()->isReadLocked());
+
     // ownership passes to the shared_array created below
     WiredTigerCursor curwrap(_uri, _tableId, true, opCtx);
     WT_CURSOR* c = curwrap.get();
@@ -822,6 +825,8 @@ RecordData WiredTigerRecordStore::dataFor(OperationContext* opCtx, const RecordI
 bool WiredTigerRecordStore::findRecord(OperationContext* opCtx,
                                        const RecordId& id,
                                        RecordData* out) const {
+    dassert(opCtx->lockState()->isReadLocked());
+
     WiredTigerCursor curwrap(_uri, _tableId, true, opCtx);
     WT_CURSOR* c = curwrap.get();
     invariant(c);
@@ -836,6 +841,8 @@ bool WiredTigerRecordStore::findRecord(OperationContext* opCtx,
 }
 
 void WiredTigerRecordStore::deleteRecord(OperationContext* opCtx, const RecordId& id) {
+    dassert(opCtx->lockState()->isWriteLocked());
+
     // Deletes should never occur on a capped collection because truncation uses
     // WT_SESSION::truncate().
     invariant(!isCapped());
@@ -864,10 +871,10 @@ bool WiredTigerRecordStore::cappedAndNeedDelete() const {
     if (!_isCapped)
         return false;
 
-    if (_dataSize.load() >= _cappedMaxSize)
+    if (_sizeInfo->dataSize.load() >= _cappedMaxSize)
         return true;
 
-    if ((_cappedMaxDocs != -1) && (_numRecords.load() > _cappedMaxDocs))
+    if ((_cappedMaxDocs != -1) && (_sizeInfo->numRecords.load() > _cappedMaxDocs))
         return true;
 
     return false;
@@ -875,6 +882,26 @@ bool WiredTigerRecordStore::cappedAndNeedDelete() const {
 
 int64_t WiredTigerRecordStore::cappedDeleteAsNeeded(OperationContext* opCtx,
                                                     const RecordId& justInserted) {
+    // If the collection does not need size adjustment, then we are in replication recovery and
+    // replaying operations we've already played. This may occur after rollback or after a shutdown.
+    // Any inserts beyond the stable timestamp have been undone, but any documents deleted from
+    // capped collections did not come back due to being performed in an untimestamped side
+    // transaction. Additionally, the SizeStorer's information reflects the state of the collection
+    // before rollback/shutdown, post capped deletions.
+    //
+    // If we have a RecordStore whose size we know accurately as of the stable timestamp, rather
+    // than as of the top of the oplog, then we must actually perform capped deletions because they
+    // have not previously been accounted for. The collection will be marked as needing size
+    // adjustment when enterring this function.
+    //
+    // One edge case to consider is where we need to delete a document that we insert as part of
+    // replication recovery. If we don't mark the collection for size adjustment then we will not
+    // perform the capped deletions as expected. In that case, the collection is guaranteed to be
+    // empty at the stable timestamp and thus guaranteed to be marked for size adjustment.
+    if (!sizeRecoveryState(getGlobalServiceContext()).collectionNeedsSizeAdjustment(_uri)) {
+        return 0;
+    }
+
     invariant(!_oplogStones);
 
     // We only want to do the checks occasionally as they are expensive.
@@ -893,7 +920,7 @@ int64_t WiredTigerRecordStore::cappedDeleteAsNeeded(OperationContext* opCtx,
         if (!lock.try_lock()) {
             // Someone else is deleting old records. Apply back-pressure if too far behind,
             // otherwise continue.
-            if ((_dataSize.load() - _cappedMaxSize) < _cappedMaxSizeSlack)
+            if ((_sizeInfo->dataSize.load() - _cappedMaxSize) < _cappedMaxSizeSlack)
                 return 0;
 
             // Don't wait forever: we're in a transaction, we could block eviction.
@@ -908,12 +935,40 @@ int64_t WiredTigerRecordStore::cappedDeleteAsNeeded(OperationContext* opCtx,
 
             // If we already waited, let someone else do cleanup unless we are significantly
             // over the limit.
-            if ((_dataSize.load() - _cappedMaxSize) < (2 * _cappedMaxSizeSlack))
+            if ((_sizeInfo->dataSize.load() - _cappedMaxSize) < (2 * _cappedMaxSizeSlack))
                 return 0;
         }
     }
 
     return cappedDeleteAsNeeded_inlock(opCtx, justInserted);
+}
+
+void WiredTigerRecordStore::_positionAtFirstRecordId(OperationContext* opCtx,
+                                                     WT_CURSOR* cursor,
+                                                     const RecordId& firstRecordId,
+                                                     bool forTruncate) const {
+    // Use the previous first RecordId, if available, to navigate to the current first
+    // RecordId. The straightforward algorithm of resetting the cursor and advancing to the first
+    // element will be slow for capped collections since there may be many tombstones to traverse
+    // at the beginning of the table.
+    if (!firstRecordId.isNull()) {
+        setKey(cursor, firstRecordId);
+        // Truncate does not require its cursor to be explicitly positioned.
+        if (!forTruncate) {
+            int cmp = 0;
+            int ret = wiredTigerPrepareConflictRetry(
+                opCtx, [&] { return cursor->search_near(cursor, &cmp); });
+            invariantWTOK(ret);
+
+            // This is (or was) the first recordId, so it should never be the case that we have a
+            // RecordId before that.
+            invariant(cmp >= 0);
+        }
+    } else {
+        invariantWTOK(WT_READ_CHECK(cursor->reset(cursor)));
+        int ret = wiredTigerPrepareConflictRetry(opCtx, [&] { return cursor->next(cursor); });
+        invariantWTOK(ret);
+    }
 }
 
 int64_t WiredTigerRecordStore::cappedDeleteAsNeeded_inlock(OperationContext* opCtx,
@@ -928,8 +983,8 @@ int64_t WiredTigerRecordStore::cappedDeleteAsNeeded_inlock(OperationContext* opC
 
     WT_SESSION* session = WiredTigerRecoveryUnit::get(opCtx)->getSession()->getSession();
 
-    int64_t dataSize = _dataSize.load();
-    int64_t numRecords = _numRecords.load();
+    int64_t dataSize = _sizeInfo->dataSize.load();
+    int64_t numRecords = _sizeInfo->numRecords.load();
 
     int64_t sizeOverCap = (dataSize > _cappedMaxSize) ? dataSize - _cappedMaxSize : 0;
     int64_t sizeSaved = 0;
@@ -945,7 +1000,7 @@ int64_t WiredTigerRecordStore::cappedDeleteAsNeeded_inlock(OperationContext* opC
         RecordId newestIdToDelete;
         int ret = 0;
         bool positioned = false;  // Mark if the cursor is on the first key
-        int64_t savedFirstKey = 0;
+        RecordId savedFirstKey;
 
         // If we know where the first record is, go to it
         if (_cappedFirstRecord != RecordId()) {
@@ -954,7 +1009,7 @@ int64_t WiredTigerRecordStore::cappedDeleteAsNeeded_inlock(OperationContext* opC
                                                  [&] { return truncateEnd->search(truncateEnd); });
             if (ret == 0) {
                 positioned = true;
-                savedFirstKey = _cappedFirstRecord.repr();
+                savedFirstKey = _cappedFirstRecord;
             }
         }
 
@@ -1008,22 +1063,35 @@ int64_t WiredTigerRecordStore::cappedDeleteAsNeeded_inlock(OperationContext* opC
             }
             invariantWTOK(truncateEnd->prev(truncateEnd));  // put the cursor back where it was
 
-            WiredTigerCursor startWrap(_uri, _tableId, true, opCtx);
-            WT_CURSOR* truncateStart = startWrap.get();
+            // Consider a direct removal, without the overhead of opening a second cursor, if we
+            // are removing a small number of records.  In the oplog case, always use truncate
+            // since we typically have a second oplog cursor cached.
+            if (docsRemoved <= kCappedDocumentRemoveLimit) {
+                RecordId firstRecordId = savedFirstKey;
+                int toRemove = docsRemoved;
 
-            if (savedFirstKey != 0) {
-                // If we know where the start point is, set it for the truncate
-                setKey(truncateStart, RecordId(savedFirstKey));
+                // Remember the key that was removed between calls to remove, that saves time in
+                // navigating to the next record.
+                while (toRemove > 0) {
+                    _positionAtFirstRecordId(opCtx, truncateEnd, firstRecordId, false);
+                    if (--toRemove > 0) {
+                        firstRecordId = getKey(truncateEnd);
+                    }
+                    invariantWTOK(truncateEnd->remove(truncateEnd));
+                }
+                ret = 0;
             } else {
-                // Position at the first record.  This is equivalent to
-                // providing a NULL argument to WT_SESSION->truncate, but
-                // in that case, truncate will need to open its own cursor.
-                // Since we already have a cursor, we can use it here to
-                // make the whole operation faster.
-                ret = WT_READ_CHECK(truncateStart->next(truncateStart));
-                invariantWTOK(ret);
+                WiredTigerCursor startWrap(_uri, _tableId, true, opCtx);
+                WT_CURSOR* truncateStart = startWrap.get();
+
+                // Position the start cursor at the first record, even if we don't have a saved
+                // first key.  This is equivalent to using a NULL cursor argument to
+                // WT_SESSION->truncate, but in that case, truncate will need to open its own
+                // cursor.  Since we already have a cursor, we can use it here to make the whole
+                // operation faster.
+                _positionAtFirstRecordId(opCtx, truncateStart, savedFirstKey, true);
+                ret = session->truncate(session, nullptr, truncateStart, truncateEnd, nullptr);
             }
-            ret = session->truncate(session, NULL, truncateStart, truncateEnd, NULL);
 
             if (ret == ENOENT || ret == WT_NOTFOUND) {
                 // TODO we should remove this case once SERVER-17141 is resolved
@@ -1094,6 +1162,7 @@ void WiredTigerRecordStore::reclaimOplog(OperationContext* opCtx) {
 }
 
 void WiredTigerRecordStore::reclaimOplog(OperationContext* opCtx, Timestamp persistedTimestamp) {
+    Timer timer;
     while (auto stone = _oplogStones->peekOldestStoneIfNeeded()) {
         invariant(stone->lastRecord.isNormal());
 
@@ -1141,8 +1210,10 @@ void WiredTigerRecordStore::reclaimOplog(OperationContext* opCtx, Timestamp pers
         }
     }
 
-    LOG(1) << "Finished truncating the oplog, it now contains approximately " << _numRecords.load()
-           << " records totaling to " << _dataSize.load() << " bytes";
+    LOG(1) << "Finished truncating the oplog, it now contains approximately "
+           << _sizeInfo->numRecords.load() << " records totaling to " << _sizeInfo->dataSize.load()
+           << " bytes";
+    log() << "WiredTiger record store oplog truncation finished in: " << timer.millis() << "ms";
 }
 
 Status WiredTigerRecordStore::insertRecords(OperationContext* opCtx,
@@ -1156,6 +1227,8 @@ Status WiredTigerRecordStore::_insertRecords(OperationContext* opCtx,
                                              Record* records,
                                              const Timestamp* timestamps,
                                              size_t nRecords) {
+    dassert(opCtx->lockState()->isWriteLocked());
+
     // We are kind of cheating on capped collections since we write all of them at once ....
     // Simplest way out would be to just block vector writes for everything except oplog ?
     int64_t totalLength = 0;
@@ -1264,6 +1337,8 @@ Status WiredTigerRecordStore::insertRecordsWithDocWriter(OperationContext* opCtx
                                                          const Timestamp* timestamps,
                                                          size_t nDocs,
                                                          RecordId* idsOut) {
+    dassert(opCtx->lockState()->isReadLocked());
+
     std::unique_ptr<Record[]> records(new Record[nDocs]);
 
     // First get all the sizes so we can allocate a single buffer for all documents. Eventually it
@@ -1305,6 +1380,8 @@ Status WiredTigerRecordStore::updateRecord(OperationContext* opCtx,
                                            int len,
                                            bool enforceQuota,
                                            UpdateNotifier* notifier) {
+    dassert(opCtx->lockState()->isWriteLocked());
+
     WiredTigerCursor curwrap(_uri, _tableId, true, opCtx);
     curwrap.assertInActiveTxn();
     WT_CURSOR* c = curwrap.get();
@@ -1415,6 +1492,8 @@ Status WiredTigerRecordStore::compact(OperationContext* opCtx,
                                       RecordStoreCompactAdaptor* adaptor,
                                       const CompactOptions* options,
                                       CompactStats* stats) {
+    dassert(opCtx->lockState()->isWriteLocked());
+
     WiredTigerSessionCache* cache = WiredTigerRecoveryUnit::get(opCtx)->getSessionCache();
     if (!cache->isEphemeral()) {
         WT_SESSION* s = WiredTigerRecoveryUnit::get(opCtx)->getSession()->getSession();
@@ -1430,6 +1509,8 @@ Status WiredTigerRecordStore::validate(OperationContext* opCtx,
                                        ValidateAdaptor* adaptor,
                                        ValidateResults* results,
                                        BSONObjBuilder* output) {
+    dassert(opCtx->lockState()->isReadLocked());
+
     if (!_isEphemeral && level == kValidateFull) {
         int err = WiredTigerUtil::verifyTable(opCtx, _uri, &results->errors);
         if (err == EBUSY) {
@@ -1559,6 +1640,8 @@ void WiredTigerRecordStore::waitForAllEarlierOplogWritesToBeVisible(OperationCon
 
 boost::optional<RecordId> WiredTigerRecordStore::oplogStartHack(
     OperationContext* opCtx, const RecordId& startingPosition) const {
+    dassert(opCtx->lockState()->isReadLocked());
+
     if (!_isOplog)
         return boost::none;
 
@@ -1584,12 +1667,15 @@ boost::optional<RecordId> WiredTigerRecordStore::oplogStartHack(
 void WiredTigerRecordStore::updateStatsAfterRepair(OperationContext* opCtx,
                                                    long long numRecords,
                                                    long long dataSize) {
-    _numRecords.store(numRecords);
-    _dataSize.store(dataSize);
+    // We're correcting the size as of now, future writes should be tracked.
+    sizeRecoveryState(getGlobalServiceContext()).markCollectionAsAlwaysNeedsSizeAdjustment(_uri);
 
-    if (_sizeStorer) {
-        _sizeStorer->storeToCache(_uri, numRecords, dataSize);
-    }
+    _sizeInfo->numRecords.store(numRecords);
+    _sizeInfo->dataSize.store(dataSize);
+
+    // If we have a WiredTigerSizeStorer, but our size info is not currently cached, add it.
+    if (_sizeStorer)
+        _sizeStorer->store(_uri, _sizeInfo);
 }
 
 RecordId WiredTigerRecordStore::_nextId() {
@@ -1608,7 +1694,8 @@ public:
     NumRecordsChange(WiredTigerRecordStore* rs, int64_t diff) : _rs(rs), _diff(diff) {}
     virtual void commit(boost::optional<Timestamp>) {}
     virtual void rollback() {
-        _rs->_numRecords.fetchAndAdd(-_diff);
+        LOG(3) << "WiredTigerRecordStore: rolling back NumRecordsChange" << -_diff;
+        _rs->_sizeInfo->numRecords.fetchAndAdd(-_diff);
     }
 
 private:
@@ -1617,13 +1704,13 @@ private:
 };
 
 void WiredTigerRecordStore::_changeNumRecords(OperationContext* opCtx, int64_t diff) {
-    if (!sizeRecoveryState(getGlobalServiceContext()).collectionNeedsSizeAdjustment(ns())) {
+    if (!sizeRecoveryState(getGlobalServiceContext()).collectionNeedsSizeAdjustment(_uri)) {
         return;
     }
 
     opCtx->recoveryUnit()->registerChange(new NumRecordsChange(this, diff));
-    if (_numRecords.fetchAndAdd(diff) < 0)
-        _numRecords.store(std::max(diff, int64_t(0)));
+    if (_sizeInfo->numRecords.fetchAndAdd(diff) < 0)
+        _sizeInfo->numRecords.store(std::max(diff, int64_t(0)));
 }
 
 class WiredTigerRecordStore::DataSizeChange : public RecoveryUnit::Change {
@@ -1640,19 +1727,18 @@ private:
 };
 
 void WiredTigerRecordStore::_increaseDataSize(OperationContext* opCtx, int64_t amount) {
-    if (!sizeRecoveryState(getGlobalServiceContext()).collectionNeedsSizeAdjustment(ns())) {
+    if (!sizeRecoveryState(getGlobalServiceContext()).collectionNeedsSizeAdjustment(_uri)) {
         return;
     }
 
     if (opCtx)
         opCtx->recoveryUnit()->registerChange(new DataSizeChange(this, amount));
 
-    if (_dataSize.fetchAndAdd(amount) < 0)
-        _dataSize.store(std::max(amount, int64_t(0)));
+    if (_sizeInfo->dataSize.fetchAndAdd(amount) < 0)
+        _sizeInfo->dataSize.store(std::max(amount, int64_t(0)));
 
-    if (_sizeStorer && _sizeStorerCounter++ % 1000 == 0) {
-        _sizeStorer->storeToCache(_uri, _numRecords.load(), _dataSize.load());
-    }
+    if (_sizeStorer)
+        _sizeStorer->store(_uri, _sizeInfo);
 }
 
 void WiredTigerRecordStore::cappedTruncateAfter(OperationContext* opCtx,
@@ -1955,6 +2041,8 @@ void StandardWiredTigerRecordStore::setKey(WT_CURSOR* cursor, RecordId id) const
 
 std::unique_ptr<SeekableRecordCursor> StandardWiredTigerRecordStore::getCursor(
     OperationContext* opCtx, bool forward) const {
+    dassert(opCtx->lockState()->isReadLocked());
+
     if (_isOplog && forward) {
         WiredTigerRecoveryUnit* wru = WiredTigerRecoveryUnit::get(opCtx);
         // If we already have a snapshot we don't know what it can see, unless we know no one
@@ -2006,6 +2094,8 @@ PrefixedWiredTigerRecordStore::PrefixedWiredTigerRecordStore(WiredTigerKVEngine*
 
 std::unique_ptr<SeekableRecordCursor> PrefixedWiredTigerRecordStore::getCursor(
     OperationContext* opCtx, bool forward) const {
+    dassert(opCtx->lockState()->isReadLocked());
+
     if (_isOplog && forward) {
         WiredTigerRecoveryUnit* wru = WiredTigerRecoveryUnit::get(opCtx);
         // If we already have a snapshot we don't know what it can see, unless we know no one

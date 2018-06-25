@@ -172,71 +172,39 @@
     }
 
     //
-    // $expr in geoNear.
+    // $expr in the $geoNear stage.
     //
 
     coll.drop();
     assert.writeOK(coll.insert({geo: {type: "Point", coordinates: [0, 0]}, a: 0}));
     assert.commandWorked(coll.ensureIndex({geo: "2dsphere"}));
     assert.eq(1,
-              assert
-                  .commandWorked(db.runCommand({
-                      geoNear: coll.getName(),
-                      near: {type: "Point", coordinates: [0, 0]},
-                      spherical: true,
-                      query: {$expr: {$eq: ["$a", 0]}}
-                  }))
-                  .results.length);
-    assert.commandFailed(db.runCommand({
-        geoNear: coll.getName(),
-        near: {type: "Point", coordinates: [0, 0]},
-        spherical: true,
-        query: {$expr: {$eq: ["$a", "$$unbound"]}}
+              coll.aggregate({
+                      $geoNear: {
+                          near: {type: "Point", coordinates: [0, 0]},
+                          distanceField: "dist",
+                          spherical: true,
+                          query: {$expr: {$eq: ["$a", 0]}}
+                      }
+                  })
+                  .toArray()
+                  .length);
+    assert.throws(() => coll.aggregate({
+        $geoNear: {
+            near: {type: "Point", coordinates: [0, 0]},
+            distanceField: "dist",
+            spherical: true,
+            query: {$expr: {$eq: ["$a", "$$unbound"]}}
+        }
     }));
-    assert.commandFailed(db.runCommand({
-        geoNear: coll.getName(),
-        near: {type: "Point", coordinates: [0, 0]},
-        spherical: true,
-        query: {$expr: {$divide: [1, "$a"]}}
+    assert.throws(() => coll.aggregate({
+        $geoNear: {
+            near: {type: "Point", coordinates: [0, 0]},
+            distanceField: "dist",
+            spherical: true,
+            query: {$expr: {$divide: [1, "$a"]}}
+        }
     }));
-
-    //
-    // $expr in group.
-    //
-
-    // The group command is not permitted in sharded collections.
-    if (!isMongos) {
-        coll.drop();
-        assert.writeOK(coll.insert({a: 0}));
-        assert.eq([{a: 0, count: 1}], coll.group({
-            cond: {$expr: {$eq: ["$a", 0]}},
-            key: {a: 1},
-            initial: {count: 0},
-            reduce: function(curr, result) {
-                result.count += 1;
-            }
-        }));
-        assert.throws(function() {
-            coll.group({
-                cond: {$expr: {$eq: ["$a", "$$unbound"]}},
-                key: {a: 1},
-                initial: {count: 0},
-                reduce: function(curr, result) {
-                    result.count += 1;
-                }
-            });
-        });
-        assert.throws(function() {
-            coll.group({
-                cond: {$expr: {$divide: [1, "$a"]}},
-                key: {a: 1},
-                initial: {count: 0},
-                reduce: function(curr, result) {
-                    result.count += 1;
-                }
-            });
-        });
-    }
 
     //
     // $expr in mapReduce.

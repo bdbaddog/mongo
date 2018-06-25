@@ -48,8 +48,8 @@ class MongoDFixture(interface.Fixture):
 
     def setup(self):
         """Set up the mongod."""
-        if not self.preserve_dbpath:
-            utils.rmtree(self._dbpath, ignore_errors=True)
+        if not self.preserve_dbpath and os.path.lexists(self._dbpath):
+            utils.rmtree(self._dbpath, ignore_errors=False)
 
         try:
             os.makedirs(self._dbpath)

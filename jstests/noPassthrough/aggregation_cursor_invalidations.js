@@ -7,10 +7,14 @@
  * to request more documents from the collection. If the pipeline is wrapped in a $facet stage, all
  * results will be computed in the initial request and buffered in the results array, preventing the
  * pipeline from requesting more documents.
- * @tags: [do_not_wrap_aggregations_in_facets]
+ * @tags: [do_not_wrap_aggregations_in_facets, requires_capped]
  */
 (function() {
     'use strict';
+
+    // This test runs a getMore in a parallel shell, which will not inherit the implicit session of
+    // the cursor establishing command.
+    TestData.disableImplicitSessions = true;
 
     // The DocumentSourceCursor which wraps PlanExecutors will batch results internally. We use the
     // 'internalDocumentSourceCursorBatchSizeBytes' parameter to disable this behavior so that we

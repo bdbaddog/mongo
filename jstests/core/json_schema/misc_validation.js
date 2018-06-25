@@ -27,6 +27,8 @@
     load("jstests/concurrency/fsm_workload_helpers/server_types.js");
     // For isReplSet
     load("jstests/libs/fixture_helpers.js");
+    // For arrayEq.
+    load("jstests/aggregation/extras/utils.js");
 
     const testName = "json_schema_misc_validation";
     const testDB = db.getSiblingDB(testName);
@@ -48,18 +50,23 @@
         coll.count({$jsonSchema: invalidSchema});
     });
 
-    // Test that an invalid $jsonSchema fails to parse in a geoNear command.
+    // Test that an invalid $jsonSchema fails to parse in a $geoNear query.
     assert.commandWorked(coll.createIndex({geo: "2dsphere"}));
     let res = testDB.runCommand({
-        geoNear: coll.getName(),
-        near: [30, 40],
-        spherical: true,
-        query: {$jsonSchema: invalidSchema}
+        aggregate: coll.getName(),
+        cursor: {},
+        pipeline: [{
+            $geoNear: {
+                near: [30, 40],
+                distanceField: "dis",
+                query: {$jsonSchema: invalidSchema},
+            }
+        }],
     });
-    assert.commandFailed(res);
+    assert.commandFailedWithCode(res, ErrorCodes.FailedToParse);
     assert.neq(-1,
-               res.errmsg.indexOf("Can't parse filter"),
-               "geoNear command failed for a reason other than invalid query");
+               res.errmsg.indexOf("Unknown $jsonSchema keyword"),
+               `$geoNear failed for a reason other than invalid query: ${tojson(res)}`);
 
     // Test that an invalid $jsonSchema fails to parse in a distinct command.
     assert.throws(function() {
@@ -81,21 +88,23 @@
     assert.eq(1,
               coll.count({$jsonSchema: {properties: {a: {type: "number"}, b: {type: "string"}}}}));
 
-    // Test that a valid $jsonSchema is legal in a geoNear command.
+    // Test that a valid $jsonSchema is legal in a $geoNear stage.
     const point = {type: "Point", coordinates: [31.0, 41.0]};
     assert.writeOK(coll.insert({geo: point, a: 1}));
     assert.writeOK(coll.insert({geo: point, a: 0}));
     assert.commandWorked(coll.createIndex({geo: "2dsphere"}));
-    res = testDB.runCommand({
-        geoNear: coll.getName(),
-        near: [30, 40],
-        spherical: true,
-        includeLocs: true,
-        query: {$jsonSchema: {properties: {a: {minimum: 1}}}}
-    });
-    assert.commandWorked(res);
-    assert.eq(1, res.results.length);
-    assert.eq(res.results[0].loc, point);
+    res = coll.aggregate({
+                  $geoNear: {
+                      near: [30, 40],
+                      spherical: true,
+                      query: {$jsonSchema: {properties: {a: {minimum: 1}}}},
+                      distanceField: "dis",
+                      includeLocs: "loc",
+                  }
+              })
+              .toArray();
+    assert.eq(1, res.length, tojson(res));
+    assert.eq(res[0].loc, point, tojson(res));
 
     // Test that a valid $jsonSchema is legal in a distinct command.
     coll.drop();
@@ -104,7 +113,7 @@
     assert.writeOK(coll.insert({a: "str"}));
     assert.writeOK(coll.insert({a: ["STR", "str"]}));
 
-    assert.eq([1, 2], coll.distinct("a", {$jsonSchema: {properties: {a: {type: "number"}}}}));
+    assert(arrayEq([1, 2], coll.distinct("a", {$jsonSchema: {properties: {a: {type: "number"}}}})));
 
     // Test that $jsonSchema in a query does not respect the collection-default collation.
     let schema = {properties: {a: {enum: ["STR"]}}};
@@ -318,7 +327,9 @@
         assert.commandWorked(res);
         assert.eq(1, res.applied);
 
-        coll.drop();
+        // Use majority write concern to clear the drop-pending that can cause lock conflicts with
+        // transactions.
+        coll.drop({writeConcern: {w: "majority"}});
         assert.writeOK(coll.insert({_id: 1, a: true}));
 
         if (FixtureHelpers.isReplSet(db) && !isMongos && isWiredTiger(db)) {

@@ -247,7 +247,9 @@ public:
 
         if (_count > 0) {
             --_count;
-            _condvar.notify_one();
+            if (_count == 0) {
+                _condvar.notify_one();
+            }
         }
     }
 
@@ -281,7 +283,8 @@ public:
     FreeMonProcessor(FreeMonCollectorCollection& registration,
                      FreeMonCollectorCollection& metrics,
                      FreeMonNetworkInterface* network,
-                     bool useCrankForTest);
+                     bool useCrankForTest,
+                     Seconds metricsGatherInterval);
 
     /**
      * Enqueue a message to process
@@ -471,7 +474,7 @@ private:
     boost::synchronized_value<boost::optional<FreeMonStorageState>> _lastReadState;
 
     // When we change to primary, do we register?
-    bool _registerOnTransitionToPrimary{false};
+    RegistrationType _registerOnTransitionToPrimary{RegistrationType::DoNotRegister};
 
     // Pending update to disk
     boost::synchronized_value<FreeMonStorageState> _state;

@@ -1,9 +1,14 @@
 /**
  * Test that the operation latencies reported in current op for a getMore on an awaitData cursor
  * include time spent blocking for the await time.
+ * @tags: [requires_capped]
  */
 (function() {
     "use test";
+
+    // This test runs a getMore in a parallel shell, which will not inherit the implicit session of
+    // the cursor establishing command.
+    TestData.disableImplicitSessions = true;
 
     const conn = MongoRunner.runMongod({});
     assert.neq(null, conn, "mongod was unable to start up");

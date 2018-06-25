@@ -56,9 +56,10 @@ namespace mongo {
 Future<AsyncDBClient::Handle> AsyncDBClient::connect(const HostAndPort& peer,
                                                      transport::ConnectSSLMode sslMode,
                                                      ServiceContext* const context,
-                                                     transport::ReactorHandle reactor) {
+                                                     transport::ReactorHandle reactor,
+                                                     Milliseconds timeout) {
     auto tl = context->getTransportLayer();
-    return tl->asyncConnect(peer, sslMode, std::move(reactor))
+    return tl->asyncConnect(peer, sslMode, std::move(reactor), timeout)
         .then([peer, context](transport::SessionHandle session) {
             return std::make_shared<AsyncDBClient>(peer, std::move(session), context);
         });
@@ -139,10 +140,8 @@ Future<void> AsyncDBClient::authenticate(const BSONObj& params) {
     }
 #endif
 
-    Promise<void> retPromise;
-    auto ret = retPromise.getFuture();
-
-    auto authCompleteCb = [promise = retPromise.share()](auth::AuthResponse response) mutable {
+    auto pf = makePromiseFuture<void>();
+    auto authCompleteCb = [promise = pf.promise.share()](auth::AuthResponse response) mutable {
         if (response.isOK()) {
             promise.emplaceValue();
         } else {
@@ -166,7 +165,7 @@ Future<void> AsyncDBClient::authenticate(const BSONObj& params) {
     auth::authenticateClient(
         params, remote(), clientName, std::move(doAuthCb), std::move(authCompleteCb));
 
-    return ret;
+    return std::move(pf.future);
 }
 
 Future<void> AsyncDBClient::initWireVersion(const std::string& appName,
@@ -181,12 +180,12 @@ Future<void> AsyncDBClient::initWireVersion(const std::string& appName,
 
     return _call(requestMsg).then([this, requestObj, hook, clkSource, start](Message response) {
         auto cmdReply = rpc::makeReply(&response);
+        _parseIsMasterResponse(requestObj, cmdReply);
         if (hook) {
             auto millis = duration_cast<Milliseconds>(clkSource->now() - start);
             executor::RemoteCommandResponse cmdResp(*cmdReply, millis);
             uassertStatusOK(hook->validateHost(_peer, requestObj, std::move(cmdResp)));
         }
-        _parseIsMasterResponse(requestObj, cmdReply);
     });
 }
 

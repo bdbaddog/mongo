@@ -253,9 +253,6 @@ public:
         uassertStatusOK(specsWithStatus.getStatus());
         auto specs = std::move(specsWithStatus.getValue());
 
-        // Index builds cannot currently handle lock interruption.
-        UninterruptibleLockGuard noInterrupt(opCtx->lockState());
-
         // now we know we have to create index(es)
         // Do not use AutoGetOrCreateDb because we may relock the DbLock in mode IX.
         Lock::DBLock dbLock(opCtx, ns.db(), MODE_X);
@@ -263,6 +260,10 @@ public:
             uasserted(ErrorCodes::NotMaster,
                       str::stream() << "Not primary while creating indexes in " << ns.ns());
         }
+
+        // Allow the strong lock acquisition above to be interrupted, but from this point forward do
+        // not allow locks or re-locks to be interrupted.
+        UninterruptibleLockGuard noInterrupt(opCtx->lockState());
 
         Database* db = DatabaseHolder::getDatabaseHolder().get(opCtx, ns.db());
         if (!db) {
@@ -386,12 +387,10 @@ public:
         writeConflictRetry(opCtx, kCommandName, ns.ns(), [&] {
             WriteUnitOfWork wunit(opCtx);
 
-            indexer.commit();
-
-            for (auto&& infoObj : indexInfoObjs) {
-                getGlobalServiceContext()->getOpObserver()->onCreateIndex(
-                    opCtx, ns, collection->uuid(), infoObj, false);
-            }
+            indexer.commit([opCtx, &ns, collection](const BSONObj& spec) {
+                opCtx->getServiceContext()->getOpObserver()->onCreateIndex(
+                    opCtx, ns, collection->uuid(), spec, false);
+            });
 
             wunit.commit();
         });

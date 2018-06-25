@@ -2427,9 +2427,9 @@ TEST_F(PipelineValidateTest, ChangeStreamIsNotValidIfNotFirstStageInFacet) {
     ASSERT(std::string::npos != parseStatus.reason().find("$changeStream"));
 }
 
-class DocumentSourceDisallowedWithSnapshotReads : public DocumentSourceMock {
+class DocumentSourceDisallowedInTransactions : public DocumentSourceMock {
 public:
-    DocumentSourceDisallowedWithSnapshotReads() : DocumentSourceMock({}) {}
+    DocumentSourceDisallowedInTransactions() : DocumentSourceMock({}) {}
 
     StageConstraints constraints(Pipeline::SplitState pipeState) const final {
         return StageConstraints{StreamType::kStreaming,
@@ -2440,42 +2440,36 @@ public:
                                 TransactionRequirement::kNotAllowed};
     }
 
-    static boost::intrusive_ptr<DocumentSourceDisallowedWithSnapshotReads> create() {
-        return new DocumentSourceDisallowedWithSnapshotReads();
+    static boost::intrusive_ptr<DocumentSourceDisallowedInTransactions> create() {
+        return new DocumentSourceDisallowedInTransactions();
     }
 };
 
-TEST_F(PipelineValidateTest, TopLevelPipelineValidatedForStagesIllegalWithSnapshotReads) {
+TEST_F(PipelineValidateTest, TopLevelPipelineValidatedForStagesIllegalInTransactions) {
     BSONObj readConcernSnapshot = BSON("readConcern" << BSON("level"
                                                              << "snapshot"));
     auto ctx = getExpCtx();
-    auto&& readConcernArgs = repl::ReadConcernArgs::get(ctx->opCtx);
-    ASSERT_OK(readConcernArgs.initialize(readConcernSnapshot["readConcern"]));
-    ASSERT(readConcernArgs.getLevel() == repl::ReadConcernLevel::kSnapshotReadConcern);
-    ctx->inSnapshotReadOrMultiDocumentTransaction = true;
+    ctx->inMultiDocumentTransaction = true;
 
     // Make a pipeline with a legal $match, and then an illegal mock stage, and verify that pipeline
     // creation fails with the expected error code.
     auto matchStage = DocumentSourceMatch::create(BSON("_id" << 3), ctx);
-    auto illegalStage = DocumentSourceDisallowedWithSnapshotReads::create();
+    auto illegalStage = DocumentSourceDisallowedInTransactions::create();
     auto pipeline = Pipeline::create({matchStage, illegalStage}, ctx);
     ASSERT_NOT_OK(pipeline.getStatus());
     ASSERT_EQ(pipeline.getStatus(), ErrorCodes::duplicateCodeForTest(50742));
 }
 
-TEST_F(PipelineValidateTest, FacetPipelineValidatedForStagesIllegalWithSnapshotReads) {
+TEST_F(PipelineValidateTest, FacetPipelineValidatedForStagesIllegalInTransactions) {
     BSONObj readConcernSnapshot = BSON("readConcern" << BSON("level"
                                                              << "snapshot"));
     auto ctx = getExpCtx();
-    auto&& readConcernArgs = repl::ReadConcernArgs::get(ctx->opCtx);
-    ASSERT_OK(readConcernArgs.initialize(readConcernSnapshot["readConcern"]));
-    ASSERT(readConcernArgs.getLevel() == repl::ReadConcernLevel::kSnapshotReadConcern);
-    ctx->inSnapshotReadOrMultiDocumentTransaction = true;
+    ctx->inMultiDocumentTransaction = true;
 
     // Make a pipeline with a legal $match, and then an illegal mock stage, and verify that pipeline
     // creation fails with the expected error code.
     auto matchStage = DocumentSourceMatch::create(BSON("_id" << 3), ctx);
-    auto illegalStage = DocumentSourceDisallowedWithSnapshotReads::create();
+    auto illegalStage = DocumentSourceDisallowedInTransactions::create();
     auto pipeline = Pipeline::createFacetPipeline({matchStage, illegalStage}, ctx);
     ASSERT_NOT_OK(pipeline.getStatus());
     ASSERT_EQ(pipeline.getStatus(), ErrorCodes::duplicateCodeForTest(50742));
@@ -2492,11 +2486,11 @@ TEST_F(PipelineDependenciesTest, EmptyPipelineShouldRequireWholeDocument) {
 
     auto depsTracker = pipeline->getDependencies(DepsTracker::MetadataAvailable::kNoMetadata);
     ASSERT_TRUE(depsTracker.needWholeDocument);
-    ASSERT_FALSE(depsTracker.getNeedTextScore());
+    ASSERT_FALSE(depsTracker.getNeedsMetadata(DepsTracker::MetadataType::TEXT_SCORE));
 
     depsTracker = pipeline->getDependencies(DepsTracker::MetadataAvailable::kTextScore);
     ASSERT_TRUE(depsTracker.needWholeDocument);
-    ASSERT_TRUE(depsTracker.getNeedTextScore());
+    ASSERT_TRUE(depsTracker.getNeedsMetadata(DepsTracker::MetadataType::TEXT_SCORE));
 }
 
 //
@@ -2557,7 +2551,7 @@ public:
 class DocumentSourceNeedsOnlyTextScore : public DocumentSourceDependencyDummy {
 public:
     GetDepsReturn getDependencies(DepsTracker* deps) const final {
-        deps->setNeedTextScore(true);
+        deps->setNeedsMetadata(DepsTracker::MetadataType::TEXT_SCORE, true);
         return GetDepsReturn::EXHAUSTIVE_META;
     }
 
@@ -2586,7 +2580,7 @@ TEST_F(PipelineDependenciesTest, ShouldRequireWholeDocumentIfAnyStageDoesNotSupp
     auto depsTracker = pipeline->getDependencies(DepsTracker::MetadataAvailable::kNoMetadata);
     ASSERT_TRUE(depsTracker.needWholeDocument);
     // The inputs did not have a text score available, so we should not require a text score.
-    ASSERT_FALSE(depsTracker.getNeedTextScore());
+    ASSERT_FALSE(depsTracker.getNeedsMetadata(DepsTracker::MetadataType::TEXT_SCORE));
 
     // Now in the other order.
     pipeline = unittest::assertGet(Pipeline::create({notSupported, needsASeeNext}, ctx));
@@ -2625,7 +2619,7 @@ TEST_F(PipelineDependenciesTest, ShouldNotAddAnyRequiredFieldsAfterFirstStageWit
 
     auto depsTracker = pipeline->getDependencies(DepsTracker::MetadataAvailable::kNoMetadata);
     ASSERT_FALSE(depsTracker.needWholeDocument);
-    ASSERT_FALSE(depsTracker.getNeedTextScore());
+    ASSERT_FALSE(depsTracker.getNeedsMetadata(DepsTracker::MetadataType::TEXT_SCORE));
 
     // 'needsOnlyB' claims to know all its field dependencies, so we shouldn't add any from
     // 'needsASeeNext'.
@@ -2638,7 +2632,7 @@ TEST_F(PipelineDependenciesTest, ShouldNotRequireTextScoreIfThereIsNoScoreAvaila
     auto pipeline = unittest::assertGet(Pipeline::create({}, ctx));
 
     auto depsTracker = pipeline->getDependencies(DepsTracker::MetadataAvailable::kNoMetadata);
-    ASSERT_FALSE(depsTracker.getNeedTextScore());
+    ASSERT_FALSE(depsTracker.getNeedsMetadata(DepsTracker::MetadataType::TEXT_SCORE));
 }
 
 TEST_F(PipelineDependenciesTest, ShouldThrowIfTextScoreIsNeededButNotPresent) {
@@ -2655,12 +2649,12 @@ TEST_F(PipelineDependenciesTest, ShouldRequireTextScoreIfAvailableAndNoStageRetu
     auto pipeline = unittest::assertGet(Pipeline::create({}, ctx));
 
     auto depsTracker = pipeline->getDependencies(DepsTracker::MetadataAvailable::kTextScore);
-    ASSERT_TRUE(depsTracker.getNeedTextScore());
+    ASSERT_TRUE(depsTracker.getNeedsMetadata(DepsTracker::MetadataType::TEXT_SCORE));
 
     auto needsASeeNext = DocumentSourceNeedsASeeNext::create();
     pipeline = unittest::assertGet(Pipeline::create({needsASeeNext}, ctx));
     depsTracker = pipeline->getDependencies(DepsTracker::MetadataAvailable::kTextScore);
-    ASSERT_TRUE(depsTracker.getNeedTextScore());
+    ASSERT_TRUE(depsTracker.getNeedsMetadata(DepsTracker::MetadataType::TEXT_SCORE));
 }
 
 TEST_F(PipelineDependenciesTest, ShouldNotRequireTextScoreIfAvailableButDefinitelyNotNeeded) {
@@ -2673,7 +2667,7 @@ TEST_F(PipelineDependenciesTest, ShouldNotRequireTextScoreIfAvailableButDefinite
 
     // 'stripsTextScore' claims that no further stage will need metadata information, so we
     // shouldn't have the text score as a dependency.
-    ASSERT_FALSE(depsTracker.getNeedTextScore());
+    ASSERT_FALSE(depsTracker.getNeedsMetadata(DepsTracker::MetadataType::TEXT_SCORE));
 }
 
 }  // namespace Dependencies

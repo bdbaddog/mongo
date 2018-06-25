@@ -196,6 +196,8 @@ inline pcrecpp::RE_Options flags2options(const char* flags) {
     return options;
 }
 
+constexpr size_t RegexMatchExpression::kMaxPatternSize;
+
 RegexMatchExpression::RegexMatchExpression(StringData path, const BSONElement& e)
     : LeafMatchExpression(REGEX, path),
       _regex(e.regex()),
@@ -214,6 +216,9 @@ RegexMatchExpression::RegexMatchExpression(StringData path, StringData regex, St
 }
 
 void RegexMatchExpression::_init() {
+    uassert(
+        ErrorCodes::BadValue, "Regular expression is too long", _regex.size() <= kMaxPatternSize);
+
     uassert(ErrorCodes::BadValue,
             "Regular expression cannot contain an embedded null byte",
             _regex.find('\0') == std::string::npos);
@@ -221,10 +226,6 @@ void RegexMatchExpression::_init() {
     uassert(ErrorCodes::BadValue,
             "Regular expression options string cannot contain an embedded null byte",
             _flags.find('\0') == std::string::npos);
-
-    uassert(ErrorCodes::BadValue,
-            str::stream() << "Regular expression is invalid: " << _re->error(),
-            _re->error().empty());
 }
 
 RegexMatchExpression::~RegexMatchExpression() {}
@@ -476,6 +477,11 @@ void InMatchExpression::_doSetCollator(const CollatorInterface* collator) {
     _collator = collator;
     _eltCmp = BSONElementComparator(BSONElementComparator::FieldNamesMode::kIgnore, _collator);
 
+    // Re-sort the list of equalities according to our current comparator. This is necessary to work
+    // around https://svn.boost.org/trac10/ticket/13140.
+    std::sort(
+        _originalEqualityVector.begin(), _originalEqualityVector.end(), _eltCmp.makeLessThan());
+
     // We need to re-compute '_equalitySet', since our set comparator has changed.
     _equalitySet = _eltCmp.makeBSONEltFlatSet(_originalEqualityVector);
 }
@@ -495,7 +501,12 @@ Status InMatchExpression::setEqualities(std::vector<BSONElement> equalities) {
             _hasEmptyArray = true;
         }
     }
+
     _originalEqualityVector = std::move(equalities);
+
+    // Sort the list of equalities to work around https://svn.boost.org/trac10/ticket/13140.
+    std::sort(
+        _originalEqualityVector.begin(), _originalEqualityVector.end(), _eltCmp.makeLessThan());
 
     _equalitySet = _eltCmp.makeBSONEltFlatSet(_originalEqualityVector);
 

@@ -49,28 +49,19 @@ namespace moe = mongo::optionenvironment;
 Status addBaseServerOptions(moe::OptionSection* options);
 
 /**
- * General server options for most standalone applications. Includes addBaseServerOptions.
- */
-Status addGeneralServerOptions(moe::OptionSection* options);
-
-Status addWindowsServerOptions(moe::OptionSection* options);
-
-Status addSSLServerOptions(moe::OptionSection* options);
+* Handle custom validation of base options that can not currently be done by using
+* Constraints in the Environment.  See the "validate" function in the Environment class for
+* more details.
+*/
+Status validateBaseOptions(const moe::Environment& params);
 
 /**
- * Handle custom validation of server options that can not currently be done by using
- * Constraints in the Environment.  See the "validate" function in the Environment class for
- * more details.
- */
-Status validateServerOptions(const moe::Environment& params);
-
-/**
- * Canonicalize server options for the given environment.
- *
- * For example, the options "objcheck", "noobjcheck", and "net.wireObjectCheck" should all be
- * merged into "net.wireObjectCheck".
- */
-Status canonicalizeServerOptions(moe::Environment* params);
+* Canonicalize base options for the given environment.
+*
+* For example, the options "objcheck", "noobjcheck", and "net.wireObjectCheck" should all be
+* merged into "net.wireObjectCheck".
+*/
+Status canonicalizeBaseOptions(moe::Environment* params);
 
 /**
  * Sets up the global server state necessary to be able to store the server options, based on how
@@ -79,15 +70,14 @@ Status canonicalizeServerOptions(moe::Environment* params);
  * For example, saves the current working directory in serverGlobalParams.cwd so that relative paths
  * in server options can be interpreted correctly.
  */
-Status setupServerOptions(const std::vector<std::string>& args);
+Status setupBaseOptions(const std::vector<std::string>& args);
 
 /**
- * Store the given parsed params in global server state.
- *
- * For example, sets the serverGlobalParams.port variable based on the net.port config parameter.
- */
-Status storeServerOptions(const moe::Environment& params);
-
-void printCommandLineOpts();
+* Store the given parsed params in global server state.
+*
+* For example, sets the serverGlobalParams.quiet variable based on the systemLog.quiet config
+* parameter.
+*/
+Status storeBaseOptions(const moe::Environment& params);
 
 }  // namespace mongo

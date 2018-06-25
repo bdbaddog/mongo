@@ -59,6 +59,7 @@
 #include "mongo/s/catalog/type_shard.h"
 #include "mongo/s/catalog/type_tags.h"
 #include "mongo/s/client/shard.h"
+#include "mongo/s/database_version_helpers.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/request_types/set_shard_version_request.h"
 #include "mongo/s/shard_key_pattern.h"
@@ -74,7 +75,7 @@
 
 namespace mongo {
 
-MONGO_FP_DECLARE(failApplyChunkOps);
+MONGO_FAIL_POINT_DEFINE(failApplyChunkOps);
 
 using repl::OpTime;
 using std::set;
@@ -148,20 +149,6 @@ Status ShardingCatalogClientImpl::updateShardingCatalogEntryForCollection(
                                         upsert,
                                         ShardingCatalogClient::kMajorityWriteConcern);
     return status.getStatus().withContext(str::stream() << "Collection metadata write failed");
-}
-
-Status ShardingCatalogClientImpl::updateDatabase(OperationContext* opCtx,
-                                                 const std::string& dbName,
-                                                 const DatabaseType& db) {
-    fassert(28616, db.validate());
-
-    auto status = updateConfigDocument(opCtx,
-                                       DatabaseType::ConfigNS,
-                                       BSON(DatabaseType::name(dbName)),
-                                       db.toBSON(),
-                                       true,
-                                       ShardingCatalogClient::kMajorityWriteConcern);
-    return status.getStatus().withContext(str::stream() << "Database metadata write failed");
 }
 
 Status ShardingCatalogClientImpl::logAction(OperationContext* opCtx,
@@ -251,13 +238,15 @@ StatusWith<repl::OpTimeWith<DatabaseType>> ShardingCatalogClientImpl::getDatabas
 
     // The admin database is always hosted on the config server.
     if (dbName == "admin") {
-        DatabaseType dbt(dbName, ShardRegistry::kConfigServerShardId, false);
+        DatabaseType dbt(
+            dbName, ShardRegistry::kConfigServerShardId, false, databaseVersion::makeFixed());
         return repl::OpTimeWith<DatabaseType>(dbt);
     }
 
     // The config database's primary shard is always config, and it is always sharded.
     if (dbName == "config") {
-        DatabaseType dbt(dbName, ShardRegistry::kConfigServerShardId, true);
+        DatabaseType dbt(
+            dbName, ShardRegistry::kConfigServerShardId, true, databaseVersion::makeFixed());
         return repl::OpTimeWith<DatabaseType>(dbt);
     }
 

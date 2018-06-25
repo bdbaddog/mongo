@@ -1,5 +1,9 @@
 // test read/write permissions
 // skip this test on 32-bit platforms
+// @tags: [requires_profiling]
+
+// TODO SERVER-35447: Multiple users cannot be authenticated on one connection within a session.
+TestData.disableImplicitSessions = true;
 
 function setupTest() {
     print("START auth1.js");
@@ -60,16 +64,6 @@ function runTest(m) {
     db.setProfilingLevel(0);
     assert.lt(0, db.system.profile.find({user: "eliot@test"}).count(), "AP1");
 
-    var p = {
-        key: {i: true},
-        reduce: function(obj, prev) {
-            prev.count++;
-        },
-        initial: {count: 0}
-    };
-
-    assert.eq(1000, t.group(p).length, "A5");
-
     assert(dbRO.auth("guest", "guest"), "auth failed 2");
 
     assert.eq(1000, tRO.count(), "B1");
@@ -79,23 +73,6 @@ function runTest(m) {
     assert.writeError(tRO.save({}));
 
     assert.eq(1000, tRO.count(), "B6");
-
-    assert.eq(1000, tRO.group(p).length, "C1");
-
-    var p = {
-        key: {i: true},
-        reduce: function(obj, prev) {
-            db.jstests_auth_auth1.save({i: 10000});
-            prev.count++;
-        },
-        initial: {count: 0}
-    };
-
-    assert.throws(function() {
-        return t.group(p);
-    }, [], "write reduce didn't fail");
-    assert.eq(1000, dbRO.jstests_auth_auth1.count(), "C3");
-
     db.getSiblingDB('admin').auth('super', 'super');
 
     assert.eq(1000,

@@ -14,9 +14,7 @@
         "dbStats",
         "distinct",
         "find",
-        "geoNear",
         "geoSearch",
-        "group",
         "mapReduce",
         "mapreduce",
         "parallelCollectionScan",
@@ -123,6 +121,12 @@
         } else if (conn.isMongos() && kDatabasesOnConfigServers.has(dbName)) {
             // Avoid overriding the read preference for config server since there may only be one
             // of them.
+            shouldForceReadPreference = false;
+        }
+
+        if (TestData.doNotOverrideReadPreference) {
+            // Use this TestData flag to allow certain runCommands to be exempted from
+            // setting secondary read preference.
             shouldForceReadPreference = false;
         }
 

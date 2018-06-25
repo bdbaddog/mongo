@@ -3,14 +3,55 @@
  * opened cursors and kills them on cleanup.
  */
 
-// Helper function used internally by ChangeStreamTest. If no passthrough is active, it is exactly
-// the same as calling db.runCommand. If a passthrough is active and has defined a function
-// 'changeStreamPassthroughAwareRunCommand', then this method will be overridden to allow individual
-// streams to explicitly exempt themselves from being modified by the passthrough.
+/**
+ * Enumeration of the possible types of change streams.
+ */
+const ChangeStreamWatchMode = Object.freeze({
+    kCollection: 1,
+    kDb: 2,
+    kCluster: 3,
+});
+
+/**
+ * Helper function used internally by ChangeStreamTest. If no passthrough is active, it is exactly
+ * the same as calling db.runCommand. If a passthrough is active and has defined a function
+ * 'changeStreamPassthroughAwareRunCommand', then this method will be overridden to allow individual
+ * streams to explicitly exempt themselves from being modified by the passthrough.
+ */
+function isChangeStreamPassthrough() {
+    return typeof changeStreamPassthroughAwareRunCommand != 'undefined';
+}
+
+/**
+ * Helper function to retrieve the type of change stream based on the passthrough suite in which the
+ * test is being run. If no passthrough is active, this method returns the kCollection watch mode.
+ */
+function changeStreamPassthroughType() {
+    return typeof ChangeStreamPassthroughHelpers === 'undefined'
+        ? ChangeStreamWatchMode.kCollection
+        : ChangeStreamPassthroughHelpers.passthroughType();
+}
+
 const runCommandChangeStreamPassthroughAware =
-    (typeof changeStreamPassthroughAwareRunCommand === 'undefined'
-         ? ((db, cmdObj) => db.runCommand(cmdObj))
-         : changeStreamPassthroughAwareRunCommand);
+    (!isChangeStreamPassthrough() ? ((db, cmdObj) => db.runCommand(cmdObj))
+                                  : changeStreamPassthroughAwareRunCommand);
+
+/**
+ * Asserts that the given opType triggers an invalidate entry depending on the type of change
+ * stream.
+ *     - single collection streams: drop, rename, and dropDatabase.
+ *     - whole DB streams: dropDatabase.
+ *     - whole cluster streams: none.
+ */
+function assertInvalidateOp({cursor, opType}) {
+    if (!isChangeStreamPassthrough() ||
+        (changeStreamPassthroughType() == ChangeStreamWatchMode.kDb && opType == "dropDatabase")) {
+        assert.soon(() => cursor.hasNext());
+        assert.eq(cursor.next().operationType, "invalidate");
+        assert(cursor.isExhausted());
+        assert(cursor.isClosed());
+    }
+}
 
 function ChangeStreamTest(_db, name = "ChangeStreamTest") {
     load("jstests/libs/namespace_utils.js");  // For getCollectionNameFromFullNamespace.
@@ -230,7 +271,7 @@ function ChangeStreamTest(_db, name = "ChangeStreamTest") {
 
     /**
      * Returns the document to be used for the value of a $changeStream stage, given a watchMode
-     * of type ChangeStreamTest.WatchMode and optional resumeAfter value.
+     * of type ChangeStreamWatchMode and optional resumeAfter value.
      */
     self.getChangeStreamStage = function(watchMode, resumeAfter) {
         const changeStreamDoc = {};
@@ -238,20 +279,20 @@ function ChangeStreamTest(_db, name = "ChangeStreamTest") {
             changeStreamDoc.resumeAfter = resumeAfter;
         }
 
-        if (watchMode == ChangeStreamTest.WatchMode.kCluster) {
+        if (watchMode == ChangeStreamWatchMode.kCluster) {
             changeStreamDoc.allChangesForCluster = true;
         }
         return changeStreamDoc;
     };
 
     /**
-     * Create a change stream of the given watch mode (see ChangeStreamTest.WatchMode) on the given
+     * Create a change stream of the given watch mode (see ChangeStreamWatchMode) on the given
      * collection. Will resume from a given point if resumeAfter is specified.
      */
     self.getChangeStream = function({watchMode, coll, resumeAfter}) {
         return self.startWatchingChanges({
             pipeline: [{$changeStream: self.getChangeStreamStage(watchMode, resumeAfter)}],
-            collection: (watchMode == ChangeStreamTest.WatchMode.kCollection ? coll : 1),
+            collection: (watchMode == ChangeStreamWatchMode.kCollection ? coll : 1),
             // Use a batch size of 0 to prevent any notifications from being returned in the first
             // batch. These would be ignored by ChangeStreamTest.getOneChange().
             aggregateOptions: {cursor: {batchSize: 0}},
@@ -293,21 +334,11 @@ ChangeStreamTest.assertChangeStreamThrowsCode = function assertChangeStreamThrow
  * the watchMode.
  */
 ChangeStreamTest.getDBForChangeStream = function(watchMode, dbObj) {
-    if (watchMode == ChangeStreamTest.WatchMode.kCluster) {
+    if (watchMode == ChangeStreamWatchMode.kCluster) {
         return dbObj.getSiblingDB("admin");
     }
     return dbObj;
 };
-
-/**
- * Used in getChangeStream() and getChangeStreamStage() helpers, for specifying which type of
- * changeStream to open.
- */
-ChangeStreamTest.WatchMode = Object.freeze({
-    kCollection: 1,
-    kDb: 2,
-    kCluster: 3,
-});
 
 /**
  * A set of functions to help validate the behaviour of $changeStreams for a given namespace.

@@ -46,6 +46,7 @@
 #include "mongo/executor/thread_pool_task_executor.h"
 #include "mongo/s/stale_exception.h"
 #include "mongo/util/log.h"
+#include "mongo/util/string_map.h"
 
 namespace mongo {
 namespace {
@@ -114,9 +115,9 @@ public:
 
         auto it = _collections.find(ns);
         if (it == _collections.end()) {
-            auto inserted = _collections.emplace(
+            auto inserted = _collections.try_emplace(
                 ns,
-                std::make_unique<CollectionShardingState>(get.owner(this), NamespaceString(ns)));
+                std::make_shared<CollectionShardingState>(get.owner(this), NamespaceString(ns)));
             invariant(inserted.second);
             it = std::move(inserted.first);
         }
@@ -156,8 +157,7 @@ public:
 private:
     mutable stdx::mutex _mutex;
 
-    using CollectionsMap =
-        stdx::unordered_map<std::string, std::unique_ptr<CollectionShardingState>>;
+    using CollectionsMap = StringMap<std::shared_ptr<CollectionShardingState>>;
     CollectionsMap _collections;
 };
 
@@ -253,21 +253,9 @@ void CollectionShardingState::checkShardVersionOrThrow(OperationContext* opCtx) 
     ChunkVersion received;
     ChunkVersion wanted;
     if (!_checkShardVersionOk(opCtx, &errmsg, &received, &wanted)) {
-        uasserted(StaleConfigInfo(_nss.ns(), received, wanted),
+        uasserted(StaleConfigInfo(_nss, received, wanted),
                   str::stream() << "shard version not ok: " << errmsg);
     }
-}
-
-bool CollectionShardingState::collectionIsSharded(OperationContext* opCtx) {
-    auto metadata = getMetadata(opCtx).getMetadata();
-    if (metadata && (metadata->getCollVersion().isStrictlyEqualTo(ChunkVersion::UNSHARDED()))) {
-        return false;
-    }
-
-    // If 'metadata' is null, then the shard doesn't know if this collection is sharded or not. In
-    // this scenario we will assume this collection is sharded. We will know sharding state
-    // definitively once SERVER-24960 has been fixed.
-    return true;
 }
 
 // Call with collection unlocked.  Note that the CollectionShardingState object involved might not

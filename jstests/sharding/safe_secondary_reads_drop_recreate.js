@@ -36,6 +36,7 @@
     };
 
     let testCases = {
+        _addShard: {skip: "primary only"},
         _cloneCatalogData: {skip: "primary only"},
         _configsvrAddShard: {skip: "primary only"},
         _configsvrAddShardToZone: {skip: "primary only"},
@@ -177,7 +178,11 @@
                     {createIndexes: coll, indexes: [{key: {loc: "2d"}, name: "loc_2d"}]}));
                 assert.writeOK(mongosConn.getCollection(nss).insert({x: 1, loc: [1, 1]}));
             },
-            command: {geoNear: coll, near: [1, 1]},
+            command: {
+                aggregate: coll,
+                cursor: {},
+                pipeline: [{$geoNear: {near: [1, 1], distanceField: "d"}}]
+            },
             checkResults: function(res) {
                 // The command should fail on the new collection, because the geo index was dropped.
                 assert.commandFailed(res);
@@ -199,20 +204,6 @@
         grantPrivilegesToRole: {skip: "primary only"},
         grantRolesToRole: {skip: "primary only"},
         grantRolesToUser: {skip: "primary only"},
-        group: {
-            setUp: function(mongosConn) {
-                assert.writeOK(mongosConn.getCollection(nss).insert({x: 1, y: 1}));
-                assert.writeOK(mongosConn.getCollection(nss).insert({x: 1, y: 1}));
-                assert.writeOK(mongosConn.getCollection(nss).insert({x: 2, y: 1}));
-                assert.writeOK(mongosConn.getCollection(nss).insert({x: 2, y: 1}));
-            },
-            command: {group: {ns: coll, key: {x: 1}}},
-            checkResults: function(res) {
-                // Expect the command to fail, since it cannot run on sharded collections.
-                assert.commandFailedWithCode(res, ErrorCodes.IllegalOperation, tojson(res));
-            },
-            behavior: "unshardedOnly"
-        },
         handshake: {skip: "does not return user data"},
         hostInfo: {skip: "does not return user data"},
         insert: {skip: "primary only"},
@@ -592,7 +583,9 @@
                 $readPreference: {mode: 'secondary'},
                 readConcern: {'level': 'local'}
             }));
-
+            // Wait for drop of previous database to replicate before beginning profiling
+            st.rs0.awaitReplication();
+            st.rs1.awaitReplication();
             assert.commandWorked(st.rs0.getPrimary().getDB(db).setProfilingLevel(2));
             assert.commandWorked(st.rs0.getSecondary().getDB(db).setProfilingLevel(2));
             assert.commandWorked(st.rs1.getPrimary().getDB(db).setProfilingLevel(2));

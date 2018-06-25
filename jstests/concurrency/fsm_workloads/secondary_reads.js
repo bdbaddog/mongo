@@ -16,7 +16,9 @@
  * For each read, we check if there is any 'hole' in the returned batch. There
  * should not be any 'hole' because oplogs are applied sequentially in batches.
  *
+ * @tags: [requires_replication]
  */
+
 var $config = (function() {
 
     // Use the workload name as the collection name.
@@ -67,7 +69,10 @@ var $config = (function() {
     }
 
     function getReadConcernLevel(supportsCommittedReads) {
-        const readConcernLevels = ['local', 'available'];
+        const readConcernLevels = ['local'];
+        if (!TestData.runningWithCausalConsistency) {
+            readConcernLevels.push('available');
+        }
         if (supportsCommittedReads) {
             readConcernLevels.push('majority');
         }
@@ -99,17 +104,6 @@ var $config = (function() {
         this.insertDocuments(db, this.collName, {w: cluster.getReplSetNumNodes()});
     };
 
-    var skip = function skip(cluster) {
-        if (cluster.isSharded() || cluster.isStandalone()) {
-            return {skip: true, msg: 'only runs in a replica set.'};
-        }
-        return {skip: false};
-    };
-
-    var teardown = function teardown(db, collName, cluster) {
-        db[this.collName].drop();
-    };
-
     return {
         threadCount: 50,
         iterations: 40,
@@ -125,7 +119,5 @@ var $config = (function() {
         },
         transitions: transitions,
         setup: setup,
-        skip: skip,
-        teardown: teardown
     };
 })();

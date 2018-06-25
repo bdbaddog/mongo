@@ -66,6 +66,7 @@
     const isUnrelated = "is unrelated";
 
     let viewsCommandTests = {
+        _addShard: {skip: isAnInternalCommand},
         _cloneCatalogData: {skip: isAnInternalCommand},
         _configsvrAddShard: {skip: isAnInternalCommand},
         _configsvrAddShardToZone: {skip: isAnInternalCommand},
@@ -87,6 +88,8 @@
         _configsvrRemoveShardFromZone: {skip: isAnInternalCommand},
         _configsvrShardCollection: {skip: isAnInternalCommand},
         _configsvrUpdateZoneKeyRange: {skip: isAnInternalCommand},
+        _cpuProfilerStart: {skip: isAnInternalCommand},
+        _cpuProfilerStop: {skip: isAnInternalCommand},
         _flushDatabaseCacheUpdates: {skip: isUnrelated},
         _flushRoutingTableCacheUpdates: {skip: isUnrelated},
         _getNextSessionMods: {skip: isAnInternalCommand},
@@ -247,11 +250,6 @@
         fsync: {skip: isUnrelated},
         fsyncUnlock: {skip: isUnrelated},
         getDatabaseVersion: {skip: isUnrelated},
-        geoNear: {
-            command:
-                {geoNear: "view", near: {type: "Point", coordinates: [-50, 37]}, spherical: true},
-            expectFailure: true
-        },
         geoSearch: {
             command: {
                 geoSearch: "view",
@@ -315,9 +313,6 @@
         grantPrivilegesToRole: {skip: "tested in auth/commands_user_defined_roles.js"},
         grantRolesToRole: {skip: isUnrelated},
         grantRolesToUser: {skip: isUnrelated},
-        group: {
-            command: {group: {ns: "test.view", key: "x", $reduce: function() {}, initial: {}}},
-        },
         handshake: {skip: isUnrelated},
         hostInfo: {skip: isUnrelated},
         insert: {command: {insert: "view", documents: [{x: 1}]}, expectFailure: true},

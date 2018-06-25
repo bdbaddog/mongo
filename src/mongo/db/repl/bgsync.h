@@ -60,7 +60,7 @@ class ReplicationCoordinatorExternalState;
 class ReplicationProcess;
 class StorageInterface;
 
-class BackgroundSync : public OplogApplier::Observer {
+class BackgroundSync {
     MONGO_DISALLOW_COPYING(BackgroundSync);
 
 public:
@@ -86,7 +86,7 @@ public:
     BackgroundSync(ReplicationCoordinator* replicationCoordinator,
                    ReplicationCoordinatorExternalState* replicationCoordinatorExternalState,
                    ReplicationProcess* replicationProcess,
-                   OplogBuffer* oplogBuffer);
+                   OplogApplier* oplogApplier);
 
     // stop syncing (when this node becomes a primary, e.g.)
     // During stepdown, the last fetched optime is not reset in order to keep track of the lastest
@@ -120,11 +120,6 @@ public:
 
     HostAndPort getSyncTarget() const;
 
-    /**
-     * This is called while shutting down to reset the counters for the OplogBuffer.
-     */
-    void onBufferCleared();
-
     void clearSyncTarget();
 
     // For monitoring
@@ -142,12 +137,6 @@ public:
     ProducerState getState() const;
     // Starts the producer if it's stopped. Otherwise, let it keep running.
     void startProducerIfStopped();
-
-    // OplogApplier::Observer functions
-    void onBatchBegin(const OplogApplier::Operations&) final {}
-    void onBatchEnd(const StatusWith<OpTime>&, const OplogApplier::Operations&) final {}
-    void onMissingDocumentsFetchedAndInserted(const std::vector<FetchInfo>&) final {}
-    void onOperationConsumed(const BSONObj& op) final;
 
 private:
     bool _inShutdown_inlock() const;
@@ -212,8 +201,8 @@ private:
 
     OpTimeWithHash _readLastAppliedOpTimeWithHash(OperationContext* opCtx);
 
-    // This OplogBuffer holds oplog entries fetched from the sync source.
-    OplogBuffer* const _oplogBuffer;
+    // This OplogApplier applies oplog entries fetched from the sync source.
+    OplogApplier* const _oplogApplier;
 
     // A pointer to the replication coordinator running the show.
     ReplicationCoordinator* _replCoord;

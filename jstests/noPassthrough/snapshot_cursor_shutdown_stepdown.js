@@ -1,5 +1,5 @@
 // Tests that stashed transaction resources are destroyed at shutdown and stepdown.
-// @tags: [requires_replication]
+// @tags: [uses_transactions]
 (function() {
     "use strict";
 
@@ -15,10 +15,6 @@
     rst.initiate();
 
     let primaryDB = rst.getPrimary().getDB(dbName);
-    if (!primaryDB.serverStatus().storageEngine.supportsSnapshotReadConcern) {
-        rst.stopSet();
-        return;
-    }
 
     let session = primaryDB.getMongo().startSession();
     let sessionDB = session.getDatabase(dbName);
@@ -75,22 +71,8 @@
         stepdownFunc(rst);
         rst.waitForState(primary, ReplSetTest.State.SECONDARY);
 
-        // Perform a getMore using the previous transaction's open cursorId. We expect to receive
-        // CursorNotFound if the cursor was properly closed on step down.
-        assert.commandWorked(sessionDB.runCommand({
-            find: collName,
-            readConcern: {level: "snapshot"},
-            txnNumber: NumberLong(1),
-            startTransaction: true,
-            autocommit: false
-        }));
-        assert.commandFailedWithCode(sessionDB.runCommand({
-            getMore: cursorId,
-            collection: collName,
-            txnNumber: NumberLong(1),
-            autocommit: false
-        }),
-                                     ErrorCodes.CursorNotFound);
+        // Kill the cursor.
+        assert.commandWorked(sessionDB.runCommand({killCursors: collName, cursors: [cursorId]}));
         rst.stopSet();
     }
 

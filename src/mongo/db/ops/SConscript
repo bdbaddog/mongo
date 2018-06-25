@@ -16,6 +16,7 @@ env.Library(
         '$BUILD_DIR/mongo/db/repl/oplog',
         '$BUILD_DIR/mongo/db/repl/repl_coordinator_interface',
         '$BUILD_DIR/mongo/db/s/sharding_runtime_d',
+        '$BUILD_DIR/mongo/db/stats/counters',
         '$BUILD_DIR/mongo/db/write_ops',
         '$BUILD_DIR/mongo/util/fail_point',
     ],
@@ -58,7 +59,7 @@ env.CppIntegrationTest(
     target='write_ops_document_stream_integration_test',
     source='write_ops_document_stream_integration_test.cpp',
     LIBDEPS=[
-        '$BUILD_DIR/mongo/client/clientdriver',
+        '$BUILD_DIR/mongo/client/clientdriver_network',
         '$BUILD_DIR/mongo/util/version_impl',
     ],
 )

@@ -59,17 +59,22 @@ public:
 
     std::unique_ptr<OplogBuffer> makeInitialSyncOplogBuffer(OperationContext* opCtx) const override;
 
-    StatusWith<OplogApplier::Operations> getNextApplierBatch(OperationContext* opCtx,
-                                                             OplogBuffer* oplogBuffer) final;
+    /**
+     * These arguments are passed directly to OplogApplierImpl's constructor along with some other
+     * parameters owned by this DataReplicationExternalStateImpl.
+     * These arguments are required by OplogApplier to get the next applier batch and to apply
+     * a batch of operations in parallel.
+     * None of the the arguments will be owned by OplogApplierImpl.
+     */
+    std::unique_ptr<OplogApplier> makeOplogApplier(
+        OplogBuffer* oplogBuffer,
+        OplogApplier::Observer* observer,
+        ReplicationConsistencyMarkers* consistencyMarkers,
+        StorageInterface* storageInterface,
+        const OplogApplier::Options& options,
+        ThreadPool* writerPool) final;
 
     StatusWith<ReplSetConfig> getCurrentConfig() const override;
-
-private:
-    StatusWith<OpTime> _multiApply(OperationContext* opCtx,
-                                   MultiApplier::Operations ops,
-                                   OplogApplier::Observer* observer,
-                                   const HostAndPort& source,
-                                   ThreadPool* writerPool) override;
 
 protected:
     ReplicationCoordinator* getReplicationCoordinator() const;

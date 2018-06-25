@@ -54,7 +54,6 @@
 #include "mongo/s/request_types/commit_chunk_migration_request_type.h"
 #include "mongo/s/request_types/set_shard_version_request.h"
 #include "mongo/s/shard_key_pattern.h"
-#include "mongo/s/stale_exception.h"
 #include "mongo/stdx/memory.h"
 #include "mongo/util/elapsed_tracker.h"
 #include "mongo/util/exit.h"
@@ -74,7 +73,6 @@ const auto msmForCss = CollectionShardingState::declareDecoration<MigrationSourc
 // entered
 const Hours kMaxWaitToEnterCriticalSectionTimeout(6);
 const char kMigratedChunkVersionField[] = "migratedChunkVersion";
-const char kControlChunkVersionField[] = "controlChunkVersion";
 const char kWriteConcernField[] = "writeConcern";
 const WriteConcernOptions kMajorityWriteConcern(WriteConcernOptions::kMajority,
                                                 WriteConcernOptions::SyncMode::UNSET,
@@ -126,10 +124,10 @@ Status checkCollectionEpochMatches(const ScopedCollectionMetadata& metadata, OID
 
 }  // namespace
 
-MONGO_FP_DECLARE(doNotRefreshRecipientAfterCommit);
-MONGO_FP_DECLARE(failMigrationCommit);
-MONGO_FP_DECLARE(hangBeforeLeavingCriticalSection);
-MONGO_FP_DECLARE(migrationCommitNetworkError);
+MONGO_FAIL_POINT_DEFINE(doNotRefreshRecipientAfterCommit);
+MONGO_FAIL_POINT_DEFINE(failMigrationCommit);
+MONGO_FAIL_POINT_DEFINE(hangBeforeLeavingCriticalSection);
+MONGO_FAIL_POINT_DEFINE(migrationCommitNetworkError);
 
 MigrationSourceManager* MigrationSourceManager::get(CollectionShardingState& css) {
     return msmForCss(css);
@@ -403,14 +401,6 @@ Status MigrationSourceManager::commitChunkMetadataOnConfig(OperationContext* opC
         if (!status.isOK())
             return status;
 
-        boost::optional<ChunkType> controlChunkType = boost::none;
-        ChunkType differentChunk;
-        if (metadata->getDifferentChunk(_args.getMinKey(), &differentChunk)) {
-            controlChunkType = std::move(differentChunk);
-        } else {
-            log() << "Moving last chunk for the collection out";
-        }
-
         ChunkType migratedChunkType;
         migratedChunkType.setMin(_args.getMinKey());
         migratedChunkType.setMax(_args.getMaxKey());
@@ -421,7 +411,6 @@ Status MigrationSourceManager::commitChunkMetadataOnConfig(OperationContext* opC
             _args.getFromShardId(),
             _args.getToShardId(),
             migratedChunkType,
-            controlChunkType,
             metadata->getCollVersion(),
             LogicalClock::get(opCtx)->getClusterTime().asTimestamp());
 

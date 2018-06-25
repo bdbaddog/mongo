@@ -108,7 +108,7 @@ public:
         const ServiceContext::UniqueOperationContext opCtxPtr = cc().makeOperationContext();
         OperationContext& opCtx = *opCtxPtr;
 
-        OldClientWriteContext ctx(&opCtx, ns());
+        dbtests::WriteContextForTests ctx(&opCtx, ns());
         DBDirectClient db(&opCtx);
 
         db.insert(ns(), BSON("x" << 1 << "y" << 2));
@@ -209,7 +209,7 @@ public:
         OperationContext& opCtx = *opCtxPtr;
         DBDirectClient db(&opCtx);
 
-        db.createCollection("unittests.clienttests.create", 4096, true);
+        db.createCollection("unittests.clienttests.create");
         BSONObj info;
         ASSERT(db.runCommand("unittests",
                              BSON("collstats"

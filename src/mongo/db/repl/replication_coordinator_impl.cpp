@@ -89,8 +89,8 @@
 namespace mongo {
 namespace repl {
 
-MONGO_FP_DECLARE(stepdownHangBeforePerformingPostMemberStateUpdateActions);
-MONGO_FP_DECLARE(transitionToPrimaryHangBeforeTakingGlobalExclusiveLock);
+MONGO_FAIL_POINT_DEFINE(stepdownHangBeforePerformingPostMemberStateUpdateActions);
+MONGO_FAIL_POINT_DEFINE(transitionToPrimaryHangBeforeTakingGlobalExclusiveLock);
 
 using CallbackArgs = executor::TaskExecutor::CallbackArgs;
 using CallbackFn = executor::TaskExecutor::CallbackFn;
@@ -254,16 +254,26 @@ void ReplicationCoordinatorImpl::WaiterList::add_inlock(WaiterType waiter) {
     _list.push_back(waiter);
 }
 
-void ReplicationCoordinatorImpl::WaiterList::signalAndRemoveIf_inlock(
+void ReplicationCoordinatorImpl::WaiterList::signalIf_inlock(
     stdx::function<bool(WaiterType)> func) {
-    // Only advance iterator when the element doesn't match.
     for (auto it = _list.begin(); it != _list.end();) {
         if (!func(*it)) {
+            // This element doesn't match, so we advance the iterator to the next one.
             ++it;
             continue;
         }
 
+        if (!(*it)->runs_once()) {
+            (*it)->notify_inlock();
+            // Keep the waiter on the list and let the guard remove it instead. Advance the
+            // iterator since we are skipping the removal.
+            ++it;
+            continue;
+        }
+
+        // Remove the waiter from the list if it was only meant to be notified once.
         WaiterType waiter = std::move(*it);
+
         if (it == std::prev(_list.end())) {
             // Iterator will be invalid after erasing the last element, so set it to the
             // next one (i.e. end()).
@@ -273,19 +283,15 @@ void ReplicationCoordinatorImpl::WaiterList::signalAndRemoveIf_inlock(
             std::swap(*it, _list.back());
             _list.pop_back();
         }
-
         // It's important to call notify() after the waiter has been removed from the list
         // since notify() might remove the waiter itself.
         waiter->notify_inlock();
     }
 }
 
-void ReplicationCoordinatorImpl::WaiterList::signalAndRemoveAll_inlock() {
-    std::vector<WaiterType> list = std::move(_list);
-    // Call notify() after removing the waiters from the list.
-    for (auto& waiter : list) {
-        waiter->notify_inlock();
-    }
+
+void ReplicationCoordinatorImpl::WaiterList::signalAll_inlock() {
+    this->signalIf_inlock([](Waiter* waiter) { return true; });
 }
 
 bool ReplicationCoordinatorImpl::WaiterList::remove_inlock(WaiterType waiter) {
@@ -814,8 +820,8 @@ void ReplicationCoordinatorImpl::shutdown(OperationContext* opCtx) {
             lk.lock();
             fassert(18823, _rsConfigState != kConfigStartingUp);
         }
-        _replicationWaiterList.signalAndRemoveAll_inlock();
-        _opTimeWaiterList.signalAndRemoveAll_inlock();
+        _replicationWaiterList.signalAll_inlock();
+        _opTimeWaiterList.signalAll_inlock();
         _currentCommittedSnapshotCond.notify_all();
         _initialSyncer.swap(initialSyncerCopy);
         _stepDownWaiters.notify_all();
@@ -1046,6 +1052,11 @@ void ReplicationCoordinatorImpl::setMyLastAppliedOpTimeForward(const OpTime& opT
     if (opTime > _getMyLastAppliedOpTime_inlock()) {
         _setMyLastAppliedOpTime_inlock(opTime, false, consistency);
         _reportUpstream_inlock(std::move(lock));
+    } else if (consistency == DataConsistency::Consistent && _canAcceptNonLocalWrites &&
+               _rsConfig.getWriteMajority() == 1) {
+        // Single vote primaries may have a lagged stable timestamp due to paring back the stable
+        // timestamp to the all committed timestamp.
+        _setStableTimestampForStorage_inlock();
     }
 }
 
@@ -1111,7 +1122,7 @@ void ReplicationCoordinatorImpl::_setMyLastAppliedOpTime_inlock(const OpTime& op
     }
 
     // Signal anyone waiting on optime changes.
-    _opTimeWaiterList.signalAndRemoveIf_inlock(
+    _opTimeWaiterList.signalIf_inlock(
         [opTime](Waiter* waiter) { return waiter->opTime <= opTime; });
 
     if (opTime.isNull()) {
@@ -1122,6 +1133,9 @@ void ReplicationCoordinatorImpl::_setMyLastAppliedOpTime_inlock(const OpTime& op
     // transactions reading from the local snapshot should start before the oldest timestamp is
     // advanced to avoid races.
     _externalState->updateLocalSnapshot(opTime);
+
+    // Notify the oplog waiters after updating the local snapshot.
+    signalOplogWaiters();
 
     // Add the new applied optime to the list of stable optime candidates and then set the last
     // stable optime. Stable optimes are used to determine the last optime that it is safe to revert
@@ -1335,9 +1349,15 @@ Status ReplicationCoordinatorImpl::_waitUntilClusterTimeForRead(OperationContext
     auto targetOpTime = OpTime(clusterTime.asTimestamp(), OpTime::kUninitializedTerm);
     invariant(!readConcern.getArgsOpTime());
 
+    // TODO SERVER-34620: Re-enable speculative behavior when "atClusterTime" is specified.
+    auto session = OperationContextSession::get(opCtx);
+    const bool speculative =
+        session && session->inMultiDocumentTransaction() && !readConcern.getArgsAtClusterTime();
+
     const bool isMajorityCommittedRead =
-        readConcern.getLevel() == ReadConcernLevel::kMajorityReadConcern ||
-        readConcern.getLevel() == ReadConcernLevel::kSnapshotReadConcern;
+        (readConcern.getLevel() == ReadConcernLevel::kMajorityReadConcern ||
+         readConcern.getLevel() == ReadConcernLevel::kSnapshotReadConcern) &&
+        !speculative;
 
     return _waitUntilOpTime(opCtx, isMajorityCommittedRead, targetOpTime, deadline);
 }
@@ -1628,10 +1648,6 @@ Status ReplicationCoordinatorImpl::stepDown(OperationContext* opCtx,
                 "specified that we should step down for"};
     }
 
-    // TODO SERVER-34395: Remove this method and kill cursors as part of killAllUserOperations call
-    // when the CursorManager no longer requires collection locks to kill cursors.
-    _externalState->killAllTransactionCursors(opCtx);
-
     stdx::unique_lock<stdx::mutex> lk(_mutex);
 
     auto status = opCtx->checkForInterruptNoAssert();
@@ -1760,6 +1776,14 @@ void ReplicationCoordinatorImpl::_signalStepDownWaiterIfReady_inlock() {
 void ReplicationCoordinatorImpl::_handleTimePassing(
     const executor::TaskExecutor::CallbackArgs& cbData) {
     if (!cbData.status.isOK()) {
+        return;
+    }
+
+    // For election protocol v1, call _startElectSelfIfEligibleV1 to avoid race
+    // against other elections caused by events like election timeout, replSetStepUp etc.
+    if (isV1ElectionProtocol()) {
+        _startElectSelfIfEligibleV1(
+            TopologyCoordinator::StartElectionReason::kSingleNodeStepDownTimeout);
         return;
     }
 
@@ -1946,14 +1970,22 @@ Status ReplicationCoordinatorImpl::processReplSetGetStatus(
     BSONObjBuilder* response, ReplSetGetStatusResponseStyle responseStyle) {
 
     BSONObj initialSyncProgress;
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
     if (responseStyle == ReplSetGetStatusResponseStyle::kInitialSync) {
-        if (_initialSyncer) {
-            initialSyncProgress = _initialSyncer->getInitialSyncProgress();
+        std::shared_ptr<InitialSyncer> initialSyncerCopy;
+        {
+            stdx::lock_guard<stdx::mutex> lk(_mutex);
+            initialSyncerCopy = _initialSyncer;
+        }
+
+        // getInitialSyncProgress must be called outside the ReplicationCoordinatorImpl::_mutex
+        // lock. Else it might deadlock with InitialSyncer::_multiApplierCallback where it first
+        // acquires InitialSyncer::_mutex and then ReplicationCoordinatorImpl::_mutex.
+        if (initialSyncerCopy) {
+            initialSyncProgress = initialSyncerCopy->getInitialSyncProgress();
         }
     }
 
-
+    stdx::lock_guard<stdx::mutex> lk(_mutex);
     Status result(ErrorCodes::InternalError, "didn't set status in prepareStatusResponse");
     _topCoord->prepareStatusResponse(
         TopologyCoordinator::ReplSetStatusArgs{
@@ -2450,9 +2482,9 @@ ReplicationCoordinatorImpl::_updateMemberStateFromTopologyCoordinator_inlock(
     PostMemberStateUpdateAction result;
     if (_memberState.primary() || newState.removed() || newState.rollback()) {
         // Wake up any threads blocked in awaitReplication, close connections, etc.
-        _replicationWaiterList.signalAndRemoveAll_inlock();
+        _replicationWaiterList.signalAll_inlock();
         // Wake up the optime waiter that is waiting for primary catch-up to finish.
-        _opTimeWaiterList.signalAndRemoveAll_inlock();
+        _opTimeWaiterList.signalAll_inlock();
         // If there are any pending stepdown command requests wake them up.
         _stepDownWaiters.notify_all();
 
@@ -2844,7 +2876,7 @@ ReplicationCoordinatorImpl::_setCurrentRSConfig_inlock(OperationContext* opCtx,
 }
 
 void ReplicationCoordinatorImpl::_wakeReadyWaiters_inlock() {
-    _replicationWaiterList.signalAndRemoveIf_inlock([this](Waiter* waiter) {
+    _replicationWaiterList.signalIf_inlock([this](Waiter* waiter) {
         return _doneWaitingForReplication_inlock(waiter->opTime, *waiter->writeConcern);
     });
 }
@@ -3326,7 +3358,7 @@ Status ReplicationCoordinatorImpl::updateTerm(OperationContext* opCtx, long long
     }
 
     // Check we haven't acquired any lock, because potential stepdown needs global lock.
-    dassert(!opCtx->lockState()->isLocked());
+    dassert(!opCtx->lockState()->isLocked() || opCtx->lockState()->isNoop());
     TopologyCoordinator::UpdateTermResult updateTermResult;
     EventHandle finishEvh;
 
@@ -3400,7 +3432,7 @@ size_t ReplicationCoordinatorImpl::getNumUncommittedSnapshots() {
     return _uncommittedSnapshotsSize.load();
 }
 
-MONGO_FP_DECLARE(disableSnapshotting);
+MONGO_FAIL_POINT_DEFINE(disableSnapshotting);
 
 bool ReplicationCoordinatorImpl::_updateCommittedSnapshot_inlock(
     const OpTime& newCommittedSnapshot) {

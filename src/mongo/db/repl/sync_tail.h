@@ -71,30 +71,6 @@ public:
                               WorkerMultikeyPathInfo* workerMultikeyPathInfo)>;
 
     /**
-     * Maximum number of operations in each batch that can be applied using multiApply().
-     */
-    static AtomicInt32 replBatchLimitOperations;
-
-    /**
-     * Lower bound of batch limit size (in bytes) returned by calculateBatchLimitBytes().
-     */
-    static const unsigned int replBatchLimitBytes = 100 * 1024 * 1024;
-
-    /**
-     * Calculates batch limit size (in bytes) using the maximum capped collection size of the oplog
-     * size.
-     * Batches are limited to 10% of the oplog.
-     */
-    static std::size_t calculateBatchLimitBytes(OperationContext* opCtx,
-                                                StorageInterface* storageInterface);
-
-    /**
-     * Creates thread pool for writer tasks.
-     */
-    static std::unique_ptr<ThreadPool> makeWriterPool();
-    static std::unique_ptr<ThreadPool> makeWriterPool(int threadCount);
-
-    /**
      * Applies the operation that is in param o.
      * Functions for applying operations/commands and increment server status counters may
      * be overridden for testing.
@@ -230,18 +206,20 @@ public:
 
     /**
      * Fetch a single document referenced in the operation from the sync source.
+     *
+     * The sync source is specified at construction in
+     * OplogApplier::Options::missingDocumentSourceForInitialSync.
      */
     virtual BSONObj getMissingDoc(OperationContext* opCtx, const OplogEntry& oplogEntry);
 
     /**
      * If an update fails, fetches the missing document and inserts it into the local collection.
      *
-     * Returns true if the document was fetched and inserted successfully.
+     * Calls OplogApplier::Observer::onMissingDocumentsFetchedAndInserted() if the document was
+     * fetched and inserted successfully.
      */
-    virtual bool fetchAndInsertMissingDocument(OperationContext* opCtx,
+    virtual void fetchAndInsertMissingDocument(OperationContext* opCtx,
                                                const OplogEntry& oplogEntry);
-
-    void setHostname(const std::string& hostname);
 
     /**
      * Applies a batch of oplog entries by writing the oplog entries to the local oplog and then
@@ -266,7 +244,9 @@ private:
 
     class OpQueueBatcher;
 
-    std::string _hostname;
+    void _oplogApplication(OplogBuffer* oplogBuffer,
+                           ReplicationCoordinator* replCoord,
+                           OpQueueBatcher* batcher) noexcept;
 
     OplogApplier::Observer* const _observer;
     ReplicationConsistencyMarkers* const _consistencyMarkers;
@@ -289,19 +269,14 @@ private:
     bool _inShutdown = false;
 };
 
-// These free functions are used by the thread pool workers to write ops to the db.
-// They consume the passed in OperationPtrs and callers should not make any assumptions about the
-// state of the container after calling. However, these functions cannot modify the pointed-to
+// This free function is used by the thread pool workers to write ops to the db.
+// This consumes the passed in OperationPtrs and callers should not make any assumptions about the
+// state of the container after calling. However, this function cannot modify the pointed-to
 // operations because the OperationPtrs container contains const pointers.
 Status multiSyncApply(OperationContext* opCtx,
                       MultiApplier::OperationPtrs* ops,
                       SyncTail* st,
                       WorkerMultikeyPathInfo* workerMultikeyPathInfo);
-
-Status multiInitialSyncApply(OperationContext* opCtx,
-                             MultiApplier::OperationPtrs* ops,
-                             SyncTail* st,
-                             WorkerMultikeyPathInfo* workerMultikeyPathInfo);
 
 }  // namespace repl
 }  // namespace mongo

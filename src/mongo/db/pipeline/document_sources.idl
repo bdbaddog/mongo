@@ -78,14 +78,14 @@ structs:
               optional: true
               description: An object representing the point at which we should resume reporting
                            changes from.
-          $_resumeAfterClusterTime:
-              cpp_name: resumeAfterClusterTimeDeprecated
-              type: ResumeTokenClusterTime
+          
+          startAfter:
+              cpp_name: startAfter
+              type: resumeToken
               optional: true
-              description: The cluster time after which we should start reporting changes.
-                           Only one of resumeAfter and _resumeAfterClusterTime should be
-                           specified.  For internal use only. Deprecated in 4.0, use 
-                           startAtOperationTime instead.
+              description: An object representing the point at which we should start reporting
+                           changes from. This is allowed to be a token from an invalidating command.
+
           startAtOperationTime:
               cpp_name: startAtOperationTime
               type: timestamp

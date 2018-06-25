@@ -32,59 +32,135 @@
 
 #include "mongo/db/repl/oplog_applier.h"
 
+#include "mongo/db/auth/authorization_session.h"
+#include "mongo/db/namespace_string.h"
 #include "mongo/db/repl/sync_tail.h"
+#include "mongo/db/server_parameters.h"
 #include "mongo/util/log.h"
 
 namespace mongo {
 namespace repl {
 
+namespace {
+
+/**
+ * This server parameter determines the number of writer threads OplogApplier will have.
+ */
+MONGO_EXPORT_STARTUP_SERVER_PARAMETER(replWriterThreadCount, int, 16)
+    ->withValidator([](const int& newVal) {
+        if (newVal < 1 || newVal > 256) {
+            return Status(ErrorCodes::BadValue, "replWriterThreadCount must be between 1 and 256");
+        }
+
+        return Status::OK();
+    });
+
+MONGO_EXPORT_SERVER_PARAMETER(replBatchLimitOperations, int, 5 * 1000)
+    ->withValidator([](const int& newVal) {
+        if (newVal < 1 || newVal > (1000 * 1000)) {
+            return Status(ErrorCodes::BadValue,
+                          "replBatchLimitOperations must be between 1 and 1 million, inclusive");
+        }
+
+        return Status::OK();
+    });
+
+}  // namespace
+
 using CallbackArgs = executor::TaskExecutor::CallbackArgs;
+
+// static
+std::unique_ptr<ThreadPool> OplogApplier::makeWriterPool() {
+    return makeWriterPool(replWriterThreadCount);
+}
+
+// static
+std::unique_ptr<ThreadPool> OplogApplier::makeWriterPool(int threadCount) {
+    ThreadPool::Options options;
+    options.threadNamePrefix = "repl writer worker ";
+    options.poolName = "repl writer worker Pool";
+    options.maxThreads = options.minThreads = static_cast<size_t>(threadCount);
+    options.onCreateThread = [](const std::string&) {
+        // Only do this once per thread
+        if (!Client::getCurrent()) {
+            Client::initThreadIfNotAlready();
+            AuthorizationSession::get(cc())->grantInternalAuthorization();
+        }
+    };
+    auto pool = stdx::make_unique<ThreadPool>(options);
+    pool->startup();
+    return pool;
+}
+
+// static
+std::size_t OplogApplier::getBatchLimitOperations() {
+    return std::size_t(replBatchLimitOperations.load());
+}
+
+// static
+std::size_t OplogApplier::calculateBatchLimitBytes(OperationContext* opCtx,
+                                                   StorageInterface* storageInterface) {
+    auto oplogMaxSizeResult =
+        storageInterface->getOplogMaxSize(opCtx, NamespaceString::kRsOplogNamespace);
+    auto oplogMaxSize = fassert(40301, oplogMaxSizeResult);
+    return std::min(oplogMaxSize / 10, std::size_t(replBatchLimitBytes));
+}
 
 OplogApplier::OplogApplier(executor::TaskExecutor* executor,
                            OplogBuffer* oplogBuffer,
-                           Observer* observer,
-                           ReplicationCoordinator* replCoord,
-                           ReplicationConsistencyMarkers* consistencyMarkers,
-                           StorageInterface* storageInterface,
-                           const OplogApplier::Options& options,
-                           ThreadPool* writerPool)
-    : _executor(executor),
-      _oplogBuffer(oplogBuffer),
-      _observer(observer),
-      _replCoord(replCoord),
-      _consistencyMarkers(consistencyMarkers),
-      _storageInterface(storageInterface),
-      _options(options),
-      _syncTail(std::make_unique<SyncTail>(
-          _observer, _consistencyMarkers, _storageInterface, multiSyncApply, writerPool, options)) {
-    invariant(!options.relaxUniqueIndexConstraints);
+                           Observer* observer)
+    : _executor(executor), _oplogBuffer(oplogBuffer), _observer(observer) {}
+
+OplogBuffer* OplogApplier::getBuffer() const {
+    return _oplogBuffer;
 }
 
 Future<void> OplogApplier::startup() {
-    auto future = _promise.getFuture();
+    auto pf = makePromiseFuture<void>();
     auto callback =
-        [ this, promise = _promise.share() ](const CallbackArgs& args) mutable noexcept {
+        [ this, promise = pf.promise.share() ](const CallbackArgs& args) mutable noexcept {
         invariant(args.status);
         log() << "Starting oplog application";
-        _syncTail->oplogApplication(_oplogBuffer, _replCoord);
+        _run(_oplogBuffer);
         log() << "Finished oplog application";
         promise.setWith([] {});
     };
     invariant(_executor->scheduleWork(callback).getStatus());
-    return future;
+    return std::move(pf.future);
 }
 
 void OplogApplier::shutdown() {
-    _syncTail->shutdown();
+    _shutdown();
 }
 
 /**
  * Pushes operations read from sync source into oplog buffer.
  */
-void OplogApplier::enqueue(const Operations& operations) {}
+void OplogApplier::enqueue(OperationContext* opCtx,
+                           Operations::const_iterator begin,
+                           Operations::const_iterator end) {
+    OplogBuffer::Batch batch;
+    for (auto i = begin; i != end; ++i) {
+        batch.push_back(i->raw);
+    }
+    enqueue(opCtx, batch.cbegin(), batch.cend());
+}
+
+void OplogApplier::enqueue(OperationContext* opCtx,
+                           OplogBuffer::Batch::const_iterator begin,
+                           OplogBuffer::Batch::const_iterator end) {
+    OCCASIONALLY {
+        LOG(2) << "oplog buffer has " << _oplogBuffer->getSize() << " bytes";
+    }
+    _oplogBuffer->pushAllNonBlocking(opCtx, begin, end);
+}
 
 StatusWith<OplogApplier::Operations> OplogApplier::getNextApplierBatch(
     OperationContext* opCtx, const BatchLimits& batchLimits) {
+    if (batchLimits.ops == 0) {
+        return Status(ErrorCodes::InvalidOptions, "Batch size must be greater than 0.");
+    }
+
     std::uint32_t totalBytes = 0;
     Operations ops;
     BSONObj op;
@@ -120,13 +196,15 @@ StatusWith<OplogApplier::Operations> OplogApplier::getNextApplierBatch(
         if (ops.size() >= batchLimits.ops) {
             return std::move(ops);
         }
-        if (totalBytes + entry.getRawObjSizeBytes() >= batchLimits.bytes) {
+
+        // Never return an empty batch if there are operations left.
+        if ((totalBytes + entry.getRawObjSizeBytes() >= batchLimits.bytes) && (ops.size() > 0)) {
             return std::move(ops);
         }
 
         // Add op to buffer.
-        ops.push_back(std::move(entry));
         totalBytes += entry.getRawObjSizeBytes();
+        ops.push_back(std::move(entry));
         BSONObj opToPopAndDiscard;
         invariant(_oplogBuffer->tryPop(opCtx, &opToPopAndDiscard));
         dassert(ops.back() == OplogEntry(opToPopAndDiscard));
@@ -136,7 +214,7 @@ StatusWith<OplogApplier::Operations> OplogApplier::getNextApplierBatch(
 
 StatusWith<OpTime> OplogApplier::multiApply(OperationContext* opCtx, Operations ops) {
     _observer->onBatchBegin(ops);
-    auto lastApplied = _syncTail->multiApply(opCtx, std::move(ops));
+    auto lastApplied = _multiApply(opCtx, std::move(ops));
     _observer->onBatchEnd(lastApplied, {});
     return lastApplied;
 }

@@ -71,7 +71,7 @@ namespace repl {
 
 namespace {
 
-MONGO_FP_DECLARE(impersonateFullyUpgradedFutureVersion);
+MONGO_FAIL_POINT_DEFINE(impersonateFullyUpgradedFutureVersion);
 
 }  // namespace
 
@@ -353,6 +353,7 @@ public:
         result.appendNumber("maxWriteBatchSize", write_ops::kMaxWriteBatchSize);
         result.appendDate("localTime", jsTime());
         result.append("logicalSessionTimeoutMinutes", localLogicalSessionTimeoutMinutes);
+        result.appendNumber("connectionId", opCtx->getClient()->getConnectionId());
 
         if (MONGO_FAIL_POINT(impersonateFullyUpgradedFutureVersion)) {
             result.append("minWireVersion", WireVersion::FUTURE_WIRE_VERSION_FOR_TESTING);

@@ -68,6 +68,9 @@ public:
     virtual void getReadyIndexes(OperationContext* opCtx,
                                  std::vector<std::string>* names) const = 0;
 
+    virtual void getAllUniqueIndexes(OperationContext* opCtx,
+                                     std::vector<std::string>* names) const {}
+
     virtual BSONObj getIndexSpec(OperationContext* opCtx, StringData idxName) const = 0;
 
     /**
@@ -124,6 +127,8 @@ public:
                                   StringData idxName,
                                   long long newExpireSeconds) = 0;
 
+    virtual void updateIndexMetadata(OperationContext* opCtx, const IndexDescriptor* desc) {}
+
     /**
      * Sets the flags field of CollectionOptions to newValue.
      * Subsequent calls to getCollectionOptions should have flags==newValue and flagsSet==true.
@@ -144,12 +149,6 @@ public:
      * Updates the 'temp' setting for this collection.
      */
     virtual void setIsTemp(OperationContext* opCtx, bool isTemp) = 0;
-
-    /**
-     * Assigns a new UUID to this collection. All collections must have UUIDs, so this is called if
-     * a collection erroneously does not have a UUID.
-     */
-    virtual void addUUID(OperationContext* opCtx, CollectionUUID uuid, Collection* coll) = 0;
 
     /**
      * Compare the UUID argument to the UUID obtained from the metadata. Return true if they

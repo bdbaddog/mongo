@@ -78,7 +78,9 @@ using std::string;
 using std::vector;
 
 
-MONGO_INITIALIZER_WITH_PREREQUISITES(SetupInternalSecurityUser, ("EndStartupOptionStorage"))
+MONGO_INITIALIZER_GENERAL(SetupInternalSecurityUser,
+                          ("EndStartupOptionStorage"),
+                          ("CreateAuthorizationManager"))
 (InitializerContext* const context) try {
     User* user = new User(UserName("__system", "local"));
 
@@ -92,10 +94,10 @@ MONGO_INITIALIZER_WITH_PREREQUISITES(SetupInternalSecurityUser, ("EndStartupOpti
     if (mongodGlobalParams.whitelistedClusterNetwork) {
         const auto& whitelist = *mongodGlobalParams.whitelistedClusterNetwork;
 
-        auto restriction = stdx::make_unique<ClientSourceRestriction>(whitelist);
-        auto restrictionSet = stdx::make_unique<RestrictionSet<>>(std::move(restriction));
+        auto restriction = std::make_unique<ClientSourceRestriction>(whitelist);
+        auto restrictionSet = std::make_unique<RestrictionSet<>>(std::move(restriction));
         auto restrictionDocument =
-            stdx::make_unique<RestrictionDocument<>>(std::move(restrictionSet));
+            std::make_unique<RestrictionDocument<>>(std::move(restrictionSet));
 
         RestrictionDocuments clusterWhiteList(std::move(restrictionDocument));
 
@@ -402,7 +404,7 @@ Status AuthorizationManagerImpl::getRolesDescription(OperationContext* opCtx,
 
 Status AuthorizationManagerImpl::getRoleDescriptionsForDB(
     OperationContext* opCtx,
-    const std::string dbname,
+    StringData dbname,
     PrivilegeFormat privileges,
     AuthenticationRestrictionsFormat restrictions,
     bool showBuiltinRoles,
@@ -553,7 +555,7 @@ void AuthorizationManagerImpl::invalidateUserByName(const UserName& userName) {
     user->invalidate();
 }
 
-void AuthorizationManagerImpl::invalidateUsersFromDB(const std::string& dbname) {
+void AuthorizationManagerImpl::invalidateUsersFromDB(StringData dbname) {
     CacheGuard guard(this, CacheGuard::fetchSynchronizationManual);
     _updateCacheGeneration_inlock();
     stdx::unordered_map<UserName, User*>::iterator it = _userCache.begin();

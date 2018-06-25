@@ -101,7 +101,7 @@ MONGO_REGISTER_SHIM(Collection::parseValidationAction)
 
 namespace {
 // Used below to fail during inserts.
-MONGO_FP_DECLARE(failCollectionInserts);
+MONGO_FAIL_POINT_DEFINE(failCollectionInserts);
 
 // Uses the collator factory to convert the BSON representation of a collator to a
 // CollatorInterface. Returns null if the BSONObj is empty. We expect the stored collation to be
@@ -193,15 +193,6 @@ CollectionImpl::~CollectionImpl() {
         LOG(2) << "destructed collection " << ns() << " with UUID " << uuid()->toString();
     }
     _magic = 0;
-}
-
-void CollectionImpl::refreshUUID(OperationContext* opCtx) {
-    auto options = getCatalogEntry()->getCollectionOptions(opCtx);
-    // refreshUUID may be called from outside a WriteUnitOfWork. In such cases, there is no
-    // change to any on disk data, so no rollback handler is needed.
-    if (opCtx->lockState()->inAWriteUnitOfWork())
-        opCtx->recoveryUnit()->onRollback([ this, oldUUID = _uuid ] { this->_uuid = oldUUID; });
-    _uuid = options.uuid;
 }
 
 bool CollectionImpl::requiresIdIndex() const {
@@ -506,7 +497,7 @@ Status CollectionImpl::_insertDocuments(OperationContext* opCtx,
         invariant(RecordId::min() < loc);
         invariant(loc < RecordId::max());
 
-        BsonRecord bsonRecord = {loc, &(it->doc)};
+        BsonRecord bsonRecord = {loc, Timestamp(it->oplogSlot.opTime.getTimestamp()), &(it->doc)};
         bsonRecords.push_back(bsonRecord);
     }
 
@@ -717,8 +708,8 @@ StatusWith<RecordId> CollectionImpl::_updateDocumentWithMove(OperationContext* o
                                                              OpDebug* opDebug,
                                                              OplogUpdateEntryArgs* args,
                                                              const SnapshotId& sid) {
+    invariant(isMMAPV1());
     // Insert new record.
-    // TODO SERVER-30638, thread through actual timestamps.
     StatusWith<RecordId> newLocation = _recordStore->insertRecord(
         opCtx, newDoc.objdata(), newDoc.objsize(), Timestamp(), _enforceQuota(enforceQuota));
     if (!newLocation.isOK()) {
@@ -739,7 +730,7 @@ StatusWith<RecordId> CollectionImpl::_updateDocumentWithMove(OperationContext* o
     _recordStore->deleteRecord(opCtx, oldLocation);
 
     std::vector<BsonRecord> bsonRecords;
-    BsonRecord bsonRecord = {newLocation.getValue(), &newDoc};
+    BsonRecord bsonRecord = {newLocation.getValue(), Timestamp(), &newDoc};
     bsonRecords.push_back(bsonRecord);
 
     // Add indexes for new record.

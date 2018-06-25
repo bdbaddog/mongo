@@ -26,6 +26,7 @@ env.SConscript(
         'crypto',
         'db',
         'dbtests',
+        'embedded',
         'executor',
         'idl',
         'installer',
@@ -297,6 +298,7 @@ env.Library(
         'db/catalog/health_log',
         'db/commands/mongod',
         'db/commands/mongod_fcv',
+        'db/commands/server_status_servers',
         'db/dbdirectclient',
         'db/ftdc/ftdc_mongod',
         'db/free_mon/free_mon_mongod',
@@ -309,6 +311,7 @@ env.Library(
         'db/mongodandmongos',
         'db/op_observer_d',
         'db/periodic_runner_job_abort_expired_transactions',
+        'db/periodic_runner_job_decrease_snapshot_cache_pressure',
         'db/query_exec',
         'db/repair_database',
         'db/repair_database_and_check_version',
@@ -409,6 +412,7 @@ mongos = env.Program(
         'db/auth/authmongos',
         'db/commands/server_status',
         'db/commands/server_status_core',
+        'db/commands/server_status_servers',
         'db/curop',
         'db/ftdc/ftdc_mongos',
         'db/logical_time_metadata_hook',
@@ -424,6 +428,7 @@ mongos = env.Program(
         's/is_mongos',
         's/sharding_egress_metadata_hook_for_mongos',
         's/sharding_initialization',
+        's/transaction/router_session',
         's/query/cluster_cursor_cleanup_job',
         'transport/service_entry_point',
         'transport/transport_layer_manager',
@@ -520,7 +525,7 @@ if not has_option('noshell') and usemozjs:
             "shell_core",
             "db/server_options_core",
             "db/service_context_noop_init",
-            "client/clientdriver",
+            "client/clientdriver_network",
             "$BUILD_DIR/mongo/util/password",
         ],
         LIBDEPS_PRIVATE=[
@@ -639,9 +644,11 @@ env.Append(MODULE_BANNERS = [distsrc.File('README'),
                              distsrc.File('THIRD-PARTY-NOTICES'),
                              distsrc.File('MPL-2')])
 
-# If no module has introduced a file named LICENSE.txt, then inject the AGPL.
-if sum(itertools.imap(lambda x: x.name == "LICENSE.txt", env['MODULE_BANNERS'])) == 0:
-    env.Append(MODULE_BANNERS = [distsrc.File('GNU-AGPL-3.0')])
+# If no module has introduced a file named LICENSE-Enterprise.txt then this
+# is a Community build, so inject the AGPL and the Community license
+if sum(itertools.imap(lambda x: x.name == "LICENSE-Enterprise.txt", env['MODULE_BANNERS'])) == 0:
+    env.Append(MODULE_BANNERS = [distsrc.File('GNU-AGPL-3.0'),
+                                 distsrc.File('LICENSE-Community.txt')])
 
 # All module banners get staged to the top level of the tarfile, so we
 # need to fail if we are going to have a name collision.

@@ -73,6 +73,7 @@
 #include "mongo/s/query/cluster_cursor_manager.h"
 #include "mongo/s/query/cluster_find.h"
 #include "mongo/s/stale_exception.h"
+#include "mongo/s/transaction/router_session_runtime_state.h"
 #include "mongo/util/fail_point_service.h"
 #include "mongo/util/log.h"
 #include "mongo/util/mongoutils/str.h"
@@ -283,7 +284,7 @@ void execCommandClient(OperationContext* opCtx,
     }
 }
 
-MONGO_FP_DECLARE(doNotRefreshShardsOnRetargettingError);
+MONGO_FAIL_POINT_DEFINE(doNotRefreshShardsOnRetargettingError);
 
 void runCommand(OperationContext* opCtx,
                 const OpMsgRequest& request,
@@ -300,10 +301,7 @@ void runCommand(OperationContext* opCtx,
         return;
     }
 
-    // Transactions are disallowed in sharded clusters in MongoDB 4.0.
-    uassert(50841,
-            "Multi-document transactions cannot be run in a sharded cluster.",
-            !request.body.hasField("startTransaction") && !request.body.hasField("autocommit"));
+    CommandHelpers::uassertShouldAttemptParse(opCtx, command, request);
 
     // Parse the 'maxTimeMS' command option, and use it to set a deadline for the operation on
     // the OperationContext. Be sure to do this as soon as possible so that further processing by
@@ -334,7 +332,25 @@ void runCommand(OperationContext* opCtx,
     // Fill out all currentOp details.
     CurOp::get(opCtx)->setGenericOpRequestDetails(opCtx, nss, command, request.body, opType);
 
-    initializeOperationSessionInfo(opCtx, request.body, command->requiresAuth(), true, true);
+    boost::optional<ScopedRouterSession> scopedSession;
+    if (auto osi = initializeOperationSessionInfo(
+            opCtx, request.body, command->requiresAuth(), true, true, true)) {
+
+        if (osi->getAutocommit()) {
+            scopedSession.emplace(opCtx);
+
+            auto routerSession = RouterSessionRuntimeState::get(opCtx);
+            invariant(routerSession);
+
+            auto txnNumber = opCtx->getTxnNumber();
+            invariant(txnNumber);
+
+            auto startTxnSetting = osi->getStartTransaction();
+            bool startTransaction = startTxnSetting ? *startTxnSetting : false;
+
+            routerSession->beginOrContinueTxn(*txnNumber, startTransaction);
+        }
+    }
 
     auto& readConcernArgs = repl::ReadConcernArgs::get(opCtx);
     auto readConcernParseStatus = readConcernArgs.initialize(request.body);
@@ -362,13 +378,13 @@ void runCommand(OperationContext* opCtx,
             try {
                 execCommandClient(opCtx, invocation.get(), request, &crb);
                 return;
-            } catch (ExceptionForCat<ErrorCategory::NeedRetargettingError>& ex) {
+            } catch (const ExceptionForCat<ErrorCategory::NeedRetargettingError>& ex) {
                 const auto staleNs = [&] {
                     if (auto staleInfo = ex.extraInfo<StaleConfigInfo>()) {
-                        return NamespaceString(staleInfo->getns());
+                        return staleInfo->getNss();
                     } else if (auto implicitCreateInfo =
                                    ex.extraInfo<CannotImplicitlyCreateCollectionInfo>()) {
-                        return NamespaceString(implicitCreateInfo->getNss());
+                        return implicitCreateInfo->getNss();
                     } else {
                         throw;
                     }
@@ -383,32 +399,34 @@ void runCommand(OperationContext* opCtx,
                     throw;
                 }
 
-                if (!canRetry)
-                    throw;
-
-                LOG(2) << "Retrying command " << redact(request.body) << causedBy(ex);
-
+                // Send setShardVersion on this thread's versioned connections to shards (to support
+                // commands that use the legacy (ShardConnection) versioning protocol).
                 if (!MONGO_FAIL_POINT(doNotRefreshShardsOnRetargettingError)) {
                     ShardConnection::checkMyConnectionVersions(opCtx, staleNs.ns());
                 }
 
+                // Mark collection entry in cache as stale.
                 if (staleNs.isValid()) {
                     Grid::get(opCtx)->catalogCache()->invalidateShardedCollection(staleNs);
                 }
-
-                continue;
-            } catch (const ExceptionFor<ErrorCodes::StaleDbVersion>& e) {
-                Grid::get(opCtx)->catalogCache()->onStaleDatabaseVersion(e->getDb(),
-                                                                         e->getVersionReceived());
-                if (!canRetry)
-                    throw;
-                continue;
-            } catch (const ExceptionForCat<ErrorCategory::SnapshotError>& ex) {
-                LOG(2) << "Retrying command " << redact(request.body) << causedBy(ex);
-                if (!canRetry)
-                    throw;
+                if (canRetry) {
+                    continue;
+                }
+                throw;
+            } catch (const ExceptionFor<ErrorCodes::StaleDbVersion>& ex) {
+                // Mark database entry in cache as stale.
+                Grid::get(opCtx)->catalogCache()->onStaleDatabaseVersion(ex->getDb(),
+                                                                         ex->getVersionReceived());
+                if (canRetry) {
+                    continue;
+                }
+                throw;
+            } catch (const ExceptionForCat<ErrorCategory::SnapshotError>&) {
                 // Simple retry on any type of snapshot error.
-                continue;
+                if (canRetry) {
+                    continue;
+                }
+                throw;
             }
             MONGO_UNREACHABLE;
         }
@@ -766,12 +784,55 @@ void Strategy::explainFind(OperationContext* opCtx,
                                                            qr.getCollation());
             millisElapsed = timer.millis();
             break;
-        } catch (const ExceptionFor<ErrorCodes::StaleDbVersion>& e) {
-            Grid::get(opCtx)->catalogCache()->onStaleDatabaseVersion(e->getDb(),
-                                                                     e->getVersionReceived());
-            if (!canRetry) {
+        } catch (const ExceptionForCat<ErrorCategory::NeedRetargettingError>& ex) {
+            const auto staleNs = [&] {
+                if (auto staleInfo = ex.extraInfo<StaleConfigInfo>()) {
+                    return staleInfo->getNss();
+                } else if (auto implicitCreateInfo =
+                               ex.extraInfo<CannotImplicitlyCreateCollectionInfo>()) {
+                    return implicitCreateInfo->getNss();
+                } else {
+                    throw;
+                }
+            }();
+
+            if (staleNs.isEmpty()) {
+                // This should be impossible but older versions tried incorrectly to handle
+                // it here.
+                log() << "Received a stale config error with an empty namespace while "
+                         "executing "
+                      << redact(explainCmd) << " : " << redact(ex);
                 throw;
             }
+
+            // Send setShardVersion on this thread's versioned connections to shards (to support
+            // commands that use the legacy (ShardConnection) versioning protocol).
+            if (!MONGO_FAIL_POINT(doNotRefreshShardsOnRetargettingError)) {
+                ShardConnection::checkMyConnectionVersions(opCtx, staleNs.ns());
+            }
+
+            // Mark collection entry in cache as stale.
+            if (staleNs.isValid()) {
+                Grid::get(opCtx)->catalogCache()->invalidateShardedCollection(staleNs);
+            }
+            if (canRetry) {
+                continue;
+            }
+            throw;
+        } catch (const ExceptionFor<ErrorCodes::StaleDbVersion>& ex) {
+            // Mark database entry in cache as stale.
+            Grid::get(opCtx)->catalogCache()->onStaleDatabaseVersion(ex->getDb(),
+                                                                     ex->getVersionReceived());
+            if (canRetry) {
+                continue;
+            }
+            throw;
+        } catch (const ExceptionForCat<ErrorCategory::SnapshotError>&) {
+            // Simple retry on any type of snapshot error.
+            if (canRetry) {
+                continue;
+            }
+            throw;
         }
     }
 

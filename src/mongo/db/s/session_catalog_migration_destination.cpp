@@ -281,7 +281,8 @@ ProcessOplogResult processSessionOplog(OperationContext* opCtx,
                                            *oplogEntry.getWallClockTime(),
                                            sessionInfo,
                                            stmtId,
-                                           oplogLink);
+                                           oplogLink,
+                                           false /* prepare */);
 
             auto oplogOpTime = result.oplogTime;
             uassert(40633,
@@ -480,7 +481,7 @@ SessionCatalogMigrationDestination::State SessionCatalogMigrationDestination::ge
     return _state;
 }
 
-void SessionCatalogMigrationDestination::forceFail(std::string& errMsg) {
+void SessionCatalogMigrationDestination::forceFail(StringData errMsg) {
     _errorOccurred(errMsg);
 }
 

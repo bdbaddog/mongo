@@ -1,5 +1,3 @@
-// mr.h
-
 /**
  *    Copyright (C) 2012 10gen Inc.
  *
@@ -43,8 +41,6 @@
 
 namespace mongo {
 
-class Collection;
-class Database;
 class OperationContext;
 
 namespace mr {
@@ -176,7 +172,6 @@ private:
 };
 
 // -----------------
-
 
 class TupleKeyCmp {
 public:
@@ -376,10 +371,6 @@ public:
     void switchMode(bool jsMode);
     void bailFromJS();
 
-    static Collection* getCollectionOrUassert(OperationContext* opCtx,
-                                              Database* db,
-                                              const NamespaceString& nss);
-
     const Config& _config;
     DBDirectClient _db;
     bool _useIncremental;  // use an incremental collection
@@ -410,9 +401,6 @@ protected:
     ScriptingFunction _reduceAndFinalizeAndInsert;
 };
 
-BSONObj fast_emit(const BSONObj& args, void* data);
-BSONObj _bailFromJS(const BSONObj& args, void* data);
-
 void addPrivilegesRequiredForMapReduce(const BasicCommand* commandTemplate,
                                        const std::string& dbname,
                                        const BSONObj& cmdObj,
@@ -423,5 +411,5 @@ void addPrivilegesRequiredForMapReduce(const BasicCommand* commandTemplate,
  */
 bool mrSupportsWriteConcern(const BSONObj& cmd);
 
-}  // end mr namespace
-}
+}  // namespace mr
+}  // namespace mongo

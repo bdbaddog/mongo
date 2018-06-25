@@ -34,15 +34,11 @@
 namespace mongo {
 namespace executor {
 
-// This is a bitmask with the first bit set. It's used to mark connections that should be kept
-// open during stepdowns.
-const unsigned int NetworkInterface::kMessagingPortKeepOpen;
-
 NetworkInterface::NetworkInterface() {}
 NetworkInterface::~NetworkInterface() {}
 
-MONGO_FP_DECLARE(networkInterfaceDiscardCommandsBeforeAcquireConn);
-MONGO_FP_DECLARE(networkInterfaceDiscardCommandsAfterAcquireConn);
+MONGO_FAIL_POINT_DEFINE(networkInterfaceDiscardCommandsBeforeAcquireConn);
+MONGO_FAIL_POINT_DEFINE(networkInterfaceDiscardCommandsAfterAcquireConn);
 
 }  // namespace executor
 }  // namespace mongo

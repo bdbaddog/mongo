@@ -1,4 +1,4 @@
-// @tags: [does_not_support_stepdowns]
+// @tags: [does_not_support_stepdowns, requires_profiling]
 
 // Confirms that profiled find execution contains all expected metrics with proper values.
 
@@ -111,7 +111,16 @@
         assert.writeOK(coll.insert({a: 5, b: i}));
         assert.writeOK(coll.insert({a: i, b: 10}));
     }
+
+    // Until we get the failpoint described in the above comment (regarding SERVER-23620), we must
+    // run the query twice. The first time will create an inactive cache entry. The second run will
+    // take the same number of works, and create an active cache entry.
     assert.neq(coll.findOne({a: 5, b: 15}), null);
+    assert.neq(coll.findOne({a: 5, b: 15}), null);
+
+    // Run a query with the same shape, but with different parameters. The plan cached for the
+    // query above will perform poorly (since the selectivities are different) and we will be
+    // forced to replan.
     assert.neq(coll.findOne({a: 15, b: 10}), null);
     profileObj = getLatestProfilerEntry(testDB, profileEntryFilter);
 
@@ -131,10 +140,6 @@
     assert.eq(coll.find().comment("a comment").itcount(), 1);
     profileObj = getLatestProfilerEntry(testDB, profileEntryFilter);
     assert.eq(profileObj.command.comment, "a comment", tojson(profileObj));
-
-    assert.eq(coll.find().maxScan(3000).itcount(), 1);
-    profileObj = getLatestProfilerEntry(testDB, profileEntryFilter);
-    assert.eq(profileObj.command.maxScan, 3000, tojson(profileObj));
 
     var maxTimeMS = 100000;
     assert.eq(coll.find().maxTimeMS(maxTimeMS).itcount(), 1);

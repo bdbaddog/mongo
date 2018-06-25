@@ -36,9 +36,9 @@
 #include "mongo/db/commands/test_commands_enabled.h"
 #include "mongo/db/op_observer.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/db/repl/repl_client_info.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/session_catalog.h"
-#include "mongo/util/fail_point_service.h"
 
 namespace mongo {
 namespace {
@@ -79,6 +79,11 @@ public:
 
         // commitTransaction is retryable.
         if (session->transactionIsCommitted()) {
+            // We set the client last op to the last optime observed by the system to ensure that
+            // we wait for the specified write concern on an optime greater than or equal to the
+            // commit oplog entry.
+            auto& replClient = repl::ReplClientInfo::forClient(opCtx->getClient());
+            replClient.setLastOpToSystemLastOpTime(opCtx);
             return true;
         }
 
@@ -93,9 +98,6 @@ public:
 
 } commitTxn;
 
-MONGO_FP_DECLARE(pauseAfterTransactionPrepare);
-
-// TODO: This is a stub for testing storage prepare functionality.
 class CmdPrepareTxn : public BasicCommand {
 public:
     CmdPrepareTxn() : BasicCommand("prepareTransaction") {}
@@ -113,7 +115,7 @@ public:
     }
 
     std::string help() const override {
-        return "Preprares a transaction. THIS IS A STUB FOR TESTING.";
+        return "Prepares a transaction. This is only expected to be called by mongos.";
     }
 
     Status checkAuthForOperation(OperationContext* opCtx,
@@ -134,17 +136,7 @@ public:
                 "Transaction isn't in progress",
                 session->inMultiDocumentTransaction());
 
-        auto opObserver = opCtx->getServiceContext()->getOpObserver();
-        invariant(opObserver);
-        opObserver->onTransactionPrepare(opCtx);
-
-        // For testing purposes, this command prepares and immediately aborts the transaction,
-        // Running commit after prepare is not allowed yet.
-        // Prepared units of work cannot be released by the session, so we immediately abort here.
-        opCtx->getWriteUnitOfWork()->prepare();
-        // This failpoint will cause readers of prepared documents to return prepare conflicts.
-        MONGO_FAIL_POINT_PAUSE_WHILE_SET(pauseAfterTransactionPrepare);
-        session->abortActiveTransaction(opCtx);
+        session->prepareTransaction(opCtx);
         return true;
     }
 };

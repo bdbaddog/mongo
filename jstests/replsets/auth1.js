@@ -6,6 +6,11 @@
 load("jstests/replsets/rslib.js");
 
 (function() {
+    "use strict";
+
+    // TODO SERVER-35447: Multiple users cannot be authenticated on one connection within a session.
+    TestData.disableImplicitSessions = true;
+
     var name = "rs_auth1";
     var port = allocatePorts(5);
     var path = "jstests/libs/";
@@ -93,7 +98,7 @@ load("jstests/replsets/rslib.js");
                             "find did not throw, returned: " + tojson(r))
                         .toString();
         printjson(error);
-        assert.gt(error.indexOf("not authorized"), -1, "error was non-auth");
+        assert.gt(error.indexOf("command find requires authentication"), -1, "error was non-auth");
     }
 
     doQueryOn(slave);

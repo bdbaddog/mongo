@@ -1,4 +1,4 @@
-/**
+/*
  *    Copyright (C) 2017 MongoDB, Inc.
  *
  *    This program is free software: you can redistribute it and/or  modify
@@ -39,6 +39,7 @@
 #include "mongo/db/repl/oplog_entry.h"
 #include "mongo/db/repl/read_concern_args.h"
 #include "mongo/db/session_txn_record_gen.h"
+#include "mongo/db/single_transaction_stats.h"
 #include "mongo/db/storage/recovery_unit.h"
 #include "mongo/platform/atomic_word.h"
 #include "mongo/stdx/unordered_map.h"
@@ -63,12 +64,6 @@ class Session {
     MONGO_DISALLOW_COPYING(Session);
 
 public:
-    struct TransactionState {
-        static const OperationContext::Decoration<TransactionState> get;
-
-        bool requiresIXReadUpgrade = false;
-    };
-
     /**
      * Holds state for a snapshot read or multi-statement transaction in between network operations.
      */
@@ -106,9 +101,26 @@ public:
         WriteUnitOfWork::RecoveryUnitState _ruState;
     };
 
+    /**
+     *  An RAII object that stashes `TxnResouces` from the `opCtx` onto the stack. At destruction
+     *  it unstashes the `TxnResources` back onto the `opCtx`.
+     */
+    class SideTransactionBlock {
+    public:
+        SideTransactionBlock(OperationContext* opCtx);
+        ~SideTransactionBlock();
+
+        // Rule of 5: because we have a class-defined destructor, we need to explictly specify
+        // the move operator and move assignment operator.
+        SideTransactionBlock(SideTransactionBlock&&) = default;
+        SideTransactionBlock& operator=(SideTransactionBlock&&) = default;
+
+    private:
+        boost::optional<Session::TxnResources> _txnResources;
+        OperationContext* _opCtx;
+    };
+
     using CommittedStatementTimestampMap = stdx::unordered_map<StmtId, repl::OpTime>;
-    using CursorKillFunction =
-        std::function<size_t(OperationContext*, LogicalSessionId, TxnNumber)>;
     using CursorExistsFunction = std::function<bool(LogicalSessionId, TxnNumber)>;
 
     static const BSONObj kDeadEndSentinel;
@@ -206,7 +218,7 @@ public:
                                      TxnNumber txnNumber,
                                      std::vector<StmtId> stmtIdsWritten,
                                      const repl::OpTime& lastStmtIdWriteOpTime,
-                                     Date_t lastStmtIdWriteDate);
+                                     Date_t oplogLastStmtIdWriteDate);
 
     /**
      * Marks the session as requiring refresh. Used when the session state has been modified
@@ -256,35 +268,26 @@ public:
     void unstashTransactionResources(OperationContext* opCtx, const std::string& cmdName);
 
     /**
-     * Registers a function that will be used to kill client cursors on transaction commit or abort.
-     * TODO SERVER-34395: Move cursor kill function into Session instead of registering.
-     */
-    static void registerCursorKillFunction(CursorKillFunction cursorKillFunc) {
-        _cursorKillFunction = cursorKillFunc;
-    }
-
-    // TODO SERVER-34113: Remove the "cursor exists" mechanism from both Session and CursorManager
-    // once snapshot reads outside of multi-statement transcactions are no longer supported.
-    static void registerCursorExistsFunction(CursorExistsFunction cursorExistsFunc) {
-        _cursorExistsFunction = cursorExistsFunc;
-    }
-
-    /**
      * Commits the transaction, including committing the write unit of work and updating
      * transaction state.
      */
     void commitTransaction(OperationContext* opCtx);
 
     /**
+     * Puts a transaction into a prepared state.
+     */
+    void prepareTransaction(OperationContext* opCtx);
+
+    /**
      * Aborts the transaction outside the transaction, releasing transaction resources.
      */
-    void abortArbitraryTransaction(OperationContext* opCtx, bool shouldKillClientCursors);
+    void abortArbitraryTransaction();
 
     /**
      * Same as abortArbitraryTransaction, except only executes if _transactionExpireDate indicates
      * that the transaction has expired.
      */
-    void abortArbitraryTransactionIfExpired(OperationContext* opCtx);
+    void abortArbitraryTransactionIfExpired();
 
     /*
      * Aborts the transaction inside the transaction, releasing transaction resources.
@@ -293,32 +296,19 @@ public:
      */
     void abortActiveTransaction(OperationContext* opCtx);
 
-    /**
-     * Kills any open client cursors associated with the current transaction.
-     */
-    void killTransactionCursors(OperationContext* opCtx);
-
     bool getAutocommit() const {
         return _autocommit;
     }
 
     /**
      * Returns whether we are in a multi-document transaction, which means we have an active
-     * transaction which has autoCommit:false and has not been committed or aborted.
+     * transaction which has autoCommit:false and has not been committed or aborted. It is possible
+     * that the current transaction is stashed onto the stack via a `SideTransactionBlock`.
      */
     bool inMultiDocumentTransaction() const {
         stdx::lock_guard<stdx::mutex> lk(_mutex);
         return _txnState == MultiDocumentTransactionState::kInProgress;
     };
-
-    /**
-     * Returns whether we are in a read-only or multi-document transaction.
-     */
-    bool inSnapshotReadOrMultiDocumentTransaction() const {
-        stdx::lock_guard<stdx::mutex> lk(_mutex);
-        return _txnState == MultiDocumentTransactionState::kInProgress ||
-            _txnState == MultiDocumentTransactionState::kInSnapshotRead;
-    }
 
     bool transactionIsCommitted() const {
         stdx::lock_guard<stdx::mutex> lk(_mutex);
@@ -353,6 +343,10 @@ public:
         return _activeTxnNumber;
     }
 
+    boost::optional<SingleTransactionStats> getSingleTransactionStats() const {
+        return _singleTransactionStats;
+    }
+
     /**
      * If this session is holding stashed locks in _txnResourceStash, reports the current state of
      * the session using the provided builder. Locks the session object's mutex while running.
@@ -384,23 +378,16 @@ public:
         const repl::OplogEntry& entry);
 
 private:
-    // Holds function to be used to kill client cursors.
-    static CursorKillFunction _cursorKillFunction;
     // Holds function which determines whether the CursorManager has client cursor references for a
     // given transaction.
     static CursorExistsFunction _cursorExistsFunction;
 
     void _beginOrContinueTxn(WithLock,
-                             OperationContext* opCtx,
                              TxnNumber txnNumber,
                              boost::optional<bool> autocommit,
-                             boost::optional<bool> startTransaction,
-                             bool* canKillCursors);
+                             boost::optional<bool> startTransaction);
 
-    void _beginOrContinueTxnOnMigration(WithLock,
-                                        OperationContext* opCtx,
-                                        TxnNumber txnNumber,
-                                        bool* canKillCursors);
+    void _beginOrContinueTxnOnMigration(WithLock, TxnNumber txnNumber);
 
     // Checks if there is a conflicting operation on the current Session
     void _checkValid(WithLock) const;
@@ -409,16 +396,19 @@ private:
     // we don't start a txn that is too old.
     void _checkTxnValid(WithLock, TxnNumber txnNumber) const;
 
-    void _setActiveTxn(WithLock,
-                       OperationContext* opCtx,
-                       TxnNumber txnNumber,
-                       bool* canKillCursors);
+    void _setActiveTxn(WithLock, TxnNumber txnNumber);
 
     void _checkIsActiveTransaction(WithLock, TxnNumber txnNumber, bool checkAbort) const;
 
     boost::optional<repl::OpTime> _checkStatementExecuted(WithLock,
                                                           TxnNumber txnNumber,
                                                           StmtId stmtId) const;
+
+    // Returns the write date of the last committed write for this session and transaction. If no
+    // write has completed yet, returns an empty date.
+    //
+    // Throws if the session has been invalidated or the active transaction number doesn't match.
+    Date_t _getLastWriteDate(WithLock, TxnNumber txnNumber) const;
 
     UpdateRequest _makeUpdateRequest(WithLock,
                                      TxnNumber newTxnNumber,
@@ -430,12 +420,10 @@ private:
                                       std::vector<StmtId> stmtIdsWritten,
                                       const repl::OpTime& lastStmtIdWriteTs);
 
-    void _abortArbitraryTransaction(WithLock, OperationContext* opCtx, bool* canKillCursors);
+    void _abortArbitraryTransaction(WithLock);
 
     // Releases stashed transaction resources to abort the transaction.
-    // 'canKillCursors' is an output parameter, which when set to true indicates that transaction
-    // client cursors may be killed.
-    void _abortTransaction(WithLock, OperationContext* opCtx, bool* canKillCursors);
+    void _abortTransaction(WithLock);
 
     // Committing a transaction first changes its state to "Committing" and writes to the oplog,
     // then it changes the state to "Committed".
@@ -451,17 +439,10 @@ private:
     // 3) Migration. Should be able to skip committing transactions.
     void _commitTransaction(stdx::unique_lock<stdx::mutex> lk, OperationContext* opCtx);
 
-    void _killTransactionCursors(OperationContext* opCtx,
-                                 LogicalSessionId lsid,
-                                 TxnNumber txnNumber);
-
     const LogicalSessionId _sessionId;
 
     // Protects the member variables below.
     mutable stdx::mutex _mutex;
-
-    // Condition variable notified when we finish an attempt to commit the global WUOW.
-    stdx::condition_variable _commitcv;
 
     // Specifies whether the session information needs to be refreshed from storage
     bool _isValid{false};
@@ -489,7 +470,6 @@ private:
     // the transaction is in any state but kInProgress, no more operations can be collected.
     enum class MultiDocumentTransactionState {
         kNone,
-        kInSnapshotRead,
         kInProgress,
         kCommitting,
         kCommitted,
@@ -525,6 +505,9 @@ private:
     // This member is only applicable to operations running in a transaction. It is reset when a
     // transaction state resets.
     std::vector<MultikeyPathInfo> _multikeyPathInfo;
+
+    // Tracks metrics for a single multi-document transaction. Not used for retryable writes.
+    boost::optional<SingleTransactionStats> _singleTransactionStats;
 };
 
 }  // namespace mongo

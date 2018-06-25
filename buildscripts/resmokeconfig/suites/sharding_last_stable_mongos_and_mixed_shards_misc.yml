@@ -17,12 +17,8 @@ selector:
   # running in fully downgraded version, the config server won't forward the
   # command to the shards - it'll just return success immediately.
   - jstests/sharding/max_time_ms_sharded_new_commands.js
-  # Calls setFCV=4.0, which cannot be run on last-stable shards.
-  - jstests/sharding/database_versioning_upgrade_downgrade.js
-  - jstests/sharding/shard_collection_cache_upgrade_downgrade.js
   #### Enable when 4.0 becomes last-stable.
   - jstests/sharding/change_stream_no_shards.js
-  - jstests/sharding/change_streams_unsharded_becomes_sharded.js
   - jstests/sharding/create_database.js
   - jstests/sharding/database_and_shard_versioning_all_commands.js
   - jstests/sharding/database_versioning_safe_secondary_reads.js
@@ -39,11 +35,11 @@ selector:
   - jstests/sharding/safe_secondary_reads_drop_recreate.js
   - jstests/sharding/safe_secondary_reads_single_migration_suspend_range_deletion.js
   - jstests/sharding/safe_secondary_reads_single_migration_waitForDelete.js
-  - jstests/sharding/move_primary_basic.js
-  - jstests/sharding/move_primary_fails_without_database_version.js
-  - jstests/sharding/movePrimary1.js
   - jstests/sharding/mongos_validate_writes.js
   - jstests/sharding/resume_change_stream_on_subset_of_shards.js
+  # Can be un-blacklisted once the version of 4.0 used for 'last-stable' includes SERVER-34338's
+  # backport.
+  - jstests/sharding/explainFind_stale_mongos.js
   # Requires fix to SERVER-31689
   - jstests/sharding/aggregation_currentop.js
   #### End "Enable when 4.0 becomes last stable"
@@ -52,8 +48,6 @@ selector:
   - jstests/sharding/aggregations_in_session.js
   # New failpoint in v4.0 mongos.
   - jstests/sharding/crash_mongos_against_upgraded_cluster.js
-  # New failpoint in v4.0 mongod.
-  - jstests/sharding/move_primary_clone_test.js
   # New waitForClusterTime
   - jstests/sharding/auth_slaveok_routing.js
   # This test should not be run with a mixed cluster environment.
@@ -67,14 +61,16 @@ selector:
   # Requires killOp to work for local operations on mongos, introduced in v4.0.
   - jstests/sharding/killop.js
   # New 4.0 feature
-  - jstests/sharding/snapshot_aggregate_mongos.js
-  - jstests/sharding/snapshot_find_mongos.js
   - jstests/sharding/change_stream_lookup_single_shard_cluster.js
+  - jstests/sharding/change_stream_metadata_notifications.js
+  - jstests/sharding/change_streams.js
+  - jstests/sharding/change_streams_primary_shard_unaware.js
   - jstests/sharding/change_streams_unsharded_becomes_sharded.js
   - jstests/sharding/change_streams_whole_db.js
   - jstests/sharding/lookup_change_stream_post_image_compound_shard_key.js
   - jstests/sharding/resume_change_stream.js
-  - jstests/sharding/transactions_prohibited_in_sharded_cluster.js
+  - jstests/sharding/change_stream_resume_from_different_mongos.js
+  - jstests/sharding/change_stream_shard_failover.js
   # Requires count command to be accurate on sharded clusters, introduced in v4.0.
   - jstests/sharding/accurate_count_with_predicate.js
   # Disabled throughout sharding. See SERVER-31937 for details.
@@ -133,7 +129,6 @@ selector:
   - jstests/sharding/sharding_multiple_ns_rs.js
   - jstests/sharding/shard_aware_init.js
   - jstests/sharding/balance_repl.js
-  - jstests/sharding/remove4.js
   - jstests/sharding/authCommands.js
   - jstests/sharding/test_stacked_migration_cleanup.js
   - jstests/sharding/shard_aware_primary_failover.js
@@ -141,12 +136,10 @@ selector:
   - jstests/sharding/mongod_returns_no_cluster_time_without_keys.js
   - jstests/sharding/delete_during_migrate.js
   - jstests/sharding/change_stream_chunk_migration.js
-  - jstests/sharding/move_primary_basic.js
   - jstests/sharding/change_streams_primary_shard_unaware.js
   - jstests/sharding/parallel.js
   - jstests/sharding/diffservers1.js
   - jstests/sharding/mongos_does_not_gossip_logical_time_without_keys.js
-  - jstests/sharding/group_slaveok.js
   - jstests/sharding/shard_existing_coll_chunk_count.js
   - jstests/sharding/explain_read_pref.js
   - jstests/sharding/auto_rebalance_parallel.js
@@ -174,7 +167,6 @@ selector:
   - jstests/sharding/cleanup_orphaned_basic.js
   - jstests/sharding/unowned_doc_filtering.js
   - jstests/sharding/basic_sharding_params.js
-  - jstests/sharding/movePrimary1.js
   - jstests/sharding/shard_aware_init_secondaries.js
   - jstests/sharding/mapReduce_inSharded_outSharded.js
   - jstests/sharding/large_chunk.js
@@ -232,7 +224,7 @@ selector:
   - jstests/sharding/addshard5.js
   - jstests/sharding/count2.js
   - jstests/sharding/features1.js
-  - jstests/sharding/change_stream_invalidation.js
+  - jstests/sharding/change_stream_metadata_notifications.js
   - jstests/sharding/regex_targeting.js
   - jstests/sharding/shard6.js
   - jstests/sharding/query_config.js
@@ -331,13 +323,11 @@ selector:
   - jstests/sharding/shard_keycount.js
   - jstests/sharding/refresh_sessions.js
   - jstests/sharding/update_immutable_fields.js
-  - jstests/sharding/move_primary_with_test_flag.js
   - jstests/sharding/drop_configdb.js
   - jstests/sharding/shard1.js
   - jstests/sharding/SERVER-7379.js
   - jstests/sharding/localhostAuthBypass.js
   - jstests/sharding/create_idx_empty_primary.js
-  - jstests/sharding/move_primary_fcv_40.js
   - jstests/sharding/clone_catalog_data.js
   - jstests/sharding/coll_epoch_test0.js
   - jstests/sharding/shard7.js
@@ -414,6 +404,8 @@ selector:
   - jstests/sharding/user_flags_sharded.js
   - jstests/sharding/move_chunk_with_session_helper.js
   - jstests/sharding/movechunk_include.js
+  # Enable when SERVER-33538 is backported.
+  - jstests/sharding/mapReduce_outSharded_checkUUID.js
 
 executor:
   config:

@@ -40,6 +40,9 @@
 #include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/json.h"
 #include "mongo/db/operation_context_noop.h"
+#include "mongo/db/repl/repl_settings.h"
+#include "mongo/db/repl/replication_coordinator_mock.h"
+#include "mongo/db/service_context.h"
 #include "mongo/db/storage/kv/kv_engine_test_harness.h"
 #include "mongo/db/storage/kv/kv_prefix.h"
 #include "mongo/db/storage/record_store_test_harness.h"
@@ -68,7 +71,12 @@ class WiredTigerHarnessHelper final : public RecordStoreHarnessHelper {
 public:
     WiredTigerHarnessHelper()
         : _dbpath("wt_test"),
-          _engine(kWiredTigerEngineName, _dbpath.path(), &_cs, "", 1, false, false, false, false) {}
+          _engine(kWiredTigerEngineName, _dbpath.path(), &_cs, "", 1, false, false, false, false) {
+        repl::ReplicationCoordinator::set(
+            getGlobalServiceContext(),
+            std::unique_ptr<repl::ReplicationCoordinator>(new repl::ReplicationCoordinatorMock(
+                getGlobalServiceContext(), repl::ReplSettings())));
+    }
 
     WiredTigerHarnessHelper(StringData extraStrings)
         : _dbpath("wt_test"),
@@ -239,10 +247,8 @@ TEST(WiredTigerRecordStoreTest, SizeStorer1) {
     rs.reset(NULL);
 
     {
-        long long numRecords;
-        long long dataSize;
-        ss.loadFromCache(uri, &numRecords, &dataSize);
-        ASSERT_EQUALS(N, numRecords);
+        auto& info = *ss.load(uri);
+        ASSERT_EQUALS(N, info.numRecords.load());
     }
 
     {
@@ -279,21 +285,18 @@ TEST(WiredTigerRecordStoreTest, SizeStorer1) {
             uow.commit();
         }
 
-        ss.syncCache(true);
+        ss.flush(true);
     }
 
     {
         ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
         const bool enableWtLogging = false;
         WiredTigerSizeStorer ss2(harnessHelper->conn(), indexUri, enableWtLogging);
-        ss2.fillCache();
-        long long numRecords;
-        long long dataSize;
-        ss2.loadFromCache(uri, &numRecords, &dataSize);
-        ASSERT_EQUALS(N, numRecords);
+        auto info = ss2.load(uri);
+        ASSERT_EQUALS(N, info->numRecords.load());
     }
 
-    rs.reset(NULL);  // this has to be deleted before ss
+    rs.reset(nullptr);  // this has to be deleted before ss
 }
 
 class GoodValidateAdaptor : public ValidateAdaptor {
@@ -324,7 +327,7 @@ private:
         wtrs->setSizeStorer(sizeStorer.get());
         uri = wtrs->getURI();
 
-        expectedNumRecords = 10000;
+        expectedNumRecords = 100;
         expectedDataSize = expectedNumRecords * 2;
         {
             ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
@@ -334,33 +337,28 @@ private:
             }
             uow.commit();
         }
-        ASSERT_EQUALS(expectedNumRecords, rs->numRecords(NULL));
-        ASSERT_EQUALS(expectedDataSize, rs->dataSize(NULL));
-        sizeStorer->storeToCache(uri, 0, 0);
+        auto info = sizeStorer->load(uri);
+        info->numRecords.store(0);
+        info->dataSize.store(0);
+        sizeStorer->store(uri, info);
     }
     virtual void tearDown() {
         expectedNumRecords = 0;
         expectedDataSize = 0;
 
-        rs.reset(NULL);
-        sizeStorer.reset(NULL);
-        harnessHelper.reset(NULL);
-        rs.reset(NULL);
+        rs.reset(nullptr);
+        sizeStorer->flush(false);
+        sizeStorer.reset(nullptr);
+        harnessHelper.reset(nullptr);
     }
 
 protected:
     long long getNumRecords() const {
-        long long numRecords;
-        long long unused;
-        sizeStorer->loadFromCache(uri, &numRecords, &unused);
-        return numRecords;
+        return sizeStorer->load(uri)->numRecords.load();
     }
 
     long long getDataSize() const {
-        long long unused;
-        long long dataSize;
-        sizeStorer->loadFromCache(uri, &unused, &dataSize);
-        return dataSize;
+        return sizeStorer->load(uri)->dataSize.load();
     }
 
     std::unique_ptr<WiredTigerHarnessHelper> harnessHelper;
@@ -416,7 +414,10 @@ TEST_F(SizeStorerValidateTest, InvalidSizeStorerAtCreation) {
     rs.reset(NULL);
 
     ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
-    sizeStorer->storeToCache(uri, expectedNumRecords * 2, expectedDataSize * 2);
+    auto info = sizeStorer->load(uri);
+    info->numRecords.store(expectedNumRecords * 2);
+    info->dataSize.store(expectedDataSize * 2);
+    sizeStorer->store(uri, info);
 
     WiredTigerRecordStore::Params params;
     params.ns = "a.b"_sd;

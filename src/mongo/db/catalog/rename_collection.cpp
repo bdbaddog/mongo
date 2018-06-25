@@ -134,6 +134,10 @@ Status renameCollectionCommon(OperationContext* opCtx,
     else if (!lockState->isW())
         globalWriteLock.emplace(opCtx);
 
+    // Allow the MODE_X lock above to be interrupted, but rename is not resilient to interruption
+    // when the onRenameCollection OpObserver takes an oplog collection lock.
+    UninterruptibleLockGuard noInterrupt(opCtx->lockState());
+
     // We stay in source context the whole time. This is mostly to set the CurOp namespace.
     boost::optional<OldClientContext> ctx;
     ctx.emplace(opCtx, source.ns());
@@ -254,7 +258,7 @@ Status renameCollectionCommon(OperationContext* opCtx,
             invariant(options.dropTarget);
             auto dropTargetUUID = targetColl->uuid();
             invariant(dropTargetUUID);
-            auto renameOpTime = opObserver->onRenameCollection(
+            auto renameOpTime = opObserver->preRenameCollection(
                 opCtx, source, target, sourceUUID, dropTargetUUID, options.stayTemp);
 
             if (!renameOpTimeFromApplyOps.isNull()) {
@@ -282,6 +286,8 @@ Status renameCollectionCommon(OperationContext* opCtx,
                 return status;
             }
 
+            opObserver->postRenameCollection(
+                opCtx, source, target, sourceUUID, dropTargetUUID, options.stayTemp);
             wunit.commit();
             return Status::OK();
         });
@@ -412,12 +418,16 @@ Status renameCollectionCommon(OperationContext* opCtx,
         AutoGetCollectionForRead autoSourceColl(opCtx, source);
         AutoGetCollection autoTmpColl(opCtx, tmpName, MODE_IX);
         ctx.reset();
-        if (globalWriteLock) {
-            const ResourceId globalLockResourceId(RESOURCE_GLOBAL, ResourceId::SINGLETON_GLOBAL);
-            lockState->downgrade(globalLockResourceId, MODE_IX);
-            invariant(!lockState->isW());
-        } else {
-            invariant(lockState->isW());
+
+        if (opCtx->getServiceContext()->getStorageEngine()->supportsDBLocking()) {
+            if (globalWriteLock) {
+                const ResourceId globalLockResourceId(RESOURCE_GLOBAL,
+                                                      ResourceId::SINGLETON_GLOBAL);
+                lockState->downgrade(globalLockResourceId, MODE_IX);
+                invariant(!lockState->isW());
+            } else {
+                invariant(lockState->isW());
+            }
         }
 
         auto cursor = sourceColl->getCursor(opCtx);

@@ -103,6 +103,7 @@ env.Library(
         "index_catalog.cpp",
     ],
     LIBDEPS=[
+        '$BUILD_DIR/mongo/base',
     ],
 )
 
@@ -112,6 +113,7 @@ env.Library(
         "index_catalog_entry.cpp",
     ],
     LIBDEPS=[
+        '$BUILD_DIR/mongo/base',
     ],
 )
 
@@ -158,9 +160,10 @@ env.CppUnitTest(
 env.Library(
     target='database_holder',
     source=[
-        "database_holder.cpp",
+        'database_holder.cpp',
     ],
     LIBDEPS=[
+        '$BUILD_DIR/mongo/base',
     ],
 )
 
@@ -170,6 +173,7 @@ env.Library(
         'collection_info_cache.cpp',
     ],
     LIBDEPS=[
+        '$BUILD_DIR/mongo/base',
     ],
 )
 
@@ -179,6 +183,7 @@ env.Library(
         'index_create.cpp',
     ],
     LIBDEPS=[
+        '$BUILD_DIR/mongo/base',
     ],
 )
 
@@ -286,7 +291,6 @@ env.Library(
         '$BUILD_DIR/mongo/db/system_index',
         '$BUILD_DIR/mongo/db/ttl_collection_cache',
         '$BUILD_DIR/mongo/db/views/views_mongod',
-        '$BUILD_DIR/mongo/s/stale_config',
     ],
     LIBDEPS_PRIVATE=[
         '$BUILD_DIR/mongo/db/logical_clock',

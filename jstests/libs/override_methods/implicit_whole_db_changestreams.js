@@ -65,8 +65,11 @@ const ChangeStreamPassthroughHelpers = {
     nsMatchFilter: function(db, collName) {
         return {
             $match: {
-                $or:
-                    [{"ns.db": db.getName(), "ns.coll": collName}, {operationType: "invalidate"}]
+                $or: [
+                    {"ns.db": db.getName(), "ns.coll": collName},
+                    {"to.db": db.getName(), "to.coll": collName},
+                    {operationType: "invalidate"}
+                ]
             }
         };
     },
@@ -96,6 +99,9 @@ const ChangeStreamPassthroughHelpers = {
     },
     upconvertGetMoreRequest: function(db, cmdObj) {
         return [this.execDBName(db), Object.assign({}, cmdObj, {collection: "$cmd.aggregate"})];
+    },
+    passthroughType: function() {
+        return ChangeStreamWatchMode.kDb;
     }
 };
 

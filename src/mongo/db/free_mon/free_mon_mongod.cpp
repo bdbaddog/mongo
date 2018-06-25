@@ -69,6 +69,9 @@
 namespace mongo {
 
 namespace {
+
+constexpr Seconds kDefaultMetricsGatherInterval(60);
+
 /**
  * Expose cloudFreeMonitoringEndpointURL set parameter to URL for free monitoring.
  */
@@ -76,7 +79,7 @@ class ExportedFreeMonEndpointURL : public LockedServerParameter<std::string> {
 public:
     ExportedFreeMonEndpointURL()
         : LockedServerParameter<std::string>("cloudFreeMonitoringEndpointURL",
-                                             "https://localhost:8080",
+                                             "https://cloud.mongodb.com/freemonitoring/mongo",
                                              ServerParameterType::kStartupOnly) {}
 
 
@@ -357,10 +360,12 @@ void startFreeMonitoring(ServiceContext* serviceContext) {
             registrationType = RegistrationType::RegisterOnStart;
         }
     } else if (globalFreeMonParams.freeMonitoringState == EnableCloudStateEnum::kRuntime) {
-        registrationType = RegistrationType::RegisterAfterOnTransitionToPrimary;
+        registrationType = RegistrationType::RegisterAfterOnTransitionToPrimaryIfEnabled;
     }
 
-    controllerPtr->start(registrationType, globalFreeMonParams.freeMonitoringTags);
+    controllerPtr->start(registrationType,
+                         globalFreeMonParams.freeMonitoringTags,
+                         Seconds(kDefaultMetricsGatherInterval));
 }
 
 void stopFreeMonitoring() {

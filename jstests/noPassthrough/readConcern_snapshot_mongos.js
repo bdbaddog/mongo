@@ -134,30 +134,10 @@
     }),
                                  ErrorCodes.InvalidOptions);
 
-    // TODO SERVER-33354: Add snapshot support for distinct on mongod.
     // TODO SERVER-33710: Add snapshot support for distinct on mongos.
     assert.commandFailedWithCode(sessionDb.runCommand({
         distinct: collName,
         key: "x",
-        readConcern: {level: "snapshot"},
-        txnNumber: NumberLong(txnNumber++)
-    }),
-                                 ErrorCodes.InvalidOptions);
-
-    // TODO SERVER-33354: Add snapshot support for geoNear on mongod.
-    // TODO SERVER-33712: Add snapshot support for geoNear on mongos.
-    assert.commandFailedWithCode(sessionDb.runCommand({
-        geoNear: collName,
-        near: [0, 0],
-        readConcern: {level: "snapshot"},
-        txnNumber: NumberLong(txnNumber++)
-    }),
-                                 ErrorCodes.InvalidOptions);
-
-    // TODO SERVER-33354: Add snapshot support for group on mongod.
-    // TODO SERVER-33711: Add snapshot support for group on mongos.
-    assert.commandFailedWithCode(sessionDb.runCommand({
-        group: {ns: collName, key: {_id: 1}, $reduce: function(curr, result) {}, initial: {}},
         readConcern: {level: "snapshot"},
         txnNumber: NumberLong(txnNumber++)
     }),

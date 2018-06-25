@@ -102,7 +102,8 @@ public:
                       const AggregationRequest& request,
                       std::unique_ptr<CollatorInterface> collator,
                       std::shared_ptr<MongoProcessInterface> mongoProcessInterface,
-                      StringMap<ExpressionContext::ResolvedNamespace> resolvedNamespaces);
+                      StringMap<ExpressionContext::ResolvedNamespace> resolvedNamespaces,
+                      boost::optional<UUID> collUUID);
 
     /**
      * Constructs an ExpressionContext to be used for MatchExpression parsing outside of the context
@@ -196,10 +197,13 @@ public:
     bool inMongos = false;
     bool allowDiskUse = false;
     bool bypassDocumentValidation = false;
-    bool inSnapshotReadOrMultiDocumentTransaction = false;
+    bool inMultiDocumentTransaction = false;
 
     NamespaceString ns;
+
+    // If known, the UUID of the execution namespace for this aggregation command.
     boost::optional<UUID> uuid;
+
     std::string tempDir;  // Defaults to empty to prevent external sorting in mongos.
 
     OperationContext* opCtx;

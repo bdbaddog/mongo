@@ -95,6 +95,7 @@
 #include "mongo/db/op_observer_registry.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/periodic_runner_job_abort_expired_transactions.h"
+#include "mongo/db/periodic_runner_job_decrease_snapshot_cache_pressure.h"
 #include "mongo/db/query/internal_plans.h"
 #include "mongo/db/repair_database_and_check_version.h"
 #include "mongo/db/repl/drop_pending_collection_reaper.h"
@@ -228,7 +229,11 @@ void logStartup(OperationContext* opCtx) {
     if (!collection) {
         BSONObj options = BSON("capped" << true << "size" << 10 * 1024 * 1024);
         repl::UnreplicatedWritesBlock uwb(opCtx);
-        uassertStatusOK(Database::userCreateNS(opCtx, db, startupLogCollectionName.ns(), options));
+        CollectionOptions collectionOptions;
+        uassertStatusOK(
+            collectionOptions.parse(options, CollectionOptions::ParseKind::parseForCommand));
+        uassertStatusOK(
+            Database::userCreateNS(opCtx, db, startupLogCollectionName.ns(), collectionOptions));
         collection = db->getCollection(opCtx, startupLogCollectionName);
     }
     invariant(collection);
@@ -270,7 +275,7 @@ void initWireSpec() {
     spec.isInternalClient = true;
 }
 
-MONGO_FP_DECLARE(shutdownAtStartup);
+MONGO_FAIL_POINT_DEFINE(shutdownAtStartup);
 
 ExitCode _initAndListen(int listenPort) {
     Client::initThread("initandlisten");
@@ -334,7 +339,7 @@ ExitCode _initAndListen(int listenPort) {
         serviceContext->setTransportLayer(std::move(tl));
     }
 
-    initializeStorageEngine(serviceContext);
+    initializeStorageEngine(serviceContext, StorageEngineInitFlags::kNone);
 
 #ifdef MONGO_CONFIG_WIREDTIGER_ENABLED
     if (EncryptionHooks::get(serviceContext)->restartRequired()) {
@@ -522,8 +527,14 @@ ExitCode _initAndListen(int listenPort) {
         waitForShardRegistryReload(startupOpCtx.get()).transitional_ignore();
     }
 
+    auto storageEngine = serviceContext->getStorageEngine();
+    invariant(storageEngine);
+
     if (!storageGlobalParams.readOnly) {
-        logStartup(startupOpCtx.get());
+
+        if (storageEngine->supportsCappedCollections()) {
+            logStartup(startupOpCtx.get());
+        }
 
         startMongoDFTDC();
 
@@ -601,13 +612,15 @@ ExitCode _initAndListen(int listenPort) {
     SessionKiller::set(serviceContext,
                        std::make_shared<SessionKiller>(serviceContext, killSessionsLocal));
 
-    // Start up a background task to periodically check for and kill expired transactions.
+    // Start up a background task to periodically check for and kill expired transactions; and a
+    // background task to periodically check for and decrease cache pressure by decreasing the
+    // target size setting for the storage engine's window of available snapshots.
+    //
     // Only do this on storage engines supporting snapshot reads, which hold resources we wish to
     // release periodically in order to avoid storage cache pressure build up.
-    auto storageEngine = serviceContext->getStorageEngine();
-    invariant(storageEngine);
     if (storageEngine->supportsReadConcernSnapshot()) {
         startPeriodicThreadToAbortExpiredTransactions(serviceContext);
+        startPeriodicThreadToDecreaseSnapshotHistoryCachePressure(serviceContext);
     }
 
     // Set up the logical session cache

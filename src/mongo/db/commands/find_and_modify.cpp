@@ -334,7 +334,7 @@ public:
             maybeDisableValidation.emplace(opCtx);
 
         const auto session = OperationContextSession::get(opCtx);
-        const auto inTransaction = session && session->inSnapshotReadOrMultiDocumentTransaction();
+        const auto inTransaction = session && session->inMultiDocumentTransaction();
         uassert(50781,
                 str::stream() << "Cannot write to system collection " << nsString.ns()
                               << " within a transaction.",
@@ -481,8 +481,11 @@ public:
                     if (!collection) {
                         uassertStatusOK(userAllowedCreateNS(nsString.db(), nsString.coll()));
                         WriteUnitOfWork wuow(opCtx);
+                        CollectionOptions collectionOptions;
+                        uassertStatusOK(collectionOptions.parse(
+                            BSONObj(), CollectionOptions::ParseKind::parseForCommand));
                         uassertStatusOK(Database::userCreateNS(
-                            opCtx, autoDb->getDb(), nsString.ns(), BSONObj()));
+                            opCtx, autoDb->getDb(), nsString.ns(), collectionOptions));
                         wuow.commit();
 
                         collection = autoDb->getDb()->getCollection(opCtx, nsString);

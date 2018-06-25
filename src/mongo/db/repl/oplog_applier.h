@@ -35,26 +35,24 @@
 #include "mongo/base/disallow_copying.h"
 #include "mongo/base/status.h"
 #include "mongo/base/status_with.h"
-#include "mongo/db/repl/multiapplier.h"
 #include "mongo/db/repl/oplog_buffer.h"
 #include "mongo/db/repl/oplog_entry.h"
-#include "mongo/db/repl/replication_consistency_markers.h"
-#include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/repl/storage_interface.h"
 #include "mongo/executor/task_executor.h"
 #include "mongo/util/concurrency/thread_pool.h"
 #include "mongo/util/future.h"
+#include "mongo/util/net/hostandport.h"
 
 namespace mongo {
 namespace repl {
-
-class SyncTail;
 
 /**
  * Applies oplog entries.
  * Reads from an OplogBuffer batches of operations that may be applied in parallel.
  */
 class OplogApplier {
+    MONGO_DISALLOW_COPYING(OplogApplier);
+
 public:
     /**
      * Used to configure behavior of this OplogApplier.
@@ -64,6 +62,10 @@ public:
         bool allowNamespaceNotFoundErrorsOnCrudOps = false;
         bool relaxUniqueIndexConstraints = false;
         bool skipWritesToOplog = false;
+
+        // For initial sync only. If an update fails, the missing document is fetched from
+        // this sync source to insert into the local collection.
+        boost::optional<HostAndPort> missingDocumentSourceForInitialSync;
     };
 
     /**
@@ -87,18 +89,42 @@ public:
     using Operations = std::vector<OplogEntry>;
 
     /**
+     * Lower bound of batch limit size (in bytes) returned by calculateBatchLimitBytes().
+     */
+    static const unsigned int replBatchLimitBytes = 100 * 1024 * 1024;
+
+    /**
+     * Creates thread pool for writer tasks.
+     */
+    static std::unique_ptr<ThreadPool> makeWriterPool();
+    static std::unique_ptr<ThreadPool> makeWriterPool(int threadCount);
+
+    /**
+     * Returns maximum number of operations in each batch that can be applied using multiApply().
+     */
+    static std::size_t getBatchLimitOperations();
+
+    /**
+     * Calculates batch limit size (in bytes) using the maximum capped collection size of the oplog
+     * size.
+     * Batches are limited to 10% of the oplog.
+     */
+    static std::size_t calculateBatchLimitBytes(OperationContext* opCtx,
+                                                StorageInterface* storageInterface);
+
+    /**
      * Constructs this OplogApplier with specific options.
      * Obtains batches of operations from the OplogBuffer to apply.
      * Reports oplog application progress using the Observer.
      */
-    OplogApplier(executor::TaskExecutor* executor,
-                 OplogBuffer* oplogBuffer,
-                 Observer* observer,
-                 ReplicationCoordinator* replCoord,
-                 ReplicationConsistencyMarkers* consistencyMarkers,
-                 StorageInterface* storageInterface,
-                 const Options& options,
-                 ThreadPool* writerPool);
+    OplogApplier(executor::TaskExecutor* executor, OplogBuffer* oplogBuffer, Observer* observer);
+
+    virtual ~OplogApplier() = default;
+
+    /**
+     * Returns this applier's buffer.
+     */
+    OplogBuffer* getBuffer() const;
 
     /**
      * Starts this OplogApplier.
@@ -114,8 +140,16 @@ public:
 
     /**
      * Pushes operations read into oplog buffer.
+     * Accepts both Operations (OplogEntry) and OplogBuffer::Batch (BSONObj) iterators.
+     * This supports current implementations of OplogFetcher and OplogBuffer which work in terms of
+     * BSONObj.
      */
-    void enqueue(const Operations& operations);
+    void enqueue(OperationContext* opCtx,
+                 Operations::const_iterator begin,
+                 Operations::const_iterator end);
+    void enqueue(OperationContext* opCtx,
+                 OplogBuffer::Batch::const_iterator begin,
+                 OplogBuffer::Batch::const_iterator end);
 
     /**
      * Returns a new batch of ops to apply.
@@ -140,13 +174,31 @@ public:
      * to at least the last optime of the batch. If 'minValid' is already greater than or equal
      * to the last optime of this batch, it will not be updated.
      *
-     * Passthrough function for SyncTail::multiApply().
-     *
      * TODO: remove when enqueue() is implemented.
      */
     StatusWith<OpTime> multiApply(OperationContext* opCtx, Operations ops);
 
 private:
+    /**
+     * Called from startup() to run oplog application loop.
+     * Currently applicable to steady state replication only.
+     * Implemented in subclasses but not visible otherwise.
+     */
+    virtual void _run(OplogBuffer* oplogBuffer) = 0;
+
+    /**
+     * Called from shutdown to signals oplog application loop to stop running.
+     * Currently applicable to steady state replication only.
+     * Implemented in subclasses but not visible otherwise.
+     */
+    virtual void _shutdown() = 0;
+
+    /**
+     * Called from multiApply() to apply a batch of operations in parallel.
+     * Implemented in subclasses but not visible otherwise.
+     */
+    virtual StatusWith<OpTime> _multiApply(OperationContext* opCtx, Operations ops) = 0;
+
     // Used to schedule task for oplog application loop.
     // Not owned by us.
     executor::TaskExecutor* const _executor;
@@ -156,24 +208,6 @@ private:
 
     // Not owned by us.
     Observer* const _observer;
-
-    // Not owned by us.
-    ReplicationCoordinator* const _replCoord;
-
-    // Not owned by us.
-    ReplicationConsistencyMarkers* const _consistencyMarkers;
-
-    // Not owned by us.
-    StorageInterface* const _storageInterface;
-
-    // Used to configure OplogApplier behavior.
-    const Options _options;
-
-    // Used to run oplog application loop.
-    std::unique_ptr<SyncTail> _syncTail;
-
-    // Used to generate Future to allow callers to wait for oplog application shutdown.
-    Promise<void> _promise;
 };
 
 /**
@@ -207,12 +241,6 @@ public:
     using FetchInfo = std::pair<OplogEntry, BSONObj>;
     virtual void onMissingDocumentsFetchedAndInserted(
         const std::vector<FetchInfo>& documentsFetchedAndInserted) = 0;
-
-    /**
-     * Used primarily by BackgroundSync to update server statistics during steady state replication.
-     * TODO: remove this function. See SERVER-33864.
-     */
-    virtual void onOperationConsumed(const BSONObj& op) = 0;
 };
 
 }  // namespace repl

@@ -7,6 +7,10 @@
 (function() {
     "use strict";
 
+    // This test looks for exact matches in log output, which does not account for implicit
+    // sessions.
+    TestData.disableImplicitSessions = true;
+
     load("jstests/libs/fixture_helpers.js");  // For FixtureHelpers.
     load("jstests/libs/check_log.js");        // For formatAsLogLine.
 
@@ -316,49 +320,7 @@
                                        keysDeleted: 1
                                      })
             },
-            {
-              test: function(db) {
-                  assert.commandWorked(db.runCommand({
-                      geoNear: coll.getName(),
-                      near: {type: "Point", coordinates: [1, 1]},
-                      spherical: true,
-                      query: {$comment: logFormatTestComment},
-                      collation: {locale: "fr"}
-                  }));
-              },
-              logFields: {
-                  command: "geoNear",
-                  geoNear: coll.getName(),
-                  near: {type: "Point", coordinates: [1, 1]},
-                  planSummary: "GEO_NEAR_2DSPHERE { loc: \"2dsphere\" }",
-                  query: {$comment: logFormatTestComment},
-                  collation: {locale: "fr"}
-              }
-            }
         ];
-
-        // The 'group' command cannot be run on a sharded collection.
-        if (!isMongos) {
-            testList.push({
-                test: function(db) {
-                    assert.eq(db.test.group({
-                        key: {a: 1},
-                        cond: {a: 1, $comment: logFormatTestComment},
-                        reduce: function() {},
-                        initial: {},
-                        collation: {locale: "fr"}
-                    }),
-                              [{"a": 1}]);
-                },
-                logFields: {
-                    command: "group",
-                    key: {a: 1},
-                    planSummary: "COLLSCAN",
-                    cond: {a: 1, $comment: logFormatTestComment},
-                    collation: {locale: "fr"}
-                }
-            });
-        }
 
         // Confirm log contains collation for find command.
         if (readWriteMode === "commands") {

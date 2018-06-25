@@ -6,16 +6,19 @@
     // For arrayEq.
     load("jstests/aggregation/extras/utils.js");
 
-    let viewsDB = db.getSiblingDB("views_creation");
+    const viewsDBName = "views_creation";
+
+    let viewsDB = db.getSiblingDB(viewsDBName);
     assert.commandWorked(viewsDB.dropDatabase());
 
     let collNames = viewsDB.getCollectionNames();
     assert.eq(0, collNames.length, tojson(collNames));
 
     // You cannot create a view that starts with 'system.'.
-    assert.commandFailedWithCode(viewsDB.runCommand({create: "system.views", viewOn: "collection"}),
-                                 ErrorCodes.InvalidNamespace,
-                                 "Created an illegal view named 'system.views'");
+    assert.commandFailedWithCode(
+        viewsDB.runCommand({create: "system.special", viewOn: "collection"}),
+        ErrorCodes.InvalidNamespace,
+        "Created an illegal view named 'system.views'");
 
     // We don't run this check on MMAPv1 as it automatically creates a system.indexes collection
     // when creating a database, which causes this command to fail with NamespaceAlreadyExists.
@@ -83,4 +86,23 @@
     assert.commandFailedWithCode(
         viewsDB.runCommand({create: "dollar$", viewOn: "collection", pipeline: pipe}),
         ErrorCodes.InvalidNamespace);
+    assert.commandFailedWithCode(viewsDB.runCommand({
+        create: "viewWithBadPipeline",
+        viewOn: "collection",
+        pipeline: [{$project: {_id: false}}, {$out: "notExistingCollection"}]
+    }),
+                                 ErrorCodes.OptionNotSupportedOnView);
+
+    // These test that, when an existing view in system.views is invalid because of a $out in the
+    // pipeline, the database errors on creation of a new view.
+    assert.commandWorked(viewsDB.system.views.insert({
+        _id: `${viewsDBName}.invalidView`,
+        viewOn: "collection",
+        pipeline: [{$project: {_id: false}}, {$out: "notExistingCollection"}]
+    }));
+    assert.commandFailedWithCode(
+        viewsDB.runCommand({create: "viewWithBadViewCatalog", viewOn: "collection", pipeline: []}),
+        ErrorCodes.OptionNotSupportedOnView);
+    assert.commandWorked(
+        viewsDB.system.views.remove({_id: `${viewsDBName}.invalidView`}, {justOne: true}));
 }());

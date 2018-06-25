@@ -290,6 +290,13 @@ public:
             return transactionRequirement == TransactionRequirement::kAllowed;
         }
 
+        /**
+         * Returns true if this stage writes persistent data to disk.
+         */
+        bool writesPersistentData() const {
+            return diskRequirement == DiskUseRequirement::kWritesPersistentData;
+        }
+
         // Indicates whether this stage needs to be at a particular position in the pipeline.
         const PositionRequirement requiredPosition;
 
@@ -641,7 +648,7 @@ public:
     /**
      * Get the dependencies this operation needs to do its job. If overridden, subclasses must add
      * all paths needed to apply their transformation to 'deps->fields', and call
-     * 'deps->setNeedTextScore()' if the text score is required.
+     * 'deps->setNeedsMetadata()' to indicate what metadata (e.g. text score), if any, is required.
      *
      * See GetDepsReturn above for the possible return values and what they mean.
      */

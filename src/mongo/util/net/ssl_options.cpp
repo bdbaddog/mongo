@@ -41,7 +41,7 @@
 #include "mongo/util/options_parser/startup_options.h"
 #include "mongo/util/text.h"
 
-#if MONGO_CONFIG_SSL_PROVIDER == SSL_PROVIDER_OPENSSL
+#if MONGO_CONFIG_SSL_PROVIDER == MONGO_CONFIG_SSL_PROVIDER_OPENSSL
 #include <openssl/ssl.h>
 #endif  // #ifdef MONGO_CONFIG_SSL
 
@@ -127,6 +127,8 @@ Status storeDisabledProtocols(const std::string& disabledProtocols,
     return Status::OK();
 }
 }  // nameapace
+
+SSLParams sslGlobalParams;
 
 Status parseCertificateSelector(SSLParams::CertificateSelector* selector,
                                 StringData name,
@@ -252,14 +254,16 @@ Status addSSLServerOptions(moe::OptionSection* options) {
                             moe::String,
                             "SSL Certificate in system store")
         .incompatibleWith("net.ssl.PEMKeyFile")
-        .incompatibleWith("net.ssl.PEMKeyPassword");
+        .incompatibleWith("net.ssl.PEMKeyPassword")
+        .setSources(moe::SourceYAMLCLI);
     options
         ->addOptionChaining("net.ssl.clusterCertificateSelector",
                             "sslClusterCertificateSelector",
                             moe::String,
                             "SSL Certificate in system store for internal SSL authentication")
         .incompatibleWith("net.ssl.clusterFile")
-        .incompatibleWith("net.ssl.clusterFilePassword");
+        .incompatibleWith("net.ssl.clusterFilePassword")
+        .setSources(moe::SourceYAMLCLI);
 #endif
 
     return Status::OK();
@@ -315,14 +319,17 @@ Status addSSLClientOptions(moe::OptionSection* options) {
                             moe::String,
                             "SSL Certificate in system store")
         .incompatibleWith("ssl.PEMKeyFile")
-        .incompatibleWith("ssl.PEMKeyPassword");
+        .incompatibleWith("ssl.PEMKeyPassword")
+        .setSources(moe::SourceYAMLCLI);
 #endif
 
-    options->addOptionChaining(
-        "ssl.disabledProtocols",
-        "sslDisabledProtocols",
-        moe::String,
-        "Comma separated list of TLS protocols to disable [TLS1_0,TLS1_1,TLS1_2]");
+    options
+        ->addOptionChaining(
+            "ssl.disabledProtocols",
+            "sslDisabledProtocols",
+            moe::String,
+            "Comma separated list of TLS protocols to disable [TLS1_0,TLS1_1,TLS1_2]")
+        .setSources(moe::SourceYAMLCLI);
 
     return Status::OK();
 }
@@ -439,7 +446,7 @@ Status storeSSLServerOptions(const moe::Environment& params) {
         if (!status.isOK()) {
             return status;
         }
-#if (MONGO_CONFIG_SSL_PROVIDER != SSL_PROVIDER_OPENSSL) || \
+#if (MONGO_CONFIG_SSL_PROVIDER != MONGO_CONFIG_SSL_PROVIDER_OPENSSL) || \
     (OPENSSL_VERSION_NUMBER >= 0x100000cf) /* 1.0.0l */
     } else {
         /* Disable TLS 1.0 by default on all platforms
@@ -581,7 +588,7 @@ Status storeSSLClientOptions(const moe::Environment& params) {
         if (!status.isOK()) {
             return status;
         }
-#if ((MONGO_CONFIG_SSL_PROVIDER != SSL_PROVIDER_OPENSSL) || \
+#if ((MONGO_CONFIG_SSL_PROVIDER != MONGO_CONFIG_SSL_PROVIDER_OPENSSL) || \
      (OPENSSL_VERSION_NUMBER >= 0x100000cf)) /* 1.0.0l */
     } else {
         /* Similar to the server setting above, we auto-disable TLS 1.0

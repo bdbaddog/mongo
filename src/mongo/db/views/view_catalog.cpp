@@ -248,7 +248,8 @@ StatusWith<stdx::unordered_set<NamespaceString>> ViewCatalog::_validatePipeline_
                               // the Pipeline for validation here. We won't do anything with the
                               // pipeline that will require a real implementation.
                               std::make_shared<StubMongoProcessInterface>(),
-                              std::move(resolvedNamespaces));
+                              std::move(resolvedNamespaces),
+                              boost::none);
 
     // Save this to a variable to avoid reading the atomic variable multiple times.
     auto currentFCV = serverGlobalParams.featureCompatibility.getVersion();
@@ -266,10 +267,23 @@ StatusWith<stdx::unordered_set<NamespaceString>> ViewCatalog::_validatePipeline_
     }
 
     // Validate that the view pipeline does not contain any ineligible stages.
-    auto sources = pipelineStatus.getValue()->getSources();
-    if (!sources.empty() && sources.front()->constraints().isChangeStreamStage()) {
-        return {ErrorCodes::OptionNotSupportedOnView,
-                "$changeStream cannot be used in a view definition"};
+    const auto& sources = pipelineStatus.getValue()->getSources();
+    if (!sources.empty()) {
+        const auto firstPersistentStage =
+            std::find_if(sources.begin(), sources.end(), [](const auto& source) {
+                return source->constraints().writesPersistentData();
+            });
+        if (sources.front()->constraints().isChangeStreamStage()) {
+            return {ErrorCodes::OptionNotSupportedOnView,
+                    "$changeStream cannot be used in a view definition"};
+        } else if (firstPersistentStage != sources.end()) {
+            mongo::StringBuilder errorMessage;
+            errorMessage << "The aggregation stage " << firstPersistentStage->get()->getSourceName()
+                         << " in location " << std::distance(sources.begin(), firstPersistentStage)
+                         << " of the pipeline cannot be used in the view definition of "
+                         << viewDef.name().ns() << " because it writes to disk";
+            return {ErrorCodes::OptionNotSupportedOnView, errorMessage.str()};
+        }
     }
 
     return std::move(involvedNamespaces);

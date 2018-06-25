@@ -896,10 +896,22 @@ TEST(RegexMatchExpression, RegexOptionsStringCannotContainEmbeddedNullByte) {
     }
 }
 
-TEST(RegexMatchExpression, RegexCannotBeInvalid) {
-    const auto invalid = "["_sd;
-    ASSERT_THROWS_CODE(
-        RegexMatchExpression regex("path", invalid, ""), AssertionException, ErrorCodes::BadValue);
+TEST(RegexMatchExpression, MalformedRegexAcceptedButMatchesNothing) {
+    RegexMatchExpression regex("a", "[(*ACCEPT)", "");
+    ASSERT_FALSE(regex.matchesBSON(BSON("a"
+                                        << "")));
+    ASSERT_FALSE(regex.matchesBSON(BSON("a"
+                                        << "[")));
+}
+
+TEST(RegexMatchExpression, RegexAcceptsUCPOption) {
+    RegexMatchExpression regex("a", "(*UCP)(\\w|\u304C)", "");
+    ASSERT(regex.matchesBSON(BSON("a"
+                                  << "k")));
+    ASSERT(regex.matchesBSON(BSON("a"
+                                  << "\u304B")));
+    ASSERT(regex.matchesBSON(BSON("a"
+                                  << "\u304C")));
 }
 
 TEST(ModMatchExpression, MatchesElement) {

@@ -10,7 +10,8 @@ selector:
   - jstests/core/txns/**/*.js
   # The following tests fail because a certain command or functionality is not supported by
   # mongos. This command or functionality is placed in a comment next to the failing test.
-  - jstests/core/apitest_db.js  # profiling.
+  - jstests/core/apitest_db.js  # serverStatus output doesn't have storageEngine.
+  - jstests/core/apitest_db_profile_level.js  # profiling.
   - jstests/core/apply_ops*.js  # applyOps, SERVER-1439.
   - jstests/core/bypass_doc_validation.js  # copyDatabase
   - jstests/core/capped*.js  # capped collections.
@@ -149,11 +150,7 @@ selector:
   - jstests/core/fts_spanish.js
   - jstests/core/geo_distinct.js
   - jstests/core/geo_s2ordering.js
-  - jstests/core/group1.js
-  - jstests/core/group2.js
-  - jstests/core/maxscan.js
   - jstests/core/nan.js
-  - jstests/core/null2.js
   - jstests/core/not2.js
   - jstests/core/sorta.js
   - jstests/core/sortc.js
@@ -175,8 +172,6 @@ selector:
   - jstests/core/orf.js #explain.executionStats is not CC
   # The `dbstats` command builds in-memory structures that are not causally consistent.
   - jstests/core/dbstats.js
-  # TODO SERVER-34248
-  - jstests/core/function_string_representations.js
   # TODO SERVER-33248: Remove this test from the blacklist. The secondary can get stuck without a
   # sync source if the RestartCatalog command kills its oplog fetching cursor, which blocks
   # secondary majority reads.

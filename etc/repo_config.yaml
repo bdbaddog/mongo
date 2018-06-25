@@ -74,6 +74,14 @@ repos:
       - yum/redhat/6/mongodb-org
       - yum/redhat/6Server/mongodb-org
 
+  - name: rhel67
+    type: rpm
+    edition: org
+    bucket: repo.mongodb.org
+    repos:
+      - yum/redhat/6/mongodb-org
+      - yum/redhat/6Server/mongodb-org
+
   - name: rhel70
     type: rpm
     edition: org
@@ -181,6 +189,18 @@ repos:
       - i386
     repos:
       - apt/ubuntu/dists/xenial/mongodb-org
+
+  - name: ubuntu1804
+    type: deb
+    code_name: "bionic"
+    edition: org
+    bucket: repo.mongodb.org
+    component: multiverse
+    architectures:
+      - amd64
+      - i386
+    repos:
+      - apt/ubuntu/dists/bionic/mongodb-org
 
 ####################
 #
@@ -337,3 +357,15 @@ repos:
       - i386
     repos:
       - apt/ubuntu/dists/xenial/mongodb-enterprise
+
+  - name: ubuntu1804
+    type: deb
+    code_name: "bionic"
+    edition: enterprise
+    bucket: repo.mongodb.com
+    component: multiverse
+    architectures:
+      - amd64
+      - i386
+    repos:
+      - apt/ubuntu/dists/bionic/mongodb-enterprise

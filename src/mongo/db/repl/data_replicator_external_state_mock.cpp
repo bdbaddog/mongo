@@ -36,6 +36,33 @@
 namespace mongo {
 namespace repl {
 
+namespace {
+
+class OplogApplierMock : public OplogApplier {
+    MONGO_DISALLOW_COPYING(OplogApplierMock);
+
+public:
+    OplogApplierMock(executor::TaskExecutor* executor,
+                     OplogBuffer* oplogBuffer,
+                     Observer* observer,
+                     DataReplicatorExternalStateMock* externalState)
+        : OplogApplier(executor, oplogBuffer, observer),
+          _observer(observer),
+          _externalState(externalState) {}
+
+private:
+    void _run(OplogBuffer* oplogBuffer) final {}
+    void _shutdown() final {}
+    StatusWith<OpTime> _multiApply(OperationContext* opCtx, Operations ops) final {
+        return _externalState->multiApplyFn(opCtx, ops, _observer);
+    }
+
+    OplogApplier::Observer* const _observer;
+    DataReplicatorExternalStateMock* const _externalState;
+};
+
+}  // namespace
+
 DataReplicatorExternalStateMock::DataReplicatorExternalStateMock()
     : multiApplyFn([](OperationContext*,
                       const MultiApplier::Operations& ops,
@@ -81,33 +108,18 @@ std::unique_ptr<OplogBuffer> DataReplicatorExternalStateMock::makeInitialSyncOpl
     return stdx::make_unique<OplogBufferBlockingQueue>();
 }
 
-StatusWith<OplogApplier::Operations> DataReplicatorExternalStateMock::getNextApplierBatch(
-    OperationContext* opCtx, OplogBuffer* oplogBuffer) {
-    OplogApplier::Operations ops;
-    OplogBuffer::Value op;
-    // For testing only. Return a single batch containing all of the operations in the oplog buffer.
-    while (oplogBuffer->tryPop(opCtx, &op)) {
-        OplogEntry entry(op);
-        // The "InitialSyncerPassesThroughGetNextApplierBatchInLockError" test case expects
-        // ErrorCodes::BadValue on an unexpected oplog entry version.
-        if (entry.getVersion() != OplogEntry::kOplogVersion) {
-            return {ErrorCodes::BadValue, ""};
-        }
-        ops.push_back(entry);
-    }
-    return std::move(ops);
+std::unique_ptr<OplogApplier> DataReplicatorExternalStateMock::makeOplogApplier(
+    OplogBuffer* oplogBuffer,
+    OplogApplier::Observer* observer,
+    ReplicationConsistencyMarkers*,
+    StorageInterface*,
+    const OplogApplier::Options&,
+    ThreadPool*) {
+    return std::make_unique<OplogApplierMock>(getTaskExecutor(), oplogBuffer, observer, this);
 }
 
 StatusWith<ReplSetConfig> DataReplicatorExternalStateMock::getCurrentConfig() const {
     return replSetConfigResult;
-}
-
-StatusWith<OpTime> DataReplicatorExternalStateMock::_multiApply(OperationContext* opCtx,
-                                                                MultiApplier::Operations ops,
-                                                                OplogApplier::Observer* observer,
-                                                                const HostAndPort& source,
-                                                                ThreadPool* writerPool) {
-    return multiApplyFn(opCtx, std::move(ops), observer);
 }
 
 }  // namespace repl

@@ -67,14 +67,6 @@
         autocommit: false
     }));
 
-    jsTestLog("Check that count accepts a statement ID");
-    assert.commandWorked(sessionDb.runCommand({
-        count: collName,
-        readConcern: {level: "snapshot"},
-        txnNumber: NumberLong(txnNumber++),
-        stmtId: NumberInt(0),
-    }));
-
     jsTestLog("Check that delete accepts a statement ID");
     assert.commandWorked(sessionDb.runCommand({
         delete: collName,
@@ -93,6 +85,8 @@
         readConcern: {level: "snapshot"},
         txnNumber: NumberLong(txnNumber++),
         stmtId: NumberInt(0),
+        startTransaction: true,
+        autocommit: false
     }));
 
     // The doTxn command is intentionally left out.
@@ -185,7 +179,8 @@
         stmtId: NumberInt(0),
         autocommit: false
     }));
-    jsTestLog("Check that geoNear accepts a statement ID");
+
+    jsTestLog("Check that geoSearch accepts a statement ID");
     assert.writeOK(testColl.insert({geo: {type: "Point", coordinates: [0, 0]}, a: 0}),
                    {writeConcern: {w: "majority"}});
     assert.writeOK(testColl.insert({geoh: {lat: 0, long: 0}, b: 0}),
@@ -203,14 +198,6 @@
         testColl.find({}, {readConcern: {level: "snapshot"}});
         return true;
     });
-    assert.commandWorked(sessionDb.runCommand({
-        geoNear: collName,
-        near: {type: "Point", coordinates: [0, 0]},
-        spherical: true,
-        readConcern: {level: "snapshot"},
-        txnNumber: NumberLong(txnNumber++),
-        stmtId: NumberInt(0)
-    }));
 
     jsTestLog("Check that geoSearch accepts a statement ID");
     assert.commandWorked(sessionDb.runCommand({
@@ -223,21 +210,6 @@
         stmtId: NumberInt(0),
         startTransaction: true,
         autocommit: false
-    }));
-
-    jsTestLog("Check that group accepts a statement ID");
-    assert.commandWorked(sessionDb.runCommand({
-        group: {
-            ns: collName,
-            key: {a: 1},
-            $reduce: function(curr, result) {
-                result.total += 1;
-            },
-            initial: {total: 0}
-        },
-        readConcern: {level: "snapshot"},
-        txnNumber: NumberLong(txnNumber++),
-        stmtId: NumberInt(0)
     }));
 
     jsTestLog("Check that insert accepts a statement ID");
@@ -267,7 +239,8 @@
 
     jsTestLog("Check that prepareTransaction accepts a statement ID");
     assert.commandWorked(sessionDb.runCommand({
-        find: collName,
+        insert: collName,
+        documents: [{_id: "doc2"}],
         readConcern: {level: "snapshot"},
         txnNumber: NumberLong(txnNumber),
         stmtId: NumberInt(0),

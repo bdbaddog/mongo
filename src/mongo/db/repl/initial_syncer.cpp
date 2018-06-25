@@ -67,28 +67,29 @@
 #include "mongo/util/mongoutils/str.h"
 #include "mongo/util/scopeguard.h"
 #include "mongo/util/time_support.h"
+#include "mongo/util/timer.h"
 
 namespace mongo {
 namespace repl {
 
 // Failpoint for initial sync
-MONGO_FP_DECLARE(failInitialSyncWithBadHost);
+MONGO_FAIL_POINT_DEFINE(failInitialSyncWithBadHost);
 
 // Failpoint which fails initial sync and leaves an oplog entry in the buffer.
-MONGO_FP_DECLARE(failInitSyncWithBufferedEntriesLeft);
+MONGO_FAIL_POINT_DEFINE(failInitSyncWithBufferedEntriesLeft);
 
 // Failpoint which causes the initial sync function to hang before copying databases.
-MONGO_FP_DECLARE(initialSyncHangBeforeCopyingDatabases);
+MONGO_FAIL_POINT_DEFINE(initialSyncHangBeforeCopyingDatabases);
 
 // Failpoint which causes the initial sync function to hang before finishing.
-MONGO_FP_DECLARE(initialSyncHangBeforeFinish);
+MONGO_FAIL_POINT_DEFINE(initialSyncHangBeforeFinish);
 
 // Failpoint which causes the initial sync function to hang before calling shouldRetry on a failed
 // operation.
-MONGO_FP_DECLARE(initialSyncHangBeforeGettingMissingDocument);
+MONGO_FAIL_POINT_DEFINE(initialSyncHangBeforeGettingMissingDocument);
 
 // Failpoint which stops the applier.
-MONGO_FP_DECLARE(rsSyncApplyStop);
+MONGO_FAIL_POINT_DEFINE(rsSyncApplyStop);
 
 namespace {
 using namespace executor;
@@ -176,7 +177,6 @@ public:
     void onMissingDocumentsFetchedAndInserted(const std::vector<FetchInfo>& docs) final {
         _fetchCount->fetchAndAdd(docs.size());
     }
-    void onOperationConsumed(const BSONObj& op) final {}
 
 private:
     AtomicUInt32* const _fetchCount;
@@ -198,7 +198,8 @@ InitialSyncer::InitialSyncer(
       _writerPool(writerPool),
       _storage(storage),
       _replicationProcess(replicationProcess),
-      _onCompletion(onCompletion) {
+      _onCompletion(onCompletion),
+      _observer(std::make_unique<InitialSyncApplyObserver>(&_fetchCount)) {
     uassert(ErrorCodes::BadValue, "task executor cannot be null", _exec);
     uassert(ErrorCodes::BadValue, "invalid storage interface", _storage);
     uassert(ErrorCodes::BadValue, "invalid replication process", _replicationProcess);
@@ -460,6 +461,8 @@ void InitialSyncer::_startInitialSyncAttemptCallback(
     // has to run outside lock.
     stdx::lock_guard<stdx::mutex> lock(_mutex);
 
+    _oplogApplier = {};
+
     LOG(2) << "Resetting sync source so a new one can be chosen for this initial sync attempt.";
     _syncSource = HostAndPort();
 
@@ -558,8 +561,17 @@ void InitialSyncer::_chooseSyncSourceCallback(
         return;
     }
 
-    // Schedule rollback ID checker.
     _syncSource = syncSource.getValue();
+
+    // Create oplog applier.
+    auto consistencyMarkers = _replicationProcess->getConsistencyMarkers();
+    OplogApplier::Options options;
+    options.allowNamespaceNotFoundErrorsOnCrudOps = true;
+    options.missingDocumentSourceForInitialSync = _syncSource;
+    _oplogApplier = _dataReplicatorExternalState->makeOplogApplier(
+        _oplogBuffer.get(), _observer.get(), consistencyMarkers, _storage, options, _writerPool);
+
+    // Schedule rollback ID checker.
     _rollbackChecker = stdx::make_unique<RollbackChecker>(_exec, _syncSource);
     auto scheduleResult = _rollbackChecker->reset([=](const RollbackChecker::Result& result) {
         return _rollbackCheckerResetCallback(result, onCompletionGuard);
@@ -584,7 +596,9 @@ Status InitialSyncer::_truncateOplogAndDropReplicatedDatabases() {
 
     // 1.) Truncate the oplog.
     LOG(2) << "Truncating the existing oplog: " << _opts.localOplogNS;
+    Timer timer;
     auto status = _storage->truncateCollection(opCtx.get(), _opts.localOplogNS);
+    log() << "Initial syncer oplog truncation finished in: " << timer.millis() << "ms";
     if (!status.isOK()) {
         // 1a.) Create the oplog.
         LOG(2) << "Creating the oplog: " << _opts.localOplogNS;
@@ -965,11 +979,9 @@ void InitialSyncer::_getNextApplierBatchCallback(
     const auto& ops = batchResult.getValue();
     if (!ops.empty()) {
         _fetchCount.store(0);
-        MultiApplier::MultiApplyFn applyBatchOfOperationsFn =
-            [ =, source = _syncSource ](OperationContext * opCtx, MultiApplier::Operations ops) {
-            InitialSyncApplyObserver observer(&_fetchCount);
-            return _dataReplicatorExternalState->_multiApply(
-                opCtx, ops, &observer, source, _writerPool);
+        MultiApplier::MultiApplyFn applyBatchOfOperationsFn = [this](OperationContext* opCtx,
+                                                                     MultiApplier::Operations ops) {
+            return _oplogApplier->multiApply(opCtx, std::move(ops));
         };
         const auto& lastEntry = ops.back();
         OpTimeWithHash lastApplied(lastEntry.getHash(), lastEntry.getOpTime());
@@ -1107,6 +1119,20 @@ void InitialSyncer::_rollbackCheckerCheckForRollbackCallback(
                    str::stream() << "Rollback occurred on our sync source " << _syncSource
                                  << " during initial sync"));
         return;
+    }
+
+    // Update all unique indexes belonging to non-replicated collections on secondaries. See comment
+    // in ReplicationCoordinatorExternalStateImpl::initializeReplSetStorage() for the explanation of
+    // why we do this.
+    // TODO: SERVER-34489 should add a check for latest FCV before making the upgrade call when
+    // upgrade downgrade is ready.
+    if (createTimestampSafeUniqueIndex) {
+        auto opCtx = makeOpCtx();
+        auto updateStatus = _storage->upgradeNonReplicatedUniqueIndexes(opCtx.get());
+        if (!updateStatus.isOK()) {
+            onCompletionGuard->setResultAndCancelRemainingWork_inlock(lock, updateStatus);
+            return;
+        }
     }
 
     // Success!
@@ -1445,10 +1471,12 @@ StatusWith<Operations> InitialSyncer::_getNextApplierBatch_inlock() {
         return Operations();
     }
 
-    // Access common batching logic in OplogApplier using passthrough function in
-    // DataReplicatorExternalState.
+    // Obtain next batch of operations from OplogApplier.
     auto opCtx = makeOpCtx();
-    return _dataReplicatorExternalState->getNextApplierBatch(opCtx.get(), _oplogBuffer.get());
+    OplogApplier::BatchLimits batchLimits;
+    batchLimits.bytes = OplogApplier::replBatchLimitBytes;
+    batchLimits.ops = OplogApplier::getBatchLimitOperations();
+    return _oplogApplier->getNextApplierBatch(opCtx.get(), batchLimits);
 }
 
 StatusWith<HostAndPort> InitialSyncer::_chooseSyncSource_inlock() {
@@ -1478,12 +1506,8 @@ Status InitialSyncer::_enqueueDocuments(Fetcher::Documents::const_iterator begin
     // Gets unblocked on shutdown.
     _oplogBuffer->waitForSpace(makeOpCtx().get(), info.toApplyDocumentBytes);
 
-    OCCASIONALLY {
-        LOG(2) << "bgsync buffer has " << _oplogBuffer->getSize() << " bytes";
-    }
-
     // Buffer docs for later application.
-    _oplogBuffer->pushAllNonBlocking(makeOpCtx().get(), begin, end);
+    _oplogApplier->enqueue(makeOpCtx().get(), begin, end);
 
     _lastFetched = info.lastDocument;
 

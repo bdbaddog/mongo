@@ -56,8 +56,13 @@ public:
 
     std::unique_ptr<OplogBuffer> makeInitialSyncOplogBuffer(OperationContext* opCtx) const override;
 
-    StatusWith<OplogApplier::Operations> getNextApplierBatch(OperationContext* opCtx,
-                                                             OplogBuffer* oplogBuffer) final;
+    std::unique_ptr<OplogApplier> makeOplogApplier(
+        OplogBuffer* oplogBuffer,
+        OplogApplier::Observer* observer,
+        ReplicationConsistencyMarkers* consistencyMarkers,
+        StorageInterface* storageInterface,
+        const OplogApplier::Options& options,
+        ThreadPool* writerPool) final;
 
     StatusWith<ReplSetConfig> getCurrentConfig() const override;
 
@@ -87,13 +92,6 @@ public:
     MultiApplyFn multiApplyFn;
 
     StatusWith<ReplSetConfig> replSetConfigResult = ReplSetConfig();
-
-private:
-    StatusWith<OpTime> _multiApply(OperationContext* opCtx,
-                                   MultiApplier::Operations ops,
-                                   OplogApplier::Observer* observer,
-                                   const HostAndPort& source,
-                                   ThreadPool* writerPool) override;
 };
 
 

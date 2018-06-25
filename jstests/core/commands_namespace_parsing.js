@@ -71,12 +71,6 @@
     assertFailsWithInvalidNamespacesForField(
         "distinct", {distinct: "", key: "a"}, isNotFullyQualified, isNotAdminCommand);
 
-    // Test group fails with an invalid collection name.
-    assertFailsWithInvalidNamespacesForField("group.ns",
-                                             {group: {ns: "", $reduce: () => {}, initial: {}}},
-                                             isNotFullyQualified,
-                                             isNotAdminCommand);
-
     // Test mapReduce fails with an invalid input collection name.
     assertFailsWithInvalidNamespacesForField("mapreduce",
                                              {
@@ -105,10 +99,6 @@
                                              },
                                              isNotFullyQualified,
                                              isNotAdminCommand);
-
-    // Test geoNear fails with an invalid collection name.
-    assertFailsWithInvalidNamespacesForField(
-        "geoNear", {geoNear: "", near: [0.0, 0.0]}, isNotFullyQualified, isNotAdminCommand);
 
     if (!isMongos) {
         // Test geoSearch fails with an invalid collection name.
@@ -361,13 +351,6 @@
                                              {explain: {distinct: "", key: "a"}},
                                              isNotFullyQualified,
                                              isNotAdminCommand);
-
-    // Test explain of group fails with an invalid collection name.
-    assertFailsWithInvalidNamespacesForField(
-        "explain.group.ns",
-        {explain: {group: {ns: "", $reduce: () => {}, initial: {}}}},
-        isNotFullyQualified,
-        isNotAdminCommand);
 
     // Test explain of find fails with an invalid collection name.
     assertFailsWithInvalidNamespacesForField(

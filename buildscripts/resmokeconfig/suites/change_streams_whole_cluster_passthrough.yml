@@ -17,6 +17,8 @@ selector:
   # "Cowardly refusing to run test with overridden write concern when it uses a command that can
   #  only perform w=1 writes: ..."
   - requires_eval_command
+  # Not relevant for whole-cluster change streams.
+  - do_not_run_in_whole_cluster_passthrough
 
 executor:
   archive:

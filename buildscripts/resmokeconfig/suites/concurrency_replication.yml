@@ -12,10 +12,13 @@ selector:
   - jstests/concurrency/fsm_workloads/agg_sort_external.js
   # The findAndModify_update_grow.js workload can cause OOM kills on test hosts.
   - jstests/concurrency/fsm_workloads/findAndModify_update_grow.js
+  exclude_with_any_tags:
+  - requires_sharding
 
 executor:
   archive:
     hooks:
+      - CheckReplDBHashInBackground
       - CheckReplDBHash
       - ValidateCollections
     tests: true
@@ -28,6 +31,7 @@ executor:
   # validating the entire contents of the collection.
   #
   # TODO SERVER-26466: Add CheckReplOplogs hook to the concurrency suite.
+  - class: CheckReplDBHashInBackground
   - class: CheckReplDBHash
   - class: ValidateCollections
   - class: CleanupConcurrencyWorkloads

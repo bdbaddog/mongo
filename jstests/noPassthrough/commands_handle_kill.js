@@ -179,14 +179,22 @@ if (${ canYield }) {
         {findAndModify: collName, filter: {fakeField: {$gt: 0}}, update: {$inc: {a: 1}}});
 
     assertCommandPropogatesPlanExecutorKillReason(
-        {geoNear: collName, near: {type: "Point", coordinates: [0, 0]}, spherical: true}, {
-            customSetup: function() {
-                assert.commandWorked(coll.createIndex({geoField: "2dsphere"}));
-            }
+        {
+          aggregate: collName,
+          cursor: {},
+          pipeline: [{
+              $geoNear: {
+                  near: {type: "Point", coordinates: [0, 0]},
+                  spherical: true,
+                  distanceField: "dis"
+              }
+          }]
+        },
+        {
+          customSetup: function() {
+              assert.commandWorked(coll.createIndex({geoField: "2dsphere"}));
+          }
         });
-
-    assertCommandPropogatesPlanExecutorKillReason(
-        {group: {ns: collName, key: "_id", $reduce: function(curr, result) {}, initial: {}}});
 
     assertCommandPropogatesPlanExecutorKillReason({find: coll.getName(), filter: {}});
 

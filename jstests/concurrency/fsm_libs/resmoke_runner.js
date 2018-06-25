@@ -8,7 +8,6 @@
     const prepareCollections = runner.internals.prepareCollections;
     const WorkloadFailure = runner.internals.WorkloadFailure;
     const throwError = runner.internals.throwError;
-    const shouldSkipWorkload = runner.internals.shouldSkipWorkload;
     const setupWorkload = runner.internals.setupWorkload;
     const teardownWorkload = runner.internals.teardownWorkload;
     const setIterations = runner.internals.setIterations;
@@ -73,11 +72,6 @@
 
         cluster.setup();
 
-        // Filter out workloads that need to be skipped.
-        //
-        // TODO SERVER-30001: Replace usages of $config.skip() functions with excluding files in the
-        // resmoke.py YAML suite by name or by tag.
-        workloads = workloads.filter(workload => !shouldSkipWorkload(workload, context, cluster));
         jsTest.log('Workload(s) started: ' + workloads.join(' '));
 
         prepareCollections(workloads, context, cluster, clusterOptions, executionOptions);
@@ -104,6 +98,18 @@
                 cleanup.push(workload);
             });
 
+            // After the $config.setup() function has been called, it is safe for the stepdown
+            // thread to start running. The main thread won't attempt to interact with the cluster
+            // until all of the spawned worker threads have finished.
+            //
+
+            // Indicate that the stepdown thread can run. It is unnecessary for the stepdown thread
+            // to indicate that it is going to start running because it will eventually after the
+            // worker threads have started.
+            if (typeof executionOptions.stepdownPermittedFile === 'string') {
+                writeFile(executionOptions.stepdownPermittedFile, '');
+            }
+
             // Since the worker threads may be running with causal consistency enabled, we set the
             // initial clusterTime and initial operationTime for the sessions they'll create so that
             // they are guaranteed to observe the effects of the workload's $config.setup() function
@@ -128,19 +134,41 @@
             }
 
             try {
-                // Start this set of worker threads.
-                threadMgr.spawnAll(cluster, executionOptions);
-                // Allow 20% of the threads to fail. This allows the workloads to run on
-                // underpowered test hosts.
-                threadMgr.checkFailed(0.2);
+                try {
+                    // Start this set of worker threads.
+                    threadMgr.spawnAll(cluster, executionOptions);
+                    // Allow 20% of the threads to fail. This allows the workloads to run on
+                    // underpowered test hosts.
+                    threadMgr.checkFailed(0.2);
+                } finally {
+                    // Threads must be joined before destruction, so do this even in the presence of
+                    // exceptions.
+                    errors.push(...threadMgr.joinAll().map(
+                        e => new WorkloadFailure(
+                            e.err, e.stack, e.tid, 'Foreground ' + e.workloads.join(' '))));
+                }
             } finally {
-                // Threads must be joined before destruction, so do this even in the presence of
-                // exceptions.
-                errors.push(...threadMgr.joinAll().map(
-                    e => new WorkloadFailure(
-                        e.err, e.stack, e.tid, 'Foreground ' + e.workloads.join(' '))));
+                // Until we are guaranteed that the stepdown thread isn't running, it isn't safe for
+                // the $config.teardown() function to be called. We should signal to resmoke.py that
+                // the stepdown thread should stop running and wait for the stepdown thread to
+                // signal that it has stopped.
+                //
+                // Signal to the stepdown thread to stop stepping down the cluster.
+                if (typeof executionOptions.stepdownPermittedFile === 'string' &&
+                    typeof executionOptions.steppingDownFile === 'string') {
+                    removeFile(executionOptions.stepdownPermittedFile);
+                    // Wait for the steppingDownFile to be removed by the stepdown thread.
+                    assert.soonNoExcept(function() {
+                        if (ls().indexOf(executionOptions.steppingDownFile) === -1) {
+                            return true;
+                        }
+                    }, "stepdown still in progress");
+                }
             }
         } finally {
+            if (cluster.shouldPerformContinuousStepdowns()) {
+                cluster.reestablishConnectionsAfterFailover();
+            }
             // Call each workload's teardown function. After all teardowns have completed check if
             // any of them failed.
             const cleanupResults = cleanup.map(
@@ -165,7 +193,6 @@
     const clusterOptions = {
         replication: {enabled: false},
         sharded: {enabled: false},
-        useExistingConnectionAsSeed: true,
     };
 
     const topology = DiscoverTopology.findConnectedNodes(db.getMongo());
@@ -192,9 +219,6 @@
     }
 
     let workloads = TestData.fsmWorkloads;
-    if (!Array.isArray(workloads)) {
-        workloads = [workloads];
-    }
 
     let sessionOptions = {};
     if (TestData.runningWithCausalConsistency) {
@@ -206,6 +230,19 @@
     }
 
     const executionOptions = {dbNamePrefix: TestData.dbNamePrefix || ""};
+    const resmokeDbPathPrefix = TestData.resmokeDbPathPrefix || ".";
+
+    // The stepdown file names need to match the same construction as found in
+    // buildscripts/resmokelib/testing/hooks/stepdown.py.
+    if (TestData.useStepdownPermittedFile) {
+        executionOptions.stepdownPermittedFile =
+            resmokeDbPathPrefix + '/concurrency_sharded_stepdown_stepdown_permitted';
+    }
+
+    if (TestData.useSteppingDownFile) {
+        executionOptions.steppingDownFile =
+            resmokeDbPathPrefix + '/concurrency_sharded_stepdown_stepping_down';
+    }
 
     if (Object.keys(sessionOptions).length > 0) {
         executionOptions.sessionOptions = sessionOptions;

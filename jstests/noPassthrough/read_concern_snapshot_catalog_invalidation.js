@@ -1,6 +1,6 @@
 // Tests that snapshot reads return an error when accessing a collection whose metadata is invalid
 // for the snapshot's point in time.
-// @tags: [requires_replication]
+// @tags: [uses_transactions]
 (function() {
     "use strict";
 
@@ -12,10 +12,6 @@
     rst.initiate();
 
     const testDB = rst.getPrimary().getDB(kDbName);
-    if (!testDB.serverStatus().storageEngine.supportsSnapshotReadConcern) {
-        rst.stopSet();
-        return;
-    }
     const adminDB = testDB.getSiblingDB("admin");
     const coll = testDB.getCollection(kCollName);
 
@@ -79,8 +75,6 @@
 
     testCommand({aggregate: kCollName, pipeline: [], cursor: {}},
                 {"command.aggregate": kCollName, "command.readConcern.level": "snapshot"});
-    testCommand({count: kCollName, filter: {x: 1}},
-                {"command.count": kCollName, "command.readConcern.level": "snapshot"});
     testCommand({delete: kCollName, deletes: [{q: {x: 1}, limit: 1}]},
                 {"command.delete": kCollName, "command.readConcern.level": "snapshot"});
     testCommand({distinct: kCollName, key: "x"},

@@ -40,11 +40,22 @@ env.Library(
         '$BUILD_DIR/mongo/db/auth/authprivilege',
         '$BUILD_DIR/mongo/db/server_options_core',
         '$BUILD_DIR/mongo/db/stats/counters',
+        '$BUILD_DIR/mongo/util/processinfo',
+        'server_status_core',
+    ],
+)
+
+env.Library(
+    target='server_status_servers',
+    source=[
+        'server_status_servers.cpp',
+    ],
+    LIBDEPS_PRIVATE=[
+        '$BUILD_DIR/mongo/db/stats/counters',
         '$BUILD_DIR/mongo/transport/message_compressor',
         '$BUILD_DIR/mongo/transport/service_executor',
-        '$BUILD_DIR/mongo/util/net/network',
         '$BUILD_DIR/mongo/util/net/ssl_manager',
-        '$BUILD_DIR/mongo/util/processinfo',
+        'server_status',
         'server_status_core',
     ],
 )
@@ -95,8 +106,8 @@ env.Library(
         '$BUILD_DIR/mongo/db/commands',
         '$BUILD_DIR/mongo/db/commands/test_commands_enabled',
         '$BUILD_DIR/mongo/db/common',
-        '$BUILD_DIR/mongo/db/log_process_details',
         '$BUILD_DIR/mongo/db/mongohasher',
+        '$BUILD_DIR/mongo/db/server_options_core',
         '$BUILD_DIR/mongo/logger/parse_log_component_settings',
     ],
 )
@@ -130,8 +141,9 @@ env.Library(
         '$BUILD_DIR/mongo/db/commands',
         '$BUILD_DIR/mongo/db/commands/test_commands_enabled',
         '$BUILD_DIR/mongo/db/common',
-        '$BUILD_DIR/mongo/client/clientdriver',
+        '$BUILD_DIR/mongo/client/clientdriver_minimal',
         '$BUILD_DIR/mongo/db/kill_sessions',
+        '$BUILD_DIR/mongo/db/log_process_details',
         '$BUILD_DIR/mongo/db/logical_session_cache',
         '$BUILD_DIR/mongo/db/logical_session_cache_impl',
         '$BUILD_DIR/mongo/db/logical_session_id',
@@ -191,7 +203,6 @@ env.Library(
 env.Library(
     target="standalone",
     source=[
-        "collection_to_capped.cpp",
         "count_cmd.cpp",
         "create_indexes.cpp",
         "current_op.cpp",
@@ -201,7 +212,6 @@ env.Library(
         "explain_cmd.cpp",
         "find_and_modify.cpp",
         "find_cmd.cpp",
-        "geo_near_cmd.cpp",
         "get_last_error.cpp",
         "getmore_cmd.cpp",
         "index_filter_commands.cpp",
@@ -222,15 +232,16 @@ env.Library(
     ],
     LIBDEPS_PRIVATE=[
         '$BUILD_DIR/mongo/base',
-        '$BUILD_DIR/mongo/db/commands',
-        '$BUILD_DIR/mongo/db/ops/write_ops_exec',
         '$BUILD_DIR/mongo/db/catalog/catalog_helpers',
-        '$BUILD_DIR/mongo/db/command_can_run_here',
-        '$BUILD_DIR/mongo/db/curop_failpoint_helpers',
         '$BUILD_DIR/mongo/db/catalog/index_key_validate',
+        '$BUILD_DIR/mongo/db/command_can_run_here',
+        '$BUILD_DIR/mongo/db/commands',
+        '$BUILD_DIR/mongo/db/curop_failpoint_helpers',
+        '$BUILD_DIR/mongo/db/ops/write_ops_exec',
         '$BUILD_DIR/mongo/db/query_exec',
         '$BUILD_DIR/mongo/db/repair_database',
         '$BUILD_DIR/mongo/db/rw_concern_d',
+        '$BUILD_DIR/mongo/db/stats/counters',
         '$BUILD_DIR/mongo/db/storage/storage_engine_common',
         '$BUILD_DIR/mongo/db/views/views_mongod',
         'core',
@@ -265,6 +276,7 @@ env.Library(
         "apply_ops_cmd.cpp",
         "clone.cpp",
         "clone_collection.cpp",
+        "collection_to_capped.cpp",
         "compact.cpp",
         "copydb.cpp",
         "copydb_start_commands.cpp",
@@ -275,7 +287,6 @@ env.Library(
         "do_txn_cmd.cpp",
         "driverHelpers.cpp",
         "eval.cpp",
-        "group_cmd.cpp",
         "haystack.cpp",
         "mr.cpp",
         "oplog_application_checks.cpp",
@@ -293,7 +304,7 @@ env.Library(
     ],
     LIBDEPS_PRIVATE=[
         '$BUILD_DIR/mongo/base',
-        '$BUILD_DIR/mongo/client/clientdriver',
+        '$BUILD_DIR/mongo/client/clientdriver_minimal',
         '$BUILD_DIR/mongo/db/auth/auth',
         '$BUILD_DIR/mongo/db/auth/authprivilege',
         '$BUILD_DIR/mongo/db/auth/role_graph',
@@ -306,6 +317,7 @@ env.Library(
         '$BUILD_DIR/mongo/db/catalog/index_key_validate',
         '$BUILD_DIR/mongo/db/cloner',
         '$BUILD_DIR/mongo/db/commands',
+        '$BUILD_DIR/mongo/db/curop_failpoint_helpers',
         '$BUILD_DIR/mongo/db/exec/stagedebug_cmd',
         '$BUILD_DIR/mongo/db/index_d',
         '$BUILD_DIR/mongo/db/repl/dbcheck',
@@ -349,11 +361,14 @@ env.Library(
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/db/commands',
+    ],
+    LIBDEPS_PRIVATE=[
         '$BUILD_DIR/mongo/db/namespace_string',
         '$BUILD_DIR/mongo/db/pipeline/aggregation_request',
         '$BUILD_DIR/mongo/db/query/command_request_response',
         '$BUILD_DIR/mongo/db/service_context',
-    ]
+        'test_commands_enabled'
+    ],
 )
 
 env.Library(

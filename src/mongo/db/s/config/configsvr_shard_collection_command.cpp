@@ -48,7 +48,6 @@
 #include "mongo/db/repl/repl_set_config.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/s/config/sharding_catalog_manager.h"
-#include "mongo/db/sessions_collection.h"
 #include "mongo/s/balancer_configuration.h"
 #include "mongo/s/catalog/type_database.h"
 #include "mongo/s/catalog/type_shard.h"
@@ -150,7 +149,7 @@ void validateAndDeduceFullRequestOptions(OperationContext* opCtx,
     // Ensure the namespace is valid.
     uassert(ErrorCodes::IllegalOperation,
             "can't shard system namespaces",
-            !nss.isSystem() || nss == SessionsCollection::kSessionsNamespaceString);
+            !nss.isSystem() || nss == NamespaceString::kLogicalSessionsNamespace);
 
     // Ensure the collation is valid. Currently we only allow the simple collation.
     bool simpleCollationSpecified = false;
@@ -785,8 +784,7 @@ public:
             // Only whitelisted collections in config may be sharded (unless we are in test mode)
             uassert(ErrorCodes::IllegalOperation,
                     "only special collections in the config db may be sharded",
-                    nss == SessionsCollection::kSessionsNamespaceString ||
-                        getTestCommandsEnabled());
+                    nss == NamespaceString::kLogicalSessionsNamespace || getTestCommandsEnabled());
 
             auto configShard = uassertStatusOK(shardRegistry->getShard(opCtx, dbType.getPrimary()));
             ScopedDbConnection configConn(configShard->getConnString());
@@ -834,7 +832,12 @@ public:
             opCtx, nss, proposedKey, shardKeyPattern, primaryShard, conn, request);
 
         // Step 4.
-        auto uuid = getUUIDFromPrimaryShard(nss, conn);
+        boost::optional<UUID> uuid;
+        if (request.getGetUUIDfromPrimaryShard()) {
+            uuid = getUUIDFromPrimaryShard(nss, conn);
+        } else {
+            uuid = UUID::gen();
+        }
 
         // isEmpty is used by multiple steps below.
         bool isEmpty = (conn->count(nss.ns()) == 0);

@@ -38,7 +38,6 @@
 #include "mongo/client/connection_pool.h"
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/client.h"
-#include "mongo/db/commands/server_status_metric.h"
 #include "mongo/db/commands/test_commands_enabled.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/dbhelpers.h"
@@ -141,36 +140,17 @@ size_t getSize(const BSONObj& o) {
 }  // namespace
 
 // Failpoint which causes rollback to hang before starting.
-MONGO_FP_DECLARE(rollbackHangBeforeStart);
-
-// The count of items in the buffer
-static Counter64 bufferCountGauge;
-static ServerStatusMetricField<Counter64> displayBufferCount("repl.buffer.count",
-                                                             &bufferCountGauge);
-// The size (bytes) of items in the buffer
-static Counter64 bufferSizeGauge;
-static ServerStatusMetricField<Counter64> displayBufferSize("repl.buffer.sizeBytes",
-                                                            &bufferSizeGauge);
-// The max size (bytes) of the buffer. If the buffer does not have a size constraint, this is
-// set to 0.
-static Counter64 bufferMaxSizeGauge;
-static ServerStatusMetricField<Counter64> displayBufferMaxSize("repl.buffer.maxSizeBytes",
-                                                               &bufferMaxSizeGauge);
-
+MONGO_FAIL_POINT_DEFINE(rollbackHangBeforeStart);
 
 BackgroundSync::BackgroundSync(
     ReplicationCoordinator* replicationCoordinator,
     ReplicationCoordinatorExternalState* replicationCoordinatorExternalState,
     ReplicationProcess* replicationProcess,
-    OplogBuffer* oplogBuffer)
-    : _oplogBuffer(oplogBuffer),
+    OplogApplier* oplogApplier)
+    : _oplogApplier(oplogApplier),
       _replCoord(replicationCoordinator),
       _replicationCoordinatorExternalState(replicationCoordinatorExternalState),
-      _replicationProcess(replicationProcess) {
-    // Update "repl.buffer.maxSizeBytes" server status metric to reflect the current oplog buffer's
-    // max size.
-    bufferMaxSizeGauge.increment(_oplogBuffer->getMaxSize() - bufferMaxSizeGauge.get());
-}
+      _replicationProcess(replicationProcess) {}
 
 void BackgroundSync::startup(OperationContext* opCtx) {
     invariant(!_producerThread);
@@ -533,7 +513,7 @@ Status BackgroundSync::_enqueueDocuments(Fetcher::Documents::const_iterator begi
     auto opCtx = cc().makeOperationContext();
 
     // Wait for enough space.
-    _oplogBuffer->waitForSpace(opCtx.get(), info.toApplyDocumentBytes);
+    _oplogApplier->getBuffer()->waitForSpace(opCtx.get(), info.toApplyDocumentBytes);
 
     {
         // Don't add more to the buffer if we are in shutdown. Continue holding the lock until we
@@ -545,21 +525,14 @@ Status BackgroundSync::_enqueueDocuments(Fetcher::Documents::const_iterator begi
             return Status::OK();
         }
 
-        OCCASIONALLY {
-            LOG(2) << "bgsync buffer has " << _oplogBuffer->getSize() << " bytes";
-        }
-
         // Buffer docs for later application.
-        _oplogBuffer->pushAllNonBlocking(opCtx.get(), begin, end);
+        _oplogApplier->enqueue(opCtx.get(), begin, end);
 
         // Update last fetched info.
         _lastFetchedHash = info.lastDocument.value;
         _lastOpTimeFetched = info.lastDocument.opTime;
         LOG(3) << "batch resetting _lastOpTimeFetched: " << _lastOpTimeFetched;
     }
-
-    bufferCountGauge.increment(info.toApplyDocumentCount);
-    bufferSizeGauge.increment(info.toApplyDocumentBytes);
 
     // Check some things periodically (whenever we run out of items in the current cursor batch).
     if (info.networkDocumentBytes > 0 && info.networkDocumentBytes < kSmallBatchLimitBytes) {
@@ -575,11 +548,6 @@ Status BackgroundSync::_enqueueDocuments(Fetcher::Documents::const_iterator begi
     return Status::OK();
 }
 
-void BackgroundSync::onOperationConsumed(const BSONObj& op) {
-    bufferCountGauge.decrement(1);
-    bufferSizeGauge.decrement(getSize(op));
-}
-
 void BackgroundSync::_runRollback(OperationContext* opCtx,
                                   const Status& fetcherReturnStatus,
                                   const HostAndPort& source,
@@ -592,6 +560,9 @@ void BackgroundSync::_runRollback(OperationContext* opCtx,
     }
 
     ShouldNotConflictWithSecondaryBatchApplicationBlock noConflict(opCtx->lockState());
+
+    // Explicitly start future read transactions without a timestamp.
+    opCtx->recoveryUnit()->setTimestampReadSource(RecoveryUnit::ReadSource::kNoTimestamp);
 
     // Rollback is a synchronous operation that uses the task executor and may not be
     // executed inside the fetcher callback.
@@ -729,7 +700,7 @@ void BackgroundSync::stop(bool resetLastFetchedOptime) {
 
     _syncSourceHost = HostAndPort();
     if (resetLastFetchedOptime) {
-        invariant(_oplogBuffer->isEmpty());
+        invariant(_oplogApplier->getBuffer()->isEmpty());
         _lastOpTimeFetched = OpTime();
         _lastFetchedHash = 0;
         log() << "Resetting last fetched optimes in bgsync";
@@ -747,6 +718,10 @@ void BackgroundSync::stop(bool resetLastFetchedOptime) {
 void BackgroundSync::start(OperationContext* opCtx) {
     OpTimeWithHash lastAppliedOpTimeWithHash;
     ShouldNotConflictWithSecondaryBatchApplicationBlock noConflict(opCtx->lockState());
+
+    // Explicitly start future read transactions without a timestamp.
+    opCtx->recoveryUnit()->setTimestampReadSource(RecoveryUnit::ReadSource::kNoTimestamp);
+
     do {
         lastAppliedOpTimeWithHash = _readLastAppliedOpTimeWithHash(opCtx);
         stdx::lock_guard<stdx::mutex> lk(_mutex);
@@ -756,7 +731,7 @@ void BackgroundSync::start(OperationContext* opCtx) {
         }
         // If a node steps down during drain mode, then the buffer may not be empty at the beginning
         // of secondary state.
-        if (!_oplogBuffer->isEmpty()) {
+        if (!_oplogApplier->getBuffer()->isEmpty()) {
             log() << "going to start syncing, but buffer is not empty";
         }
         _state = ProducerState::Running;
@@ -774,13 +749,6 @@ void BackgroundSync::start(OperationContext* opCtx) {
     } while (lastAppliedOpTimeWithHash.opTime != _replCoord->getMyLastAppliedOpTime());
 
     LOG(1) << "bgsync fetch queue set to: " << _lastOpTimeFetched << " " << _lastFetchedHash;
-}
-
-void BackgroundSync::onBufferCleared() {
-    const auto count = bufferCountGauge.get();
-    bufferCountGauge.decrement(count);
-    const auto size = bufferSizeGauge.get();
-    bufferSizeGauge.decrement(size);
 }
 
 OpTimeWithHash BackgroundSync::_readLastAppliedOpTimeWithHash(OperationContext* opCtx) {

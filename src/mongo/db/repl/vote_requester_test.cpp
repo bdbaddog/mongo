@@ -31,6 +31,7 @@
 #include <memory>
 
 #include "mongo/base/status.h"
+#include "mongo/db/commands.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/repl/repl_set_request_votes_args.h"
 #include "mongo/db/repl/vote_requester.h"
@@ -112,7 +113,16 @@ protected:
 
     void processResponse(const RemoteCommandRequest& request,
                          const RemoteCommandResponse& response) {
-        _requester->processResponse(request, response);
+        if (!response.isOK()) {
+            _requester->processResponse(request, response);
+            return;
+        }
+        BSONObjBuilder builder(response.data);
+        // Appends ok:1.0 (status ok) to response data if 'ok' field is missing.
+        CommandHelpers::appendCommandStatusNoThrow(builder, Status::OK());
+        RemoteCommandResponse responseWithCmdStatus = response;
+        responseWithCmdStatus.data = builder.obj();
+        _requester->processResponse(request, responseWithCmdStatus);
     }
 
     int getNumResponders() {
@@ -135,11 +145,26 @@ protected:
         return RemoteCommandResponse(ErrorCodes::NodeNotFound, "not on my watch");
     }
 
+    RemoteCommandResponse callbackCanceledCommandResponse() {
+        return RemoteCommandResponse(ErrorCodes::CallbackCanceled, "Testing canceled callback");
+    }
+
     RemoteCommandResponse votedYes() {
         ReplSetRequestVotesResponse response;
         response.setVoteGranted(true);
         response.setTerm(1);
         return RemoteCommandResponse(response.toBSON(), BSONObj(), Milliseconds(10));
+    }
+
+    RemoteCommandResponse votedYesStatusNotOkBecauseFailedToStoreLastVote() {
+        ReplSetRequestVotesResponse response;
+        BSONObjBuilder result;
+        response.setVoteGranted(true);
+        response.setTerm(1);
+        response.addToBSON(&result);
+        auto status = Status(ErrorCodes::InterruptedDueToStepDown, "operation was interrupted");
+        CommandHelpers::appendCommandStatusNoThrow(result, status);
+        return RemoteCommandResponse(result.obj(), BSONObj(), Milliseconds(10));
     }
 
     RemoteCommandResponse votedNoBecauseConfigVersionDoesNotMatch() {
@@ -272,6 +297,19 @@ TEST_F(VoteRequesterTest, ImmediateGoodResponseWinElection) {
     ASSERT_EQUALS(1, getNumResponders());
 }
 
+TEST_F(VoteRequesterTest, VoterFailedToStoreLastVote) {
+    startCapturingLogMessages();
+    ASSERT_FALSE(hasReceivedSufficientResponses());
+    processResponse(requestFrom("host1"), votedYesStatusNotOkBecauseFailedToStoreLastVote());
+    ASSERT_FALSE(hasReceivedSufficientResponses());
+    ASSERT_EQUALS(1, countLogLinesContaining("received an invalid response from host1:27017"));
+    processResponse(requestFrom("host2"), votedYes());
+    ASSERT_TRUE(hasReceivedSufficientResponses());
+    ASSERT(VoteRequester::Result::kSuccessfullyElected == getResult());
+    ASSERT_EQUALS(2, getNumResponders());
+    stopCapturingLogMessages();
+}
+
 TEST_F(VoteRequesterTest, BadConfigVersionWinElection) {
     startCapturingLogMessages();
     ASSERT_FALSE(hasReceivedSufficientResponses());
@@ -359,6 +397,22 @@ TEST_F(VoteRequesterTest, NotEnoughVotesLoseElection) {
     ASSERT_TRUE(hasReceivedSufficientResponses());
     ASSERT(VoteRequester::Result::kInsufficientVotes == getResult());
     ASSERT_EQUALS(1, getNumResponders());
+    stopCapturingLogMessages();
+}
+
+TEST_F(VoteRequesterTest, CallbackCanceledNotEnoughVotesLoseElection) {
+    startCapturingLogMessages();
+    ASSERT_FALSE(hasReceivedSufficientResponses());
+    processResponse(requestFrom("host1"), votedNoBecauseAlreadyVoted());
+    ASSERT_FALSE(hasReceivedSufficientResponses());
+    ASSERT_EQUALS(1, countLogLinesContaining("received a no vote from host1:27017"));
+    processResponse(requestFrom("host2"), callbackCanceledCommandResponse());
+    ASSERT_EQUALS(1, countLogLinesContaining("failed to receive response from host2:27017"));
+    // Make sure processing the callbackCanceled Response was necessary to get sufficient responses.
+    ASSERT_TRUE(hasReceivedSufficientResponses());
+    // Because of the CallbackCanceled Response, host2 doesn't count as a responder.
+    ASSERT_EQUALS(1, getNumResponders());
+    ASSERT(VoteRequester::Result::kInsufficientVotes == getResult());
     stopCapturingLogMessages();
 }
 

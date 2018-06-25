@@ -59,7 +59,7 @@ struct TimestampedBSONObj {
 
 /**
  * Storage interface used by the replication system to interact with storage.
- * This interface provides seperation of concerns and a place for mocking out test
+ * This interface provides separation of concerns and a place for mocking out test
  * interactions.
  *
  * The grouping of functionality includes general collection helpers, and more specific replication
@@ -339,6 +339,12 @@ public:
      */
     virtual StatusWith<OptionalCollectionUUID> getCollectionUUID(OperationContext* opCtx,
                                                                  const NamespaceString& nss) = 0;
+
+    /**
+     * Updates unique indexes belonging to all non-replicated collections. To be called at the
+     * end of initial sync.
+     */
+    virtual Status upgradeNonReplicatedUniqueIndexes(OperationContext* opCtx) = 0;
 
     /**
      * Sets the highest timestamp at which the storage engine is allowed to take a checkpoint.

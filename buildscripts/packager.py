@@ -41,7 +41,7 @@ import tempfile
 import time
 
 # The MongoDB names for the architectures we support.
-ARCH_CHOICES = ["x86_64", "arm64"]
+ARCH_CHOICES = ["x86_64", "arm64", "s390x"]
 
 # Made up names for the flavors of distribution we package for.
 DISTROS = ["suse", "debian", "redhat", "ubuntu", "amazon", "amazon2"]
@@ -294,6 +294,8 @@ class Distro(object):
                 return "trusty"
             elif build_os == 'ubuntu1604':
                 return "xenial"
+            elif build_os == 'ubuntu1804':
+                return "bionic"
             else:
                 raise Exception("unsupported build_os: %s" % build_os)
         elif self.dname == 'debian':
@@ -329,7 +331,7 @@ class Distro(object):
         if re.search("(suse)", self.dname):
             return ["suse11", "suse12"]
         elif re.search("(redhat|fedora|centos)", self.dname):
-            return ["rhel70", "rhel71", "rhel72", "rhel62", "rhel55"]
+            return ["rhel70", "rhel71", "rhel72", "rhel62", "rhel55", "rhel67"]
         elif self.dname in ['amazon', 'amazon2']:
             return [self.dname]
         elif self.dname == 'ubuntu':
@@ -337,6 +339,7 @@ class Distro(object):
                 "ubuntu1204",
                 "ubuntu1404",
                 "ubuntu1604",
+                "ubuntu1804",
             ]
         elif self.dname == 'debian':
             return ["debian81", "debian92"]
@@ -489,7 +492,7 @@ def unpack_binaries_into(build_os, arch, spec, where):
     try:
         sysassert(["tar", "xvzf", rootdir + "/" + tarfile(build_os, arch, spec)])
         release_dir = glob('mongodb-linux-*')[0]
-        for releasefile in "bin", "GNU-AGPL-3.0", "README", "THIRD-PARTY-NOTICES", "MPL-2":
+        for releasefile in "bin", "LICENSE-Community.txt", "GNU-AGPL-3.0", "README", "THIRD-PARTY-NOTICES", "MPL-2":
             print "moving file: %s/%s" % (release_dir, releasefile)
             os.rename("%s/%s" % (release_dir, releasefile), releasefile)
         os.rmdir(release_dir)
@@ -625,7 +628,7 @@ def make_deb_repo(repo, distro, build_os):
 Label: mongodb
 Suite: %s
 Codename: %s/mongodb-org
-Architectures: amd64 arm64
+Architectures: amd64 arm64 s390x
 Components: %s
 Description: MongoDB packages
 """ % (distro.repo_os_version(build_os), distro.repo_os_version(build_os), distro.repo_component())

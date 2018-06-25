@@ -55,7 +55,7 @@ MONGO_EXPORT_STARTUP_SERVER_PARAMETER(disableLogicalSessionCacheRefresh, bool, f
 constexpr Minutes LogicalSessionCacheImpl::kLogicalSessionDefaultRefresh;
 
 LogicalSessionCacheImpl::LogicalSessionCacheImpl(
-    std::unique_ptr<ServiceLiason> service,
+    std::unique_ptr<ServiceLiaison> service,
     std::shared_ptr<SessionsCollection> collection,
     std::shared_ptr<TransactionReaper> transactionReaper,
     Options options)
@@ -64,6 +64,9 @@ LogicalSessionCacheImpl::LogicalSessionCacheImpl(
       _service(std::move(service)),
       _sessionsColl(std::move(collection)),
       _transactionReaper(std::move(transactionReaper)) {
+    _stats.setLastSessionsCollectionJobTimestamp(now());
+    _stats.setLastTransactionReaperJobTimestamp(now());
+
     if (!disableLogicalSessionCacheRefresh) {
         _service->scheduleJob({"LogicalSessionCacheRefresh",
                                [this](Client* client) { _periodicRefresh(client); },
@@ -74,8 +77,6 @@ LogicalSessionCacheImpl::LogicalSessionCacheImpl(
                                    _refreshInterval});
         }
     }
-    _stats.setLastSessionsCollectionJobTimestamp(now());
-    _stats.setLastTransactionReaperJobTimestamp(now());
 }
 
 LogicalSessionCacheImpl::~LogicalSessionCacheImpl() {

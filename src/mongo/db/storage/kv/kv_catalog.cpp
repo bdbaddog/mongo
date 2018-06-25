@@ -269,12 +269,18 @@ KVCatalog::FeatureTracker::FeatureBits KVCatalog::FeatureTracker::getInfo(
     BSONElement nonRepairableFeaturesElem;
     auto nonRepairableFeaturesStatus = bsonExtractTypedField(
         obj, kNonRepairableFeaturesFieldName, BSONType::NumberLong, &nonRepairableFeaturesElem);
-    fassert(40111, nonRepairableFeaturesStatus);
+    if (!nonRepairableFeaturesStatus.isOK()) {
+        error() << "error: exception extracting typed field with obj:" << redact(obj);
+        fassert(40111, nonRepairableFeaturesStatus);
+    }
 
     BSONElement repairableFeaturesElem;
     auto repairableFeaturesStatus = bsonExtractTypedField(
         obj, kRepairableFeaturesFieldName, BSONType::NumberLong, &repairableFeaturesElem);
-    fassert(40112, repairableFeaturesStatus);
+    if (!repairableFeaturesStatus.isOK()) {
+        error() << "error: exception extracting typed field with obj:" << redact(obj);
+        fassert(40112, repairableFeaturesStatus);
+    }
 
     FeatureBits versionInfo;
     versionInfo.nonRepairableFeatures =
@@ -451,7 +457,7 @@ BSONObj KVCatalog::_findEntry(OperationContext* opCtx, StringData ns, RecordId* 
     {
         stdx::lock_guard<stdx::mutex> lk(_identsLock);
         NSToIdentMap::const_iterator it = _idents.find(ns.toString());
-        invariant(it != _idents.end());
+        invariant(it != _idents.end(), str::stream() << "Did not find collection. Ns: " << ns);
         dl = it->second.storedLoc;
     }
 

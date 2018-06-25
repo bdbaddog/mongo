@@ -112,6 +112,9 @@ function RollbackTest(name = "RollbackTest", replSet) {
                 "logComponentVerbosity": tojsononeline(TestData.logComponentVerbosity)
             };
         }
+        if (TestData.syncdelay) {
+            nodeOptions["syncdelay"] = TestData.syncdelay;
+        }
 
         let replSet = new ReplSetTest({name, nodes: 3, useBridge: true, nodeOptions: nodeOptions});
         replSet.startSet();
@@ -375,5 +378,12 @@ function RollbackTest(name = "RollbackTest", replSet) {
         curPrimary = rst.getPrimary();
         curSecondary = rst.getSecondary();
         assert.neq(curPrimary, curSecondary);
+    };
+
+    /**
+     * Returns the underlying ReplSetTest in case the user needs to make adjustments to it.
+     */
+    this.getTestFixture = function() {
+        return rst;
     };
 }

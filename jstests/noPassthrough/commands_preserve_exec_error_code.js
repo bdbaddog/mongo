@@ -1,6 +1,6 @@
 // Tests that an error encountered during PlanExecutor execution will be propagated back to the user
 // with the original error code. This is important for retryable errors like
-// 'InterruptedDueToReplStateChange',
+// 'InterruptedDueToStepDown',
 // and also to ensure that the error is not swallowed and the diagnostic info is not lost.
 (function() {
     "use strict";
@@ -36,18 +36,10 @@
     assertFailsWithInternalError(() => coll.updateOne({_id: 1}, {$set: {x: 2}}));
     assertFailsWithInternalError(() => coll.deleteOne({_id: 1}));
     assertFailsWithInternalError(() => coll.count({_id: 1}));
-    assertFailsWithInternalError(() => coll.group({
-                                               key: "_id",
-                                               cond: {},
-                                               reduce: () => {
-                                                   result.total += 1;
-                                               },
-                                               initial: {total: 0}
-                                           })
-                                           .itcount());
     assertFailsWithInternalError(() => coll.aggregate([]).itcount());
+    assertFailsWithInternalError(
+        () => coll.aggregate([{$geoNear: {near: [0, 0], distanceField: "d"}}]).itcount());
     assertCmdFailsWithInternalError({distinct: coll.getName(), key: "_id"});
-    assertCmdFailsWithInternalError({geoNear: coll.getName(), near: [0, 0]});
     assertCmdFailsWithInternalError(
         {findAndModify: coll.getName(), query: {_id: 1}, update: {$set: {x: 2}}});
 

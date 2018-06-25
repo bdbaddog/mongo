@@ -480,6 +480,8 @@ var DB;
      * See also: db.copyDatabase()
      */
     DB.prototype.cloneDatabase = function(from) {
+        print(
+            "WARNING: db.cloneDatabase is deprecated. See http://dochub.mongodb.org/core/copydb-clone-deprecation");
         assert(isString(from) && from.length);
         return this._dbCommand({clone: from});
     };
@@ -531,6 +533,8 @@ var DB;
     */
     DB.prototype.copyDatabase = function(
         fromdb, todb, fromhost, username, password, mechanism, slaveOk) {
+        print(
+            "WARNING: db.copyDatabase is deprecated. See http://dochub.mongodb.org/core/copydb-clone-deprecation");
         assert(isString(fromdb) && fromdb.length);
         assert(isString(todb) && todb.length);
         fromhost = fromhost || "";
@@ -592,9 +596,9 @@ var DB;
         print(
             "\tdb.aggregate([pipeline], {options}) - performs a collectionless aggregation on this database; returns a cursor");
         print("\tdb.auth(username, password)");
-        print("\tdb.cloneDatabase(fromhost)");
+        print("\tdb.cloneDatabase(fromhost) - deprecated");
         print("\tdb.commandHelp(name) returns the help for the command");
-        print("\tdb.copyDatabase(fromdb, todb, fromhost)");
+        print("\tdb.copyDatabase(fromdb, todb, fromhost) - deprecated");
         print("\tdb.createCollection(name, {size: ..., capped: ..., max: ...})");
         print("\tdb.createView(name, viewOn, [{$operator: {...}}, ...], {viewOptions})");
         print("\tdb.createUser(userDocument)");
@@ -753,29 +757,6 @@ var DB;
     DB.prototype.dbEval = DB.prototype.eval;
 
     /**
-     *
-     *  <p>
-     *   Similar to SQL group by.  For example: </p>
-     *
-     *  <code>select a,b,sum(c) csum from coll where active=1 group by a,b</code>
-     *
-     *  <p>
-     *    corresponds to the following in 10gen:
-     *  </p>
-     *
-     *  <code>
-        db.group(
-            {
-                ns: "coll",
-                key: { a:true, b:true },
-                // keyf: ...,
-                cond: { active:1 },
-                reduce: function(obj,prev) { prev.csum += obj.c; },
-                initial: { csum: 0 }
-            });
-        </code>
-     *
-     *
      * <p>
      *  An array of grouped items is returned.  The array must fit in RAM, thus this function is not
      * suitable when the return set is extremely large.
@@ -824,16 +805,6 @@ var DB;
 
         return this.eval(groupFunction, this._groupFixParms(parmsObj));
     };
-
-    DB.prototype.groupcmd = function(parmsObj) {
-        var ret = this.runCommand({"group": this._groupFixParms(parmsObj)});
-        if (!ret.ok) {
-            throw _getErrorWithCode(ret, "group command failed: " + tojson(ret));
-        }
-        return ret.retval;
-    };
-
-    DB.prototype.group = DB.prototype.groupcmd;
 
     DB.prototype._groupFixParms = function(parmsObj) {
         var parms = Object.extend({}, parmsObj);
@@ -1956,7 +1927,7 @@ var DB;
             // but is not allowed to inspect it.
             print("Successfully initiated free monitoring, but unable to determine status " +
                   "as you lack the 'checkFreeMonitoringStatus' privilege.");
-            return null;
+            return;
         }
         assert.commandWorked(cmd);
 
@@ -1964,10 +1935,10 @@ var DB;
             print("Successfully initiated free monitoring. The registration is " +
                   "proceeding in the background. ");
             print("Run db.getFreeMonitoringStatus() at any time to check on the progress.");
-            return null;
+            return;
         }
 
-        return cmd;
+        print(tojson(cmd));
     };
 
     DB.prototype.disableFreeMonitoring = function() {

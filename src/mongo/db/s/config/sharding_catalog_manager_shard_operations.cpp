@@ -45,6 +45,7 @@
 #include "mongo/db/audit.h"
 #include "mongo/db/catalog_raii.h"
 #include "mongo/db/client.h"
+#include "mongo/db/commands/feature_compatibility_version.h"
 #include "mongo/db/commands/feature_compatibility_version_command_parser.h"
 #include "mongo/db/commands/feature_compatibility_version_parser.h"
 #include "mongo/db/namespace_string.h"
@@ -52,8 +53,9 @@
 #include "mongo/db/repl/repl_client_info.h"
 #include "mongo/db/repl/repl_set_config.h"
 #include "mongo/db/repl/replication_coordinator.h"
+#include "mongo/db/s/add_shard_cmd_gen.h"
+#include "mongo/db/s/add_shard_util.h"
 #include "mongo/db/s/type_shard_identity.h"
-#include "mongo/db/sessions_collection.h"
 #include "mongo/db/wire_version.h"
 #include "mongo/executor/task_executor.h"
 #include "mongo/rpc/get_status_from_command_result.h"
@@ -473,14 +475,14 @@ Status ShardingCatalogManager::_dropSessionsCollection(
     OperationContext* opCtx, std::shared_ptr<RemoteCommandTargeter> targeter) {
 
     BSONObjBuilder builder;
-    builder.append("drop", SessionsCollection::kSessionsNamespaceString.coll());
+    builder.append("drop", NamespaceString::kLogicalSessionsNamespace.coll());
     {
         BSONObjBuilder wcBuilder(builder.subobjStart("writeConcern"));
         wcBuilder.append("w", "majority");
     }
 
     auto swCommandResponse = _runCommandForAddShard(
-        opCtx, targeter.get(), SessionsCollection::kSessionsNamespaceString.db(), builder.done());
+        opCtx, targeter.get(), NamespaceString::kLogicalSessionsNamespace.db(), builder.done());
     if (!swCommandResponse.isOK()) {
         return swCommandResponse.getStatus();
     }
@@ -642,82 +644,114 @@ StatusWith<std::string> ShardingCatalogManager::addShard(
         shardType.setMaxSizeMB(maxSize);
     }
 
-    // Insert a shardIdentity document onto the shard. This also triggers sharding initialization on
-    // the shard.
-    LOG(2) << "going to insert shardIdentity document into shard: " << shardType;
-    auto commandRequest = createShardIdentityUpsertForAddShard(opCtx, shardType.getName());
-    auto swCommandResponse =
-        _runCommandForAddShard(opCtx, targeter.get(), NamespaceString::kAdminDb, commandRequest);
-    if (!swCommandResponse.isOK()) {
-        return swCommandResponse.getStatus();
-    }
-    auto commandResponse = std::move(swCommandResponse.getValue());
-    BatchedCommandResponse batchResponse;
-    auto batchResponseStatus =
-        Shard::CommandResponse::processBatchWriteResponse(commandResponse, &batchResponse);
-    if (!batchResponseStatus.isOK()) {
-        return batchResponseStatus;
-    }
+    // Helper function that runs a command on the to-be shard and returns the status
+    auto runCmdOnNewShard = [this, &opCtx, &targeter](const BSONObj& cmd) -> Status {
+        auto response =
+            _runCommandForAddShard(opCtx, targeter.get(), NamespaceString::kAdminDb, cmd);
+        // Grabs the underlying status from a StatusWith object by taking the first
+        // non-OK status, if there is one. This is needed due to the semantics of
+        // _runCommandForAddShard.
+        auto commandResponse = std::move(response.getValue());
+        BatchedCommandResponse batchResponse;
+        return Shard::CommandResponse::processBatchWriteResponse(commandResponse, &batchResponse);
+    };
 
+    // Run _addShard command on the shard, which in turn inserts a shardIdentity document onto the
+    // shard and triggers initialization
+    LOG(2) << "going to run _addShard command on shard: " << shardType;
+    AddShard addShardCmd = add_shard_util::createAddShardCmd(opCtx, shardType.getName());
+    BSONObj passthroughFields;  // Needed for IDL toBSON method
+    auto addShardCmdBSON = addShardCmd.toBSON(passthroughFields);
 
-    // Since addShard runs under the fcvLock, it is guaranteed the fcv state won't change, but it's
-    // possible an earlier setFCV failed partway, so we handle all possible fcv states. Note, if
-    // the state is upgrading (downgrading), a user cannot switch to downgrading (upgrading) without
-    // first finishing the upgrade (downgrade).
-    BSONObj setFCVCmd;
-    switch (serverGlobalParams.featureCompatibility.getVersion()) {
-        case ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo40:
-        case ServerGlobalParams::FeatureCompatibility::Version::kUpgradingTo40:
-            setFCVCmd = BSON(FeatureCompatibilityVersionCommandParser::kCommandName
-                             << FeatureCompatibilityVersionParser::kVersion40
-                             << WriteConcernOptions::kWriteConcernField
-                             << opCtx->getWriteConcern().toBSON());
-            break;
-        default:
-            setFCVCmd = BSON(FeatureCompatibilityVersionCommandParser::kCommandName
-                             << FeatureCompatibilityVersionParser::kVersion36
-                             << WriteConcernOptions::kWriteConcernField
-                             << opCtx->getWriteConcern().toBSON());
-            break;
-    }
-    auto versionResponse =
-        _runCommandForAddShard(opCtx, targeter.get(), NamespaceString::kAdminDb, setFCVCmd);
-    if (!versionResponse.isOK()) {
-        return versionResponse.getStatus();
-    }
+    // Run _addShard command
+    auto addShardStatus = runCmdOnNewShard(addShardCmdBSON);
 
-    if (!versionResponse.getValue().commandStatus.isOK()) {
-        return versionResponse.getValue().commandStatus;
+    if (!addShardStatus.isOK()) {
+        // TODO (SERVER-35552): Fix this to use an FCV check instead
+        // If the _addShard command is not found, that means the mongod for the shard we're adding
+        // is running on an older version, so we retry instead with the old method of inserting a
+        // shard identity document directly.
+        if (addShardStatus == ErrorCodes::CommandNotFound) {
+            // Insert a shardIdentity document onto the shard. This also triggers sharding
+            // initialization on the shard.
+            LOG(2) << AddShard::kCommandName
+                   << " command not found. going to insert shardIdentity document into "
+                      "shard: "
+                   << shardType;
+
+            auto idCommand = add_shard_util::createShardIdentityUpsertForAddShard(addShardCmd);
+            auto shardUpsertCmdStatus = runCmdOnNewShard(idCommand);
+
+            if (!shardUpsertCmdStatus.isOK()) {
+                return shardUpsertCmdStatus;
+            }
+        }
     }
 
-    log() << "going to insert new entry for shard into config.shards: " << shardType.toString();
+    {
+        // Hold the fcvLock across checking the FCV, sending setFCV to the new shard, and
+        // writing the entry for the new shard to config.shards. This ensures the FCV doesn't change
+        // after we send setFCV to the new shard, but before we write its entry to config.shards.
+        // (Note, we don't use a Global IX lock here, because we don't want to hold the global lock
+        // while blocking on the network).
+        invariant(!opCtx->lockState()->isLocked());
+        Lock::SharedLock lk(opCtx->lockState(), FeatureCompatibilityVersion::fcvLock);
 
-    Status result = Grid::get(opCtx)->catalogClient()->insertConfigDocument(
-        opCtx,
-        ShardType::ConfigNS,
-        shardType.toBSON(),
-        ShardingCatalogClient::kMajorityWriteConcern);
-    if (!result.isOK()) {
-        log() << "error adding shard: " << shardType.toBSON() << " err: " << result.reason();
-        return result;
+        BSONObj setFCVCmd;
+        switch (serverGlobalParams.featureCompatibility.getVersion()) {
+            case ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo40:
+            case ServerGlobalParams::FeatureCompatibility::Version::kUpgradingTo40:
+                setFCVCmd = BSON(FeatureCompatibilityVersionCommandParser::kCommandName
+                                 << FeatureCompatibilityVersionParser::kVersion40
+                                 << WriteConcernOptions::kWriteConcernField
+                                 << opCtx->getWriteConcern().toBSON());
+                break;
+            default:
+                setFCVCmd = BSON(FeatureCompatibilityVersionCommandParser::kCommandName
+                                 << FeatureCompatibilityVersionParser::kVersion36
+                                 << WriteConcernOptions::kWriteConcernField
+                                 << opCtx->getWriteConcern().toBSON());
+                break;
+        }
+        auto versionResponse =
+            _runCommandForAddShard(opCtx, targeter.get(), NamespaceString::kAdminDb, setFCVCmd);
+        if (!versionResponse.isOK()) {
+            return versionResponse.getStatus();
+        }
+
+        if (!versionResponse.getValue().commandStatus.isOK()) {
+            return versionResponse.getValue().commandStatus;
+        }
+
+        log() << "going to insert new entry for shard into config.shards: " << shardType.toString();
+
+        Status result = Grid::get(opCtx)->catalogClient()->insertConfigDocument(
+            opCtx,
+            ShardType::ConfigNS,
+            shardType.toBSON(),
+            ShardingCatalogClient::kLocalWriteConcern);
+        if (!result.isOK()) {
+            log() << "error adding shard: " << shardType.toBSON() << " err: " << result.reason();
+            return result;
+        }
     }
 
     // Add all databases which were discovered on the new shard
     for (const auto& dbName : dbNamesStatus.getValue()) {
-        DatabaseType dbt(dbName, shardType.getName(), false);
+        DatabaseType dbt(dbName, shardType.getName(), false, databaseVersion::makeNew());
 
-        // If we're in FCV 4.0, we should add a version to each database.
-        if (serverGlobalParams.featureCompatibility.getVersion() ==
-                ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo40 ||
-            serverGlobalParams.featureCompatibility.getVersion() ==
-                ServerGlobalParams::FeatureCompatibility::Version::kUpgradingTo40) {
-            dbt.setVersion(databaseVersion::makeNew());
-        }
-
-        Status status = Grid::get(opCtx)->catalogClient()->updateDatabase(opCtx, dbName, dbt);
-        if (!status.isOK()) {
-            log() << "adding shard " << shardConnectionString.toString()
-                  << " even though could not add database " << dbName;
+        {
+            const auto status = Grid::get(opCtx)->catalogClient()->updateConfigDocument(
+                opCtx,
+                DatabaseType::ConfigNS,
+                BSON(DatabaseType::name(dbName)),
+                dbt.toBSON(),
+                true,
+                ShardingCatalogClient::kLocalWriteConcern);
+            if (!status.isOK()) {
+                log() << "adding shard " << shardConnectionString.toString()
+                      << " even though could not add database " << dbName;
+            }
         }
     }
 
@@ -867,33 +901,6 @@ StatusWith<ShardDrainingStatus> ShardingCatalogManager::removeShard(OperationCon
 
 void ShardingCatalogManager::appendConnectionStats(executor::ConnectionPoolStats* stats) {
     _executorForAddShard->appendConnectionStats(stats);
-}
-
-BSONObj ShardingCatalogManager::createShardIdentityUpsertForAddShard(OperationContext* opCtx,
-                                                                     const std::string& shardName) {
-    BatchedCommandRequest request([&] {
-        write_ops::Update updateOp(NamespaceString::kServerConfigurationNamespace);
-        updateOp.setUpdates(
-            {[&] {
-                write_ops::UpdateOpEntry entry;
-                entry.setQ(BSON("_id"
-                                << "shardIdentity"
-                                << ShardIdentityType::shardName(shardName)
-                                << ShardIdentityType::clusterId(
-                                       ClusterIdentityLoader::get(opCtx)->getClusterId())));
-                entry.setU(BSON("$set" << BSON(ShardIdentityType::configsvrConnString(
-                                    repl::ReplicationCoordinator::get(opCtx)
-                                        ->getConfig()
-                                        .getConnectionString()
-                                        .toString()))));
-                entry.setUpsert(true);
-                return entry;
-            }()});
-        return updateOp;
-    }());
-    request.setWriteConcern(ShardingCatalogClient::kMajorityWriteConcern.toBSON());
-
-    return request.toBSON();
 }
 
 // static

@@ -143,10 +143,8 @@ BSONArray decompressMetrics(ConstDataRange cdr) {
     ConstDataRange raw(outBuffer.data(), outBuffer.data() + outBuffer.size());
     auto swObj = raw.read<Validated<BSONObj>>();
     ASSERT_OK(swObj.getStatus());
-    auto obj = swObj.getValue().val;
-    ASSERT(obj.couldBeArray());
 
-    return BSONArray(obj.getOwned());
+    return BSONArray(swObj.getValue().val["data"].Obj().getOwned());
 }
 
 /**
@@ -177,8 +175,10 @@ public:
 
         if (_count > 0) {
             --_count;
-            _payload = std::move(payload);
-            _condvar.notify_one();
+            if (_count == 0) {
+                _payload = std::move(payload);
+                _condvar.notify_one();
+            }
         }
     }
 
@@ -242,29 +242,21 @@ public:
 
         _registers.addAndFetch(1);
 
-        Promise<FreeMonRegistrationResponse> promise;
-        auto future = promise.getFuture();
+        auto pf = makePromiseFuture<FreeMonRegistrationResponse>();
         if (_options.doSync) {
-            promise.setFrom(doRegister(req));
+            pf.promise.setFrom(doRegister(req));
         } else {
-            auto shared_promise = promise.share();
+            auto swSchedule =
+                _threadPool->scheduleWork([ sharedPromise = pf.promise.share(), req, this ](
+                    const executor::TaskExecutor::CallbackArgs& cbArgs) mutable {
 
-            auto swSchedule = _threadPool->scheduleWork([shared_promise, req, this](
-                const executor::TaskExecutor::CallbackArgs& cbArgs) mutable {
-
-                auto swResp = doRegister(req);
-                if (!swResp.isOK()) {
-                    shared_promise.setError(swResp.getStatus());
-                } else {
-                    shared_promise.emplaceValue(swResp.getValue());
-                }
-
-            });
+                    sharedPromise.setWith([&] { return doRegister(req); });
+                });
 
             ASSERT_OK(swSchedule.getStatus());
         }
 
-        return future;
+        return std::move(pf.future);
     }
 
     StatusWith<FreeMonRegistrationResponse> doRegister(const FreeMonRegistrationRequest& req) {
@@ -297,29 +289,21 @@ public:
 
         _metrics.addAndFetch(1);
 
-        Promise<FreeMonMetricsResponse> promise;
-        auto future = promise.getFuture();
+        auto pf = makePromiseFuture<FreeMonMetricsResponse>();
         if (_options.doSync) {
-            promise.setFrom(doMetrics(req));
+            pf.promise.setFrom(doMetrics(req));
         } else {
-            auto shared_promise = promise.share();
+            auto swSchedule =
+                _threadPool->scheduleWork([ sharedPromise = pf.promise.share(), req, this ](
+                    const executor::TaskExecutor::CallbackArgs& cbArgs) mutable {
 
-            auto swSchedule = _threadPool->scheduleWork([shared_promise, req, this](
-                const executor::TaskExecutor::CallbackArgs& cbArgs) mutable {
-
-                auto swResp = doMetrics(req);
-                if (!swResp.isOK()) {
-                    shared_promise.setError(swResp.getStatus());
-                } else {
-                    shared_promise.emplaceValue(swResp.getValue());
-                }
-
-            });
+                    sharedPromise.setWith([&] { return doMetrics(req); });
+                });
 
             ASSERT_OK(swSchedule.getStatus());
         }
 
-        return future;
+        return std::move(pf.future);
     }
 
     StatusWith<FreeMonMetricsResponse> doMetrics(const FreeMonMetricsRequest& req) {
@@ -556,6 +540,19 @@ TEST(FreeMonProcessorTest, TestRegistrationResponseValidation) {
                        << "reportingInterval"
                        << 1LL))));
 
+    // max reporting interval
+    ASSERT_OK(FreeMonProcessor::validateRegistrationResponse(FreeMonRegistrationResponse::parse(
+        IDLParserErrorContext("foo"),
+        BSON("version" << 1LL << "haltMetricsUploading" << false << "id"
+                       << "mock123"
+                       << "informationalURL"
+                       << "http://www.example.com/123"
+                       << "message"
+                       << "msg456"
+                       << "reportingInterval"
+                       << 30 * 60 * 60 * 24LL))));
+
+
     // Negative: bad protocol version
     ASSERT_NOT_OK(FreeMonProcessor::validateRegistrationResponse(FreeMonRegistrationResponse::parse(
         IDLParserErrorContext("foo"),
@@ -637,7 +634,7 @@ TEST(FreeMonProcessorTest, TestRegistrationResponseValidation) {
                        << "message"
                        << "msg456"
                        << "reportingInterval"
-                       << (60LL * 60 * 24 + 1LL)))));
+                       << (60LL * 60 * 24 * 30 + 1LL)))));
 }
 
 
@@ -655,6 +652,20 @@ TEST(FreeMonProcessorTest, TestMetricsResponseValidation) {
                        << "msg456"
                        << "reportingInterval"
                        << 1LL))));
+
+    // max reporting interval
+    ASSERT_OK(FreeMonProcessor::validateMetricsResponse(FreeMonMetricsResponse::parse(
+        IDLParserErrorContext("foo"),
+
+        BSON("version" << 1LL << "haltMetricsUploading" << false << "permanentlyDelete" << false
+                       << "id"
+                       << "mock123"
+                       << "informationalURL"
+                       << "http://www.example.com/123"
+                       << "message"
+                       << "msg456"
+                       << "reportingInterval"
+                       << 60 * 60 * 24 * 30LL))));
 
     // Negative: bad protocol version
     ASSERT_NOT_OK(FreeMonProcessor::validateMetricsResponse(FreeMonMetricsResponse::parse(
@@ -748,7 +759,7 @@ TEST(FreeMonProcessorTest, TestMetricsResponseValidation) {
                        << "message"
                        << "msg456"
                        << "reportingInterval"
-                       << (60LL * 60 * 24 + 1LL)))));
+                       << (60LL * 60 * 24 * 30 + 1LL)))));
 }
 
 /**
@@ -847,7 +858,7 @@ struct ControllerHolder {
 
     void start(RegistrationType registrationType) {
         std::vector<std::string> tags;
-        controller->start(registrationType, tags);
+        controller->start(registrationType, tags, Seconds(1));
     }
 
 
@@ -861,7 +872,6 @@ struct ControllerHolder {
 
     std::unique_ptr<FreeMonController> controller;
 };
-
 
 // Positive: Test Register works
 TEST_F(FreeMonControllerTest, TestRegister) {
@@ -1021,11 +1031,11 @@ TEST_F(FreeMonControllerTest, TestMetricsWithDisabledStorageThenRegister) {
     FreeMonStorage::replace(_opCtx.get(), initStorage(StorageStateEnum::disabled));
 
     controller.start(RegistrationType::RegisterAfterOnTransitionToPrimary);
-    controller->turnCrankForTest(Turner().registerServer().collect(4));
+    controller->turnCrankForTest(Turner().registerServer().metricsSend().collect(4));
 
     ASSERT_OK(controller->registerServerCommand(Milliseconds::min()));
 
-    controller->turnCrankForTest(Turner().registerCommand().collect(2).metricsSend());
+    controller->turnCrankForTest(Turner().registerCommand().metricsSend().collect(2).metricsSend());
 
     ASSERT_GTE(controller.network->getRegistersCalls(), 1);
     ASSERT_GTE(controller.network->getMetricsCalls(), 1);
@@ -1042,7 +1052,7 @@ TEST_F(FreeMonControllerTest, TestMetricsWithDisabledStorageThenRegisterAndRereg
     FreeMonStorage::replace(_opCtx.get(), initStorage(StorageStateEnum::disabled));
 
     controller.start(RegistrationType::RegisterAfterOnTransitionToPrimary);
-    controller->turnCrankForTest(Turner().registerServer().collect(4));
+    controller->turnCrankForTest(Turner().registerServer().metricsSend().collect(4));
 
     ASSERT_OK(controller->registerServerCommand(Milliseconds::min()));
 
@@ -1058,7 +1068,7 @@ TEST_F(FreeMonControllerTest, TestMetricsWithDisabledStorageThenRegisterAndRereg
 
     ASSERT_OK(controller->registerServerCommand(Milliseconds::min()));
 
-    controller->turnCrankForTest(Turner().registerCommand().collect(2).metricsSend());
+    controller->turnCrankForTest(Turner().registerCommand().metricsSend().collect(2).metricsSend());
 
     ASSERT_TRUE(FreeMonStorage::read(_opCtx.get())->getState() == StorageStateEnum::enabled);
 
@@ -1104,7 +1114,7 @@ TEST_F(FreeMonControllerTest, TestMetricsHalt) {
     controller.start(RegistrationType::RegisterOnStart);
 
     controller->turnCrankForTest(
-        Turner().registerServer().registerCommand().collect(4).metricsSend());
+        Turner().registerServer().registerCommand().metricsSend().collect(4).metricsSend());
 
     ASSERT_TRUE(!FreeMonStorage::read(_opCtx.get()).get().getRegistrationId().empty());
     ASSERT_TRUE(FreeMonStorage::read(_opCtx.get()).get().getState() == StorageStateEnum::disabled);
@@ -1168,13 +1178,11 @@ TEST_F(FreeMonControllerTest, TestPreRegistrationMetricBatching) {
 
     controller.start(RegistrationType::RegisterAfterOnTransitionToPrimary);
 
-    controller->turnCrankForTest(Turner().registerServer().collect(3));
+    controller->turnCrankForTest(Turner().registerServer().collect(4));
 
     ASSERT_OK(controller->registerServerCommand(Milliseconds::min()));
 
-    controller->turnCrankForTest(Turner().registerCommand().collect(1));
-
-    controller->turnCrankForTest(Turner().metricsSend().collect(1));
+    controller->turnCrankForTest(Turner().registerCommand().metricsSend());
 
     // Ensure we sent all the metrics batched before registration
     ASSERT_EQ(controller.network->getLastMetrics().nFields(), 4);
@@ -1185,27 +1193,7 @@ TEST_F(FreeMonControllerTest, TestPreRegistrationMetricBatching) {
     ASSERT_EQ(controller.network->getLastMetrics().nFields(), 2);
 }
 
-// Negative: Test metrics buffers on failure, and retries
-TEST_F(FreeMonControllerTest, TestMetricBatchingOnError) {
-    FreeMonNetworkInterfaceMock::Options opts;
-    opts.fail2MetricsUploads = true;
-    ControllerHolder controller(_mockThreadPool.get(), opts);
-
-    controller.start(RegistrationType::RegisterOnStart);
-
-    controller->turnCrankForTest(Turner().registerServer().registerCommand().collect(2));
-
-    controller->turnCrankForTest(Turner().metricsSend().collect());
-
-    // Ensure we sent all the metrics batched before registration
-    ASSERT_EQ(controller.network->getLastMetrics().nFields(), 2);
-
-    controller->turnCrankForTest(Turner().metricsSend().collect());
-
-    // Ensure we resent all the failed metrics
-    ASSERT_EQ(controller.network->getLastMetrics().nFields(), 3);
-}
-
+#if 0
 // Negative: Test metrics buffers on failure, and retries and ensure 2 metrics occurs after a blip
 // of an error
 // Note: this test operates in real-time because it needs to test multiple retries matched with
@@ -1217,24 +1205,19 @@ TEST_F(FreeMonControllerTest, TestMetricBatchingOnErrorRealtime) {
 
     controller.start(RegistrationType::RegisterOnStart);
 
-    // Ensure the first upload sends 2 samples
-    ASSERT_TRUE(controller.network->waitMetricsCalls(1, Seconds(5)).is_initialized());
+    // Ensure the second upload sends 1 samples
+    ASSERT_TRUE(controller.network->waitMetricsCalls(2, Seconds(5)).is_initialized());
     ASSERT_EQ(controller.network->getLastMetrics().nFields(), 2);
 
-    // Ensure the second upload sends 3 samples because first failed
+    // Ensure the third upload sends 3 samples because first failed
     ASSERT_TRUE(controller.network->waitMetricsCalls(1, Seconds(5)).is_initialized());
-    ASSERT_EQ(controller.network->getLastMetrics().nFields(), 3);
-
-    // Ensure the third upload sends 5 samples because second failed
-    // Since the second retry is 2s, we collected 2 samples
-    ASSERT_TRUE(controller.network->waitMetricsCalls(1, Seconds(5)).is_initialized());
-    ASSERT_GTE(controller.network->getLastMetrics().nFields(), 4);
+    ASSERT_EQ(controller.network->getLastMetrics().nFields(), 4);
 
     // Ensure the fourth upload sends 2 samples
     ASSERT_TRUE(controller.network->waitMetricsCalls(1, Seconds(5)).is_initialized());
     ASSERT_EQ(controller.network->getLastMetrics().nFields(), 2);
 }
-
+#endif
 
 class FreeMonControllerRSTest : public FreeMonControllerTest {
 private:
@@ -1462,7 +1445,8 @@ TEST_F(FreeMonControllerRSTest, SecondaryStartOnBadUpdate) {
 
     controller.start(RegistrationType::RegisterAfterOnTransitionToPrimary);
 
-    controller->turnCrankForTest(Turner().registerServer().registerCommand().collect(2));
+    controller->turnCrankForTest(
+        Turner().registerServer().registerCommand().metricsSend().collect(2));
 
     controller->notifyOnUpsert(BSON("version" << 2LL));
 
@@ -1499,7 +1483,7 @@ TEST_F(FreeMonControllerRSTest, SecondaryRollbackStopMetrics) {
     controller->notifyOnRollback();
 
     controller->turnCrankForTest(
-        Turner().notifyOnRollback().registerCommand().collect(2).metricsSend());
+        Turner().notifyOnRollback().registerCommand().metricsSend().collect(2).metricsSend());
 
     // Since there is no local write, it remains enabled
     ASSERT_TRUE(FreeMonStorage::read(_opCtx.get()).get().getState() == StorageStateEnum::enabled);

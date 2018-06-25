@@ -126,6 +126,13 @@ Status MobileKVEngine::createRecordStore(OperationContext* opCtx,
                                          StringData ident,
                                          const CollectionOptions& options) {
     // TODO: eventually will support file renaming but otherwise do not use collection options.
+
+    // Mobile doesn't support capped collections
+    if (options.capped) {
+        return Status(ErrorCodes::InvalidOptions,
+                      "Capped collections are not supported by the mobile storage engine");
+    }
+
     MobileRecordStore::create(opCtx, ident.toString());
     return Status::OK();
 }
@@ -161,8 +168,9 @@ Status MobileKVEngine::dropIdent(OperationContext* opCtx, StringData ident) {
     } catch (const WriteConflictException&) {
         // It is possible that this drop fails because of transaction running in parallel.
         // We pretend that it succeeded, queue it for now and keep retrying later.
-        LOG(2) << "MobileSE: Caught WriteConflictException while dropping table, queuing to retry "
-                  "later";
+        LOG(MOBILE_LOG_LEVEL_LOW)
+            << "MobileSE: Caught WriteConflictException while dropping table, "
+               "queuing to retry later";
         MobileRecoveryUnit::get(opCtx)->enqueueFailedDrop(dropQuery);
     }
     return Status::OK();

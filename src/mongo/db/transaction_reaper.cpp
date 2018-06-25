@@ -193,7 +193,7 @@ public:
     void handleLsid(const LogicalSessionId& lsid) {
         _batch.insert(lsid);
 
-        if (_batch.size() > write_ops::kMaxWriteBatchSize) {
+        if (_batch.size() >= write_ops::kMaxWriteBatchSize) {
             _numReaped += removeSessionsRecords(_opCtx, _sessionsCollection, _batch);
             _batch.clear();
         }
@@ -231,7 +231,7 @@ public:
     bool initialize() {
         auto routingInfo =
             uassertStatusOK(Grid::get(_opCtx)->catalogCache()->getCollectionRoutingInfo(
-                _opCtx, SessionsCollection::kSessionsNamespaceString));
+                _opCtx, NamespaceString::kLogicalSessionsNamespace));
         _cm = routingInfo.cm();
         return !!_cm;
     }
@@ -244,7 +244,7 @@ public:
         auto& lsids = _shards[shardId];
         lsids.insert(lsid);
 
-        if (lsids.size() > write_ops::kMaxWriteBatchSize) {
+        if (lsids.size() >= write_ops::kMaxWriteBatchSize) {
             _numReaped += removeSessionsRecords(_opCtx, _sessionsCollection, lsids);
             _shards.erase(shardId);
         }

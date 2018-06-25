@@ -69,10 +69,6 @@ selector:
   # can cause OOM kills on test hosts
   - jstests/concurrency/fsm_workloads/findAndModify_update_grow.js
 
-  # the group command cannot be issued against a sharded cluster
-  - jstests/concurrency/fsm_workloads/group.js
-  - jstests/concurrency/fsm_workloads/group_cond.js
-  - jstests/concurrency/fsm_workloads/group_killop.js
   # eval doesn't work with sharded collections
   - jstests/concurrency/fsm_workloads/indexed_insert_eval.js
   - jstests/concurrency/fsm_workloads/indexed_insert_eval_nolock.js
@@ -108,6 +104,13 @@ selector:
   # stagedebug can only be run against a standalone mongod
   - jstests/concurrency/fsm_workloads/yield_and_hashed.js
   - jstests/concurrency/fsm_workloads/yield_and_sorted.js
+
+  # TODO Unblacklist (SERVER-35538).
+  - jstests/concurrency/fsm_workloads/database_versioning.js
+
+  exclude_with_any_tags:
+  - uses_transactions
+  - requires_replication
 
 executor:
   archive:

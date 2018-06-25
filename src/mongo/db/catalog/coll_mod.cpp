@@ -64,7 +64,7 @@ namespace {
 
 // Causes the server to hang when it attempts to assign UUIDs to the provided database (or all
 // databases if none are provided).
-MONGO_FP_DECLARE(hangBeforeDatabaseUpgrade);
+MONGO_FAIL_POINT_DEFINE(hangBeforeDatabaseUpgrade);
 
 struct CollModRequest {
     const IndexDescriptor* idx = nullptr;
@@ -300,7 +300,7 @@ Status _collModInternal(OperationContext* opCtx,
                         const NamespaceString& nss,
                         const BSONObj& cmdObj,
                         BSONObjBuilder* result,
-                        OptionalCollectionUUID uuid) {
+                        bool upgradeUniqueIndexes) {
     StringData dbName = nss.db();
     AutoGetDb autoDb(opCtx, dbName, MODE_X);
     Database* const db = autoDb.getDb();
@@ -424,24 +424,28 @@ Status _collModInternal(OperationContext* opCtx,
     if (!cmr.noPadding.eoo())
         setCollectionOptionFlag(opCtx, coll, cmr.noPadding, result);
 
-    // Add collection UUID if it is missing. This returns an error if a collection already has a
-    // different UUID. As we don't assign UUIDs to system.indexes (SERVER-29926), don't implicitly
-    // upgrade them on collMod either.
-    if (!nss.isSystemDotIndexes()) {
-        if (uuid && !coll->uuid()) {
-            log() << "Assigning UUID " << uuid.get().toString() << " to collection " << coll->ns();
-            CollectionCatalogEntry* cce = coll->getCatalogEntry();
-            cce->addUUID(opCtx, uuid.get(), coll);
-        } else if (uuid && coll->uuid() && uuid.get() != coll->uuid().get()) {
-            return Status(ErrorCodes::Error(40676),
-                          str::stream() << "collMod " << redact(cmdObj) << " provides a UUID ("
-                                        << uuid.get().toString()
-                                        << ") that does not match the UUID ("
-                                        << coll->uuid().get().toString()
-                                        << ") of the collection "
-                                        << nss.ns());
+    // Upgrade unique indexes
+    if (upgradeUniqueIndexes) {
+        // A cmdObj with an empty collMod, i.e. nFields = 1, implies that it is a Unique Index
+        // upgrade collMod.
+        invariant(cmdObj.nFields() == 1);
+        std::vector<std::string> indexNames;
+        coll->getCatalogEntry()->getAllUniqueIndexes(opCtx, &indexNames);
+
+        for (size_t i = 0; i < indexNames.size(); i++) {
+            const IndexDescriptor* desc =
+                coll->getIndexCatalog()->findIndexByName(opCtx, indexNames[i]);
+            invariant(desc);
+
+            // Update index metadata in storage engine.
+            coll->getCatalogEntry()->updateIndexMetadata(opCtx, desc);
+
+            // Refresh the in-memory instance of the index.
+            desc = coll->getIndexCatalog()->refreshEntry(opCtx, desc);
+
+            opCtx->recoveryUnit()->onRollback(
+                [opCtx, desc, coll]() { coll->getIndexCatalog()->refreshEntry(opCtx, desc); });
         }
-        coll->refreshUUID(opCtx);
     }
 
     // Only observe non-view collMods, as view operations are observed as operations on the
@@ -454,109 +458,114 @@ Status _collModInternal(OperationContext* opCtx,
     return Status::OK();
 }
 
-void _addCollectionUUIDsPerDatabase(OperationContext* opCtx,
-                                    const std::string& dbname,
-                                    std::map<std::string, UUID>& collToUUID) {
-    // Iterate through all collections of database dbname and make necessary UUID changes.
-    std::vector<NamespaceString> collNamespaceStrings;
-    {
-        AutoGetDb autoDb(opCtx, dbname, MODE_X);
-        Database* const db = autoDb.getDb();
-        // If the database no longer exists, we're done with upgrading.
-        if (!db) {
-            return;
-        }
-        for (auto collectionIt = db->begin(); collectionIt != db->end(); ++collectionIt) {
-            Collection* coll = *collectionIt;
-            collNamespaceStrings.push_back(coll->ns());
-        }
-    }
-    for (auto& collNSS : collNamespaceStrings) {
-        // Skip system.namespaces until SERVER-30095 is addressed.
-        if (collNSS.coll() == "system.namespaces") {
-            continue;
-        }
-        // Skip all non-replicated collections.
-        if (collNSS.db() == "local" || collNSS.coll() == "system.profile") {
-            continue;
-        }
-
-        AutoGetDb autoDb(opCtx, dbname, MODE_X);
-        Database* const db = autoDb.getDb();
-        Collection* coll = db ? db->getCollection(opCtx, collNSS) : nullptr;
-        // If the collection no longer exists, skip it.
-        if (!coll) {
-            continue;
-        }
-        BSONObjBuilder collModObjBuilder;
-        collModObjBuilder.append("collMod", coll->ns().coll());
-        BSONObj collModObj = collModObjBuilder.done();
-        OptionalCollectionUUID uuid = boost::none;
-        if (collToUUID.find(collNSS.coll().toString()) != collToUUID.end()) {
-            // This is a sharded collection. Use the UUID generated by the config server.
-            uuid = collToUUID.at(collNSS.coll().toString());
-        } else {
-            // This is an unsharded collection. Generate a UUID.
-            uuid = UUID::gen();
-        }
-
-        if (!coll->uuid()) {
-            uassertStatusOK(collModForUUIDUpgrade(opCtx, coll->ns(), collModObj, uuid.get()));
-        }
-    }
-}
 }  // namespace
 
 Status collMod(OperationContext* opCtx,
                const NamespaceString& nss,
                const BSONObj& cmdObj,
                BSONObjBuilder* result) {
-    return _collModInternal(opCtx, nss, cmdObj, result, /*UUID*/ boost::none);
+    return _collModInternal(opCtx,
+                            nss,
+                            cmdObj,
+                            result,
+                            /*upgradeUniqueIndexes*/ false);
 }
 
-Status collModForUUIDUpgrade(OperationContext* opCtx,
-                             const NamespaceString& nss,
-                             const BSONObj& cmdObj,
-                             CollectionUUID uuid) {
-    BSONObjBuilder resultWeDontCareAbout;
-    return _collModInternal(opCtx, nss, cmdObj, &resultWeDontCareAbout, uuid);
-}
+Status collModWithUpgrade(OperationContext* opCtx,
+                          const NamespaceString& nss,
+                          const BSONObj& cmdObj) {
+    // A cmdObj with an empty collMod, i.e. nFields = 1, implies that it is a Unique Index
+    // upgrade collMod.
+    bool upgradeUniqueIndex = createTimestampSafeUniqueIndex && (cmdObj.nFields() == 1);
 
-void addCollectionUUIDs(OperationContext* opCtx) {
-    // A map of the form { db1: { collB: UUID, collA: UUID, ... }, db2: { ... } }
-    std::map<std::string, std::map<std::string, UUID>> dbToCollToUUID;
-    if (ShardingState::get(opCtx)->enabled()) {
-        log() << "obtaining UUIDs for pre-existing sharded collections from config server";
-
-        // Get UUIDs for all existing sharded collections from the config server. Since the sharded
-        // collections are not stored per-database in config.collections, it's more efficient to
-        // read all the collections at once than to read them by database.
-        auto shardedColls =
-            uassertStatusOK(
-                Grid::get(opCtx)->shardRegistry()->getConfigShard()->exhaustiveFindOnConfig(
-                    opCtx,
-                    ReadPreferenceSetting{ReadPreference::PrimaryOnly},
-                    repl::ReadConcernLevel::kMajorityReadConcern,
-                    CollectionType::ConfigNS,
-                    BSON("dropped" << false),  // query
-                    BSONObj(),                 // sort
-                    boost::none                // limit
-                    ))
-                .docs;
-
-        for (const auto& coll : shardedColls) {
-            auto collType = uassertStatusOK(CollectionType::fromBSON(coll));
-            uassert(ErrorCodes::InternalError,
-                    str::stream() << "expected entry " << coll << " in config.collections for "
-                                  << collType.getNs().ns()
-                                  << " to have a UUID, but it did not",
-                    collType.getUUID());
-            dbToCollToUUID[collType.getNs().db().toString()].emplace(
-                collType.getNs().coll().toString(), *collType.getUUID());
+    // Update all non-replicated unique indexes on upgrade i.e. setFCV=4.2.
+    if (upgradeUniqueIndex && nss == NamespaceString::kServerConfigurationNamespace) {
+        auto schemaStatus = updateNonReplicatedUniqueIndexes(opCtx);
+        if (!schemaStatus.isOK()) {
+            return schemaStatus;
         }
     }
 
-    // Add UUIDs to all collections of all databases if they do not already have UUIDs.
+    BSONObjBuilder resultWeDontCareAbout;
+    return _collModInternal(opCtx, nss, cmdObj, &resultWeDontCareAbout, upgradeUniqueIndex);
+}
+
+Status _updateNonReplicatedIndexPerCollection(OperationContext* opCtx, Collection* coll) {
+    BSONObjBuilder collModObjBuilder;
+    collModObjBuilder.append("collMod", coll->ns().coll());
+    BSONObj collModObj = collModObjBuilder.done();
+
+    BSONObjBuilder resultWeDontCareAbout;
+    auto collModStatus = _collModInternal(opCtx,
+                                          coll->ns(),
+                                          collModObj,
+                                          &resultWeDontCareAbout,
+                                          /*upgradeUniqueIndexes*/ true);
+    return collModStatus;
+}
+
+Status _updateNonReplicatedUniqueIndexesPerDatabase(OperationContext* opCtx,
+                                                    const std::string& dbName) {
+    AutoGetDb autoDb(opCtx, dbName, MODE_X);
+    Database* const db = autoDb.getDb();
+
+    // Iterate through all collections if we're in the "local" database.
+    if (dbName == "local") {
+        for (auto collectionIt = db->begin(); collectionIt != db->end(); ++collectionIt) {
+            Collection* coll = *collectionIt;
+
+            auto collModStatus = _updateNonReplicatedIndexPerCollection(opCtx, coll);
+            if (!collModStatus.isOK())
+                return collModStatus;
+        }
+    } else {
+        // If we're not in the "local" database, the only non-replicated collection
+        // could be system.profile.
+        Collection* coll =
+            db ? db->getCollection(opCtx, NamespaceString(dbName, "system.profile")) : nullptr;
+        if (!coll)
+            return Status::OK();
+
+        auto collModStatus = _updateNonReplicatedIndexPerCollection(opCtx, coll);
+        if (!collModStatus.isOK())
+            return collModStatus;
+    }
+    return Status::OK();
+}
+
+void _updateUniqueIndexesForDatabase(OperationContext* opCtx, const std::string& dbname) {
+    // Iterate through all replicated collections of the database, for unique index update.
+    // Non-replicated unique indexes are updated via the upgrade of admin.system.version
+    // collection.
+    {
+        AutoGetDb autoDb(opCtx, dbname, MODE_X);
+        Database* const db = autoDb.getDb();
+        // If the database no longer exists, nothing more to do.
+        if (!db)
+            return;
+
+        for (auto collectionIt = db->begin(); collectionIt != db->end(); ++collectionIt) {
+            Collection* coll = *collectionIt;
+            NamespaceString collNSS = coll->ns();
+
+            // Skip non-replicated collection.
+            if (collNSS.coll() == "system.profile")
+                continue;
+
+            BSONObjBuilder collModObjBuilder;
+            collModObjBuilder.append("collMod", collNSS.coll());
+            BSONObj collModObj = collModObjBuilder.done();
+
+            uassertStatusOK(collModWithUpgrade(opCtx, collNSS, collModObj));
+        }
+    }
+}
+
+void updateUniqueIndexesOnUpgrade(OperationContext* opCtx) {
+    if (!createTimestampSafeUniqueIndex)
+        return;
+
+    // Update all unique indexes except the _id index.
     std::vector<std::string> dbNames;
     StorageEngine* storageEngine = opCtx->getServiceContext()->getStorageEngine();
     {
@@ -567,31 +576,44 @@ void addCollectionUUIDs(OperationContext* opCtx) {
     for (auto it = dbNames.begin(); it != dbNames.end(); ++it) {
         auto dbName = *it;
 
-        MONGO_FAIL_POINT_BLOCK(hangBeforeDatabaseUpgrade, customArgs) {
-            const auto& data = customArgs.getData();
-            const auto dbElem = data["database"];
-            if (!dbElem || dbElem.checkAndGetStringData() == dbName) {
-                log() << "collMod - hangBeforeDatabaseUpgrade fail point enabled for " << dbName
-                      << ". Blocking until fail point is disabled.";
-                while (MONGO_FAIL_POINT(hangBeforeDatabaseUpgrade)) {
-                    mongo::sleepsecs(1);
-                }
-            }
-        }
-
-        _addCollectionUUIDsPerDatabase(opCtx, dbName, dbToCollToUUID[dbName]);
+        // Non-replicated unique indexes are updated via the upgrade of admin.system.version
+        // collection.
+        if (dbName != "local")
+            _updateUniqueIndexesForDatabase(opCtx, dbName);
     }
 
     const auto& clientInfo = repl::ReplClientInfo::forClient(opCtx->getClient());
     auto awaitOpTime = clientInfo.getLastOp();
 
-    log() << "Finished adding UUIDs to collections, waiting for all UUIDs to be committed at optime"
-          << awaitOpTime << ".";
+    log() << "Finished updating version of unique indexes for upgrade, waiting for all"
+          << " index updates to be committed at optime " << awaitOpTime;
 
     const WriteConcernOptions writeConcern(WriteConcernOptions::kMajority,
                                            WriteConcernOptions::SyncMode::UNSET,
                                            /*timeout*/ INT_MAX);
     repl::ReplicationCoordinator::get(opCtx)->awaitReplication(opCtx, awaitOpTime, writeConcern);
+}
+
+Status updateNonReplicatedUniqueIndexes(OperationContext* opCtx) {
+    if (!createTimestampSafeUniqueIndex)
+        return Status::OK();
+
+    // Update all unique indexes belonging to all non-replicated collections.
+    // (_id indexes are not updated).
+    std::vector<std::string> dbNames;
+    StorageEngine* storageEngine = opCtx->getServiceContext()->getStorageEngine();
+    {
+        Lock::GlobalLock lk(opCtx, MODE_IS);
+        storageEngine->listDatabases(&dbNames);
+    }
+    for (auto it = dbNames.begin(); it != dbNames.end(); ++it) {
+        auto dbName = *it;
+        auto schemaStatus = _updateNonReplicatedUniqueIndexesPerDatabase(opCtx, dbName);
+        if (!schemaStatus.isOK()) {
+            return schemaStatus;
+        }
+    }
+    return Status::OK();
 }
 
 }  // namespace mongo

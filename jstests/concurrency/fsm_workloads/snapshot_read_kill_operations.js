@@ -3,6 +3,7 @@
 /**
  * Test a snapshot read spanning a find and getmore that runs concurrently with killSessions,
  * killOp, killCursors, and txnNumber change.
+ *
  * @tags: [uses_transactions]
  */
 load('jstests/concurrency/fsm_workload_helpers/snapshot_read_utils.js');
@@ -27,10 +28,11 @@ var $config = (function() {
         },
 
         snapshotGetMore: function snapshotGetMore(db, collName) {
-            doSnapshotGetMore(collName,
-                              this,
-                              [ErrorCodes.NoSuchTransaction, ErrorCodes.CursorNotFound],
-                              [ErrorCodes.NoSuchTransaction]);
+            doSnapshotGetMore(
+                collName,
+                this,
+                [ErrorCodes.NoSuchTransaction, ErrorCodes.CursorNotFound, ErrorCodes.Interrupted],
+                [ErrorCodes.NoSuchTransaction]);
         },
 
         incrementTxnNumber: function incrementTxnNumber(db, collName) {
@@ -94,15 +96,6 @@ var $config = (function() {
         killSessionsFromDocs(db, collName);
     }
 
-    const skip = function skip(cluster) {
-        // TODO(SERVER-34570) remove isSharded() check once transactions are supported in sharded
-        // environments.
-        if (cluster.isSharded() || cluster.isStandalone()) {
-            return {skip: true, msg: 'only runs in a replica set.'};
-        }
-        return {skip: false};
-    };
-
     return {
         threadCount: threadCount,
         iterations: 10,
@@ -112,7 +105,6 @@ var $config = (function() {
         setup: setup,
         teardown: teardown,
         data: data,
-        skip: skip
     };
 
 })();

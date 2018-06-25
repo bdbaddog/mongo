@@ -202,6 +202,28 @@ var authCommandsLib = {
           ]
         },
         {
+          testname: "_addShard",
+          command: {
+              _addShard: 1,
+              shardIdentity: {
+                  shardName: "shard0000",
+                  clusterId: ObjectId('5b2031806195dffd744258ee'),
+                  configsvrConnectionString: "foobarbaz/host:20022,host:20023,host:20024"
+              }
+          },
+          skipSharded: true,  // Command doesn't exist on mongos
+          testcases: [
+              {
+                runOnDb: adminDbName,
+                roles: {__system: 1},
+                privileges: [{resource: {cluster: true}, actions: ["internal"]}],
+                expectFail: true
+              },
+              {runOnDb: firstDbName, roles: {}},
+              {runOnDb: secondDbName, roles: {}}
+          ]
+        },
+        {
           testname: "addShard",
           command: {addShard: "x"},
           skipUnlessSharded: true,
@@ -1695,6 +1717,35 @@ var authCommandsLib = {
               {runOnDb: firstDbName, roles: {}},
               {runOnDb: secondDbName, roles: {}}
           ]
+        },
+        {
+          testname: "aggregate_geoNear",
+          command: {
+              aggregate: "coll",
+              cursor: {},
+              pipeline: [{$geoNear: {near: [50, 50], distanceField: "dist"}}]
+          },
+          setup: (db) => {
+              db.coll.drop();
+              assert.commandWorked(db.coll.createIndex({loc: "2d"}));
+              assert.commandWorked(db.coll.insert({loc: [45.32, 51.12]}));
+          },
+          teardown: (db) => {
+              db.coll.drop();
+          },
+          testcases: [
+              {
+                runOnDb: firstDbName,
+                roles: roles_read,
+                privileges: [{resource: {db: firstDbName, collection: "coll"}, actions: ["find"]}]
+              },
+              {
+                runOnDb: secondDbName,
+                roles: roles_readAny,
+                privileges:
+                    [{resource: {db: secondDbName, collection: "coll"}, actions: ["find"]}]
+              },
+          ],
         },
         {
           testname: "buildInfo",
@@ -3881,30 +3932,6 @@ var authCommandsLib = {
           ]
         },
         {
-          testname: "geoNear",
-          command: {geoNear: "x", near: [50, 50], num: 1},
-          setup: function(db) {
-              db.x.drop();
-              db.x.save({loc: [50, 50]});
-              db.x.ensureIndex({loc: "2d"});
-          },
-          teardown: function(db) {
-              db.x.drop();
-          },
-          testcases: [
-              {
-                runOnDb: firstDbName,
-                roles: roles_read,
-                privileges: [{resource: {db: firstDbName, collection: "x"}, actions: ["find"]}]
-              },
-              {
-                runOnDb: secondDbName,
-                roles: roles_readAny,
-                privileges: [{resource: {db: secondDbName, collection: "x"}, actions: ["find"]}]
-              }
-          ]
-        },
-        {
           testname: "geoSearch",
           command: {geoSearch: "x", near: [50, 50], maxDistance: 6, limit: 1, search: {}},
           skipSharded: true,
@@ -4084,38 +4111,6 @@ var authCommandsLib = {
               },
               {runOnDb: firstDbName, roles: {}},
               {runOnDb: secondDbName, roles: {}}
-          ]
-        },
-        {
-          testname: "group",
-          command: {
-              group: {
-                  ns: "x",
-                  key: {groupby: 1},
-                  initial: {total: 0},
-                  $reduce: function(curr, result) {
-                      result.total += curr.n;
-                  }
-              }
-          },
-          setup: function(db) {
-              db.x.insert({groupby: 1, n: 5});
-              db.x.insert({groupby: 1, n: 6});
-          },
-          teardown: function(db) {
-              db.x.drop();
-          },
-          testcases: [
-              {
-                runOnDb: firstDbName,
-                roles: roles_read,
-                privileges: [{resource: {db: firstDbName, collection: "x"}, actions: ["find"]}]
-              },
-              {
-                runOnDb: secondDbName,
-                roles: roles_readAny,
-                privileges: [{resource: {db: secondDbName, collection: "x"}, actions: ["find"]}]
-              }
           ]
         },
         {

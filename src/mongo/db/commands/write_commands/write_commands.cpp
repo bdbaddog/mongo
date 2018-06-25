@@ -237,7 +237,7 @@ private:
                 throw;
             }
         } catch (const ExceptionFor<ErrorCodes::Unauthorized>&) {
-            CommandHelpers::logAuthViolation(opCtx, this, *_request, ErrorCodes::Unauthorized);
+            CommandHelpers::auditLogAuthEvent(opCtx, this, *_request, ErrorCodes::Unauthorized);
             throw;
         }
     }
@@ -262,7 +262,7 @@ private:
 
     void _transactionChecks(OperationContext* opCtx) const {
         auto session = OperationContextSession::get(opCtx);
-        if (!session || !session->inSnapshotReadOrMultiDocumentTransaction())
+        if (!session || !session->inMultiDocumentTransaction())
             return;
         uassert(50791,
                 str::stream() << "Cannot write to system collection " << ns().toString()

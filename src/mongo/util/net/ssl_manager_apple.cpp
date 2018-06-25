@@ -215,47 +215,63 @@ bool isUnixDomainSocket(const std::string& hostname) {
 
 namespace detail {
 template <typename T>
-struct CFTypeMap {};
+struct CFTypeMap;
+
 template <>
 struct CFTypeMap<::CFStringRef> {
-    static constexpr StringData typeName = "string"_sd;
+    static constexpr StringData typeName() {
+        return "string"_sd;
+    }
+
     static ::CFTypeID type() {
         return ::CFStringGetTypeID();
     }
 };
-constexpr StringData CFTypeMap<::CFStringRef>::typeName;
+
 template <>
 struct CFTypeMap<::CFDataRef> {
-    static constexpr StringData typeName = "data"_sd;
+    static constexpr StringData typeName() {
+        return "data"_sd;
+    }
+
     static ::CFTypeID type() {
         return ::CFDataGetTypeID();
     }
 };
-constexpr StringData CFTypeMap<::CFDataRef>::typeName;
+
 template <>
 struct CFTypeMap<::CFNumberRef> {
-    static constexpr StringData typeName = "number"_sd;
+    static constexpr StringData typeName() {
+        return "number"_sd;
+    }
+
     static ::CFTypeID type() {
         return ::CFNumberGetTypeID();
     }
 };
-constexpr StringData CFTypeMap<::CFNumberRef>::typeName;
+
 template <>
 struct CFTypeMap<::CFArrayRef> {
-    static constexpr StringData typeName = "array"_sd;
+    static constexpr StringData typeName() {
+        return "array"_sd;
+    }
+
     static ::CFTypeID type() {
         return ::CFArrayGetTypeID();
     }
 };
-constexpr StringData CFTypeMap<::CFArrayRef>::typeName;
+
 template <>
 struct CFTypeMap<::CFDictionaryRef> {
-    static constexpr StringData typeName = "dictionary"_sd;
+    static constexpr StringData typeName() {
+        return "dictionary"_sd;
+    }
+
     static ::CFTypeID type() {
         return ::CFDictionaryGetTypeID();
     }
 };
-constexpr StringData CFTypeMap<::CFDictionaryRef>::typeName;
+
 }  // namespace detail
 
 template <typename T>
@@ -274,7 +290,7 @@ StatusWith<T> extractDictionaryValue(::CFDictionaryRef dict, ::CFStringRef key) 
         return badValue("Missing value");
     }
     if (::CFGetTypeID(val) != detail::CFTypeMap<T>::type()) {
-        return badValue(str::stream() << "Value is not a " << detail::CFTypeMap<T>::typeName);
+        return badValue(str::stream() << "Value is not a " << detail::CFTypeMap<T>::typeName());
     }
     return reinterpret_cast<T>(val);
 }
@@ -1077,6 +1093,7 @@ private:
     bool _weakValidation;
     bool _allowInvalidCertificates;
     bool _allowInvalidHostnames;
+    bool _suppressNoCertificateWarning;
     asio::ssl::apple::Context _clientCtx;
     asio::ssl::apple::Context _serverCtx;
     CFUniquePtr<::CFArrayRef> _ca;
@@ -1086,7 +1103,8 @@ private:
 SSLManagerApple::SSLManagerApple(const SSLParams& params, bool isServer)
     : _weakValidation(params.sslWeakCertificateValidation),
       _allowInvalidCertificates(params.sslAllowInvalidCertificates),
-      _allowInvalidHostnames(params.sslAllowInvalidHostnames) {
+      _allowInvalidHostnames(params.sslAllowInvalidHostnames),
+      _suppressNoCertificateWarning(params.suppressNoTLSPeerCertificateWarning) {
 
     uassertStatusOK(initSSLContext(&_clientCtx, params, ConnectionDirection::kOutgoing));
     if (_clientCtx.certs) {
@@ -1240,11 +1258,14 @@ StatusWith<boost::optional<SSLPeerInfo>> SSLManagerApple::parseAndValidatePeerCe
         return {boost::none};
     }
 
-    const auto badCert = [](StringData msg,
-                            bool warn = false) -> StatusWith<boost::optional<SSLPeerInfo>> {
+    const auto badCert = [this](StringData msg,
+                                bool warn = false) -> StatusWith<boost::optional<SSLPeerInfo>> {
         constexpr StringData prefix = "SSL peer certificate validation failed: "_sd;
         if (warn) {
-            warning() << prefix << msg;
+            // do not output warning if "no certificate" warnings are suppressed
+            if (!_suppressNoCertificateWarning) {
+                warning() << prefix << msg;
+            }
             return {boost::none};
         } else {
             std::string m = str::stream() << prefix << msg << "; connection rejected";
@@ -1422,15 +1443,6 @@ MONGO_INITIALIZER(SSLManager)(InitializerContext*) {
     stdx::lock_guard<SimpleMutex> lck(sslManagerMtx);
     if (!isSSLServer || (sslGlobalParams.sslMode.load() != SSLParams::SSLMode_disabled)) {
         theSSLManager = new SSLManagerApple(sslGlobalParams, isSSLServer);
-        const auto& config = theSSLManager->getSSLConfiguration();
-        log() << "Secure Transport Initialized";
-        if (!config.clientSubjectName.empty()) {
-            log() << "Client Certificate Name: " << config.clientSubjectName;
-        }
-        if (!config.serverSubjectName.empty()) {
-            log() << "Server Certificate Name: " << config.serverSubjectName;
-            log() << "Server Certificate Expiration: " << config.serverCertificateExpirationDate;
-        }
     }
     return Status::OK();
 }

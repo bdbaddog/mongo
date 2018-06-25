@@ -6,10 +6,12 @@ doassert = function(msg, obj) {
     if (typeof(msg) == "object")
         msg = tojson(msg);
 
-    if (typeof(msg) == "string" && msg.indexOf("assert") == 0)
-        print(msg);
-    else
-        print("assert: " + msg);
+    if (jsTest.options().traceExceptions) {
+        if (typeof(msg) == "string" && msg.indexOf("assert") == 0)
+            print(msg);
+        else
+            print("assert: " + msg);
+    }
 
     var ex;
     if (obj) {
@@ -17,7 +19,9 @@ doassert = function(msg, obj) {
     } else {
         ex = Error(msg);
     }
-    print(ex.stack);
+    if (jsTest.options().traceExceptions) {
+        print(ex.stack);
+    }
     throw ex;
 };
 
@@ -191,6 +195,20 @@ assert = (function() {
 
         doassert(_buildAssertionMessage(
             msg, "[" + tojson(aSorted) + "] != [" + tojson(bSorted) + "] are not equal"));
+    };
+
+    assert.setEq = function(aSet, bSet, msg) {
+        const failAssertion = function() {
+            doassert(_buildAssertionMessage(msg, tojson(aSet) + " != " + tojson(bSet)));
+        };
+        if (aSet.size !== bSet.size) {
+            failAssertion();
+        }
+        for (let a of aSet) {
+            if (!bSet.has(a)) {
+                failAssertion();
+            }
+        }
     };
 
     assert.eq.automsg = function(a, b) {

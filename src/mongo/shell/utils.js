@@ -24,10 +24,16 @@ function reconnect(db) {
 function _getErrorWithCode(codeOrObj, message) {
     var e = new Error(message);
     if (codeOrObj != undefined) {
-        if (codeOrObj.writeError) {
-            e.code = codeOrObj.writeError.code;
-        } else if (codeOrObj.code) {
-            e.code = codeOrObj.code;
+        if (codeOrObj.writeError || codeOrObj.code) {
+            if (codeOrObj.writeError) {
+                e.code = codeOrObj.writeError.code;
+            } else if (codeOrObj.code) {
+                e.code = codeOrObj.code;
+            }
+
+            if (codeOrObj.hasOwnProperty("errorLabels")) {
+                e.errorLabels = codeOrObj.errorLabels;
+            }
         } else {
             // At this point assume codeOrObj is a number type
             e.code = codeOrObj;
@@ -305,6 +311,12 @@ jsTestOptions = function() {
             logRetryAttempts: TestData.logRetryAttempts || false,
             connectionString: TestData.connectionString || "",
             skipCheckDBHashes: TestData.skipCheckDBHashes || false,
+            traceExceptions: TestData.hasOwnProperty("traceExceptions") ? TestData.traceExceptions
+                                                                        : true,
+            transactionLifetimeLimitSeconds: TestData.transactionLifetimeLimitSeconds,
+            mqlTestFile: TestData.mqlTestFile,
+            mqlRootPath: TestData.mqlRootPath,
+            disableImplicitSessions: TestData.disableImplicitSessions || false,
         });
     }
     return _jsTestOptions;
@@ -546,6 +558,16 @@ if (typeof _shouldRetryWrites === 'undefined') {
     // We ensure the _shouldRetryWrites() function is always defined, in case the JavaScript engine
     // is being used from someplace other than the mongo shell (e.g. map-reduce).
     _shouldRetryWrites = function _shouldRetryWrites() {
+        return false;
+    };
+}
+
+if (typeof _shouldUseImplicitSessions === 'undefined') {
+    // We ensure the _shouldUseImplicitSessions() function is always defined, in case the JavaScript
+    // engine is being used from someplace other than the mongo shell (e.g. map-reduce). If the
+    // function was not defined, implicit sessions are disabled to prevent unnecessary sessions from
+    // being created.
+    _shouldUseImplicitSessions = function _shouldUseImplicitSessions() {
         return false;
     };
 }
@@ -986,6 +1008,47 @@ shellHelper.show = function(what) {
 
         } else {
             print("Cannot show automationNotices, \"db\" is not set");
+            return "";
+        }
+    }
+
+    if (what == "freeMonitoring") {
+        var dbDeclared, ex;
+        try {
+            // !!db essentially casts db to a boolean
+            // Will throw a reference exception if db hasn't been declared.
+            dbDeclared = !!db;
+        } catch (ex) {
+            dbDeclared = false;
+        }
+
+        if (dbDeclared) {
+            const freemonStatus = db.adminCommand({getFreeMonitoringStatus: 1});
+
+            if (freemonStatus.ok) {
+                if (freemonStatus.state == 'enabled' &&
+                    freemonStatus.hasOwnProperty('userReminder')) {
+                    print("---");
+                    print(freemonStatus.userReminder);
+                    print("---");
+                } else if (freemonStatus.state === 'undecided') {
+                    print(
+                        "---\n" +
+                        "Enable MongoDB's free cloud-based monitoring service to collect and display\n" +
+                        "metrics about your deployment (disk utilization, CPU, operation statistics,\n" +
+                        "etc).\n" + "\n" +
+                        "The monitoring data will be available on a MongoDB website with a unique\n" +
+                        "URL created for you. Anyone you share the URL with will also be able to\n" +
+                        "view this page. MongoDB may use this information to make product\n" +
+                        "improvements and to suggest MongoDB products and deployment options to you.\n" +
+                        "\n" + "To enable free monitoring, run the following command:\n" +
+                        "db.enableFreeMonitoring()\n" + "---\n");
+                }
+            }
+
+            return "";
+        } else {
+            print("Cannot show freeMonitoring, \"db\" is not set");
             return "";
         }
     }

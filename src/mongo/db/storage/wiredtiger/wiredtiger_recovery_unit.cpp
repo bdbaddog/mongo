@@ -36,6 +36,7 @@
 
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/db/server_options.h"
+#include "mongo/db/storage/wiredtiger/wiredtiger_begin_transaction_block.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_kv_engine.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_prepare_conflict.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_session_cache.h"
@@ -50,7 +51,7 @@ namespace {
 // transaction is not prepared. This should always be enabled if WTPrepareConflictForReads is
 // used, which fails randomly. If this is not enabled, no prepare conflicts will be resolved,
 // because the recovery unit may not ever actually be in a prepared state.
-MONGO_FP_DECLARE(WTAlwaysNotifyPrepareConflictWaiters);
+MONGO_FAIL_POINT_DEFINE(WTAlwaysNotifyPrepareConflictWaiters);
 
 // SnapshotIds need to be globally unique, as they are used in a WorkingSetMember to
 // determine if documents changed, but a different recovery unit may be used across a getMore,
@@ -343,12 +344,14 @@ void WiredTigerRecoveryUnit::_txnOpen() {
     WT_SESSION* session = _session->getSession();
 
     switch (_timestampReadSource) {
-        case ReadSource::kNone: {
+        case ReadSource::kUnset:
+        case ReadSource::kNoTimestamp: {
             WiredTigerBeginTxnBlock txnOpen(session, _ignorePrepared);
 
             if (_isOplogReader) {
-                auto status = txnOpen.setTimestamp(
-                    Timestamp(_oplogManager->getOplogReadTimestamp()), true /* roundToOldest */);
+                auto status =
+                    txnOpen.setTimestamp(Timestamp(_oplogManager->getOplogReadTimestamp()),
+                                         WiredTigerBeginTxnBlock::RoundToOldest::kRound);
                 fassert(50771, status);
             }
             txnOpen.done();
@@ -382,7 +385,7 @@ void WiredTigerRecoveryUnit::_txnOpen() {
         }
         case ReadSource::kProvided: {
             WiredTigerBeginTxnBlock txnOpen(session, _ignorePrepared);
-            auto status = txnOpen.setTimestamp(_readAtTimestamp, session);
+            auto status = txnOpen.setTimestamp(_readAtTimestamp);
 
             if (!status.isOK() && status.code() == ErrorCodes::BadValue) {
                 uasserted(ErrorCodes::SnapshotTooOld,
@@ -463,7 +466,8 @@ void WiredTigerRecoveryUnit::setPrepareTimestamp(Timestamp timestamp) {
 }
 
 void WiredTigerRecoveryUnit::setIgnorePrepared(bool value) {
-    _ignorePrepared = value;
+    _ignorePrepared = (value) ? WiredTigerBeginTxnBlock::IgnorePrepared::kIgnore
+                              : WiredTigerBeginTxnBlock::IgnorePrepared::kNoIgnore;
 }
 
 void WiredTigerRecoveryUnit::setTimestampReadSource(ReadSource readSource,
@@ -471,7 +475,7 @@ void WiredTigerRecoveryUnit::setTimestampReadSource(ReadSource readSource,
     LOG(3) << "setting timestamp read source: " << static_cast<int>(readSource)
            << ", provided timestamp: " << ((provided) ? provided->toString() : "none");
 
-    invariant(!_active || _timestampReadSource == ReadSource::kNone ||
+    invariant(!_active || _timestampReadSource == ReadSource::kUnset ||
               _timestampReadSource == readSource);
     invariant(!provided == (readSource != ReadSource::kProvided));
     invariant(!(provided && provided->isNull()));

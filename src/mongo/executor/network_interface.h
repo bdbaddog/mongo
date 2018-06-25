@@ -44,8 +44,8 @@ class BSONObjBuilder;
 
 namespace executor {
 
-MONGO_FP_FORWARD_DECLARE(networkInterfaceDiscardCommandsBeforeAcquireConn);
-MONGO_FP_FORWARD_DECLARE(networkInterfaceDiscardCommandsAfterAcquireConn);
+MONGO_FAIL_POINT_DECLARE(networkInterfaceDiscardCommandsBeforeAcquireConn);
+MONGO_FAIL_POINT_DECLARE(networkInterfaceDiscardCommandsAfterAcquireConn);
 
 /**
  * Interface to networking for use by TaskExecutor implementations.
@@ -54,9 +54,6 @@ class NetworkInterface {
     MONGO_DISALLOW_COPYING(NetworkInterface);
 
 public:
-    // A flag to keep replication MessagingPorts open when all other sockets are disconnected.
-    static const unsigned int kMessagingPortKeepOpen = 1;
-
     using Response = RemoteCommandResponse;
     using RemoteCommandCompletionFn = stdx::function<void(const TaskExecutor::ResponseStatus&)>;
 
@@ -153,18 +150,17 @@ public:
         const TaskExecutor::CallbackHandle& cbHandle,
         RemoteCommandRequest& request,
         const transport::BatonHandle& baton = nullptr) {
-        Promise<TaskExecutor::ResponseStatus> promise;
-        auto future = promise.getFuture();
+        auto pf = makePromiseFuture<TaskExecutor::ResponseStatus>();
 
         auto status =
             startCommand(cbHandle,
                          request,
-                         [sp = promise.share()](const TaskExecutor::ResponseStatus& rs) mutable {
+                         [sp = pf.promise.share()](const TaskExecutor::ResponseStatus& rs) mutable {
                              sp.emplaceValue(rs);
                          },
                          baton);
 
-        return future;
+        return std::move(pf.future);
     }
 
     /**

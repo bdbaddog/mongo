@@ -37,6 +37,7 @@
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/repl/repl_client_info.h"
 #include "mongo/db/server_options.h"
+#include "mongo/db/write_concern.h"
 #include "mongo/s/catalog/sharding_catalog_client_impl.h"
 #include "mongo/s/catalog/type_database.h"
 #include "mongo/s/catalog_cache.h"
@@ -111,28 +112,13 @@ DatabaseType ShardingCatalogManager::createDatabase(OperationContext* opCtx,
     const auto primaryShardId =
         uassertStatusOK(_selectShardForNewDatabase(opCtx, Grid::get(opCtx)->shardRegistry()));
 
-    // Take the fcvLock to prevent the fcv from changing from the point we decide whether to include
-    // a databaseVersion until after we finish writing the database entry. Otherwise, we may end up
-    // in fcv>3.6, but without a databaseVersion.
-    invariant(!opCtx->lockState()->isLocked());
-    Lock::SharedLock lk(opCtx->lockState(), FeatureCompatibilityVersion::fcvLock);
-
-    // If in FCV>3.6, generate a databaseVersion, including a UUID, for the new database.
-    boost::optional<DatabaseVersion> dbVersion = boost::none;
-    if (serverGlobalParams.featureCompatibility.getVersion() ==
-            ServerGlobalParams::FeatureCompatibility::Version::kUpgradingTo40 ||
-        serverGlobalParams.featureCompatibility.getVersion() ==
-            ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo40) {
-        dbVersion = databaseVersion::makeNew();
-    }
-
     // Insert an entry for the new database into the sharding catalog.
-    DatabaseType db(dbName, std::move(primaryShardId), false, std::move(dbVersion));
+    DatabaseType db(dbName, std::move(primaryShardId), false, databaseVersion::makeNew());
 
     log() << "Registering new database " << db << " in sharding catalog";
 
     uassertStatusOK(Grid::get(opCtx)->catalogClient()->insertConfigDocument(
-        opCtx, DatabaseType::ConfigNS, db.toBSON(), ShardingCatalogClient::kMajorityWriteConcern));
+        opCtx, DatabaseType::ConfigNS, db.toBSON(), ShardingCatalogClient::kLocalWriteConcern));
 
     return db;
 }
@@ -154,8 +140,26 @@ void ShardingCatalogManager::enableSharding(OperationContext* opCtx, const std::
     auto dbType = createDatabase(opCtx, dbName);
     dbType.setSharded(true);
 
+    // We must wait for the database entry to be majority committed, because it's possible that
+    // reading from the majority snapshot has been set on the RecoveryUnit due to an earlier read,
+    // such as overtaking a distlock or loading the ShardRegistry.
+    WriteConcernResult unusedResult;
+    uassertStatusOK(
+        waitForWriteConcern(opCtx,
+                            repl::ReplClientInfo::forClient(opCtx->getClient()).getLastOp(),
+                            WriteConcernOptions(WriteConcernOptions::kMajority,
+                                                WriteConcernOptions::SyncMode::UNSET,
+                                                Milliseconds{30000}),
+                            &unusedResult));
+
     log() << "Enabling sharding for database [" << dbName << "] in config db";
-    uassertStatusOK(Grid::get(opCtx)->catalogClient()->updateDatabase(opCtx, dbName, dbType));
+    uassertStatusOK(Grid::get(opCtx)->catalogClient()->updateConfigDocument(
+        opCtx,
+        DatabaseType::ConfigNS,
+        BSON(DatabaseType::name(dbName)),
+        BSON("$set" << BSON(DatabaseType::sharded(true))),
+        false,
+        ShardingCatalogClient::kLocalWriteConcern));
 }
 
 StatusWith<std::vector<std::string>> ShardingCatalogManager::getDatabasesForShard(
@@ -192,18 +196,6 @@ Status ShardingCatalogManager::commitMovePrimary(OperationContext* opCtx,
 
     auto const configShard = Grid::get(opCtx)->shardRegistry()->getConfigShard();
 
-    // Check if the FCV has been changed under us.
-    invariant(!opCtx->lockState()->isLocked());
-    Lock::SharedLock lk(opCtx->lockState(), FeatureCompatibilityVersion::fcvLock);
-
-    auto currentFCV = serverGlobalParams.featureCompatibility.getVersion();
-
-    // If we're not in 4.0, then fail. We want to have assurance that the schema will accept a
-    // version field in config.databases.
-    uassert(ErrorCodes::ConflictingOperationInProgress,
-            "committing movePrimary failed due to version mismatch",
-            currentFCV == ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo40);
-
     // Must use local read concern because we will perform subsequent writes.
     auto findResponse = uassertStatusOK(
         configShard->exhaustiveFindOnConfig(opCtx,
@@ -234,24 +226,18 @@ Status ShardingCatalogManager::commitMovePrimary(OperationContext* opCtx,
 
     auto const currentDatabaseVersion = dbType.getVersion();
 
-    uassert(ErrorCodes::InternalError,
-            str::stream() << "DatabaseVersion doesn't exist in database entry despite the config "
-                          << "server being in FCV 4.0"
-                          << dbType.toBSON(),
-            currentDatabaseVersion != boost::none);
-
-    newDbType.setVersion(databaseVersion::makeIncremented(*currentDatabaseVersion));
+    newDbType.setVersion(databaseVersion::makeIncremented(currentDatabaseVersion));
 
     auto updateQueryBuilder = BSONObjBuilder(BSON(DatabaseType::name << dbname));
-    updateQueryBuilder.append(DatabaseType::version.name(), currentDatabaseVersion->toBSON());
+    updateQueryBuilder.append(DatabaseType::version.name(), currentDatabaseVersion.toBSON());
 
     auto updateStatus = Grid::get(opCtx)->catalogClient()->updateConfigDocument(
         opCtx,
         DatabaseType::ConfigNS,
         updateQueryBuilder.obj(),
         newDbType.toBSON(),
-        true,
-        ShardingCatalogClient::kMajorityWriteConcern);
+        false,
+        ShardingCatalogClient::kLocalWriteConcern);
 
     if (!updateStatus.isOK()) {
         log() << "error committing movePrimary: " << dbname
@@ -266,7 +252,7 @@ Status ShardingCatalogManager::commitMovePrimary(OperationContext* opCtx,
     uassert(ErrorCodes::IncompatibleShardingMetadata,
             str::stream() << "Tried to update primary shard for database '" << dbname
                           << " with version "
-                          << currentDatabaseVersion->getLastMod(),
+                          << currentDatabaseVersion.getLastMod(),
             updateStatus.getValue());
 
     // Ensure the next attempt to retrieve the database or any of its collections will do a full

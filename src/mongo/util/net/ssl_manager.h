@@ -45,7 +45,7 @@
 #include "mongo/util/time_support.h"
 
 // SChannel implementation
-#if MONGO_CONFIG_SSL_PROVIDER == SSL_PROVIDER_OPENSSL
+#if MONGO_CONFIG_SSL_PROVIDER == MONGO_CONFIG_SSL_PROVIDER_OPENSSL
 #include <openssl/err.h>
 #include <openssl/ssl.h>
 #endif
@@ -62,13 +62,13 @@ const std::string getSSLVersion(const std::string& prefix, const std::string& su
 namespace mongo {
 struct SSLParams;
 
-#if MONGO_CONFIG_SSL_PROVIDER == SSL_PROVIDER_OPENSSL
+#if MONGO_CONFIG_SSL_PROVIDER == MONGO_CONFIG_SSL_PROVIDER_OPENSSL
 typedef SSL_CTX* SSLContextType;
 typedef SSL* SSLConnectionType;
-#elif MONGO_CONFIG_SSL_PROVIDER == SSL_PROVIDER_WINDOWS
+#elif MONGO_CONFIG_SSL_PROVIDER == MONGO_CONFIG_SSL_PROVIDER_WINDOWS
 typedef SCHANNEL_CRED* SSLContextType;
 typedef PCtxtHandle SSLConnectionType;
-#elif MONGO_CONFIG_SSL_PROVIDER == SSL_PROVIDER_APPLE
+#elif MONGO_CONFIG_SSL_PROVIDER == MONGO_CONFIG_SSL_PROVIDER_APPLE
 typedef asio::ssl::apple::Context* SSLContextType;
 typedef SSLContextRef SSLConnectionType;
 #else
@@ -194,14 +194,6 @@ public:
 SSLManagerInterface* getSSLManager();
 
 extern bool isSSLServer;
-
-/**
- * The global SSL configuration. This should be accessed only after global initialization has
- * completed. If it must be accessed in an initializer, the initializer should have
- * "EndStartupOptionStorage" as a prerequisite.
- */
-const SSLParams& getSSLGlobalParams();
-
 
 /**
  * Returns true if the `nameToMatch` is a valid match against the `certHostName` requirement from an

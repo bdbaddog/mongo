@@ -41,6 +41,7 @@
 #include "mongo/shell/shell_options.h"
 #include "mongo/shell/shell_utils_extended.h"
 #include "mongo/shell/shell_utils_launcher.h"
+#include "mongo/util/fail_point_service.h"
 #include "mongo/util/log.h"
 #include "mongo/util/processinfo.h"
 #include "mongo/util/quick_exit.h"
@@ -158,6 +159,24 @@ BSONObj getBuildInfo(const BSONObj& a, void* data) {
     return BSON("" << b.done());
 }
 
+BSONObj _setShellFailPoint(const BSONObj& a, void* data) {
+    if (a.nFields() != 1) {
+        uasserted(ErrorCodes::BadValue,
+                  str::stream() << "_setShellFailPoint takes exactly 1 argument, but was given "
+                                << a.nFields());
+    }
+
+    if (!a.firstElement().isABSONObj()) {
+        uasserted(ErrorCodes::BadValue,
+                  str::stream() << "_setShellFailPoint given a non-object as an argument.");
+    }
+
+    auto cmdObj = a.firstElement().Obj();
+    setGlobalFailPoint(cmdObj.firstElement().str(), cmdObj);
+
+    return BSON("" << true);
+}
+
 BSONObj computeSHA256Block(const BSONObj& a, void* data) {
     std::vector<ConstDataRange> blocks;
 
@@ -253,6 +272,10 @@ BSONObj shouldRetryWrites(const BSONObj&, void* data) {
     return BSON("" << shellGlobalParams.shouldRetryWrites);
 }
 
+BSONObj shouldUseImplicitSessions(const BSONObj&, void* data) {
+    return BSON("" << true);
+}
+
 BSONObj interpreterVersion(const BSONObj& a, void* data) {
     uassert(16453, "interpreterVersion accepts no arguments", a.nFields() == 0);
     return BSON("" << getGlobalScriptEngine()->getInterpreterVersionString());
@@ -271,6 +294,7 @@ void installShellUtils(Scope& scope) {
     scope.injectNative("_srand", JSSrand);
     scope.injectNative("_rand", JSRand);
     scope.injectNative("_isWindows", isWindows);
+    scope.injectNative("_setShellFailPoint", _setShellFailPoint);
     scope.injectNative("interpreterVersion", interpreterVersion);
     scope.injectNative("getBuildInfo", getBuildInfo);
     scope.injectNative("computeSHA256Block", computeSHA256Block);
@@ -290,6 +314,7 @@ void initScope(Scope& scope) {
     scope.injectNative("_writeMode", writeMode);
     scope.injectNative("_readMode", readMode);
     scope.injectNative("_shouldRetryWrites", shouldRetryWrites);
+    scope.injectNative("_shouldUseImplicitSessions", shouldUseImplicitSessions);
     scope.externalSetup();
     mongo::shell_utils::installShellUtils(scope);
     scope.execSetup(JSFiles::servers);

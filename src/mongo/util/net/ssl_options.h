@@ -35,8 +35,8 @@
 
 namespace mongo {
 
-#if (MONGO_CONFIG_SSL_PROVIDER == SSL_PROVIDER_WINDOWS) || \
-    (MONGO_CONFIG_SSL_PROVIDER == SSL_PROVIDER_APPLE)
+#if (MONGO_CONFIG_SSL_PROVIDER == MONGO_CONFIG_SSL_PROVIDER_WINDOWS) || \
+    (MONGO_CONFIG_SSL_PROVIDER == MONGO_CONFIG_SSL_PROVIDER_APPLE)
 #define MONGO_CONFIG_SSL_CERTIFICATE_SELECTORS 1
 #endif
 
@@ -77,6 +77,8 @@ struct SSLParams {
     bool sslAllowInvalidHostnames = false;        // --sslAllowInvalidHostnames
     bool disableNonSSLConnectionLogging =
         false;  // --setParameter disableNonSSLConnectionLogging=true
+    bool suppressNoTLSPeerCertificateWarning =
+        false;  // --setParameter suppressNoTLSPeerCertificateWarning
 
     SSLParams() {
         sslMode.store(SSLMode_disabled);
@@ -106,6 +108,13 @@ struct SSLParams {
 };
 
 extern SSLParams sslGlobalParams;
+
+/**
+* The global SSL configuration. This should be accessed only after global initialization has
+* completed. If it must be accessed in an initializer, the initializer should have
+* "EndStartupOptionStorage" as a prerequisite.
+*/
+const SSLParams& getSSLGlobalParams();
 
 Status addSSLServerOptions(mongo::optionenvironment::OptionSection* options);
 

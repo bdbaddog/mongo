@@ -116,7 +116,7 @@ namespace {
 using TaskExecutor = executor::TaskExecutor;
 using CallbackArgs = TaskExecutor::CallbackArgs;
 
-MONGO_FP_DECLARE(suspendRangeDeletion);
+MONGO_FAIL_POINT_DEFINE(suspendRangeDeletion);
 
 /**
  * Deletes ranges, in background, until done, normally using a task executor attached to the
@@ -171,7 +171,7 @@ MetadataManager::~MetadataManager() {
 void MetadataManager::_clearAllCleanups(WithLock lock) {
     _clearAllCleanups(
         lock,
-        {ErrorCodes::InterruptedDueToReplStateChange,
+        {ErrorCodes::InterruptedDueToStepDown,
          str::stream() << "Range deletions in " << _nss.ns()
                        << " abandoned because collection was dropped or became unsharded"});
 }

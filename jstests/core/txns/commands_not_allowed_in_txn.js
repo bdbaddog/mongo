@@ -50,7 +50,7 @@
             startTransaction: true,
             autocommit: false
         })),
-                                     [50767, 50768]);
+                                     [50767, 50768, 50851]);
         assert.commandFailedWithCode(sessionDb.adminCommand({
             commitTransaction: 1,
             txnNumber: NumberLong(txnNumber),
@@ -75,7 +75,7 @@
                 {},
                 command,
                 {txnNumber: NumberLong(txnNumber), stmtId: NumberInt(1), autocommit: false})),
-            [50767, 50768]);
+            [50767, 50768, 50851]);
         assert.commandWorked(sessionDb.adminCommand({
             commitTransaction: 1,
             txnNumber: NumberLong(txnNumber),
@@ -85,20 +85,20 @@
     }
 
     //
-    // Test commands that check out the session but are not allowed in multi-document transactions.
+    // Test commands that check out the session but are not allowed in multi-document
+    // transactions.
     //
 
     const sessionCommands = [
+        {count: collName},
+        {count: collName, query: {a: 1}},
         {applyOps: [{op: "u", ns: testColl.getFullName(), o2: {_id: 0}, o: {$set: {a: 5}}}]},
         {explain: {find: collName}},
         {eval: "function() {return 1;}"},
         {"$eval": "function() {return 1;}"},
         {filemd5: 1, root: "fs"},
-        {geoNear: collName, near: [0, 0]},
-        {group: {ns: collName, key: {_id: 1}, $reduce: function(curr, result) {}, initial: {}}},
         {mapReduce: collName, map: function() {}, reduce: function(key, vals) {}, out: "out"},
         {parallelCollectionScan: collName, numCursors: 1},
-        {refreshLogicalSessionCacheNow: 1}
     ];
 
     sessionCommands.forEach(testCommand);

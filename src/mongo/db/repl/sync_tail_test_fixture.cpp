@@ -85,6 +85,14 @@ void SyncTailOpObserver::onCreateCollection(OperationContext* opCtx,
     onCreateCollectionFn(opCtx, coll, collectionName, options, idIndex);
 }
 
+// static
+OplogApplier::Options SyncTailTest::makeInitialSyncOptions() {
+    OplogApplier::Options options;
+    options.allowNamespaceNotFoundErrorsOnCrudOps = true;
+    options.missingDocumentSourceForInitialSync = HostAndPort("localhost", 123);
+    return options;
+}
+
 void SyncTailTest::setUp() {
     ServiceContextMongoDTest::setUp();
 
@@ -208,17 +216,25 @@ Status SyncTailTest::runOpInitialSync(const OplogEntry& op) {
 }
 
 Status SyncTailTest::runOpsInitialSync(std::vector<OplogEntry> ops) {
+    auto options = makeInitialSyncOptions();
     SyncTail syncTail(nullptr,
                       getConsistencyMarkers(),
                       getStorageInterface(),
                       SyncTail::MultiSyncApplyFunc(),
-                      nullptr);
-    MultiApplier::OperationPtrs opsPtrs;
+                      nullptr,
+                      options);
+    // Apply each operation in a batch of one because 'ops' may contain a mix of commands and CRUD
+    // operations provided by idempotency tests.
     for (auto& op : ops) {
+        MultiApplier::OperationPtrs opsPtrs;
         opsPtrs.push_back(&op);
+        WorkerMultikeyPathInfo pathInfo;
+        auto status = multiSyncApply(_opCtx.get(), &opsPtrs, &syncTail, &pathInfo);
+        if (!status.isOK()) {
+            return status;
+        }
     }
-    WorkerMultikeyPathInfo pathInfo;
-    return multiInitialSyncApply(_opCtx.get(), &opsPtrs, &syncTail, &pathInfo);
+    return Status::OK();
 }
 
 

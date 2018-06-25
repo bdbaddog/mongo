@@ -63,7 +63,6 @@
 #include "mongo/db/server_options.h"
 #include "mongo/db/server_parameters.h"
 #include "mongo/db/service_context.h"
-#include "mongo/db/sessions_collection.h"
 #include "mongo/db/stats/top.h"
 #include "mongo/db/storage/recovery_unit.h"
 #include "mongo/db/storage/storage_engine.h"
@@ -90,7 +89,7 @@ MONGO_REGISTER_SHIM(Database::makeImpl)
 }
 
 namespace {
-MONGO_FP_DECLARE(hangBeforeLoggingCreateCollection);
+MONGO_FAIL_POINT_DEFINE(hangBeforeLoggingCreateCollection);
 }  // namespace
 
 using std::endl;
@@ -455,7 +454,7 @@ Status DatabaseImpl::dropCollection(OperationContext* opCtx,
                     return Status(ErrorCodes::IllegalOperation,
                                   "turn off profiling before dropping system.profile collection");
             } else if (!(nss.isSystemDotViews() || nss.isHealthlog() ||
-                         nss == SessionsCollection::kSessionsNamespaceString ||
+                         nss == NamespaceString::kLogicalSessionsNamespace ||
                          nss == NamespaceString::kSystemKeysNamespace)) {
                 return Status(ErrorCodes::IllegalOperation,
                               str::stream() << "can't drop system collection " << fullns);
@@ -553,9 +552,11 @@ Status DatabaseImpl::dropCollectionEvenIfSystem(OperationContext* opCtx,
             log() << "dropCollection: " << fullns << " (" << uuidString << ") - index namespace '"
                   << index->indexNamespace()
                   << "' would be too long after drop-pending rename. Dropping index immediately.";
-            fassert(40463, collection->getIndexCatalog()->dropIndex(opCtx, index));
+            // Log the operation before the drop so that each drop is timestamped at the same time
+            // as the oplog entry.
             opObserver->onDropIndex(
                 opCtx, fullns, collection->uuid(), index->indexName(), index->infoObj());
+            fassert(40463, collection->getIndexCatalog()->dropIndex(opCtx, index));
         }
 
         // Log oplog entry for collection drop and proceed to complete rest of two phase drop
@@ -948,14 +949,13 @@ MONGO_REGISTER_SHIM(Database::userCreateNS)
 (OperationContext* opCtx,
  Database* db,
  StringData ns,
- BSONObj options,
- CollectionOptions::ParseKind parseKind,
+ CollectionOptions collectionOptions,
  bool createDefaultIndexes,
  const BSONObj& idIndex)
     ->Status {
     invariant(db);
 
-    LOG(1) << "create collection " << ns << ' ' << options;
+    LOG(1) << "create collection " << ns << ' ' << collectionOptions.toBSON();
 
     if (!NamespaceString::validCollectionComponent(ns))
         return Status(ErrorCodes::InvalidNamespace, str::stream() << "invalid ns: " << ns);
@@ -969,12 +969,6 @@ MONGO_REGISTER_SHIM(Database::userCreateNS)
     if (db->getViewCatalog()->lookup(opCtx, ns))
         return Status(ErrorCodes::NamespaceExists,
                       str::stream() << "a view '" << ns.toString() << "' already exists");
-
-    CollectionOptions collectionOptions;
-    Status status = collectionOptions.parse(options, parseKind);
-
-    if (!status.isOK())
-        return status;
 
     // Validate the collation, if there is one.
     std::unique_ptr<CollatorInterface> collator;
@@ -1023,7 +1017,7 @@ MONGO_REGISTER_SHIM(Database::userCreateNS)
         }
     }
 
-    status = validateStorageOptions(
+    Status status = validateStorageOptions(
         opCtx->getServiceContext(),
         collectionOptions.storageEngine,
         [](const auto& x, const auto& y) { return x->validateCollectionStorageOptions(y); });
@@ -1043,7 +1037,6 @@ MONGO_REGISTER_SHIM(Database::userCreateNS)
     }
 
     if (collectionOptions.isView()) {
-        invariant(parseKind == CollectionOptions::parseForCommand);
         uassertStatusOK(db->createView(opCtx, ns, collectionOptions));
     } else {
         invariant(

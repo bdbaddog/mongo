@@ -37,6 +37,14 @@ namespace mongo {
 
 class ClockSource;
 
+/**
+ * Creates a harness for generic KVEngine testing of all KVEngine implementations.
+ *
+ * A particular KVHarnessHelper implementation (with a particular KVEngine implementation) will
+ * implement registerFactory() and create() such that generic unit tests can create() and test the
+ * particular KVHarnessHelper implementation. This library can be pulled into a particular
+ * implementation's CppUnitTest to exercise the generic test coverage on that implementation.
+ */
 class KVHarnessHelper {
 public:
     virtual ~KVHarnessHelper() {}

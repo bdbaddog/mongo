@@ -185,30 +185,6 @@ ChunkVersion getPersistedMaxChunkVersion(OperationContext* opCtx, const Namespac
 /**
  * This function will throw on error!
  *
- * Retrieves the persisted max db version for 'dbName', if there are any persisted dbs. If there
- * are none -- meaning there's no persisted metadata for 'dbName' --, returns boost::optional.
- */
-boost::optional<DatabaseVersion> getPersistedMaxDbVersion(OperationContext* opCtx,
-                                                          StringData dbName) {
-
-    auto statusWithDatabaseEntry = readShardDatabasesEntry(opCtx, dbName);
-    if (statusWithDatabaseEntry == ErrorCodes::NamespaceNotFound) {
-        // There is no persisted metadata.
-        return boost::none;
-    }
-    uassert(ErrorCodes::OperationFailed,
-            str::stream() << "Failed to read persisted database entry for db '" << dbName.toString()
-                          << "' due to '"
-                          << statusWithDatabaseEntry.getStatus().toString()
-                          << "'.",
-            statusWithDatabaseEntry.isOK());
-
-    return statusWithDatabaseEntry.getValue().getDbVersion();
-}
-
-/**
- * This function will throw on error!
- *
  * Tries to find persisted chunk metadata with chunk versions GTE to 'version'.
  *
  * If 'version's epoch matches persisted metadata, returns persisted metadata GTE 'version'.
@@ -381,7 +357,7 @@ void ShardServerCatalogCacheLoader::notifyOfCollectionVersionUpdate(const Namesp
 }
 
 void ShardServerCatalogCacheLoader::initializeReplicaSetRole(bool isPrimary) {
-    stdx::lock_guard<stdx::mutex> lock(_mutex);
+    stdx::lock_guard<stdx::mutex> lg(_mutex);
     invariant(_role == ReplicaSetRole::None);
 
     if (isPrimary) {
@@ -392,7 +368,7 @@ void ShardServerCatalogCacheLoader::initializeReplicaSetRole(bool isPrimary) {
 }
 
 void ShardServerCatalogCacheLoader::onStepDown() {
-    stdx::lock_guard<stdx::mutex> lock(_mutex);
+    stdx::lock_guard<stdx::mutex> lg(_mutex);
     invariant(_role != ReplicaSetRole::None);
     _contexts.interrupt(ErrorCodes::PrimarySteppedDown);
     ++_term;
@@ -400,58 +376,47 @@ void ShardServerCatalogCacheLoader::onStepDown() {
 }
 
 void ShardServerCatalogCacheLoader::onStepUp() {
-    stdx::lock_guard<stdx::mutex> lock(_mutex);
+    stdx::lock_guard<stdx::mutex> lg(_mutex);
     invariant(_role != ReplicaSetRole::None);
     ++_term;
     _role = ReplicaSetRole::Primary;
 }
 
 std::shared_ptr<Notification<void>> ShardServerCatalogCacheLoader::getChunksSince(
-    const NamespaceString& nss,
-    ChunkVersion version,
-    stdx::function<void(OperationContext*, StatusWith<CollectionAndChangedChunks>)> callbackFn) {
-    long long currentTerm;
-    bool isPrimary;
-    {
-        // Take the mutex so that we can discern whether we're primary or secondary and schedule a
-        // task with the corresponding _term value.
-        stdx::lock_guard<stdx::mutex> lock(_mutex);
-        invariant(_role != ReplicaSetRole::None);
-
-        currentTerm = _term;
-        isPrimary = (_role == ReplicaSetRole::Primary);
-    }
-
+    const NamespaceString& nss, ChunkVersion version, GetChunksSinceCallbackFn callbackFn) {
     auto notify = std::make_shared<Notification<void>>();
 
-    uassertStatusOK(_threadPool.schedule(
-        [ this, nss, version, callbackFn, notify, isPrimary, currentTerm ]() noexcept {
-            auto context = _contexts.makeOperationContext(*Client::getCurrent());
+    bool isPrimary;
+    long long term;
+    std::tie(isPrimary, term) = [&] {
+        stdx::lock_guard<stdx::mutex> lock(_mutex);
+        return std::make_tuple(_role == ReplicaSetRole::Primary, _term);
+    }();
 
-            {
-                stdx::lock_guard<stdx::mutex> lock(_mutex);
-                // We may have missed an OperationContextGroup interrupt since this operation began
-                // but before the OperationContext was added to the group. So we'll check that
-                // we're still in the same _term.
-                if (_term != currentTerm) {
-                    callbackFn(context.opCtx(),
-                               Status{ErrorCodes::Interrupted,
-                                      "Unable to refresh routing table because replica set state "
-                                      "changed or node is shutting down."});
-                    notify->set();
-                    return;
-                }
-            }
+    uassertStatusOK(_threadPool.schedule(
+        [ this, nss, version, callbackFn, notify, isPrimary, term ]() noexcept {
+            auto context = _contexts.makeOperationContext(*Client::getCurrent());
+            auto const opCtx = context.opCtx();
 
             try {
+                {
+                    // We may have missed an OperationContextGroup interrupt since this operation
+                    // began but before the OperationContext was added to the group. So we'll check
+                    // that we're still in the same _term.
+                    stdx::lock_guard<stdx::mutex> lock(_mutex);
+                    uassert(ErrorCodes::Interrupted,
+                            "Unable to refresh routing table because replica set state changed or "
+                            "the node is shutting down.",
+                            _term == term);
+                }
+
                 if (isPrimary) {
-                    _schedulePrimaryGetChunksSince(
-                        context.opCtx(), nss, version, currentTerm, callbackFn, notify);
+                    _schedulePrimaryGetChunksSince(opCtx, nss, version, term, callbackFn, notify);
                 } else {
-                    _runSecondaryGetChunksSince(context.opCtx(), nss, version, callbackFn);
+                    _runSecondaryGetChunksSince(opCtx, nss, version, callbackFn, notify);
                 }
             } catch (const DBException& ex) {
-                callbackFn(context.opCtx(), ex.toStatus());
+                callbackFn(opCtx, ex.toStatus());
                 notify->set();
             }
         }));
@@ -614,13 +579,15 @@ void ShardServerCatalogCacheLoader::_runSecondaryGetChunksSince(
     OperationContext* opCtx,
     const NamespaceString& nss,
     const ChunkVersion& catalogCacheSinceVersion,
-    stdx::function<void(OperationContext*, StatusWith<CollectionAndChangedChunks>)> callbackFn) {
+    stdx::function<void(OperationContext*, StatusWith<CollectionAndChangedChunks>)> callbackFn,
+    std::shared_ptr<Notification<void>> notify) {
     forcePrimaryCollectionRefreshAndWaitForReplication(opCtx, nss);
 
     // Read the local metadata.
     auto swCollAndChunks =
         _getCompletePersistedMetadataForSecondarySinceVersion(opCtx, nss, catalogCacheSinceVersion);
     callbackFn(opCtx, std::move(swCollAndChunks));
+    notify->set();
 }
 
 void ShardServerCatalogCacheLoader::_schedulePrimaryGetChunksSince(
@@ -749,7 +716,7 @@ void ShardServerCatalogCacheLoader::_schedulePrimaryGetDatabase(
         OperationContext * opCtx, StatusWith<DatabaseType> swDatabaseType) {
         if (swDatabaseType == ErrorCodes::NamespaceNotFound) {
             Status scheduleStatus = _ensureMajorityPrimaryAndScheduleDbTask(
-                opCtx, name, dbTask{swDatabaseType, termScheduled});
+                opCtx, name, DBTask{swDatabaseType, termScheduled});
             if (!scheduleStatus.isOK()) {
                 callbackFn(opCtx, scheduleStatus);
                 return;
@@ -760,7 +727,7 @@ void ShardServerCatalogCacheLoader::_schedulePrimaryGetDatabase(
 
         } else if (swDatabaseType.isOK()) {
             Status scheduleStatus = _ensureMajorityPrimaryAndScheduleDbTask(
-                opCtx, name, dbTask{swDatabaseType, termScheduled});
+                opCtx, name, DBTask{swDatabaseType, termScheduled});
             if (!scheduleStatus.isOK()) {
                 callbackFn(opCtx, scheduleStatus);
                 return;
@@ -917,7 +884,7 @@ Status ShardServerCatalogCacheLoader::_ensureMajorityPrimaryAndScheduleCollAndCh
 }
 
 Status ShardServerCatalogCacheLoader::_ensureMajorityPrimaryAndScheduleDbTask(
-    OperationContext* opCtx, StringData dbName, dbTask task) {
+    OperationContext* opCtx, StringData dbName, DBTask task) {
     Status linearizableReadStatus = waitForLinearizableReadConcern(opCtx);
     if (!linearizableReadStatus.isOK()) {
         return linearizableReadStatus.withContext(
@@ -1067,7 +1034,7 @@ void ShardServerCatalogCacheLoader::_updatePersistedDbMetadata(OperationContext*
                                                                StringData dbName) {
     stdx::unique_lock<stdx::mutex> lock(_mutex);
 
-    const dbTask& task = _dbTaskLists[dbName.toString()].front();
+    const DBTask& task = _dbTaskLists[dbName.toString()].front();
 
     // If this task is from an old term and no longer valid, do not execute and return true so that
     // the task gets removed from the task list
@@ -1151,7 +1118,7 @@ ShardServerCatalogCacheLoader::collAndChunkTask::collAndChunkTask(
     }
 }
 
-ShardServerCatalogCacheLoader::dbTask::dbTask(StatusWith<DatabaseType> swDatabaseType,
+ShardServerCatalogCacheLoader::DBTask::DBTask(StatusWith<DatabaseType> swDatabaseType,
                                               long long currentTerm)
     : taskNum(taskIdGenerator.fetchAndAdd(1)), termCreated(currentTerm) {
     if (swDatabaseType.isOK()) {
@@ -1195,7 +1162,7 @@ void ShardServerCatalogCacheLoader::CollAndChunkTaskList::addTask(collAndChunkTa
     }
 }
 
-void ShardServerCatalogCacheLoader::DbTaskList::addTask(dbTask task) {
+void ShardServerCatalogCacheLoader::DbTaskList::addTask(DBTask task) {
     if (_tasks.empty()) {
         _tasks.emplace_back(std::move(task));
         return;

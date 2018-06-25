@@ -32,6 +32,7 @@
 
 #include "mongo/db/free_mon/free_mon_controller.h"
 #include "mongo/db/free_mon/free_mon_storage.h"
+#include "mongo/db/operation_context.h"
 
 namespace mongo {
 namespace {
@@ -43,6 +44,8 @@ bool isStandaloneOrPrimary(OperationContext* opCtx) {
     return !isReplSet || (repl::ReplicationCoordinator::get(opCtx)->getMemberState() ==
                           repl::MemberState::RS_PRIMARY);
 }
+
+const auto getFreeMonDeleteState = OperationContext::declareDecoration<bool>();
 
 }  // namespace
 
@@ -70,6 +73,10 @@ void FreeMonOpObserver::onInserts(OperationContext* opCtx,
                                   std::vector<InsertStatement>::const_iterator begin,
                                   std::vector<InsertStatement>::const_iterator end,
                                   bool fromMigrate) {
+    if (nss != NamespaceString::kServerConfigurationNamespace) {
+        return;
+    }
+
     if (isStandaloneOrPrimary(opCtx)) {
         return;
     }
@@ -77,14 +84,12 @@ void FreeMonOpObserver::onInserts(OperationContext* opCtx,
     for (auto it = begin; it != end; ++it) {
         const auto& insertedDoc = it->doc;
 
-        if (nss == NamespaceString::kServerConfigurationNamespace) {
-            if (auto idElem = insertedDoc["_id"]) {
-                if (idElem.str() == FreeMonStorage::kFreeMonDocIdKey) {
-                    auto controller = FreeMonController::get(opCtx->getServiceContext());
+        if (auto idElem = insertedDoc["_id"]) {
+            if (idElem.str() == FreeMonStorage::kFreeMonDocIdKey) {
+                auto controller = FreeMonController::get(opCtx->getServiceContext());
 
-                    if (controller != nullptr) {
-                        controller->notifyOnUpsert(insertedDoc.getOwned());
-                    }
+                if (controller != nullptr) {
+                    controller->notifyOnUpsert(insertedDoc.getOwned());
                 }
             }
         }
@@ -92,19 +97,33 @@ void FreeMonOpObserver::onInserts(OperationContext* opCtx,
 }
 
 void FreeMonOpObserver::onUpdate(OperationContext* opCtx, const OplogUpdateEntryArgs& args) {
+    if (args.nss != NamespaceString::kServerConfigurationNamespace) {
+        return;
+    }
+
     if (isStandaloneOrPrimary(opCtx)) {
         return;
     }
 
-    if (args.nss == NamespaceString::kServerConfigurationNamespace) {
-        if (args.updatedDoc["_id"].str() == FreeMonStorage::kFreeMonDocIdKey) {
-            auto controller = FreeMonController::get(opCtx->getServiceContext());
+    if (args.updatedDoc["_id"].str() == FreeMonStorage::kFreeMonDocIdKey) {
+        auto controller = FreeMonController::get(opCtx->getServiceContext());
 
-            if (controller != nullptr) {
-                controller->notifyOnUpsert(args.updatedDoc.getOwned());
-            }
+        if (controller != nullptr) {
+            controller->notifyOnUpsert(args.updatedDoc.getOwned());
         }
     }
+}
+
+void FreeMonOpObserver::aboutToDelete(OperationContext* opCtx,
+                                      const NamespaceString& nss,
+                                      const BSONObj& doc) {
+
+    bool isFreeMonDoc = (nss == NamespaceString::kServerConfigurationNamespace) &&
+        (doc["_id"].str() == FreeMonStorage::kFreeMonDocIdKey);
+
+    // Set a flag that indicates whether the document to be delete is the free monitoring state
+    // document
+    getFreeMonDeleteState(opCtx) = isFreeMonDoc;
 }
 
 void FreeMonOpObserver::onDelete(OperationContext* opCtx,
@@ -113,17 +132,19 @@ void FreeMonOpObserver::onDelete(OperationContext* opCtx,
                                  StmtId stmtId,
                                  bool fromMigrate,
                                  const boost::optional<BSONObj>& deletedDoc) {
+    if (nss != NamespaceString::kServerConfigurationNamespace) {
+        return;
+    }
+
     if (isStandaloneOrPrimary(opCtx)) {
         return;
     }
 
-    if (nss == NamespaceString::kServerConfigurationNamespace) {
-        if (deletedDoc.get()["_id"].str() == FreeMonStorage::kFreeMonDocIdKey) {
-            auto controller = FreeMonController::get(opCtx->getServiceContext());
+    if (getFreeMonDeleteState(opCtx) == true) {
+        auto controller = FreeMonController::get(opCtx->getServiceContext());
 
-            if (controller != nullptr) {
-                controller->notifyOnDelete();
-            }
+        if (controller != nullptr) {
+            controller->notifyOnDelete();
         }
     }
 }

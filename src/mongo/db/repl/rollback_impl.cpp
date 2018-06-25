@@ -51,6 +51,7 @@
 #include "mongo/db/s/shard_identity_rollback_notifier.h"
 #include "mongo/db/s/type_shard_identity.h"
 #include "mongo/db/server_parameters.h"
+#include "mongo/db/server_recovery.h"
 #include "mongo/db/session_catalog.h"
 #include "mongo/s/catalog/type_config_version.h"
 #include "mongo/util/log.h"
@@ -61,13 +62,25 @@ namespace repl {
 namespace {
 
 RollbackImpl::Listener kNoopListener;
-RollbackImpl::RollbackTimeLimitHolder kRollbackTimeLimitHolder;
 
 // Control whether or not the server will write out data files containing deleted documents during
 // rollback. This server parameter affects both rollback via refetch and rollback via recovery to
 // stable timestamp.
 constexpr bool createRollbackFilesDefault = true;
 MONGO_EXPORT_SERVER_PARAMETER(createRollbackDataFiles, bool, createRollbackFilesDefault);
+
+/**
+ * This amount, measured in seconds, represents the maximum allowed rollback period.
+ * It is calculated by taking the difference of the wall clock times of the oplog entries
+ * at the top of the local oplog and at the common point.
+ */
+MONGO_EXPORT_SERVER_PARAMETER(rollbackTimeLimitSecs, int, 60 * 60 * 24)  // Default 1 day
+    ->withValidator([](const int& newVal) {
+        if (newVal > 0) {
+            return Status::OK();
+        }
+        return Status(ErrorCodes::BadValue, "rollbackTimeLimitSecs must be greater than 0");
+    });
 
 // The name of the insert, update and delete commands as found in oplog command entries.
 constexpr auto kInsertCmdName = "insert"_sd;
@@ -127,6 +140,11 @@ Status RollbackImpl::runRollback(OperationContext* opCtx) {
         return status;
     }
     _listener->onTransitionToRollback();
+
+    // We clear the SizeRecoveryState before we recover to a stable timestamp. This ensures that we
+    // only use size adjustment markings from the storage and replication recovery processes in this
+    // rollback.
+    sizeRecoveryState(opCtx->getServiceContext()).clearStateBeforeRecovery();
 
     // After successfully transitioning to the ROLLBACK state, we must always transition back to
     // SECONDARY, even if we fail at any point during the rollback process.
@@ -405,18 +423,41 @@ void RollbackImpl::_correctRecordStoreCounts(OperationContext* opCtx) {
     // truncation is not allowed to occur until the record store counts are corrected.
     const auto& uuidCatalog = UUIDCatalog::get(opCtx);
     for (const auto& uiCount : _newCounts) {
-        auto uuid = uiCount.first;
-        const auto nss = uuidCatalog.lookupNSSByUUID(uuid);
-        invariant(!nss.isEmpty(),
+        const auto uuid = uiCount.first;
+        const auto coll = uuidCatalog.lookupCollectionByUUID(uuid);
+        invariant(coll,
                   str::stream() << "The collection with UUID " << uuid
                                 << " is unexpectedly missing in the UUIDCatalog");
-        auto status = _storageInterface->setCollectionCount(
-            opCtx, {nss.db().toString(), uuid}, uiCount.second);
+        const auto nss = coll->ns();
+        invariant(!nss.isEmpty(),
+                  str::stream() << "The collection with UUID " << uuid << " has no namespace.");
+        const auto ident = coll->getRecordStore()->getIdent();
+        invariant(!ident.empty(),
+                  str::stream() << "The collection with UUID " << uuid << " has no ident.");
+
+        const auto newCount = uiCount.second;
+        // If the collection is marked for size adjustment, then we made sure the collection size
+        // was accurate at the stable timestamp and we can trust replication recovery to keep it
+        // correct. This is necessary for capped collections whose deletions will be untracked
+        // if we just set the collection count here.
+        if (sizeRecoveryState(opCtx->getServiceContext())
+                .collectionAlwaysNeedsSizeAdjustment(ident)) {
+            LOG(2) << "Not setting collection count to " << newCount << " for " << nss.ns() << " ("
+                   << uuid.toString() << ") [" << ident
+                   << "] because it is marked for size adjustment.";
+            continue;
+        }
+
+        auto status =
+            _storageInterface->setCollectionCount(opCtx, {nss.db().toString(), uuid}, newCount);
         if (!status.isOK()) {
             // We ignore errors here because crashing or leaving rollback would only leave
             // collection counts more inaccurate.
-            warning() << "Failed to set count of " << nss.ns() << " (" << uuid.toString() << ") to "
-                      << uiCount.second << ". Received: " << status;
+            warning() << "Failed to set count of " << nss.ns() << " (" << uuid.toString() << ") ["
+                      << ident << "] to " << newCount << ". Received: " << status;
+        } else {
+            LOG(2) << "Set collection count of " << nss.ns() << " (" << uuid.toString() << ") ["
+                   << ident << "] to " << newCount << ".";
         }
     }
 }
@@ -665,7 +706,7 @@ Status RollbackImpl::_checkAgainstTimeLimit(
             _rollbackStats.lastLocalWallClockTime = topOfOplogWallTime;
             _rollbackStats.commonPointWallClockTime = commonPointWallTime;
 
-            auto timeLimit = kRollbackTimeLimitHolder.getRollbackTimeLimit();
+            auto timeLimit = static_cast<unsigned long long>(rollbackTimeLimitSecs.loadRelaxed());
 
             if (diff > timeLimit) {
                 return Status(ErrorCodes::UnrecoverableRollbackError,
@@ -915,56 +956,6 @@ void RollbackImpl::_summarizeRollback(OperationContext* opCtx) const {
     log() << "\ttotal number of entries rolled back (including no-ops): "
           << _observerInfo.numberOfEntriesObserved;
 }
-
-/**
- * This amount, measured in seconds, represents the maximum allowed rollback period.
- * It is calculated by taking the difference of the wall clock times of the oplog entries
- * at the top of the local oplog and at the common point.
- */
-class RollbackTimeLimitServerParameter final : public ServerParameter {
-    MONGO_DISALLOW_COPYING(RollbackTimeLimitServerParameter);
-
-public:
-    static constexpr auto kName = "rollbackTimeLimitSecs"_sd;
-
-    RollbackTimeLimitServerParameter()
-        : ServerParameter(ServerParameterSet::getGlobal(), kName.toString(), true, true) {}
-
-    virtual void append(OperationContext* opCtx,
-                        BSONObjBuilder& builder,
-                        const std::string& name) final {
-        builder.append(name,
-                       static_cast<long long>(kRollbackTimeLimitHolder.getRollbackTimeLimit()));
-    }
-
-    virtual Status set(const BSONElement& newValueElement) final {
-        long long newValue;
-        if (!newValueElement.coerce(&newValue) || newValue <= 0)
-            return Status(ErrorCodes::BadValue,
-                          mongoutils::str::stream() << "Invalid value for " << kName << ": "
-                                                    << newValueElement
-                                                    << ". Must be a positive integer.");
-        kRollbackTimeLimitHolder.setRollbackTimeLimit(static_cast<unsigned long long>(newValue));
-        return Status::OK();
-    }
-
-    virtual Status setFromString(const std::string& str) final {
-        long long newValue;
-        Status status = parseNumberFromString(str, &newValue);
-        if (!status.isOK())
-            return status;
-        if (newValue <= 0)
-            return Status(ErrorCodes::BadValue,
-                          mongoutils::str::stream() << "Invalid value for " << kName << ": "
-                                                    << newValue
-                                                    << ". Must be a positive integer.");
-
-        kRollbackTimeLimitHolder.setRollbackTimeLimit(static_cast<unsigned long long>(newValue));
-        return Status::OK();
-    }
-} rollbackTimeLimitSecs;
-
-constexpr decltype(RollbackTimeLimitServerParameter::kName) RollbackTimeLimitServerParameter::kName;
 
 }  // namespace repl
 }  // namespace mongo

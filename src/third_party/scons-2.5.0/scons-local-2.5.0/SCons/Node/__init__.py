@@ -43,6 +43,7 @@ be able to depend on any other type of "thing."
 
 __revision__ = "src/engine/SCons/Node/__init__.py rel_2.5.1:3735:9dc6cee5c168 2016/11/03 14:02:02 bdbaddog"
 
+import os
 import collections
 import copy
 from itertools import chain
@@ -1432,6 +1433,9 @@ class Node(object):
         for children, signatures in pairs:
             for child, signature in zip(children, signatures):
                 schild = str(child)
+                # TODO: Really need to make sure the child is a filepath and not some string content (for example something output by configure context to be tried)
+                if os.altsep:
+                    schild = schild.replace(os.altsep, os.sep)
                 m[schild] = signature
         return m
 
@@ -1449,13 +1453,13 @@ class Node(object):
             List of csigs for provided list of children
         """
         prev = []
-        # for c in map(str, children):
-        #     # If there is no previous signature,
-        #     # we place None in the corresponding position.
-        #     prev.append(dmap.get(c))
-
         for c in children:
-            c_str = str(c)
+            try:
+                # This should yield a patch which matches what is in the sconsign
+                c_str = c.get_path()
+            except AttributeError as e:
+                # For non filesystem node types
+                c_str = str(c)
             df = dmap.get(c_str)
             if df:
                 prev.append(df)
@@ -1475,8 +1479,19 @@ class Node(object):
                         prev.append(df)
                         break
                 else:
-                    prev.append(None)
+                    p = c_str.split(os.sep)[-1]
+                    matches = [f for f in dmap.keys() if f.endswith(p)]
+                    print "CHANGE_DEBUG: file:%s prev_build_files:%s"%(c_str,",".join(matches))
+                    # print "CHANGE_DEBUG: file:%s prev_build_files:%s"%(c_str,",".join(dmap.keys()))
+                    # TODO: may want to use c.fs.File(...,create=0). Though that doesn't resolve
+                    #  test/Repository/JavaH.py failure while below does.
+                    possibles = [(f,v) for f,v in dmap.items() if c.File('#/%s'%f).rfile() == c]
+                    if len(possibles) == 1:
+                        prev.append(possibles[0][1])
+                    else:
+                        prev.append(None)
             except AttributeError as e:
+                print "CHANGE_DEBUG: Exception :%s"%e
                 prev.append(None)
 
         # prev = [dmap.get(str(c), dmap.get(str(c.find_repo_file()[0]))) for c in children]

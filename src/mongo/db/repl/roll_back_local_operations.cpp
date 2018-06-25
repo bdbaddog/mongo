@@ -44,13 +44,15 @@ namespace repl {
 // functionality for rs_rollback_no_uuid.cpp. See SERVER-29766.
 
 // Failpoint which causes rollback to hang before finishing.
-MONGO_FP_DECLARE(rollbackHangBeforeFinish);
+MONGO_FAIL_POINT_DEFINE(rollbackHangBeforeFinish);
 
 // Failpoint which causes rollback to hang and then fail after minValid is written.
-MONGO_FP_DECLARE(rollbackHangThenFailAfterWritingMinValid);
+MONGO_FAIL_POINT_DEFINE(rollbackHangThenFailAfterWritingMinValid);
 
 
 namespace {
+
+constexpr int kMaxConnectionAttempts = 3;
 
 OpTime getOpTime(const OplogInterface::Iterator::Value& oplogValue) {
     return fassert(40298, OpTime::parseFromOplogEntry(oplogValue.first));
@@ -166,10 +168,25 @@ StatusWith<RollBackLocalOperations::RollbackCommonPoint> syncRollBackLocalOperat
     const OplogInterface& localOplog,
     const OplogInterface& remoteOplog,
     const RollBackLocalOperations::RollbackOperationFn& rollbackOperation) {
-    auto remoteIterator = remoteOplog.makeIterator();
+
+    std::unique_ptr<OplogInterface::Iterator> remoteIterator;
+
+    // Retry in case of network errors.
+    for (int attemptsLeft = kMaxConnectionAttempts - 1; attemptsLeft >= 0; attemptsLeft--) {
+        try {
+            remoteIterator = remoteOplog.makeIterator();
+        } catch (DBException&) {
+            if (attemptsLeft == 0) {
+                throw;
+            }
+        }
+    }
+
+    invariant(remoteIterator);
     auto remoteResult = remoteIterator->next();
     if (!remoteResult.isOK()) {
-        return Status(ErrorCodes::InvalidSyncSource, "remote oplog empty or unreadable");
+        return Status(ErrorCodes::InvalidSyncSource, remoteResult.getStatus().reason())
+            .withContext("remote oplog empty or unreadable");
     }
 
     RollBackLocalOperations finder(localOplog, rollbackOperation);

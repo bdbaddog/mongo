@@ -36,6 +36,7 @@
     };
 
     let testCases = {
+        _addShard: {skip: "primary only"},
         _cloneCatalogData: {skip: "primary only"},
         _configsvrAddShard: {skip: "primary only"},
         _configsvrAddShardToZone: {skip: "primary only"},
@@ -174,20 +175,6 @@
         forceerror: {skip: "does not return user data"},
         fsync: {skip: "does not return user data"},
         fsyncUnlock: {skip: "does not return user data"},
-        geoNear: {
-            setUp: function(mongosConn) {
-                assert.commandWorked(mongosConn.getCollection(nss).runCommand(
-                    {createIndexes: coll, indexes: [{key: {loc: "2d"}, name: "loc_2d"}]}));
-                assert.writeOK(mongosConn.getCollection(nss).insert({x: 1, loc: [1, 1]}));
-            },
-            command: {geoNear: coll, near: [1, 1]},
-            checkResults: function(res) {
-                // The command should work and return correct results due to rerouting
-                assert.commandWorked(res);
-                assert.eq(1, res.results.length, tojson(res));
-            },
-            behavior: "versioned"
-        },
         geoSearch: {skip: "not supported in mongos"},
         getCmdLineOpts: {skip: "does not return user data"},
         getDiagnosticData: {skip: "does not return user data"},
@@ -203,20 +190,6 @@
         grantPrivilegesToRole: {skip: "primary only"},
         grantRolesToRole: {skip: "primary only"},
         grantRolesToUser: {skip: "primary only"},
-        group: {
-            setUp: function(mongosConn) {
-                assert.writeOK(mongosConn.getCollection(nss).insert({x: 1, y: 1}));
-                assert.writeOK(mongosConn.getCollection(nss).insert({x: 1, y: 1}));
-                assert.writeOK(mongosConn.getCollection(nss).insert({x: 2, y: 1}));
-                assert.writeOK(mongosConn.getCollection(nss).insert({x: 2, y: 1}));
-            },
-            command: {group: {ns: coll, key: {x: 1}}},
-            checkResults: function(res) {
-                // Expect the command to fail, since it cannot run on sharded collections.
-                assert.commandFailedWithCode(res, ErrorCodes.IllegalOperation, tojson(res));
-            },
-            behavior: "unshardedOnly"
-        },
         handshake: {skip: "does not return user data"},
         hostInfo: {skip: "does not return user data"},
         insert: {skip: "primary only"},

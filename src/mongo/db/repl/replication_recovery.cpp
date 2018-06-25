@@ -37,20 +37,22 @@
 #include "mongo/db/db_raii.h"
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/namespace_string.h"
+#include "mongo/db/repl/oplog_applier_impl.h"
 #include "mongo/db/repl/oplog_buffer.h"
 #include "mongo/db/repl/replication_consistency_markers_impl.h"
 #include "mongo/db/repl/storage_interface.h"
-#include "mongo/db/repl/sync_tail.h"
 #include "mongo/db/server_recovery.h"
 #include "mongo/db/session.h"
 #include "mongo/util/log.h"
+#include "mongo/util/timer.h"
 
 namespace mongo {
 namespace repl {
 
 namespace {
 
-const auto kRecoveryLogLevel = logger::LogSeverity::Debug(2);
+const auto kRecoveryBatchLogLevel = logger::LogSeverity::Debug(2);
+const auto kRecoveryOperationLogLevel = logger::LogSeverity::Debug(3);
 
 /**
  * Tracks and logs operations applied during recovery.
@@ -59,18 +61,19 @@ class RecoveryOplogApplierStats : public OplogApplier::Observer {
 public:
     void onBatchBegin(const OplogApplier::Operations& batch) final {
         _numBatches++;
-        LOG_FOR_RECOVERY(kRecoveryLogLevel)
+        LOG_FOR_RECOVERY(kRecoveryBatchLogLevel)
             << "Applying operations in batch: " << _numBatches << "(" << batch.size()
             << " operations from " << batch.front().getOpTime() << " (inclusive) to "
             << batch.back().getOpTime()
             << " (inclusive)). Operations applied so far: " << _numOpsApplied;
 
         _numOpsApplied += batch.size();
-        if (shouldLog(::mongo::logger::LogComponent::kStorageRecovery, kRecoveryLogLevel)) {
+        if (shouldLog(::mongo::logger::LogComponent::kStorageRecovery,
+                      kRecoveryOperationLogLevel)) {
             std::size_t i = 0;
             for (const auto& entry : batch) {
                 i++;
-                LOG_FOR_RECOVERY(kRecoveryLogLevel)
+                LOG_FOR_RECOVERY(kRecoveryOperationLogLevel)
                     << "Applying op " << i << " of " << batch.size() << " (in batch " << _numBatches
                     << ") during replication recovery: " << redact(entry.raw);
             }
@@ -79,10 +82,9 @@ public:
 
     void onBatchEnd(const StatusWith<OpTime>&, const OplogApplier::Operations&) final {}
     void onMissingDocumentsFetchedAndInserted(const std::vector<FetchInfo>&) final {}
-    void onOperationConsumed(const BSONObj& op) final {}
 
     void complete(const OpTime& applyThroughOpTime) const {
-        LOG_FOR_RECOVERY(kRecoveryLogLevel)
+        LOG_FOR_RECOVERY(kRecoveryBatchLogLevel)
             << "Applied " << _numOpsApplied << " operations in " << _numBatches
             << " batches. Last operation applied with optime: " << applyThroughOpTime;
     }
@@ -214,7 +216,6 @@ void ReplicationRecoveryImpl::recoverFromOplog(OperationContext* opCtx,
             inReplicationRecovery(serviceCtx),
             "replication recovery flag is unexpectedly unset when exiting recoverFromOplog()");
         inReplicationRecovery(serviceCtx) = false;
-        sizeRecoveryState(serviceCtx).clearStateAfterRecovery();
     });
 
     const auto truncateAfterPoint = _consistencyMarkers->getOplogTruncateAfterPoint(opCtx);
@@ -327,8 +328,8 @@ void ReplicationRecoveryImpl::_recoverFromUnstableCheckpoint(OperationContext* o
 }
 
 void ReplicationRecoveryImpl::_applyToEndOfOplog(OperationContext* opCtx,
-                                                 Timestamp oplogApplicationStartPoint,
-                                                 Timestamp topOfOplog) {
+                                                 const Timestamp& oplogApplicationStartPoint,
+                                                 const Timestamp& topOfOplog) {
     invariant(!oplogApplicationStartPoint.isNull());
     invariant(!topOfOplog.isNull());
 
@@ -351,22 +352,22 @@ void ReplicationRecoveryImpl::_applyToEndOfOplog(OperationContext* opCtx,
 
     RecoveryOplogApplierStats stats;
 
-    auto writerPool = SyncTail::makeWriterPool();
+    auto writerPool = OplogApplier::makeWriterPool();
     OplogApplier::Options options;
     options.allowNamespaceNotFoundErrorsOnCrudOps = true;
     options.skipWritesToOplog = true;
-    OplogApplier oplogApplier(nullptr,
-                              &oplogBuffer,
-                              &stats,
-                              nullptr,
-                              _consistencyMarkers,
-                              _storageInterface,
-                              options,
-                              writerPool.get());
+    OplogApplierImpl oplogApplier(nullptr,
+                                  &oplogBuffer,
+                                  &stats,
+                                  nullptr,
+                                  _consistencyMarkers,
+                                  _storageInterface,
+                                  options,
+                                  writerPool.get());
 
     OplogApplier::BatchLimits batchLimits;
-    batchLimits.bytes = SyncTail::calculateBatchLimitBytes(opCtx, _storageInterface);
-    batchLimits.ops = std::size_t(SyncTail::replBatchLimitOperations.load());
+    batchLimits.bytes = OplogApplier::calculateBatchLimitBytes(opCtx, _storageInterface);
+    batchLimits.ops = OplogApplier::getBatchLimitOperations();
 
     OpTime applyThroughOpTime;
     OplogApplier::Operations batch;
@@ -379,6 +380,11 @@ void ReplicationRecoveryImpl::_applyToEndOfOplog(OperationContext* opCtx,
               str::stream() << "Oplog buffer not empty after applying operations. Last operation "
                                "applied with optime: "
                             << applyThroughOpTime.toBSON());
+    invariant(applyThroughOpTime.getTimestamp() == topOfOplog,
+              str::stream() << "Did not apply to top of oplog. Applied through: "
+                            << applyThroughOpTime.toString()
+                            << ". Top of oplog: "
+                            << topOfOplog.toString());
     oplogBuffer.shutdown(opCtx);
 
     // We may crash before setting appliedThrough. If we have a stable checkpoint, we will recover
@@ -412,6 +418,7 @@ StatusWith<OpTime> ReplicationRecoveryImpl::_getTopOfOplog(OperationContext* opC
 
 void ReplicationRecoveryImpl::_truncateOplogTo(OperationContext* opCtx,
                                                Timestamp truncateTimestamp) {
+    Timer timer;
     const NamespaceString oplogNss(NamespaceString::kRsOplogNamespace);
     AutoGetDb autoDb(opCtx, oplogNss.db(), MODE_IX);
     Lock::CollectionLock oplogCollectionLoc(opCtx->lockState(), oplogNss.ns(), MODE_X);
@@ -448,6 +455,8 @@ void ReplicationRecoveryImpl::_truncateOplogTo(OperationContext* opCtx,
                 invariant(!oldestIDToDelete.isNull());
                 oplogCollection->cappedTruncateAfter(opCtx, oldestIDToDelete, /*inclusive=*/true);
             }
+            log() << "Replication recovery oplog truncation finished in: " << timer.millis()
+                  << "ms";
             return;
         }
 

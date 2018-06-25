@@ -7,6 +7,7 @@
  * once the read has begun, catalog operations with conflicting locks will block until the read is
  * finished. Additionally, index operations running concurrently with the snapshot read may cause
  * the read to fail with a SnapshotUnavailable error.
+ *
  * @tags: [uses_transactions]
  */
 
@@ -131,18 +132,6 @@ var $config = (function() {
         }
     }
 
-    function teardown(db, collName, cluster) {
-    }
-
-    const skip = function skip(cluster) {
-        // TODO(SERVER-34570) remove isSharded() check once transactions are supported in sharded
-        // environments.
-        if (cluster.isSharded() || cluster.isStandalone()) {
-            return {skip: true, msg: 'only runs in a replica set.'};
-        }
-        return {skip: false};
-    };
-
     return {
         threadCount: 5,
         iterations: 10,
@@ -150,9 +139,7 @@ var $config = (function() {
         states: states,
         transitions: transitions,
         setup: setup,
-        teardown: teardown,
         data: data,
-        skip: skip
     };
 
 })();

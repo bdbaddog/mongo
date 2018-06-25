@@ -90,11 +90,6 @@ struct Record {
     RecordData data;
 };
 
-struct BsonRecord {
-    RecordId id;
-    const BSONObj* docPtr;
-};
-
 enum ValidateCmdLevel : int {
     kValidateIndex = 0x01,
     kValidateRecordStore = 0x02,
@@ -299,6 +294,8 @@ public:
     virtual const std::string& ns() const {
         return _ns;
     }
+
+    virtual const std::string& getIdent() const = 0;
 
     /**
      * The dataSize is an approximation of the sum of the sizes (in bytes) of the

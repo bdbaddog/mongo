@@ -98,7 +98,7 @@ error_code("NotSecondary", 95)
 error_code("OperationFailed", 96)
 error_code("NoProjectionFound", 97)
 error_code("DBPathInUse", 98)
-error_code("CannotSatisfyWriteConcern", 100)
+error_code("UnsatisfiableWriteConcern", 100)
 error_code("OutdatedClient", 101)
 error_code("IncompatibleAuditMetadata", 102)
 error_code("NewReplicaSetConfigurationIncompatible", 103)
@@ -256,6 +256,10 @@ error_code("FreeMonHttpPermanentFailure", 255)
 error_code("TransactionCommitted", 256)
 error_code("TransactionTooLarge", 257)
 error_code("UnknownFeatureCompatibilityVersion", 258);
+error_code("KeyedExecutorRetry", 259);
+error_code("InvalidResumeToken", 260);
+error_code("TooManyFilesOpen", 261);
+error_code("FailPointSetFailed", 262)
 
 # Error codes 4000-8999 are reserved.
 
@@ -268,7 +272,7 @@ error_code("BSONObjectTooLarge", 10334)
 error_code("DuplicateKey", 11000)
 error_code("InterruptedAtShutdown", 11600)
 error_code("Interrupted", 11601)
-error_code("InterruptedDueToReplStateChange", 11602)
+error_code("InterruptedDueToStepDown", 11602)
 error_code("OutOfDiskSpace", 14031 )
 error_code("KeyTooLong", 17280);
 error_code("BackgroundOperationInProgressForDatabase", 12586);
@@ -284,7 +288,7 @@ error_code("OBSOLETE_PrepareConfigsFailed", 13104);
 error_class("NetworkError", ["HostUnreachable", "HostNotFound", "NetworkTimeout", "SocketException"])
 error_class("Interruption", ["Interrupted",
                              "InterruptedAtShutdown",
-                             "InterruptedDueToReplStateChange",
+                             "InterruptedDueToStepDown",
                              "ExceededTimeLimit",
                              "CursorKilled",
                              "LockTimeout"])
@@ -296,7 +300,7 @@ error_class("NotMasterError", [
     "NotMaster",
     "NotMasterNoSlaveOk",
     "NotMasterOrSecondary",
-    "InterruptedDueToReplStateChange",
+    "InterruptedDueToStepDown",
     "PrimarySteppedDown",
     ])
 error_class("StaleShardVersionError",
@@ -306,7 +310,7 @@ error_class("NeedRetargettingError",
 error_class("WriteConcernError", ["WriteConcernFailed",
                                   "WriteConcernLegacyOK",
                                   "UnknownReplWriteConcern",
-                                  "CannotSatisfyWriteConcern"])
+                                  "UnsatisfiableWriteConcern"])
 error_class("ShutdownError", ["ShutdownInProgress", "InterruptedAtShutdown"])
 
 #TODO SERVER-28679 add checksum failure.

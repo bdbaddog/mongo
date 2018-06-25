@@ -894,7 +894,7 @@ BSONObj IndexCatalogImpl::getDefaultIdIndexSpec() const {
 
 void IndexCatalogImpl::dropAllIndexes(OperationContext* opCtx,
                                       bool includingIdIndex,
-                                      std::map<std::string, BSONObj>* droppedIndexes) {
+                                      stdx::function<void(const IndexDescriptor*)> onDropFn) {
     invariant(opCtx->lockState()->isCollectionLockedForMode(_collection->ns().toString(), MODE_X));
 
     BackgroundOperation::assertNoBgOpInProgForNs(_collection->ns().ns());
@@ -934,11 +934,13 @@ void IndexCatalogImpl::dropAllIndexes(OperationContext* opCtx,
         LOG(1) << "\t dropAllIndexes dropping: " << desc->toString();
         IndexCatalogEntry* entry = _entries.find(desc);
         invariant(entry);
-        _dropIndex(opCtx, entry).transitional_ignore();
 
-        if (droppedIndexes != nullptr) {
-            droppedIndexes->emplace(desc->indexName(), desc->infoObj());
+        // If the onDrop function creates an oplog entry, it should run first so that the drop is
+        // timestamped at the same optime.
+        if (onDropFn) {
+            onDropFn(desc);
         }
+        _dropIndex(opCtx, entry).transitional_ignore();
     }
 
     // verify state is sane post cleaning
@@ -1376,6 +1378,13 @@ Status IndexCatalogImpl::_indexFilteredRecords(OperationContext* opCtx,
     for (auto bsonRecord : bsonRecords) {
         int64_t inserted;
         invariant(bsonRecord.id != RecordId());
+
+        if (!bsonRecord.ts.isNull()) {
+            Status status = opCtx->recoveryUnit()->setTimestamp(bsonRecord.ts);
+            if (!status.isOK())
+                return status;
+        }
+
         Status status = index->accessMethod()->insert(
             opCtx, *bsonRecord.docPtr, bsonRecord.id, options, &inserted);
         if (!status.isOK())

@@ -36,6 +36,7 @@
 #include "mongo/db/repl/optime.h"
 #include "mongo/db/repl/optime_with.h"
 #include "mongo/db/repl/repl_set_config.h"
+#include "mongo/db/repl/replication_consistency_markers.h"
 #include "mongo/rpc/metadata/oplog_query_metadata.h"
 #include "mongo/rpc/metadata/repl_set_metadata.h"
 #include "mongo/util/concurrency/thread_pool.h"
@@ -108,33 +109,20 @@ public:
         OperationContext* opCtx) const = 0;
 
     /**
-     * Returns a new batch of operations to apply.
-     *
-     * This function is a passthrough for OplogApplier::getNextApplierBatch()
+     * Creates an OplogApplier using the provided options.
      */
-    virtual StatusWith<OplogApplier::Operations> getNextApplierBatch(OperationContext* opCtx,
-                                                                     OplogBuffer* oplogBuffer) = 0;
+    virtual std::unique_ptr<OplogApplier> makeOplogApplier(
+        OplogBuffer* oplogBuffer,
+        OplogApplier::Observer* observer,
+        ReplicationConsistencyMarkers* consistencyMarkers,
+        StorageInterface* storageInterface,
+        const OplogApplier::Options& options,
+        ThreadPool* writerPool) = 0;
 
     /**
      * Returns the current replica set config if there is one, or an error why there isn't.
      */
     virtual StatusWith<ReplSetConfig> getCurrentConfig() const = 0;
-
-private:
-    /**
-     * Applies the operations described in the oplog entries contained in "ops".
-     *
-     * Used exclusively by the InitialSyncer to construct a MultiApplier.
-     */
-    virtual StatusWith<OpTime> _multiApply(OperationContext* opCtx,
-                                           MultiApplier::Operations ops,
-                                           OplogApplier::Observer* observer,
-                                           const HostAndPort& source,
-                                           ThreadPool* writerPool) = 0;
-
-    // Provides InitialSyncer with access to _multiApply, _multiSyncApply and
-    // _multiInitialSyncApply.
-    friend class InitialSyncer;
 };
 
 }  // namespace repl

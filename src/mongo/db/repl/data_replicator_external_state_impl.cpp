@@ -33,15 +33,14 @@
 #include "mongo/db/repl/data_replicator_external_state_impl.h"
 
 #include "mongo/base/init.h"
+#include "mongo/db/repl/oplog_applier_impl.h"
 #include "mongo/db/repl/oplog_buffer_blocking_queue.h"
 #include "mongo/db/repl/oplog_buffer_collection.h"
 #include "mongo/db/repl/oplog_buffer_proxy.h"
-#include "mongo/db/repl/replication_consistency_markers.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/repl/replication_coordinator_external_state.h"
 #include "mongo/db/repl/replication_process.h"
 #include "mongo/db/repl/storage_interface.h"
-#include "mongo/db/repl/sync_tail.h"
 #include "mongo/db/server_parameters.h"
 #include "mongo/util/log.h"
 
@@ -147,32 +146,25 @@ std::unique_ptr<OplogBuffer> DataReplicatorExternalStateImpl::makeInitialSyncOpl
     }
 }
 
-StatusWith<OplogApplier::Operations> DataReplicatorExternalStateImpl::getNextApplierBatch(
-    OperationContext* opCtx, OplogBuffer* oplogBuffer) {
-    OplogApplier oplogApplier(
-        nullptr, oplogBuffer, nullptr, nullptr, nullptr, nullptr, {}, nullptr);
-    OplogApplier::BatchLimits batchLimits;
-    batchLimits.bytes = SyncTail::replBatchLimitBytes;
-    batchLimits.ops = std::size_t(SyncTail::replBatchLimitOperations.load());
-    return oplogApplier.getNextApplierBatch(opCtx, batchLimits);
+std::unique_ptr<OplogApplier> DataReplicatorExternalStateImpl::makeOplogApplier(
+    OplogBuffer* oplogBuffer,
+    OplogApplier::Observer* observer,
+    ReplicationConsistencyMarkers* consistencyMarkers,
+    StorageInterface* storageInterface,
+    const OplogApplier::Options& options,
+    ThreadPool* writerPool) {
+    return std::make_unique<OplogApplierImpl>(getTaskExecutor(),
+                                              oplogBuffer,
+                                              observer,
+                                              _replicationCoordinator,
+                                              consistencyMarkers,
+                                              storageInterface,
+                                              options,
+                                              writerPool);
 }
 
 StatusWith<ReplSetConfig> DataReplicatorExternalStateImpl::getCurrentConfig() const {
     return _replicationCoordinator->getConfig();
-}
-
-StatusWith<OpTime> DataReplicatorExternalStateImpl::_multiApply(OperationContext* opCtx,
-                                                                MultiApplier::Operations ops,
-                                                                OplogApplier::Observer* observer,
-                                                                const HostAndPort& source,
-                                                                ThreadPool* writerPool) {
-    auto replicationProcess = ReplicationProcess::get(opCtx);
-    auto consistencyMarkers = replicationProcess->getConsistencyMarkers();
-    auto storageInterface = StorageInterface::get(opCtx);
-    SyncTail syncTail(
-        observer, consistencyMarkers, storageInterface, repl::multiInitialSyncApply, writerPool);
-    syncTail.setHostname(source.toString());
-    return syncTail.multiApply(opCtx, std::move(ops));
 }
 
 ReplicationCoordinator* DataReplicatorExternalStateImpl::getReplicationCoordinator() const {

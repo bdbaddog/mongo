@@ -67,20 +67,47 @@ namespace {
 constexpr auto checkValueType = &DocumentSourceChangeStream::checkValueType;
 }  // namespace
 
+boost::intrusive_ptr<DocumentSourceChangeStreamTransform>
+DocumentSourceChangeStreamTransform::create(const boost::intrusive_ptr<ExpressionContext>& expCtx,
+                                            BSONObj changeStreamSpec) {
+    return new DocumentSourceChangeStreamTransform(expCtx, changeStreamSpec);
+}
+
 DocumentSourceChangeStreamTransform::DocumentSourceChangeStreamTransform(
-    const boost::intrusive_ptr<ExpressionContext>& expCtx,
-    BSONObj changeStreamSpec,
-    ServerGlobalParams::FeatureCompatibility::Version fcv,
-    bool isIndependentOfAnyCollection)
+    const boost::intrusive_ptr<ExpressionContext>& expCtx, BSONObj changeStreamSpec)
     : DocumentSource(expCtx),
       _changeStreamSpec(changeStreamSpec.getOwned()),
-      _resumeTokenFormat(
-          fcv >= ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo40
-              ? ResumeToken::SerializationFormat::kHexString
-              : ResumeToken::SerializationFormat::kBinData),
-      _isIndependentOfAnyCollection(isIndependentOfAnyCollection) {
+      _isIndependentOfAnyCollection(expCtx->ns.isCollectionlessAggregateNS()) {
 
     _nsRegex.emplace(DocumentSourceChangeStream::getNsRegexForChangeStream(expCtx->ns));
+
+    auto spec = DocumentSourceChangeStreamSpec::parse(IDLParserErrorContext("$changeStream"),
+                                                      _changeStreamSpec);
+
+    // If the change stream spec includes a resumeToken with a shard key, populate the document key
+    // cache with the field paths.
+    if (auto resumeAfter = spec.getResumeAfter()) {
+        ResumeToken token = resumeAfter.get();
+        ResumeTokenData tokenData = token.getData();
+
+        if (!tokenData.documentKey.missing() && tokenData.uuid) {
+            std::vector<FieldPath> docKeyFields;
+            auto docKey = tokenData.documentKey.getDocument();
+
+            auto iter = docKey.fieldIterator();
+            while (iter.more()) {
+                auto fieldPair = iter.next();
+                docKeyFields.push_back(fieldPair.first);
+            }
+
+            // If the document key from the resume token has more than one field, that means it
+            // includes the shard key and thus should never change.
+            auto isFinal = docKey.size() > 1;
+
+            _documentKeyCache[tokenData.uuid.get()] =
+                DocumentKeyCacheEntry({docKeyFields, isFinal});
+        }
+    }
 }
 
 DocumentSource::StageConstraints DocumentSourceChangeStreamTransform::constraints(
@@ -261,10 +288,34 @@ Document DocumentSourceChangeStreamTransform::applyTransformation(const Document
                 invariant(nextDoc);
 
                 return applyTransformation(*nextDoc);
+            } else if (!input.getNestedField("o.drop").missing()) {
+                operationType = DocumentSourceChangeStream::kDropCollectionOpType;
+
+                // The "o.drop" field will contain the actual collection name.
+                nss = NamespaceString(nss.db(), input.getNestedField("o.drop").getString());
+            } else if (!input.getNestedField("o.renameCollection").missing()) {
+                operationType = DocumentSourceChangeStream::kRenameCollectionOpType;
+
+                // The "o.renameCollection" field contains the namespace of the original collection.
+                nss = NamespaceString(input.getNestedField("o.renameCollection").getString());
+
+                // The "o.to" field contains the target namespace for the rename.
+                const auto renameTargetNss =
+                    NamespaceString(input.getNestedField("o.to").getString());
+                doc.addField(DocumentSourceChangeStream::kRenameTargetNssField,
+                             Value(Document{{"db", renameTargetNss.db()},
+                                            {"coll", renameTargetNss.coll()}}));
+            } else if (!input.getNestedField("o.dropDatabase").missing()) {
+                operationType = DocumentSourceChangeStream::kDropDatabaseOpType;
+
+                // Extract the database name from the namespace field and leave the collection name
+                // empty.
+                nss = NamespaceString(nss.db());
+            } else {
+                // All other commands will invalidate the stream.
+                operationType = DocumentSourceChangeStream::kInvalidateOpType;
             }
-            // Any command that makes it through our filter is an invalidating command such as a
-            // drop.
-            operationType = DocumentSourceChangeStream::kInvalidateOpType;
+
             // Make sure the result doesn't have a document key.
             documentKey = Value();
             break;
@@ -280,15 +331,10 @@ Document DocumentSourceChangeStreamTransform::applyTransformation(const Document
         default: { MONGO_UNREACHABLE; }
     }
 
-    // UUID should always be present except for invalidate entries.  It will not be under
-    // FCV 3.4, so we should close the stream as invalid.
-    if (operationType != DocumentSourceChangeStream::kInvalidateOpType && uuid.missing()) {
-        warning() << "Saw a CRUD op without a UUID.  Did Feature Compatibility Version get "
-                     "downgraded after opening the stream?";
-        operationType = DocumentSourceChangeStream::kInvalidateOpType;
-        fullDocument = Value();
-        updateDescription = Value();
-        documentKey = Value();
+    // UUID should always be present except for invalidate and dropDatabase entries.
+    if (operationType != DocumentSourceChangeStream::kInvalidateOpType &&
+        operationType != DocumentSourceChangeStream::kDropDatabaseOpType) {
+        invariant(!uuid.missing(), "Saw a CRUD op without a UUID");
     }
 
     // Note that 'documentKey' and/or 'uuid' might be missing, in which case they will not appear
@@ -303,7 +349,7 @@ Document DocumentSourceChangeStreamTransform::applyTransformation(const Document
     }
 
     doc.addField(DocumentSourceChangeStream::kIdField,
-                 Value(ResumeToken(resumeTokenData).toDocument(_resumeTokenFormat)));
+                 Value(ResumeToken(resumeTokenData).toDocument()));
     doc.addField(DocumentSourceChangeStream::kOperationTypeField, Value(operationType));
     doc.addField(DocumentSourceChangeStream::kClusterTimeField, Value(resumeTokenData.clusterTime));
 
@@ -321,7 +367,9 @@ Document DocumentSourceChangeStreamTransform::applyTransformation(const Document
 
     doc.addField(DocumentSourceChangeStream::kFullDocumentField, fullDocument);
     doc.addField(DocumentSourceChangeStream::kNamespaceField,
-                 Value(Document{{"db", nss.db()}, {"coll", nss.coll()}}));
+                 operationType == DocumentSourceChangeStream::kDropDatabaseOpType
+                     ? Value(Document{{"db", nss.db()}})
+                     : Value(Document{{"db", nss.db()}, {"coll", nss.coll()}}));
     doc.addField(DocumentSourceChangeStream::kDocumentKeyField, documentKey);
 
     // Note that 'updateDescription' might be the 'missing' value, in which case it will not be
@@ -337,11 +385,9 @@ Value DocumentSourceChangeStreamTransform::serialize(
     // cluster time on the mongos.  This ensures all shards use the same start time.
     if (pExpCtx->inMongos &&
         changeStreamOptions[DocumentSourceChangeStreamSpec::kResumeAfterFieldName].missing() &&
-        changeStreamOptions
-            [DocumentSourceChangeStreamSpec::kResumeAfterClusterTimeDeprecatedFieldName]
-                .missing() &&
         changeStreamOptions[DocumentSourceChangeStreamSpec::kStartAtOperationTimeFieldName]
-            .missing()) {
+            .missing() &&
+        changeStreamOptions[DocumentSourceChangeStreamSpec::kStartAfterFieldName].missing()) {
         MutableDocument newChangeStreamOptions(changeStreamOptions);
 
         // Use the current cluster time plus 1 tick since the oplog query will include all

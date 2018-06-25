@@ -41,7 +41,7 @@
 
 load('jstests/libs/cycle_detection.js');  // for Graph
 
-// For withTxnAndAutoRetryOnWriteConflict.
+// For withTxnAndAutoRetry.
 load('jstests/concurrency/fsm_workload_helpers/auto_retry_transaction.js');
 
 var $config = (function() {
@@ -97,60 +97,88 @@ var $config = (function() {
         }
     }
 
+    // Overridable functions for subclasses to do more complex transactions.
+    const getAllCollections = (db, collName) => [db.getCollection(collName)];
+
+    function getAllDocuments(db, collName, numDocs, {useTxn}) {
+        let allDocuments = [];
+
+        if (useTxn) {
+            withTxnAndAutoRetry(this.session, () => {
+                allDocuments = [];
+                for (let collection of this.collections) {
+                    const txnDbName = collection.getDB().getName();
+                    const txnCollName = collection.getName();
+                    const txnCollection =
+                        this.session.getDatabase(txnDbName).getCollection(txnCollName);
+
+                    // We intentionally use a smaller batch size when fetching all of the
+                    // documents in the collection in order to stress the behavior of reading
+                    // from the same snapshot over the course of multiple network roundtrips.
+                    const batchSize = Math.max(2, Math.floor(numDocs / 5));
+                    allDocuments.push(...txnCollection.find().batchSize(batchSize).toArray());
+                }
+            });
+        } else {
+            for (let collection of this.collections) {
+                allDocuments.push(...collection.find().toArray());
+            }
+        }
+
+        assertWhenOwnColl.eq(allDocuments.length, numDocs * this.collections.length);
+
+        return allDocuments;
+    }
+
+    function getDocIdsToUpdate(numDocs) {
+        // Generate between [2, numDocs / 2] operations.
+        const numOps = 2 + Random.randInt(Math.ceil(numDocs / 2) - 1);
+
+        // Select 'numOps' document (without replacement) to update.
+        let docIds = Array.from({length: numDocs}, (value, index) => index);
+        return Array.shuffle(docIds).slice(0, numOps);
+    }
+
     const states = (function() {
-
-        function getAllDocuments(collection, numDocs) {
-            // We intentionally use a smaller batch size when fetching all of the documents in the
-            // collection in order to stress the behavior of reading from the same snapshot over the
-            // course of multiple network roundtrips.
-            const batchSize = Math.max(2, Math.floor(numDocs / 5));
-
-            collection.getDB().getSession().startTransaction();
-            const documents =
-                collection.find().batchSize(batchSize).readConcern('snapshot').toArray();
-            collection.getDB().getSession().commitTransaction();
-
-            assertWhenOwnColl.eq(numDocs, documents.length, () => tojson(documents));
-            return documents;
-        }
-
-        function getDocIdsToUpdate(numDocs) {
-            // Generate between [2, numDocs / 2] operations.
-            const numOps = 2 + Random.randInt(Math.ceil(numDocs / 2) - 1);
-
-            // Select 'numOps' document (without replacement) to update.
-            let docIds = Array.from({length: numDocs}, (value, index) => index);
-            return Array.shuffle(docIds).slice(0, numOps);
-        }
 
         return {
             init: function init(db, collName) {
                 this.iteration = 0;
                 this.session = db.getMongo().startSession({causalConsistency: false});
+                this.collections = this.getAllCollections(db, collName);
             },
 
             update: function update(db, collName) {
-                const collection = this.session.getDatabase(db.getName()).getCollection(collName);
-                const docIds = getDocIdsToUpdate(this.numDocs);
+                const docIds = this.getDocIdsToUpdate(this.numDocs);
 
-                // We apply the following update to each of the 'docIds' documents to record the
-                // number of times we expect to see the transaction being run in this execution of
-                // the update() state function by this worker thread present across all documents.
-                // Using the $push operator causes a transaction which commits after another
-                // transaction to appear later in the array.
-                const updateMods = {
-                    $push: {
-                        order: {
-                            tid: this.tid,
-                            iteration: this.iteration,
-                            numUpdated: docIds.length,
-                        }
-                    }
-                };
-
-                withTxnAndAutoRetryOnWriteConflict(this.session, () => {
+                withTxnAndAutoRetry(this.session, () => {
                     for (let [i, docId] of docIds.entries()) {
-                        const res = collection.runCommand('update', {
+                        const collection =
+                            this.collections[Random.randInt(this.collections.length)];
+                        const txnDbName = collection.getDB().getName();
+                        const txnCollName = collection.getName();
+                        // We apply the following update to each of the 'docIds' documents
+                        // to record the number of times we expect to see the transaction
+                        // being run in this execution of the update() state function by this
+                        // worker thread present across all documents. Using the $push
+                        // operator causes a transaction which commits after another
+                        // transaction to appear later in the array.
+                        const updateMods = {
+                            $push: {
+                                order: {
+                                    tid: this.tid,
+                                    iteration: this.iteration,
+                                    numUpdated: docIds.length,
+                                },
+                                metadata: {
+                                    dbName: txnDbName,
+                                    collName: txnCollName,
+                                }
+                            }
+                        };
+                        const txnCollection =
+                            this.session.getDatabase(txnDbName).getCollection(txnCollName);
+                        const res = txnCollection.runCommand('update', {
                             updates: [{q: {_id: docId}, u: updateMods}],
                         });
                         assertAlways.commandWorked(res);
@@ -163,8 +191,7 @@ var $config = (function() {
             },
 
             checkConsistency: function checkConsistency(db, collName) {
-                const collection = this.session.getDatabase(db.getName()).getCollection(collName);
-                const documents = getAllDocuments(collection, this.numDocs);
+                const documents = this.getAllDocuments(db, collName, this.numDocs, {useTxn: true});
                 checkTransactionCommitOrder(documents);
                 checkNumUpdatedByEachTransaction(documents);
             }
@@ -178,28 +205,25 @@ var $config = (function() {
     };
 
     function setup(db, collName, cluster) {
-        const bulk = db[collName].initializeUnorderedBulkOp();
+        this.collections = this.getAllCollections(db, collName);
 
-        for (let i = 0; i < this.numDocs; ++i) {
-            bulk.insert({_id: i, order: []});
+        for (let collection of this.collections) {
+            const bulk = collection.initializeUnorderedBulkOp();
+
+            for (let i = 0; i < this.numDocs; ++i) {
+                bulk.insert({_id: i, order: []});
+            }
+
+            const res = bulk.execute({w: 'majority'});
+            assertWhenOwnColl.commandWorked(res);
+            assertWhenOwnColl.eq(this.numDocs, res.nInserted);
         }
-
-        const res = bulk.execute({w: 'majority'});
-        assertWhenOwnColl.commandWorked(res);
-        assertWhenOwnColl.eq(this.numDocs, res.nInserted);
     }
 
     function teardown(db, collName, cluster) {
-        const documents = db[collName].find().toArray();
+        const documents = this.getAllDocuments(db, collName, this.numDocs, {useTxn: false});
         checkTransactionCommitOrder(documents);
         checkNumUpdatedByEachTransaction(documents);
-    }
-
-    function skip(cluster) {
-        if (cluster.isSharded() || cluster.isStandalone()) {
-            return {skip: true, msg: 'only runs in a replica set.'};
-        }
-        return {skip: false};
     }
 
     return {
@@ -207,10 +231,14 @@ var $config = (function() {
         iterations: 50,
         states: states,
         transitions: transitions,
-        data: {numDocs: 10},
+        data: {
+            getAllCollections,
+            getAllDocuments,
+            getDocIdsToUpdate,
+            numDocs: 10,
+        },
         setup: setup,
         teardown: teardown,
-        skip: skip
     };
 
 })();

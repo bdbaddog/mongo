@@ -444,7 +444,7 @@ add_option('cache-dir',
 )
 
 add_option("cxx-std",
-    choices=["14"],
+    choices=["14", "17"],
     default="14",
     help="Select the C++ langauge standard to build with",
 )
@@ -1100,6 +1100,9 @@ os_macros = {
     "iOS-sim": "defined(__APPLE__) && TARGET_OS_IOS && TARGET_OS_SIMULATOR",
     "tvOS": "defined(__APPLE__) && TARGET_OS_TV && !TARGET_OS_SIMULATOR",
     "tvOS-sim": "defined(__APPLE__) && TARGET_OS_TV && TARGET_OS_SIMULATOR",
+    "watchOS": "defined(__APPLE__) && TARGET_OS_WATCH && !TARGET_OS_SIMULATOR",
+    "watchOS-sim": "defined(__APPLE__) && TARGET_OS_WATCH && TARGET_OS_SIMULATOR",
+
     # NOTE: Once we have XCode 8 required, we can rely on the value of TARGET_OS_OSX. In case
     # we are on an older XCode, use TARGET_OS_MAC and TARGET_OS_IPHONE. We don't need to correct
     # the above declarations since we will never target them with anything other than XCode 8.
@@ -2252,15 +2255,24 @@ def doConfigure(myenv):
         usingLibStdCxx = conf.CheckLibStdCxx()
         conf.Finish()
 
-    if not myenv.ToolchainIs('msvc'):
+    if myenv.ToolchainIs('msvc'):
+        if get_option('cxx-std') == "14":
+            myenv.AppendUnique(CCFLAGS=['/std:c++14'])
+        elif get_option('cxx-std') == "17":
+            myenv.AppendUnique(CCFLAGS=['/std:c++17', '/Zc:__cplusplus'])
+    else:
         if get_option('cxx-std') == "14":
             if not AddToCXXFLAGSIfSupported(myenv, '-std=c++14'):
                 myenv.ConfError('Compiler does not honor -std=c++14')
+        elif get_option('cxx-std') == "17":
+            if not AddToCXXFLAGSIfSupported(myenv, '-std=c++17'):
+                myenv.ConfError('Compiler does not honor -std=c++17')
+
         if not AddToCFLAGSIfSupported(myenv, '-std=c11'):
-            myenv.ConfError("C++14 mode selected for C++ files, but can't enable C11 for C files")
+            myenv.ConfError("C++14/17 mode selected for C++ files, but can't enable C11 for C files")
 
     if using_system_version_of_cxx_libraries():
-        print( 'WARNING: System versions of C++ libraries must be compiled with C++14 support' )
+        print( 'WARNING: System versions of C++ libraries must be compiled with C++14/17 support' )
 
     # We appear to have C++14, or at least a flag to enable it. Check that the declared C++
     # language level is not less than C++14, and that we can at least compile an 'auto'
@@ -2285,12 +2297,29 @@ def doConfigure(myenv):
         context.Result(ret)
         return ret
 
+    def CheckCxx17(context):
+        test_body = """
+        #if __cplusplus < 201703L
+        #error
+        #endif
+        namespace NestedNamespaceDecls::AreACXX17Feature {};
+        """
+
+        context.Message('Checking for C++17... ')
+        ret = context.TryCompile(textwrap.dedent(test_body), ".cpp")
+        context.Result(ret)
+        return ret
+
     conf = Configure(myenv, help=False, custom_tests = {
         'CheckCxx14' : CheckCxx14,
+        'CheckCxx17' : CheckCxx17,
     })
 
     if not conf.CheckCxx14():
         myenv.ConfError('C++14 support is required to build MongoDB')
+
+    if get_option('cxx-std') == "17" and not conf.CheckCxx17():
+        myenv.ConfError('C++17 was requested, but the compiler appears not to offer it')
 
     conf.Finish()
 
@@ -2442,8 +2471,10 @@ def doConfigure(myenv):
 
         # On 32-bit systems, we need to define this in order to get access to
         # the 64-bit versions of fseek, etc.
+        # except on 32 bit android where it breaks boost
         if not conf.CheckTypeSize('off_t', includes="#include <sys/types.h>", expect=8):
-            myenv.Append(CPPDEFINES=["_FILE_OFFSET_BITS=64"])
+            if not env.TargetOSIs('android'):
+                myenv.Append(CPPDEFINES=["_FILE_OFFSET_BITS=64"])
 
         conf.Finish()
 
@@ -2576,8 +2607,13 @@ def doConfigure(myenv):
         # Explicitly enable GNU build id's if the linker supports it.
         AddToLINKFLAGSIfSupported(myenv, '-Wl,--build-id')
 
-        # Explicitly use the new gnu hash section if the linker offers it.
-        AddToLINKFLAGSIfSupported(myenv, '-Wl,--hash-style=gnu')
+        # Explicitly use the new gnu hash section if the linker offers
+        # it, except on android since older runtimes seem to not
+        # support it. For that platform, use 'both'.
+        if env.TargetOSIs('android'):
+            AddToLINKFLAGSIfSupported(myenv, '-Wl,--hash-style=both')
+        else:
+            AddToLINKFLAGSIfSupported(myenv, '-Wl,--hash-style=gnu')
 
         # Try to have the linker tell us about ODR violations. Don't
         # use it when using clang with libstdc++, as libstdc++ was
@@ -2944,12 +2980,12 @@ def doConfigure(myenv):
     if ssl_provider == 'native':
         if conf.env.TargetOSIs('windows'):
             ssl_provider = 'windows'
-            env.SetConfigHeaderDefine("MONGO_CONFIG_SSL_PROVIDER", "SSL_PROVIDER_WINDOWS")
+            env.SetConfigHeaderDefine("MONGO_CONFIG_SSL_PROVIDER", "MONGO_CONFIG_SSL_PROVIDER_WINDOWS")
             conf.env.Append( MONGO_CRYPTO=["windows"] )
 
         elif conf.env.TargetOSIs('darwin', 'macOS'):
             ssl_provider = 'apple'
-            env.SetConfigHeaderDefine("MONGO_CONFIG_SSL_PROVIDER", "SSL_PROVIDER_APPLE")
+            env.SetConfigHeaderDefine("MONGO_CONFIG_SSL_PROVIDER", "MONGO_CONFIG_SSL_PROVIDER_APPLE")
             conf.env.Append( MONGO_CRYPTO=["apple"] )
             conf.env.AppendUnique(FRAMEWORKS=[
                 'CoreFoundation',
@@ -2960,7 +2996,7 @@ def doConfigure(myenv):
         if has_option("ssl"):
             checkOpenSSL(conf)
             # Working OpenSSL available, use it.
-            env.SetConfigHeaderDefine("MONGO_CONFIG_SSL_PROVIDER", "SSL_PROVIDER_OPENSSL")
+            env.SetConfigHeaderDefine("MONGO_CONFIG_SSL_PROVIDER", "MONGO_CONFIG_SSL_PROVIDER_OPENSSL")
 
             conf.env.Append( MONGO_CRYPTO=["openssl"] )
         else:
@@ -3128,16 +3164,17 @@ def doConfigure(myenv):
         test_body = """
         #include <atomic>
 
-        int main() {{
+        int main(int argc, char* argv[]) {{
             std::atomic<{0}> x;
 
             x.store(0);
-            {0} y = 1;
+            // Use argc to ensure we can't optimize everything away.
+            {0} y = argc;
             x.fetch_add(y);
             x.fetch_sub(y);
             x.exchange(y);
-            x.compare_exchange_strong(y, x);
-            x.is_lock_free();
+            if (x.compare_exchange_strong(y, x) && x.is_lock_free())
+                return 0;
             return x.load();
         }}
         """.format(base_type)
@@ -3224,7 +3261,24 @@ def doConfigure(myenv):
             conf.env.SetConfigHeaderDefine("MONGO_CONFIG_MAX_EXTENDED_ALIGNMENT", size)
             break
  
+    def CheckMongoCMinVersion(context):
+        compile_test_body = textwrap.dedent("""
+        #include <mongoc.h>
+
+        #if !MONGOC_CHECK_VERSION(1,10,0)
+        #error
+        #endif
+        """)
+
+        context.Message("Checking if mongoc version is 1.10.0 or newer...")
+        result = context.TryCompile(compile_test_body, ".cpp")
+        context.Result(result)
+        return result
+
+    conf.AddTest('CheckMongoCMinVersion', CheckMongoCMinVersion)
+
     mongoc_mode = get_option('use-system-mongo-c')
+    conf.env['MONGO_HAVE_LIBMONGOC'] = False
     if mongoc_mode != 'off':
         conf.env['MONGO_HAVE_LIBMONGOC'] = conf.CheckLibWithHeader(
                 ["mongoc-1.0"],
@@ -3234,6 +3288,8 @@ def doConfigure(myenv):
                 autoadd=False )
         if not conf.env['MONGO_HAVE_LIBMONGOC'] and mongoc_mode == 'on':
             myenv.ConfError("Failed to find the required C driver headers")
+        if conf.env['MONGO_HAVE_LIBMONGOC'] and not conf.CheckMongoCMinVersion():
+            myenv.ConfError("Version of mongoc is too old. Version 1.10+ required")
 
     # ask each module to configure itself and the build environment.
     moduleconfig.configure_modules(mongo_modules, conf)
@@ -3322,7 +3378,7 @@ if get_option('install-mode') == 'hygienic':
         )
     elif env['PLATFORM'] == 'darwin':
         env.AppendUnique(
-            PROGLINKFLAGS=[
+            LINKFLAGS=[
                 '-Wl,-rpath,@loader_path/../lib'
             ],
             SHLINKFLAGS=[

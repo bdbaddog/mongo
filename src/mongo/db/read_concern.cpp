@@ -205,12 +205,24 @@ Status makeNoopWriteIfNeeded(OperationContext* opCtx, LogicalTime clusterTime) {
 Status waitForReadConcern(OperationContext* opCtx,
                           const repl::ReadConcernArgs& readConcernArgs,
                           bool allowAfterClusterTime) {
+    // If we are in a direct client within a transaction, then we may be holding locks, so it is
+    // illegal to wait for read concern. This is fine, since the outer operation should have handled
+    // waiting for read concern.
+    auto session = OperationContextSession::get(opCtx);
+    if (opCtx->getClient()->isInDirectClient() && session &&
+        session->inMultiDocumentTransaction()) {
+        return Status::OK();
+    }
+
     repl::ReplicationCoordinator* const replCoord = repl::ReplicationCoordinator::get(opCtx);
     invariant(replCoord);
 
-    auto session = OperationContextSession::get(opCtx);
-    // Currently speculative read concern is used only for transactions and snapshot reads.
-    const bool speculative = session && session->inSnapshotReadOrMultiDocumentTransaction();
+    // Currently speculative read concern is used only for transactions. However, speculative read
+    // concern is not yet supported with atClusterTime.
+    //
+    // TODO SERVER-34620: Re-enable speculative behavior when "atClusterTime" is specified.
+    const bool speculative =
+        session && session->inMultiDocumentTransaction() && !readConcernArgs.getArgsAtClusterTime();
 
     if (readConcernArgs.getLevel() == repl::ReadConcernLevel::kLinearizableReadConcern) {
         if (replCoord->getReplicationMode() != repl::ReplicationCoordinator::modeReplSet) {
@@ -235,21 +247,6 @@ Status waitForReadConcern(OperationContext* opCtx,
         if (!replCoord->getMemberState().primary()) {
             return {ErrorCodes::NotMaster,
                     "cannot satisfy linearizable read concern on non-primary node"};
-        }
-    }
-
-    if (readConcernArgs.getLevel() == repl::ReadConcernLevel::kSnapshotReadConcern) {
-        if (replCoord->getReplicationMode() != repl::ReplicationCoordinator::modeReplSet) {
-            return {ErrorCodes::NotAReplicaSet,
-                    "node needs to be a replica set member to use readConcern: snapshot"};
-        }
-
-        if (!replCoord->isV1ElectionProtocol()) {
-            return {ErrorCodes::IncompatibleElectionProtocol,
-                    "Replica sets running protocol version 0 do not support readConcern: snapshot"};
-        }
-        if (speculative) {
-            session->setSpeculativeTransactionOpTimeToLastApplied(opCtx);
         }
     }
 
@@ -301,6 +298,20 @@ Status waitForReadConcern(OperationContext* opCtx,
         }
     }
 
+    if (readConcernArgs.getLevel() == repl::ReadConcernLevel::kSnapshotReadConcern) {
+        if (replCoord->getReplicationMode() != repl::ReplicationCoordinator::modeReplSet) {
+            return {ErrorCodes::NotAReplicaSet,
+                    "node needs to be a replica set member to use readConcern: snapshot"};
+        }
+
+        if (!replCoord->isV1ElectionProtocol()) {
+            return {ErrorCodes::IncompatibleElectionProtocol,
+                    "Replica sets running protocol version 0 do not support readConcern: snapshot"};
+        }
+        if (speculative) {
+            session->setSpeculativeTransactionOpTimeToLastApplied(opCtx);
+        }
+    }
 
     if (atClusterTime) {
         // TODO(SERVER-34620): We should be using Session::setSpeculativeTransactionReadOpTime when

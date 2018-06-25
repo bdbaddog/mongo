@@ -68,7 +68,11 @@ class ServiceEntryPoint;
 namespace transport {
 
 // This fail point simulates reads and writes that always return 1 byte and fail with EAGAIN
-MONGO_FP_FORWARD_DECLARE(transportLayerASIOshortOpportunisticReadWrite);
+MONGO_FAIL_POINT_DECLARE(transportLayerASIOshortOpportunisticReadWrite);
+
+// This fail point will cause an asyncConnect to timeout after it's successfully connected
+// to the remote peer
+MONGO_FAIL_POINT_DECLARE(transportLayerASIOasyncConnectTimesOut);
 
 /**
  * A TransportLayer implementation based on ASIO networking primitives.
@@ -95,7 +99,7 @@ public:
         }
 
         int port = ServerGlobalParams::DefaultDBPort;  // port to bind to
-        std::string ipList;                            // addresses to bind to
+        std::vector<std::string> ipList;               // addresses to bind to
 #ifndef _WIN32
         bool useUnixSockets = true;  // whether to allow UNIX sockets in ipList
 #endif
@@ -115,7 +119,8 @@ public:
 
     Future<SessionHandle> asyncConnect(HostAndPort peer,
                                        ConnectSSLMode sslMode,
-                                       const ReactorHandle& reactor) final;
+                                       const ReactorHandle& reactor,
+                                       Milliseconds timeout) final;
 
     Status setup() final;
 
