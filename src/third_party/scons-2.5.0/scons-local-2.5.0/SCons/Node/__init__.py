@@ -1435,7 +1435,7 @@ class Node(object):
                 m[schild] = signature
         return m
 
-    def _get_previous_signatures(self, dmap, children):
+   def _get_previous_signatures(self, dmap, children):
         """
         Return a list of corresponding csigs from previous
         build in order of the node/files in children.
@@ -1449,22 +1449,25 @@ class Node(object):
             List of csigs for provided list of children
         """
         prev = []
-        # for c in map(str, children):
-        #     # If there is no previous signature,
-        #     # we place None in the corresponding position.
-        #     prev.append(dmap.get(c))
 
         for c in children:
-            c_str = str(c)
-            df = dmap.get(c_str)
+            try:
+                # this should yield a path which matches what's in the sconsign
+                c_str = c.get_path()
+            except AttributeError as e:
+                # For non filesystem node objects
+                c_str = str(c)
+
+            df = dmap.get(c_str) or dmap.get(str(c))
             if df:
                 prev.append(df)
                 continue
 
+
             try:
                 # We're not finding the file as listed in the
-                # current childrens list in the list loaded from
-                # Sconsign. So let's see if it was previously
+                # current children list in the list loaded from
+                # SConsign. So let's see if it was previously
                 # retrieved from the repo.
                 # Also since we only have find_repo_file() on File objects
                 # Handle if we have any other Node type not having that method
@@ -1475,16 +1478,17 @@ class Node(object):
                         prev.append(df)
                         break
                 else:
-                    print "CHANGE_DEBUG: file:%s prev_build_files:%s"%(c_str,",".join(dmap.keys()))
+                    print("CHANGE_DEBUG: file:%s PREV_BUILD_FILES:%s" % (c_str, ",".join(dmap.keys())))
+
                     # TODO: may want to use c.fs.File(...,create=0). Though that doesn't resolve
                     #  test/Repository/JavaH.py failure while below does.
-                    possibles = [(f,v) for f,v in dmap.items() if c.File('#/%s'%f).rfile() == c]
+                    possibles = [(f,v) for f,v in dmap.items() if c.Entry('#/%s'%f).rfile() == c]
                     if len(possibles) == 1:
                         prev.append(possibles[0][1])
                     else:
                         prev.append(None)
             except AttributeError as e:
-                print "CHANGE_DEBUG: Exception :%s"%e
+                print("CHANGE_DEBUG (Exception): file:%s PREV_BUILD_FILES:%s" % (c_str, ",".join(dmap.keys())))
                 prev.append(None)
 
         # prev = [dmap.get(str(c), dmap.get(str(c.find_repo_file()[0]))) for c in children]
