@@ -1435,7 +1435,7 @@ class Node(object):
                 m[schild] = signature
         return m
 
-   def _get_previous_signatures(self, dmap, children):
+    def _get_previous_signatures(self, dmap, children):
         """
         Return a list of corresponding csigs from previous
         build in order of the node/files in children.
