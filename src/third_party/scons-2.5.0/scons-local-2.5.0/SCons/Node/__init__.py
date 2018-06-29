@@ -1480,33 +1480,36 @@ class Node(object):
                 prev.append(df)
                 continue
 
+            prev.append(None)
+            continue
 
-            try:
-                # We're not finding the file as listed in the
-                # current children list in the list loaded from
-                # SConsign. So let's see if it was previously
-                # retrieved from the repo.
-                # Also since we only have find_repo_file() on File objects
-                # Handle if we have any other Node type not having that method
-                for rf in c.find_repo_file():
-                    rfs = str(rf)
-                    df = dmap.get(rfs)
-                    if df:
-                        prev.append(df)
-                        break
-                else:
-                    print("CHANGE_DEBUG: file:%s PREV_BUILD_FILES:%s" % (c_str, ",".join(dmap.keys())))
+            # TODO: This may not be necessary at all..
+            # try:
+            #     # We're not finding the file as listed in the
+            #     # current children list in the list loaded from
+            #     # SConsign. So let's see if it was previously
+            #     # retrieved from the repo.
+            #     # Also since we only have find_repo_file() on File objects
+            #     # Handle if we have any other Node type not having that method
+            #     for rf in c.find_repo_file():
+            #         rfs = str(rf)
+            #         df = dmap.get(rfs)
+            #         if df:
+            #             prev.append(df)
+            #             break
+            #     else:
+            #         print("CHANGE_DEBUG: file:%s PREV_BUILD_FILES:%s" % (c_str, ",".join(dmap.keys())))
 
-                    # TODO: may want to use c.fs.File(...,create=0). Though that doesn't resolve
-                    #  test/Repository/JavaH.py failure while below does.
-                    possibles = [(f,v) for f,v in dmap.items() if c.Entry('#/%s'%f).rfile() == c]
-                    if len(possibles) == 1:
-                        prev.append(possibles[0][1])
-                    else:
-                        prev.append(None)
-            except AttributeError as e:
-                print("CHANGE_DEBUG (Exception): file:%s PREV_BUILD_FILES:%s" % (c_str, ",".join(dmap.keys())))
-                prev.append(None)
+            #         # TODO: may want to use c.fs.File(...,create=0). Though that doesn't resolve
+            #         #  test/Repository/JavaH.py failure while below does.
+            #         possibles = [(f,v) for f,v in dmap.items() if c.Entry('#/%s'%f).rfile() == c]
+            #         if len(possibles) == 1:
+            #             prev.append(possibles[0][1])
+            #         else:
+            #             prev.append(None)
+            # except AttributeError as e:
+            #     print("CHANGE_DEBUG (Exception): file:%s PREV_BUILD_FILES:%s" % (c_str, ",".join(dmap.keys())))
+            #     prev.append(None)
 
         # prev = [dmap.get(str(c), dmap.get(str(c.find_repo_file()[0]))) for c in children]
         return prev
