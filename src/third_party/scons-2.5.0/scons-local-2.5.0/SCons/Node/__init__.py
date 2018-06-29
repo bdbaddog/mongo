@@ -1453,46 +1453,66 @@ class Node(object):
             List of csigs for provided list of children
         """
         prev = []
+
         for c in children:
+
+            # First try the simple name for node
             try:
-                # This should yield a patch which matches what is in the sconsign
-                c_str = c.get_path()
-            except AttributeError as e:
-                # For non filesystem node types
+                # Check if we have something derived from Node.FS.Base
+                c.fs
                 c_str = str(c)
-            df = dmap.get(c_str)
+                if os.altsep:
+                    c_str = c_str.replace(os.sep, os.altsep)
+                df=dmap.get(c_str)
+                if not df:
+                    try:
+                        # this should yield a path which matches what's in the sconsign
+                        c_str = c.get_path()
+                        if os.altsep:
+                            c_str = c_str.replace(os.sep, os.altsep)
+
+                        df = dmap.get(c_str)
+                    except AttributeError as e:
+                        import pdb; pdb.set_trace()
+            except AttributeError as e:
+                # We have a non file node, likely Value
+                c_str = str(c)
+                df = dmap.get(c_str)
+
             if df:
                 prev.append(df)
                 continue
 
-            try:
-                # We're not finding the file as listed in the
-                # current childrens list in the list loaded from
-                # Sconsign. So let's see if it was previously
-                # retrieved from the repo.
-                # Also since we only have find_repo_file() on File objects
-                # Handle if we have any other Node type not having that method
-                for rf in c.find_repo_file():
-                    rfs = str(rf)
-                    df = dmap.get(rfs)
-                    if df:
-                        prev.append(df)
-                        break
-                else:
-                    p = c_str.split(os.sep)[-1]
-                    matches = [f for f in dmap.keys() if f.endswith(p)]
-                    print "CHANGE_DEBUG: file:%s prev_build_files:%s"%(c_str,",".join(matches))
-                    # print "CHANGE_DEBUG: file:%s prev_build_files:%s"%(c_str,",".join(dmap.keys()))
-                    # TODO: may want to use c.fs.File(...,create=0). Though that doesn't resolve
-                    #  test/Repository/JavaH.py failure while below does.
-                    possibles = [(f,v) for f,v in dmap.items() if c.File('#/%s'%f).rfile() == c]
-                    if len(possibles) == 1:
-                        prev.append(possibles[0][1])
-                    else:
-                        prev.append(None)
-            except AttributeError as e:
-                print "CHANGE_DEBUG: Exception :%s"%e
-                prev.append(None)
+            prev.append(None)
+            continue
+
+            # TODO: This may not be necessary at all..
+            # try:
+            #     # We're not finding the file as listed in the
+            #     # current children list in the list loaded from
+            #     # SConsign. So let's see if it was previously
+            #     # retrieved from the repo.
+            #     # Also since we only have find_repo_file() on File objects
+            #     # Handle if we have any other Node type not having that method
+            #     for rf in c.find_repo_file():
+            #         rfs = str(rf)
+            #         df = dmap.get(rfs)
+            #         if df:
+            #             prev.append(df)
+            #             break
+            #     else:
+            #         print("CHANGE_DEBUG: file:%s PREV_BUILD_FILES:%s" % (c_str, ",".join(dmap.keys())))
+
+            #         # TODO: may want to use c.fs.File(...,create=0). Though that doesn't resolve
+            #         #  test/Repository/JavaH.py failure while below does.
+            #         possibles = [(f,v) for f,v in dmap.items() if c.Entry('#/%s'%f).rfile() == c]
+            #         if len(possibles) == 1:
+            #             prev.append(possibles[0][1])
+            #         else:
+            #             prev.append(None)
+            # except AttributeError as e:
+            #     print("CHANGE_DEBUG (Exception): file:%s PREV_BUILD_FILES:%s" % (c_str, ",".join(dmap.keys())))
+            #     prev.append(None)
 
         # prev = [dmap.get(str(c), dmap.get(str(c.find_repo_file()[0]))) for c in children]
         return prev
@@ -1551,7 +1571,6 @@ class Node(object):
         # Now build new then based on map built above.
         previous_children = self._get_previous_signatures(dmap, children)
 
-            
         for child, prev_ni in zip(children, previous_children):
             if _decider_map[child.changed_since_last_build](child, self, prev_ni):
                 if t: Trace(': %s changed' % child)
