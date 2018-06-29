@@ -43,6 +43,7 @@ be able to depend on any other type of "thing."
 
 __revision__ = "src/engine/SCons/Node/__init__.py rel_2.5.1:3735:9dc6cee5c168 2016/11/03 14:02:02 bdbaddog"
 
+import os
 import collections
 import copy
 from itertools import chain
@@ -1451,14 +1452,30 @@ class Node(object):
         prev = []
 
         for c in children:
-            try:
-                # this should yield a path which matches what's in the sconsign
-                c_str = c.get_path()
-            except AttributeError as e:
-                # For non filesystem node objects
-                c_str = str(c)
 
-            df = dmap.get(c_str) or dmap.get(str(c))
+            # First try the simple name for node
+            try:
+                # Check if we have something derived from Node.FS.Base
+                c.fs
+                c_str = str(c)
+                if os.altsep:
+                    c_str = c_str.replace(os.sep, os.altsep)
+                df=dmap.get(c_str)
+                if not df:
+                    try:
+                        # this should yield a path which matches what's in the sconsign
+                        c_str = c.get_path()
+                        if os.altsep:
+                            c_str = c_str.replace(os.sep, os.altsep)
+
+                        df = dmap.get(c_str)
+                    except AttributeError as e:
+                        import pdb; pdb.set_trace()
+            except AttributeError as e:
+                # We have a non file node, likely Value
+                c_str = str(c)
+                df = dmap.get(c_str)
+
             if df:
                 prev.append(df)
                 continue
@@ -1548,7 +1565,6 @@ class Node(object):
         # Now build new then based on map built above.
         previous_children = self._get_previous_signatures(dmap, children)
 
-            
         for child, prev_ni in zip(children, previous_children):
             if _decider_map[child.changed_since_last_build](child, self, prev_ni):
                 if t: Trace(': %s changed' % child)
