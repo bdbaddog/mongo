@@ -185,7 +185,13 @@ def compile_idl(args):
 
     # Compile the IDL through the 3 passes
     with io.open(args.input_file, encoding='utf-8') as file_stream:
-        parsed_doc = parser.parse(file_stream, error_file_name=error_file_name)
+        parsed_doc = parser.parse(file_stream, args.input_file,
+                                  CompilerImportResolver(args.import_directories))
+
+        # Stop compiling if we only need to scan import dependencies
+        if args.write_dependencies:
+            _write_dependencies(parsed_doc.spec)
+            return True
 
         if not parsed_doc.errors:
             _update_import_includes(args, parsed_doc.spec, header_file_name)
