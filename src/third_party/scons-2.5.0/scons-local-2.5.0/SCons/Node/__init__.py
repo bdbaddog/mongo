@@ -242,6 +242,20 @@ _target_from_source_map = {0 : target_from_source_none,
 # used by it.
 #
 
+class DeciderNeedsNode(Exception):
+    """
+    Indicate that the decider needs the node as well as the target and the dependency.
+    Normally the node and the target are the same, but in the case of repository
+    They may be different. Also the NodeInfo is retrieved from the node
+    """
+    def __init__(self, call_this_decider):
+        """
+        :param call_this_decider: to return the decider to call directly since deciders
+               are called through several levels of indirection
+        """
+        self.decider = call_this_decider
+
+
 #
 # First, the single decider functions
 #
@@ -1405,117 +1419,6 @@ class Node(object):
             return None
         return self._tags.get(key, None)
 
-    def _build_dependency_map(self, binfo):
-        """
-        Build mapping from file -> signature
-
-        Args:
-            self - self
-            binfo - buildinfo from node being considered
-
-        Returns: 
-            dictionary of file->signature mappings
-        """
-
-        # For an "empty" binfo properties like bsources
-        # do not exist: check this to avoid exception.
-        if (len(binfo.bsourcesigs) + len(binfo.bdependsigs) + \
-                len(binfo.bimplicitsigs)) == 0:
-            return{}
-
-        pairs = [
-            (binfo.bsources, binfo.bsourcesigs),
-            (binfo.bdepends, binfo.bdependsigs),
-            (binfo.bimplicit, binfo.bimplicitsigs)
-           ]
-
-        m = {}
-        for children, signatures in pairs:
-            for child, signature in zip(children, signatures):
-                schild = str(child)
-                # TODO: Really need to make sure the child is a filepath and not some string content (for example something output by configure context to be tried)
-                if os.altsep:
-                    schild = schild.replace(os.altsep, os.sep)
-                m[schild] = signature
-        return m
-
-    def _get_previous_signatures(self, dmap, children):
-        """
-        Return a list of corresponding csigs from previous
-        build in order of the node/files in children.
-
-        Args:
-            self - self
-            dmap - Dictionary of file -> csig
-            children - List of children
-        
-        Returns:
-            List of csigs for provided list of children
-        """
-        prev = []
-
-        for c in children:
-
-            # First try the simple name for node
-            try:
-                # Check if we have something derived from Node.FS.Base
-                c.fs
-                c_str = str(c)
-                if os.altsep:
-                    c_str = c_str.replace(os.sep, os.altsep)
-                df=dmap.get(c_str)
-                if not df:
-                    try:
-                        # this should yield a path which matches what's in the sconsign
-                        c_str = c.get_path()
-                        if os.altsep:
-                            c_str = c_str.replace(os.sep, os.altsep)
-
-                        df = dmap.get(c_str)
-                    except AttributeError as e:
-                        import pdb; pdb.set_trace()
-            except AttributeError as e:
-                # We have a non file node, likely Value
-                c_str = str(c)
-                df = dmap.get(c_str)
-
-            if df:
-                prev.append(df)
-                continue
-
-            prev.append(None)
-            continue
-
-            # TODO: This may not be necessary at all..
-            # try:
-            #     # We're not finding the file as listed in the
-            #     # current children list in the list loaded from
-            #     # SConsign. So let's see if it was previously
-            #     # retrieved from the repo.
-            #     # Also since we only have find_repo_file() on File objects
-            #     # Handle if we have any other Node type not having that method
-            #     for rf in c.find_repo_file():
-            #         rfs = str(rf)
-            #         df = dmap.get(rfs)
-            #         if df:
-            #             prev.append(df)
-            #             break
-            #     else:
-            #         print("CHANGE_DEBUG: file:%s PREV_BUILD_FILES:%s" % (c_str, ",".join(dmap.keys())))
-
-            #         # TODO: may want to use c.fs.File(...,create=0). Though that doesn't resolve
-            #         #  test/Repository/JavaH.py failure while below does.
-            #         possibles = [(f,v) for f,v in dmap.items() if c.Entry('#/%s'%f).rfile() == c]
-            #         if len(possibles) == 1:
-            #             prev.append(possibles[0][1])
-            #         else:
-            #             prev.append(None)
-            # except AttributeError as e:
-            #     print("CHANGE_DEBUG (Exception): file:%s PREV_BUILD_FILES:%s" % (c_str, ",".join(dmap.keys())))
-            #     prev.append(None)
-
-        # prev = [dmap.get(str(c), dmap.get(str(c.find_repo_file()[0]))) for c in children]
-        return prev
 
     def changed(self, node=None, allowcache=False):
         """
@@ -1548,37 +1451,33 @@ class Node(object):
         result = False
 
         bi = node.get_stored_info().binfo
-        previous_children = bi.bsourcesigs + bi.bdependsigs + bi.bimplicitsigs
-        dmap = self._build_dependency_map(bi)
-        
+        then = bi.bsourcesigs + bi.bdependsigs + bi.bimplicitsigs
         children = self.children()
 
-        diff = len(children) - len(dmap)
+        diff = len(children) - len(then)
         if diff:
             # The old and new dependency lists are different lengths.
             # This always indicates that the Node must be rebuilt.
-
-            # TODO: Below is from new logic
-            # # We also extend the old dependency list with enough None
-            # # entries to equal the new dependency list, for the benefit
-            # # of the loop below that updates node information.
-            # then.extend([None] * diff)
-            
-            if t: Trace(': old %s new %s' % (len(previous_children), len(children)))
-            
+            # We also extend the old dependency list with enough None
+            # entries to equal the new dependency list, for the benefit
+            # of the loop below that updates node information.
+            then.extend([None] * diff)
+            if t: Trace(': old %s new %s' % (len(then), len(children)))
             result = True
 
-        # Now build new then based on map built above.
-        previous_children = self._get_previous_signatures(dmap, children)
+        for child, prev_ni in zip(children, then):
+            try:
+                if _decider_map[child.changed_since_last_build](child, self, prev_ni):
+                    if t: Trace(': %s changed' % child)
+                    result = True
+            except DeciderNeedsNode as e:
+                if e.decider(self, prev_ni, node=node):
+                    if t: Trace(': %s changed' % child)
+                    result = True
 
-        for child, prev_ni in zip(children, previous_children):
-            if _decider_map[child.changed_since_last_build](child, self, prev_ni):
-                if t: Trace(': %s changed' % child)
-                result = True
-
+        contents = self.get_executor().get_contents()
         if self.has_builder():
-            contents = self.get_executor().get_contents()
-
+            import SCons.Util
             newsig = SCons.Util.MD5signature(contents)
             if bi.bactsig != newsig:
                 if t: Trace(': bactsig %s != newsig %s' % (bi.bactsig, newsig))
