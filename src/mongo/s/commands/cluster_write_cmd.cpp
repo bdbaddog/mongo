@@ -273,22 +273,22 @@ private:
                 for (size_t i = 0; i < numAttempts; ++i) {
                     globalOpCounters.gotInsert();
                 }
-                debug.ninserted = response.getN();
+                debug.additiveMetrics.ninserted = response.getN();
                 break;
             case BatchedCommandRequest::BatchType_Update:
                 for (size_t i = 0; i < numAttempts; ++i) {
                     globalOpCounters.gotUpdate();
                 }
                 debug.upsert = response.isUpsertDetailsSet();
-                debug.nMatched =
+                debug.additiveMetrics.nMatched =
                     response.getN() - (debug.upsert ? response.sizeUpsertDetails() : 0);
-                debug.nModified = response.getNModified();
+                debug.additiveMetrics.nModified = response.getNModified();
                 break;
             case BatchedCommandRequest::BatchType_Delete:
                 for (size_t i = 0; i < numAttempts; ++i) {
                     globalOpCounters.gotDelete();
                 }
-                debug.ndeleted = response.getN();
+                debug.additiveMetrics.ndeleted = response.getN();
                 break;
         }
 
@@ -302,20 +302,16 @@ private:
         return response.getOk();
     }
 
-    void run(OperationContext* opCtx, CommandReplyBuilder* result) override {
-        try {
-            BSONObjBuilder bob = result->getBodyBuilder();
-            bool ok = runImpl(opCtx, *_request, _batchedRequest, bob);
+    void run(OperationContext* opCtx, rpc::ReplyBuilderInterface* result) override {
+        BSONObjBuilder bob = result->getBodyBuilder();
+        bool ok = runImpl(opCtx, *_request, _batchedRequest, bob);
+        if (!ok)
             CommandHelpers::appendSimpleCommandStatus(bob, ok);
-        } catch (const ExceptionFor<ErrorCodes::Unauthorized>&) {
-            CommandHelpers::auditLogAuthEvent(opCtx, this, *_request, ErrorCodes::Unauthorized);
-            throw;
-        }
     }
 
     void explain(OperationContext* opCtx,
                  ExplainOptions::Verbosity verbosity,
-                 BSONObjBuilder* result) override {
+                 rpc::ReplyBuilderInterface* result) override {
         uassert(ErrorCodes::InvalidLength,
                 "explained write batches must be of size 1",
                 _batchedRequest.sizeWriteOps() == 1U);
@@ -333,8 +329,9 @@ private:
                                         explainCmd,
                                         targetingBatchItem,
                                         &shardResults));
+        auto bodyBuilder = result->getBodyBuilder();
         uassertStatusOK(ClusterExplain::buildExplainResult(
-            opCtx, shardResults, ClusterExplain::kWriteOnShards, timer.millis(), result));
+            opCtx, shardResults, ClusterExplain::kWriteOnShards, timer.millis(), &bodyBuilder));
     }
 
     NamespaceString ns() const override {
@@ -342,6 +339,10 @@ private:
     }
 
     bool supportsWriteConcern() const override {
+        return true;
+    }
+
+    bool supportsReadConcern(repl::ReadConcernLevel level) const final {
         return true;
     }
 

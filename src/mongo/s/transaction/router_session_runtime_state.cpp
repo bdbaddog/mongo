@@ -32,6 +32,8 @@
 
 #include "mongo/s/transaction/router_session_runtime_state.h"
 
+#include "mongo/db/logical_session_id.h"
+#include "mongo/db/repl/read_concern_args.h"
 #include "mongo/stdx/unordered_map.h"
 #include "mongo/util/log.h"
 
@@ -40,6 +42,7 @@ namespace mongo {
 namespace {
 
 const char kAutoCommitField[] = "autocommit";
+const char kCoordinatorField[] = "coordinator";
 const char kStartTransactionField[] = "startTransaction";
 
 class RouterSessionCatalog {
@@ -101,24 +104,66 @@ RouterSessionCatalog* RouterSessionCatalog::get(OperationContext* opCtx) {
     return get(opCtx->getServiceContext());
 }
 
+bool isTransactionCommand(const BSONObj& cmd) {
+    auto cmdName = cmd.firstElement().fieldNameStringData();
+    return cmdName == "abortTransaction" || cmdName == "commitTransaction" ||
+        cmdName == "prepareTransaction";
+}
+
+void appendReadConcernForTxn(BSONObjBuilder* bob, repl::ReadConcernArgs readConcernArgs) {
+    // Check for an existing read concern. The first statement in a transaction may already have
+    // one.
+    if (bob->hasField(repl::ReadConcernArgs::kReadConcernFieldName)) {
+        // TODO SERVER-36237: For commands that support atClusterTime, mongos will attach an
+        // atClusterTime to the readConcern, without updating the read concern decoration. Once the
+        // router session tracks atClusterTime, it can verify that the sent readConcern matches that
+        // on the decoration.
+        return;
+    }
+
+    readConcernArgs.appendInfo(bob);
+}
+
 }  // unnamed namespace
 
+TransactionParticipant::TransactionParticipant(bool isCoordinator,
+                                               TxnNumber txnNumber,
+                                               repl::ReadConcernArgs readConcernArgs)
+    : _isCoordinator(isCoordinator), _txnNumber(txnNumber), _readConcernArgs(readConcernArgs) {}
+
 BSONObj TransactionParticipant::attachTxnFieldsIfNeeded(BSONObj cmd) {
+    auto isTxnCmd = isTransactionCommand(cmd);  // check first before moving cmd.
     BSONObjBuilder newCmd(std::move(cmd));
 
-    if (_state == State::kMustStart) {
+    if (_state == State::kMustStart && !isTxnCmd) {
         newCmd.append(kStartTransactionField, true);
+
+        appendReadConcernForTxn(&newCmd, _readConcernArgs);
+    }
+
+    if (_isCoordinator) {
+        newCmd.append(kCoordinatorField, true);
     }
 
     newCmd.append(kAutoCommitField, false);
 
-    // TODO: append readConcern
+    if (!newCmd.hasField(OperationSessionInfo::kTxnNumberFieldName)) {
+        newCmd.append(OperationSessionInfo::kTxnNumberFieldName, _txnNumber);
+    } else {
+        auto osi =
+            OperationSessionInfoFromClient::parse("OperationSessionInfo"_sd, newCmd.asTempObj());
+        invariant(_txnNumber == *osi.getTxnNumber());
+    }
 
     return newCmd.obj();
 }
 
 TransactionParticipant::State TransactionParticipant::getState() {
     return _state;
+}
+
+bool TransactionParticipant::isCoordinator() {
+    return _isCoordinator;
 }
 
 void TransactionParticipant::markAsCommandSent() {
@@ -151,6 +196,10 @@ bool RouterSessionRuntimeState::isCheckedOut() {
     return _isCheckedOut;
 }
 
+boost::optional<ShardId> RouterSessionRuntimeState::getCoordinatorId() const {
+    return _coordinatorId;
+}
+
 TransactionParticipant& RouterSessionRuntimeState::getOrCreateParticipant(const ShardId& shard) {
     auto iter = _participants.find(shard.toString());
 
@@ -158,7 +207,19 @@ TransactionParticipant& RouterSessionRuntimeState::getOrCreateParticipant(const 
         return iter->second;
     }
 
-    auto resultPair = _participants.try_emplace(shard.toString(), TransactionParticipant());
+    // The first participant is chosen as the coordinator.
+    auto isFirstParticipant = _participants.empty();
+    if (isFirstParticipant) {
+        invariant(!_coordinatorId);
+        _coordinatorId = shard.toString();
+    }
+
+    // The transaction must have been started with a readConcern.
+    invariant(!_readConcernArgs.isEmpty());
+
+    auto resultPair = _participants.try_emplace(
+        shard.toString(), TransactionParticipant(isFirstParticipant, _txnNumber, _readConcernArgs));
+
     return resultPair.first->second;
 }
 
@@ -166,7 +227,9 @@ const LogicalSessionId& RouterSessionRuntimeState::getSessionId() const {
     return _sessionId;
 }
 
-void RouterSessionRuntimeState::beginOrContinueTxn(TxnNumber txnNumber, bool startTransaction) {
+void RouterSessionRuntimeState::beginOrContinueTxn(OperationContext* opCtx,
+                                                   TxnNumber txnNumber,
+                                                   bool startTransaction) {
     invariant(_isCheckedOut);
 
     if (startTransaction) {
@@ -184,6 +247,12 @@ void RouterSessionRuntimeState::beginOrContinueTxn(TxnNumber txnNumber, bool sta
                               << _sessionId,
                 txnNumber > _txnNumber);
 
+        auto& readConcernArgs = repl::ReadConcernArgs::get(opCtx);
+        // TODO SERVER-36240: Determine readConcern upconverting behavior on mongos.
+        uassert(ErrorCodes::InvalidOptions,
+                "The first command in a transaction must specify a readConcern",
+                !readConcernArgs.isEmpty());
+        _readConcernArgs = readConcernArgs;
     } else {
         // TODO: figure out what to do with recovery
         uassert(ErrorCodes::NoSuchTransaction,
@@ -192,6 +261,10 @@ void RouterSessionRuntimeState::beginOrContinueTxn(TxnNumber txnNumber, bool sta
                               << " with txnId "
                               << txnNumber,
                 txnNumber == _txnNumber);
+
+        uassert(ErrorCodes::InvalidOptions,
+                "Only the first command in a transaction may specify a readConcern",
+                repl::ReadConcernArgs::get(opCtx).isEmpty());
     }
 
     if (_txnNumber == txnNumber) {
@@ -200,6 +273,7 @@ void RouterSessionRuntimeState::beginOrContinueTxn(TxnNumber txnNumber, bool sta
 
     _txnNumber = txnNumber;
     _participants.clear();
+    _coordinatorId.reset();
 }
 
 ScopedRouterSession::ScopedRouterSession(OperationContext* opCtx) : _opCtx(opCtx) {

@@ -298,7 +298,7 @@ public:
      * Returns ErrorCodes::QueryPlanKilled if the PlanExecutor was killed while saved.
      *
      * If allowed, will yield and retry if a WriteConflictException is encountered. If the time
-     * limit is exceeded during this retry process, returns ErrorCodes::ExceededTimeLimit. If this
+     * limit is exceeded during this retry process, returns ErrorCodes::MaxTimeMSExpired. If this
      * PlanExecutor is killed during this retry process, returns ErrorCodes::QueryPlanKilled. In
      * this scenario, locks will have been released, and will not be held when control returns to
      * the caller.
@@ -461,6 +461,10 @@ public:
         return _currentState == kDisposed;
     }
 
+    bool isDetached() const {
+        return _currentState == kDetached;
+    }
+
     /**
      * If the last oplog timestamp is being tracked for this PlanExecutor, return it.
      * Otherwise return a null timestamp.
@@ -468,6 +472,12 @@ public:
     Timestamp getLatestOplogTimestamp();
 
 private:
+    /**
+     * Returns true if the PlanExecutor should listen for inserts, which is when a getMore is called
+     * on a tailable and awaitData cursor that still has time left and hasn't been interrupted.
+     */
+    bool shouldListenForInserts();
+
     /**
      * Returns true if the PlanExecutor should wait for data to be inserted, which is when a getMore
      * is called on a tailable and awaitData cursor on a capped collection.  Returns false if an EOF

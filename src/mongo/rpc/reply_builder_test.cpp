@@ -31,8 +31,6 @@
 #include "mongo/bson/util/builder.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/json.h"
-#include "mongo/rpc/command_reply.h"
-#include "mongo/rpc/command_reply_builder.h"
 #include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/rpc/legacy_reply.h"
 #include "mongo/rpc/legacy_reply_builder.h"
@@ -55,11 +53,6 @@ TEST(LegacyReplyBuilder, RoundTrip) {
     testRoundTrip<rpc::LegacyReply>(r, true);
 }
 
-TEST(CommandReplyBuilder, RoundTrip) {
-    rpc::CommandReplyBuilder r;
-    testRoundTrip<rpc::CommandReply>(r, false);
-}
-
 TEST(OpMsgReplyBuilder, RoundTrip) {
     rpc::OpMsgReplyBuilder r;
     testRoundTrip<rpc::OpMsgReply>(r, true);
@@ -71,11 +64,6 @@ void testErrors(rpc::ReplyBuilderInterface& replyBuilder);
 TEST(LegacyReplyBuilder, Errors) {
     rpc::LegacyReplyBuilder r;
     testErrors<rpc::LegacyReply>(r);
-}
-
-TEST(CommandReplyBuilder, Errors) {
-    rpc::CommandReplyBuilder r;
-    testErrors<rpc::CommandReply>(r);
 }
 
 TEST(OpMsgReplyBuilder, Errors) {
@@ -128,20 +116,6 @@ BSONObj buildErrReply(const Status status, const BSONObj& extraInfo = {}) {
     return bob.obj();
 }
 
-TEST(CommandReplyBuilder, CommandError) {
-    const Status status(ErrorCodes::InvalidLength, "Response payload too long");
-    BSONObj metadata = buildMetadata();
-    rpc::CommandReplyBuilder replyBuilder;
-    replyBuilder.setCommandReply(status);
-    replyBuilder.setMetadata(metadata);
-    auto msg = replyBuilder.done();
-
-    rpc::CommandReply parsed(&msg);
-
-    ASSERT_BSONOBJ_EQ(parsed.getMetadata(), metadata);
-    ASSERT_BSONOBJ_EQ(parsed.getCommandReply(), buildErrReply(status));
-}
-
 TEST(LegacyReplyBuilder, CommandError) {
     const Status status(ErrorCodes::InvalidLength, "Response payload too long");
     BSONObj metadata = buildMetadata();
@@ -151,7 +125,7 @@ TEST(LegacyReplyBuilder, CommandError) {
     const BSONObj extraObj = extra.obj();
     rpc::LegacyReplyBuilder replyBuilder;
     replyBuilder.setCommandReply(status, extraObj);
-    replyBuilder.setMetadata(metadata);
+    replyBuilder.getBodyBuilder().appendElements(metadata);
     auto msg = replyBuilder.done();
 
     rpc::LegacyReply parsed(&msg);
@@ -162,7 +136,6 @@ TEST(LegacyReplyBuilder, CommandError) {
         return unifiedBuilder.obj();
     }());
 
-    ASSERT_BSONOBJ_EQ(parsed.getMetadata(), body);
     ASSERT_BSONOBJ_EQ(parsed.getCommandReply(), body);
 }
 
@@ -175,7 +148,7 @@ TEST(OpMsgReplyBuilder, CommandError) {
     const BSONObj extraObj = extra.obj();
     rpc::OpMsgReplyBuilder replyBuilder;
     replyBuilder.setCommandReply(status, extraObj);
-    replyBuilder.setMetadata(metadata);
+    replyBuilder.getBodyBuilder().appendElements(metadata);
     auto msg = replyBuilder.done();
 
     rpc::OpMsgReply parsed(&msg);
@@ -186,7 +159,6 @@ TEST(OpMsgReplyBuilder, CommandError) {
         return unifiedBuilder.obj();
     }());
 
-    ASSERT_BSONOBJ_EQ(parsed.getMetadata(), body);
     ASSERT_BSONOBJ_EQ(parsed.getCommandReply(), body);
 }
 
@@ -196,7 +168,7 @@ void testRoundTrip(rpc::ReplyBuilderInterface& replyBuilder, bool unifiedBodyAnd
     auto commandReply = buildEmptyCommand();
 
     replyBuilder.setCommandReply(commandReply);
-    replyBuilder.setMetadata(metadata);
+    replyBuilder.getBodyBuilder().appendElements(metadata);
 
     auto msg = replyBuilder.done();
 
@@ -210,10 +182,8 @@ void testRoundTrip(rpc::ReplyBuilderInterface& replyBuilder, bool unifiedBodyAnd
         }());
 
         ASSERT_BSONOBJ_EQ(parsed.getCommandReply(), body);
-        ASSERT_BSONOBJ_EQ(parsed.getMetadata(), body);
     } else {
         ASSERT_BSONOBJ_EQ(parsed.getCommandReply(), commandReply);
-        ASSERT_BSONOBJ_EQ(parsed.getMetadata(), metadata);
     }
 }
 
@@ -224,7 +194,7 @@ void testErrors(rpc::ReplyBuilderInterface& replyBuilder) {
     const auto status = Status(ErrorExtraInfoExample(123), "Why does this keep failing!");
 
     replyBuilder.setCommandReply(status);
-    replyBuilder.setMetadata(buildMetadata());
+    replyBuilder.getBodyBuilder().appendElements(buildMetadata());
 
     const auto msg = replyBuilder.done();
 

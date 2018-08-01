@@ -208,13 +208,6 @@ public:
     virtual bool isEphemeral() const = 0;
 
     /**
-     * Only MMAPv1 should override this and return true to trigger MMAPv1-specific behavior.
-     */
-    virtual bool isMmapV1() const {
-        return false;
-    }
-
-    /**
      * Populates and tears down in-memory data structures, respectively. Only required for storage
      * engines that support recoverToStableTimestamp().
      *
@@ -270,6 +263,15 @@ public:
      * Storage engines implementing this feature should fassert when unable to leave backup mode.
      */
     virtual void endBackup(OperationContext* opCtx) {
+        return;
+    }
+
+    virtual StatusWith<std::vector<std::string>> beginNonBlockingBackup(OperationContext* opCtx) {
+        return Status(ErrorCodes::CommandNotSupported,
+                      "The current storage engine does not support a concurrent mode.");
+    }
+
+    virtual void endNonBlockingBackup(OperationContext* opCtx) {
         return;
     }
 
@@ -356,12 +358,16 @@ public:
     }
 
     /**
-     * Returns a timestamp that is guaranteed to be persisted to disk in a checkpoint. Returns
-     * boost::none if there is no stable checkpoint. This method should return at least the value of
-     * `getRecoveryTimestamp` if the node started from a stable checkpoint. fasserts if
-     * StorageEngine::supportsRecoverToStableTimestamp() would return false.
+     * Returns a timestamp that is guaranteed to exist on storage engine recovery to a stable
+     * timestamp. This indicates when the storage engine can safely rollback to stable; and for
+     * durable engines, it is also the guaranteed minimum stable recovery point on server restart
+     * after crash or shutdown.
+     *
+     * fasserts if StorageEngine::supportsRecoverToStableTimestamp() would return false. Returns
+     * boost::none if the recovery time has not yet been established. Replication recoverable
+     * rollback may not succeed before establishment, and restart will require resync.
      */
-    virtual boost::optional<Timestamp> getLastStableCheckpointTimestamp() const {
+    virtual boost::optional<Timestamp> getLastStableRecoveryTimestamp() const {
         MONGO_UNREACHABLE;
     }
 

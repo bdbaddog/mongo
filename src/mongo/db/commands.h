@@ -256,6 +256,9 @@ public:
      */
     Command(StringData name, StringData oldName = StringData());
 
+    Command(const Command&) = delete;
+    Command& operator=(const Command&) = delete;
+
     // Do not remove or relocate the definition of this "key function".
     // See https://gcc.gnu.org/wiki/VerboseDiagnostics#missing_vtable
     virtual ~Command();
@@ -370,12 +373,12 @@ public:
     }
 
     /**
-     * Returns whether this operation is a read, write, or command.
+     * Returns whether this operation is a read, write, command, or multi-document transaction.
      *
      * Commands which implement database read or write logic should override this to return kRead
      * or kWrite as appropriate.
      */
-    enum class ReadWriteType { kCommand, kRead, kWrite };
+    enum class ReadWriteType { kCommand, kRead, kWrite, kTransaction };
     virtual ReadWriteType getReadWriteType() const {
         return ReadWriteType::kCommand;
     }
@@ -414,58 +417,16 @@ private:
     ServerStatusMetricField<Counter64> _commandsFailedMetric;
 };
 
-class CommandReplyBuilder {
-public:
-    explicit CommandReplyBuilder(BSONObjBuilder bodyObj);
-
-    CommandReplyBuilder(const CommandReplyBuilder&) = delete;
-    CommandReplyBuilder& operator=(const CommandReplyBuilder&) = delete;
-
-    /**
-     * Returns a BSONObjBuilder that can be used to build the reply in-place. The returned
-     * builder (or an object into which it has been moved) must be completed before calling
-     * any more methods on this object. A builder is completed by a call to `done()` or by
-     * its destructor. Can be called repeatedly to append multiple things to the reply, as
-     * long as each returned builder must be completed between calls.
-     */
-    BSONObjBuilder getBodyBuilder() const;
-
-    void reset();
-
-    /**
-     * Appends a key:object field to this reply.
-     */
-    template <typename T>
-    void append(StringData key, const T& object) {
-        getBodyBuilder() << key << object;
-    }
-
-    /**
-     * The specified 'object' must be BSON-serializable.
-     *
-     * BSONSerializable 'x' means 'x.serialize(bob)' appends a representation of 'x'
-     * into 'BSONObjBuilder* bob'.
-     */
-    template <typename T>
-    void fillFrom(const T& object) {
-        static_assert(!isStatusOrStatusWith<std::decay_t<T>>,
-                      "Status and StatusWith<T> aren't supported by TypedCommand and fillFrom(). "
-                      "Use uassertStatusOK() instead.");
-        auto bob = getBodyBuilder();
-        object.serialize(&bob);
-    }
-
-private:
-    BufBuilder* const _bodyBuf;
-    const std::size_t _bodyOffset;
-};
-
 /**
  * Represents a single invocation of a given command.
  */
 class CommandInvocation {
 public:
     CommandInvocation(const Command* definition) : _definition(definition) {}
+
+    CommandInvocation(const CommandInvocation&) = delete;
+    CommandInvocation& operator=(const CommandInvocation&) = delete;
+
     virtual ~CommandInvocation();
 
     /**
@@ -476,11 +437,11 @@ public:
      * indicated either by throwing (preferred), or by calling
      * `CommandHelpers::extractOrAppendOk`.
      */
-    virtual void run(OperationContext* opCtx, CommandReplyBuilder* result) = 0;
+    virtual void run(OperationContext* opCtx, rpc::ReplyBuilderInterface* result) = 0;
 
     virtual void explain(OperationContext* opCtx,
                          ExplainOptions::Verbosity verbosity,
-                         BSONObjBuilder* result) {
+                         rpc::ReplyBuilderInterface* result) {
         uasserted(ErrorCodes::IllegalOperation,
                   str::stream() << "Cannot explain cmd: " << definition()->getName());
     }
@@ -600,7 +561,7 @@ public:
     virtual Status explain(OperationContext* opCtx,
                            const OpMsgRequest& request,
                            ExplainOptions::Verbosity verbosity,
-                           BSONObjBuilder* out) const;
+                           rpc::ReplyBuilderInterface* result) const;
 
     /**
      * Checks if the client associated with the given OperationContext is authorized to run this
@@ -808,14 +769,14 @@ private:
     decltype(auto) _callTypedRun(OperationContext* opCtx) {
         return static_cast<Invocation*>(this)->typedRun(opCtx);
     }
-    void _runImpl(std::true_type, OperationContext* opCtx, CommandReplyBuilder*) {
+    void _runImpl(std::true_type, OperationContext* opCtx, rpc::ReplyBuilderInterface*) {
         _callTypedRun(opCtx);
     }
-    void _runImpl(std::false_type, OperationContext* opCtx, CommandReplyBuilder* reply) {
+    void _runImpl(std::false_type, OperationContext* opCtx, rpc::ReplyBuilderInterface* reply) {
         reply->fillFrom(_callTypedRun(opCtx));
     }
 
-    void run(OperationContext* opCtx, CommandReplyBuilder* reply) final {
+    void run(OperationContext* opCtx, rpc::ReplyBuilderInterface* reply) final {
         using VoidResultTag = std::is_void<decltype(_callTypedRun(opCtx))>;
         _runImpl(VoidResultTag{}, opCtx, reply);
     }

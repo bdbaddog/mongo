@@ -31,9 +31,10 @@
 #include "mongo/db/pipeline/change_stream_constants.h"
 #include "mongo/db/pipeline/document_source.h"
 #include "mongo/db/pipeline/document_source_change_stream.h"
+#include "mongo/db/pipeline/document_source_change_stream_gen.h"
 #include "mongo/db/pipeline/document_source_sort.h"
-#include "mongo/db/pipeline/document_sources_gen.h"
 #include "mongo/db/pipeline/resume_token.h"
+#include "mongo/db/query/query_knobs.h"
 
 namespace mongo {
 /**
@@ -137,7 +138,7 @@ public:
             DocumentSourceSort::create(pExpCtx,
                                        change_stream_constants::kSortSpec,
                                        noLimit,
-                                       DocumentSourceSort::kMaxMemoryUsageBytes,
+                                       internalDocumentSourceSortMaxBlockingSortBytes.load(),
                                        mergingPresorted);
         return {sortMergingPresorted, this};
     };

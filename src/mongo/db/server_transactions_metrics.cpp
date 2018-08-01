@@ -51,6 +51,30 @@ ServerTransactionsMetrics* ServerTransactionsMetrics::get(OperationContext* opCt
     return get(opCtx->getServiceContext());
 }
 
+unsigned long long ServerTransactionsMetrics::getCurrentActive() const {
+    return _currentActive.load();
+}
+
+void ServerTransactionsMetrics::decrementCurrentActive() {
+    _currentActive.fetchAndSubtract(1);
+}
+
+void ServerTransactionsMetrics::incrementCurrentActive() {
+    _currentActive.fetchAndAdd(1);
+}
+
+unsigned long long ServerTransactionsMetrics::getCurrentInactive() const {
+    return _currentInactive.load();
+}
+
+void ServerTransactionsMetrics::decrementCurrentInactive() {
+    _currentInactive.fetchAndSubtract(1);
+}
+
+void ServerTransactionsMetrics::incrementCurrentInactive() {
+    _currentInactive.fetchAndAdd(1);
+}
+
 unsigned long long ServerTransactionsMetrics::getCurrentOpen() const {
     return _currentOpen.load();
 }
@@ -88,7 +112,12 @@ void ServerTransactionsMetrics::incrementTotalCommitted() {
 }
 
 void ServerTransactionsMetrics::updateStats(TransactionsStats* stats) {
-    // This is a dummy function until we start tracking global transactions metrics.
+    stats->setCurrentActive(_currentActive.load());
+    stats->setCurrentInactive(_currentInactive.load());
+    stats->setCurrentOpen(_currentOpen.load());
+    stats->setTotalAborted(_totalAborted.load());
+    stats->setTotalCommitted(_totalCommitted.load());
+    stats->setTotalStarted(_totalStarted.load());
 }
 
 class TransactionsSSS : public ServerStatusSection {

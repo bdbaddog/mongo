@@ -178,9 +178,6 @@ public:
 
     virtual Status processReplSetFreeze(int secs, BSONObjBuilder* resultObj);
 
-    virtual Status processHeartbeat(const ReplSetHeartbeatArgs& args,
-                                    ReplSetHeartbeatResponse* response);
-
     virtual Status processReplSetReconfig(OperationContext* opCtx,
                                           const ReplSetReconfigArgs& args,
                                           BSONObjBuilder* resultObj);
@@ -188,10 +185,6 @@ public:
     virtual Status processReplSetInitiate(OperationContext* opCtx,
                                           const BSONObj& configObj,
                                           BSONObjBuilder* resultObj);
-
-    virtual Status processReplSetFresh(const ReplSetFreshArgs& args, BSONObjBuilder* resultObj);
-
-    virtual Status processReplSetElect(const ReplSetElectArgs& args, BSONObjBuilder* resultObj);
 
     virtual Status processReplSetUpdatePosition(const UpdatePositionArgs& updates,
                                                 long long* configVersion);
@@ -230,8 +223,6 @@ public:
 
     virtual Status processHeartbeatV1(const ReplSetHeartbeatArgsV1& args,
                                       ReplSetHeartbeatResponse* response);
-
-    virtual bool isV1ElectionProtocol() const override;
 
     virtual bool getWriteConcernMajorityShouldJournal();
 
@@ -299,6 +290,7 @@ private:
     };
     bool _alwaysAllowWrites = false;
     bool _resetLastOpTimesCalled = false;
+    long long _term = OpTime::kInitialTerm;
 };
 
 }  // namespace repl

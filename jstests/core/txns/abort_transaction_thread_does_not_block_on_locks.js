@@ -84,14 +84,19 @@
 
         jsTest.log("Starting a drop operation, which will block until both transactions finish");
         let awaitDrop = startParallelShell(function() {
-            db.getSiblingDB("test")["abort_transaction_thread_does_not_block_on_locks"].drop();
+            db.getSiblingDB("test")["abort_transaction_thread_does_not_block_on_locks"].drop(
+                {writeConcern: {w: "majority"}});
         });
 
         assert.soon(function() {
             // Wait for the drop to have a pending MODE_X lock on the database, which will block
             // MODE_IS lock requests behind it.
-            return testDB.runCommand({find: collName, maxTimeMS: 100}).code ===
-                ErrorCodes.ExceededTimeLimit;
+            let res = testDB.runCommand({find: collName, maxTimeMS: 100});
+            if (res.code == ErrorCodes.MaxTimeMSExpired) {
+                return true;
+            }
+            assert.commandWorked(res);
+            return false;
         });
 
         // Should take 'transactionLifeTime' plus the period of the transaction aborter thread,

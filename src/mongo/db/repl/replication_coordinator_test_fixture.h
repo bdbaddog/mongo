@@ -33,6 +33,7 @@
 #include "mongo/db/client.h"
 #include "mongo/db/repl/repl_settings.h"
 #include "mongo/db/repl/replication_coordinator.h"
+#include "mongo/db/service_context_d_test_fixture.h"
 #include "mongo/executor/network_interface_mock.h"
 #include "mongo/executor/task_executor.h"
 #include "mongo/unittest/unittest.h"
@@ -55,20 +56,13 @@ using executor::NetworkInterfaceMock;
 /**
  * Fixture for testing ReplicationCoordinatorImpl behaviors.
  */
-class ReplCoordTest : public mongo::unittest::Test {
+class ReplCoordTest : public ServiceContextMongoDTest {
 public:
     /**
      * Makes a command response with the given "doc" response and optional elapsed time "millis".
      */
     static executor::RemoteCommandResponse makeResponseStatus(
         const BSONObj& doc, Milliseconds millis = Milliseconds(0));
-
-    /**
-     * Makes a command response with the given "doc" response, metadata and optional elapsed time
-     * "millis".
-     */
-    static executor::RemoteCommandResponse makeResponseStatus(
-        const BSONObj& doc, const BSONObj& metadata, Milliseconds millis = Milliseconds(0));
 
     /**
      * Constructs a ReplSetConfig from the given BSON, or raises a test failure exception.
@@ -81,8 +75,8 @@ public:
     static BSONObj addProtocolVersion(const BSONObj& configDoc, int protocolVersion);
 
 protected:
-    virtual void setUp();
-    virtual void tearDown();
+    ReplCoordTest();
+    virtual ~ReplCoordTest();
 
     /**
      * Asserts that calling start(configDoc, selfHost) successfully initiates the
@@ -128,27 +122,6 @@ protected:
      */
     ReplicationCoordinatorExternalStateMock* getExternalState() {
         return _externalState;
-    }
-
-    /**
-     * Makes a new OperationContext on the default Client for this test.
-     */
-    ServiceContext::UniqueOperationContext makeOperationContext() {
-        return _client->makeOperationContext();
-    }
-
-    /**
-     * Returns the ServiceContext for this test.
-     */
-    ServiceContext* getServiceContext() {
-        return getGlobalServiceContext();
-    }
-
-    /**
-     * Returns the default Client for this test.
-     */
-    Client* getClient() {
-        return _client.get();
     }
 
     /**
@@ -258,7 +231,6 @@ protected:
     /**
      * Receive the heartbeat request from replication coordinator and reply with a response.
      */
-    void replyToReceivedHeartbeat();
     void replyToReceivedHeartbeatV1();
     /**
      * Consumes the network operation and responds if it's a heartbeat request.
@@ -298,7 +270,6 @@ private:
 
     ReplSettings _settings;
     bool _callShutdown = false;
-    ServiceContext::UniqueClient _client = getGlobalServiceContext()->makeClient("testClient");
 };
 
 }  // namespace repl

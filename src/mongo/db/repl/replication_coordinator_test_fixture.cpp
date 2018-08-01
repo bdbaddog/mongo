@@ -35,7 +35,6 @@
 #include "mongo/db/logical_clock.h"
 #include "mongo/db/operation_context_noop.h"
 #include "mongo/db/repl/is_master_response.h"
-#include "mongo/db/repl/repl_set_heartbeat_args.h"
 #include "mongo/db/repl/repl_set_heartbeat_args_v1.h"
 #include "mongo/db/repl/repl_settings.h"
 #include "mongo/db/repl/replication_consistency_markers_mock.h"
@@ -45,6 +44,8 @@
 #include "mongo/db/repl/replication_recovery_mock.h"
 #include "mongo/db/repl/storage_interface_mock.h"
 #include "mongo/db/repl/topology_coordinator.h"
+#include "mongo/db/storage/storage_engine_init.h"
+#include "mongo/db/storage/storage_options.h"
 #include "mongo/executor/network_interface_mock.h"
 #include "mongo/executor/thread_pool_mock.h"
 #include "mongo/executor/thread_pool_task_executor.h"
@@ -79,12 +80,11 @@ BSONObj ReplCoordTest::addProtocolVersion(const BSONObj& configDoc, int protocol
     return builder.obj();
 }
 
-
-void ReplCoordTest::setUp() {
+ReplCoordTest::ReplCoordTest() {
     _settings.setReplSetString("mySet/node1:12345,node2:54321");
 }
 
-void ReplCoordTest::tearDown() {
+ReplCoordTest::~ReplCoordTest() {
     getGlobalFailPointRegistry()
         ->getFailPoint("blockHeartbeatReconfigFinish")
         ->setMode(FailPoint::off);
@@ -212,15 +212,8 @@ void ReplCoordTest::assertStartSuccess(const BSONObj& configDoc, const HostAndPo
 
 executor::RemoteCommandResponse ReplCoordTest::makeResponseStatus(const BSONObj& doc,
                                                                   Milliseconds millis) {
-    return makeResponseStatus(doc, BSONObj(), millis);
-}
-
-executor::RemoteCommandResponse ReplCoordTest::makeResponseStatus(const BSONObj& doc,
-                                                                  const BSONObj& metadata,
-                                                                  Milliseconds millis) {
-    log() << "Responding with " << doc << " (metadata: " << metadata << "; elapsed: " << millis
-          << ")";
-    return RemoteCommandResponse(doc, metadata, millis);
+    log() << "Responding with " << doc << " (elapsed: " << millis << ")";
+    return RemoteCommandResponse(doc, millis);
 }
 
 void ReplCoordTest::simulateEnoughHeartbeatsForAllNodesUp() {
@@ -233,15 +226,15 @@ void ReplCoordTest::simulateEnoughHeartbeatsForAllNodesUp() {
         const RemoteCommandRequest& request = noi->getRequest();
         log() << request.target.toString() << " processing " << request.cmdObj;
         ReplSetHeartbeatArgsV1 hbArgs;
-        ReplSetHeartbeatArgs hbArgsPV0;
         if (hbArgs.initialize(request.cmdObj).isOK()) {
             ReplSetHeartbeatResponse hbResp;
             hbResp.setSetName(rsConfig.getReplSetName());
             hbResp.setState(MemberState::RS_SECONDARY);
             hbResp.setConfigVersion(rsConfig.getConfigVersion());
             hbResp.setAppliedOpTime(OpTime(Timestamp(100, 2), 0));
+            hbResp.setDurableOpTime(OpTime(Timestamp(100, 2), 0));
             BSONObjBuilder respObj;
-            net->scheduleResponse(noi, net->now(), makeResponseStatus(hbResp.toBSON(true)));
+            net->scheduleResponse(noi, net->now(), makeResponseStatus(hbResp.toBSON()));
         } else {
             error() << "Black holing unexpected request to " << request.target << ": "
                     << request.cmdObj;
@@ -344,7 +337,7 @@ void ReplCoordTest::simulateSuccessfulV1ElectionWithoutExitingDrainMode(Date_t e
             hbResp.setAppliedOpTime(opTime);
             hbResp.setDurableOpTime(opTime);
             hbResp.setConfigVersion(rsConfig.getConfigVersion());
-            net->scheduleResponse(noi, net->now(), makeResponseStatus(hbResp.toBSON(true)));
+            net->scheduleResponse(noi, net->now(), makeResponseStatus(hbResp.toBSON()));
         } else if (request.cmdObj.firstElement().fieldNameStringData() == "replSetRequestVotes") {
             net->scheduleResponse(noi,
                                   net->now(),
@@ -413,26 +406,6 @@ void ReplCoordTest::shutdown(OperationContext* opCtx) {
     _callShutdown = false;
 }
 
-void ReplCoordTest::replyToReceivedHeartbeat() {
-    NetworkInterfaceMock* net = getNet();
-    net->enterNetwork();
-    const NetworkInterfaceMock::NetworkOperationIterator noi = net->getNextReadyRequest();
-    const RemoteCommandRequest& request = noi->getRequest();
-    const ReplSetConfig rsConfig = getReplCoord()->getReplicaSetConfig_forTest();
-    repl::ReplSetHeartbeatArgs hbArgs;
-    ASSERT_OK(hbArgs.initialize(request.cmdObj));
-    repl::ReplSetHeartbeatResponse hbResp;
-    hbResp.setSetName(rsConfig.getReplSetName());
-    hbResp.setState(MemberState::RS_SECONDARY);
-    hbResp.setConfigVersion(rsConfig.getConfigVersion());
-    BSONObjBuilder respObj;
-    respObj << "ok" << 1;
-    hbResp.addToBSON(&respObj, false);
-    net->scheduleResponse(noi, net->now(), makeResponseStatus(respObj.obj()));
-    net->runReadyNetworkOperations();
-    getNet()->exitNetwork();
-}
-
 void ReplCoordTest::replyToReceivedHeartbeatV1() {
     NetworkInterfaceMock* net = getNet();
     net->enterNetwork();
@@ -456,8 +429,9 @@ bool ReplCoordTest::consumeHeartbeatV1(const NetworkInterfaceMock::NetworkOperat
     hbResp.setState(MemberState::RS_SECONDARY);
     hbResp.setConfigVersion(rsConfig.getConfigVersion());
     hbResp.setAppliedOpTime(lastApplied);
+    hbResp.setDurableOpTime(lastApplied);
     BSONObjBuilder respObj;
-    net->scheduleResponse(noi, net->now(), makeResponseStatus(hbResp.toBSON(true)));
+    net->scheduleResponse(noi, net->now(), makeResponseStatus(hbResp.toBSON()));
     return true;
 }
 

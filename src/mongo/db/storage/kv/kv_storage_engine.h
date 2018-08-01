@@ -109,6 +109,10 @@ public:
 
     virtual void endBackup(OperationContext* opCtx);
 
+    virtual StatusWith<std::vector<std::string>> beginNonBlockingBackup(OperationContext* opCtx);
+
+    virtual void endNonBlockingBackup(OperationContext* opCtx);
+
     virtual bool isDurable() const;
 
     virtual bool isEphemeral() const;
@@ -135,7 +139,7 @@ public:
 
     virtual boost::optional<Timestamp> getRecoveryTimestamp() const override;
 
-    virtual boost::optional<Timestamp> getLastStableCheckpointTimestamp() const override;
+    virtual boost::optional<Timestamp> getLastStableRecoveryTimestamp() const override;
 
     virtual Timestamp getAllCommittedTimestamp() const override;
 

@@ -52,9 +52,7 @@ public:
     LegacyReplyBuilder& setCommandReply(Status nonOKStatus, BSONObj extraErrorInfo) final;
     LegacyReplyBuilder& setRawCommandReply(const BSONObj& commandReply) final;
 
-    BSONObjBuilder getInPlaceReplyBuilder(std::size_t) final;
-
-    LegacyReplyBuilder& setMetadata(const BSONObj& metadata) final;
+    BSONObjBuilder getBodyBuilder() final;
 
     void reset() final;
 
@@ -62,14 +60,15 @@ public:
 
     Protocol getProtocol() const final;
 
-private:
-    enum class State { kMetadata, kCommandReply, kOutputDocs, kDone };
+    void reserveBytes(const std::size_t bytes) final;
 
-    BufBuilder _builder{};
+private:
+    BufBuilder _builder;
+    std::size_t _bodyOffset = 0;
     Message _message;
-    State _state{State::kCommandReply};
+    bool _haveCommandReply = false;
     // For stale config errors we need to set the correct ResultFlag.
-    bool _staleConfigError{false};
+    bool _staleConfigError = false;
 };
 
 }  // namespace rpc

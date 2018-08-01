@@ -63,7 +63,7 @@ public:
         _lastHeartbeatRecv = newHeartbeatRecvTime;
     }
     const std::string& getLastHeartbeatMsg() const {
-        return _lastResponse.getHbMsg();
+        return _lastHeartbeatMessage;
     }
     const HostAndPort& getSyncSource() const {
         return _lastResponse.getSyncingTo();
@@ -87,12 +87,6 @@ public:
 
     long long getTerm() const {
         return _lastResponse.getTerm();
-    }
-
-    // Returns true if the last heartbeat data explicilty stated that the node
-    // is not electable.
-    bool isUnelectable() const {
-        return _lastResponse.hasIsElectable() && !_lastResponse.isElectable();
     }
 
     // Was this member up for the last heartbeat?
@@ -235,6 +229,9 @@ private:
     Date_t _lastHeartbeat;
     // This is the last time we got a heartbeat request from a given member.
     Date_t _lastHeartbeatRecv;
+
+    // This is the error message we got last time from contacting a given member.
+    std::string _lastHeartbeatMessage;
 
     // Did the last heartbeat show a failure to authenticate?
     bool _authIssue;

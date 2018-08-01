@@ -31,7 +31,7 @@
 
 #include "mongo/platform/basic.h"
 
-#include "mongo/client/dbclientinterface.h"
+#include "mongo/client/dbclient_connection.h"
 
 #include <algorithm>
 #include <utility>
@@ -42,7 +42,7 @@
 #include "mongo/bson/util/builder.h"
 #include "mongo/client/authenticate.h"
 #include "mongo/client/constants.h"
-#include "mongo/client/dbclientcursor.h"
+#include "mongo/client/dbclient_cursor.h"
 #include "mongo/client/replica_set_monitor.h"
 #include "mongo/config.h"
 #include "mongo/db/auth/internal_user_auth.h"
@@ -58,7 +58,6 @@
 #include "mongo/executor/remote_command_response.h"
 #include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/rpc/metadata/client_metadata.h"
-#include "mongo/s/is_mongos.h"
 #include "mongo/s/stale_exception.h"
 #include "mongo/stdx/functional.h"
 #include "mongo/stdx/memory.h"
@@ -66,7 +65,6 @@
 #include "mongo/util/assert_util.h"
 #include "mongo/util/concurrency/mutex.h"
 #include "mongo/util/debug_util.h"
-#include "mongo/util/fail_point_service.h"
 #include "mongo/util/log.h"
 #include "mongo/util/net/socket_exception.h"
 #include "mongo/util/net/socket_utils.h"
@@ -84,8 +82,6 @@ using std::map;
 using std::string;
 
 namespace {
-
-MONGO_FAIL_POINT_DEFINE(turnOffDBClientIncompatibleWithUpgradedServerCheck);
 
 /**
  * RAII class to force usage of OP_QUERY on a connection.
@@ -113,7 +109,7 @@ executor::RemoteCommandResponse initWireVersion(DBClientConnection* conn,
                                                 StringData applicationName) {
     try {
         // We need to force the usage of OP_QUERY on this command, even if we have previously
-        // detected support for OP_COMMAND on a connection. This is necessary to handle the case
+        // detected support for OP_MSG on a connection. This is necessary to handle the case
         // where we reconnect to an older version of MongoDB running at the same host/port.
         ScopedForceOpQuery forceOpQuery{conn};
 
@@ -157,8 +153,7 @@ executor::RemoteCommandResponse initWireVersion(DBClientConnection* conn,
 
         conn->getCompressorManager().clientFinish(isMasterObj);
 
-        return executor::RemoteCommandResponse{
-            std::move(isMasterObj), result->getMetadata().getOwned(), finish - start};
+        return executor::RemoteCommandResponse{std::move(isMasterObj), finish - start};
 
     } catch (...) {
         return exceptionToStatus();
@@ -248,16 +243,6 @@ Status DBClientConnection::connect(const HostAndPort& serverAddress, StringData 
     auto validateStatus =
         rpc::validateWireVersion(WireSpec::instance().outgoing, swProtocolSet.getValue().version);
     if (!validateStatus.isOK()) {
-        if (mongo::isMongos() && validateStatus == ErrorCodes::IncompatibleWithUpgradedServer &&
-            !MONGO_FAIL_POINT(turnOffDBClientIncompatibleWithUpgradedServerCheck)) {
-            severe() << "This mongos server must be upgraded. It is attempting to communicate with "
-                        "an upgraded cluster with which it is incompatible. Error: '"
-                     << validateStatus.toString()
-                     << "' Crashing in order to bring attention to the incompatibility, rather "
-                        "than erroring endlessly.";
-            fassertNoTrace(50709, false);
-        }
-
         warning() << "remote host has incompatible wire version: " << validateStatus;
 
         return validateStatus;

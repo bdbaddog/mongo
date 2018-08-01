@@ -47,17 +47,16 @@
 #include "mongo/db/repl/repl_client_info.h"
 #include "mongo/db/repl/repl_set_config.h"
 #include "mongo/db/repl/replication_coordinator.h"
+#include "mongo/db/s/config/initial_split_policy.h"
 #include "mongo/db/s/config/sharding_catalog_manager.h"
 #include "mongo/s/balancer_configuration.h"
 #include "mongo/s/catalog/type_database.h"
 #include "mongo/s/catalog/type_shard.h"
 #include "mongo/s/catalog_cache.h"
-#include "mongo/s/catalog_cache.h"
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/commands/cluster_commands_helpers.h"
 #include "mongo/s/config_server_client.h"
 #include "mongo/s/grid.h"
-#include "mongo/s/request_types/migration_secondary_throttle_options.h"
 #include "mongo/s/request_types/shard_collection_gen.h"
 #include "mongo/s/shard_util.h"
 #include "mongo/util/log.h"
@@ -177,7 +176,8 @@ void validateAndDeduceFullRequestOptions(OperationContext* opCtx,
                           << maxNumInitialChunksForShards
                           << ", 8192 * number of shards; or "
                           << maxNumInitialChunksTotal,
-            numChunks <= maxNumInitialChunksForShards && numChunks <= maxNumInitialChunksTotal);
+            numChunks >= 0 && numChunks <= maxNumInitialChunksForShards &&
+                numChunks <= maxNumInitialChunksTotal);
 
     // Retrieve the collection metadata in order to verify that it is legal to shard this
     // collection.
@@ -438,86 +438,10 @@ void validateShardKeyAgainstExistingIndexes(OperationContext* opCtx,
 }
 
 /**
- * For new collections which use hashed shard keys, we can can pre-split the range of possible
- * hashes into a large number of chunks, and distribute them evenly at creation time. Until we
- * design a better initialization scheme, the safest way to pre-split is to make one big chunk for
- * each shard and migrate them one at a time.
- *
- * Populates 'initSplits' with the split points to use on the primary shard to produce the initial
- * "big chunks."
- * Also populates 'allSplits' with the additional split points to use on the "big chunks" after the
- * "big chunks" have been spread evenly across shards through migrations.
- */
-void determinePresplittingPoints(OperationContext* opCtx,
-                                 int numShards,
-                                 bool isEmpty,
-                                 const BSONObj& proposedKey,
-                                 const ShardKeyPattern& shardKeyPattern,
-                                 const ConfigsvrShardCollectionRequest& request,
-                                 std::vector<BSONObj>* initSplits,
-                                 std::vector<BSONObj>* allSplits) {
-    auto numChunks = request.getNumInitialChunks();
-
-    if (request.getInitialSplitPoints()) {
-        *initSplits = std::move(*request.getInitialSplitPoints());
-        return;
-    }
-
-    if (shardKeyPattern.isHashedPattern() && isEmpty) {
-        // If initial split points are not specified, only pre-split when using a hashed shard
-        // key and the collection is empty
-        if (numChunks <= 0) {
-            // default number of initial chunks
-            numChunks = 2 * numShards;
-        }
-
-        // hashes are signed, 64-bit ints. So we divide the range (-MIN long, +MAX long)
-        // into intervals of size (2^64/numChunks) and create split points at the
-        // boundaries.  The logic below ensures that initial chunks are all
-        // symmetric around 0.
-        long long intervalSize = (std::numeric_limits<long long>::max() / numChunks) * 2;
-        long long current = 0;
-
-        if (numChunks % 2 == 0) {
-            allSplits->push_back(BSON(proposedKey.firstElementFieldName() << current));
-            current += intervalSize;
-        } else {
-            current += intervalSize / 2;
-        }
-
-        for (int i = 0; i < (numChunks - 1) / 2; i++) {
-            allSplits->push_back(BSON(proposedKey.firstElementFieldName() << current));
-            allSplits->push_back(BSON(proposedKey.firstElementFieldName() << -current));
-            current += intervalSize;
-        }
-
-        sort(allSplits->begin(),
-             allSplits->end(),
-             SimpleBSONObjComparator::kInstance.makeLessThan());
-
-        // The initial splits define the "big chunks" that we will subdivide later.
-        int lastIndex = -1;
-        for (int i = 1; i < numShards; i++) {
-            if (lastIndex < (i * numChunks) / numShards - 1) {
-                lastIndex = (i * numChunks) / numShards - 1;
-                initSplits->push_back(allSplits->at(lastIndex));
-            }
-        }
-    } else if (numChunks > 0) {
-        uasserted(ErrorCodes::InvalidOptions,
-                  str::stream() << (!shardKeyPattern.isHashedPattern()
-                                        ? "numInitialChunks is not supported "
-                                          "when the shard key is not hashed."
-                                        : "numInitialChunks is not supported "
-                                          "when the collection is not empty."));
-    }
-}
-
-/**
  * Migrates the initial "big chunks" from the primary shard to spread them evenly across the shards.
  *
- * If 'allSplits' is not empty, additionally splits each "big chunk" into smaller chunks using the
- * points in 'allSplits.'
+ * If 'finalSplitPoints' is not empty, additionally splits each "big chunk" into smaller chunks
+ * using the points in 'finalSplitPoints.'
  */
 void migrateAndFurtherSplitInitialChunks(OperationContext* opCtx,
                                          const NamespaceString& nss,
@@ -525,7 +449,7 @@ void migrateAndFurtherSplitInitialChunks(OperationContext* opCtx,
                                          const std::vector<ShardId>& shardIds,
                                          bool isEmpty,
                                          const ShardKeyPattern& shardKeyPattern,
-                                         const std::vector<BSONObj>& allSplits) {
+                                         const std::vector<BSONObj>& finalSplitPoints) {
     auto catalogCache = Grid::get(opCtx)->catalogCache();
 
     if (!shardKeyPattern.isHashedPattern()) {
@@ -581,7 +505,7 @@ void migrateAndFurtherSplitInitialChunks(OperationContext* opCtx,
         }
     }
 
-    if (allSplits.empty()) {
+    if (finalSplitPoints.empty()) {
         return;
     }
 
@@ -593,14 +517,14 @@ void migrateAndFurtherSplitInitialChunks(OperationContext* opCtx,
             routingInfo.cm());
     chunkManager = routingInfo.cm();
 
-    // Subdivide the big chunks by splitting at each of the points in "allSplits"
+    // Subdivide the big chunks by splitting at each of the points in "finalSplitPoints"
     // that we haven't already split by.
     boost::optional<Chunk> currentChunk(
-        chunkManager->findIntersectingChunkWithSimpleCollation(allSplits[0]));
+        chunkManager->findIntersectingChunkWithSimpleCollation(finalSplitPoints[0]));
 
     std::vector<BSONObj> subSplits;
-    for (unsigned i = 0; i <= allSplits.size(); i++) {
-        if (i == allSplits.size() || !currentChunk->containsKey(allSplits[i])) {
+    for (unsigned i = 0; i <= finalSplitPoints.size(); i++) {
+        if (i == finalSplitPoints.size() || !currentChunk->containsKey(finalSplitPoints[i])) {
             if (!subSplits.empty()) {
                 auto splitStatus = shardutil::splitChunkAtMultiplePoints(
                     opCtx,
@@ -619,12 +543,12 @@ void migrateAndFurtherSplitInitialChunks(OperationContext* opCtx,
                 subSplits.clear();
             }
 
-            if (i < allSplits.size()) {
+            if (i < finalSplitPoints.size()) {
                 currentChunk.emplace(
-                    chunkManager->findIntersectingChunkWithSimpleCollation(allSplits[i]));
+                    chunkManager->findIntersectingChunkWithSimpleCollation(finalSplitPoints[i]));
             }
         } else {
-            BSONObj splitPoint(allSplits[i]);
+            BSONObj splitPoint(finalSplitPoints[i]);
 
             // Do not split on the boundaries
             if (currentChunk->getMin().woCompare(splitPoint) == 0) {
@@ -635,7 +559,6 @@ void migrateAndFurtherSplitInitialChunks(OperationContext* opCtx,
         }
     }
 }
-
 boost::optional<UUID> getUUIDFromPrimaryShard(const NamespaceString& nss,
                                               ScopedDbConnection& conn) {
     // Obtain the collection's UUID from the primary shard's listCollections response.
@@ -666,7 +589,7 @@ boost::optional<UUID> getUUIDFromPrimaryShard(const NamespaceString& nss,
             str::stream() << "expected primary shard to return 'info' field as part of "
                              "listCollections for "
                           << nss.ns()
-                          << " because the cluster is in featureCompatibilityVersion=3.6, but got "
+                          << ", but got "
                           << res,
             !collectionInfo.isEmpty());
 
@@ -680,7 +603,7 @@ boost::optional<UUID> getUUIDFromPrimaryShard(const NamespaceString& nss,
 }
 
 /**
- * Internal sharding command run on config servers to add a shard to the cluster.
+ * Internal sharding command run on config servers to shard a collection.
  */
 class ConfigSvrShardCollectionCommand : public BasicCommand {
 public:
@@ -827,32 +750,82 @@ public:
             return true;
         }
 
+        bool isEmpty = (conn->count(nss.ns()) == 0);
+        boost::optional<UUID> uuid;
+
+        if (serverGlobalParams.featureCompatibility.getVersion() ==
+            ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo42) {
+
+            // The primary shard will read the config.tags collection so we need to lock the zone
+            // mutex.
+            Lock::ExclusiveLock lk = catalogManager->lockZoneMutex(opCtx);
+
+            ShardsvrShardCollection shardsvrShardCollectionRequest;
+            shardsvrShardCollectionRequest.set_shardsvrShardCollection(nss);
+            shardsvrShardCollectionRequest.setKey(request.getKey());
+            shardsvrShardCollectionRequest.setUnique(request.getUnique());
+            shardsvrShardCollectionRequest.setNumInitialChunks(request.getNumInitialChunks());
+            shardsvrShardCollectionRequest.setInitialSplitPoints(request.getInitialSplitPoints());
+            shardsvrShardCollectionRequest.setCollation(request.getCollation());
+            shardsvrShardCollectionRequest.setGetUUIDfromPrimaryShard(
+                request.getGetUUIDfromPrimaryShard());
+
+            auto cmdResponse = uassertStatusOK(primaryShard->runCommandWithFixedRetryAttempts(
+                opCtx,
+                ReadPreferenceSetting(ReadPreference::PrimaryOnly),
+                "admin",
+                CommandHelpers::appendMajorityWriteConcern(CommandHelpers::appendPassthroughFields(
+                    cmdObj, shardsvrShardCollectionRequest.toBSON())),
+                Shard::RetryPolicy::kIdempotent));
+
+            // SERVER-14394 Remove status check below and replace with
+            // filterCommandReplyForPassthrough
+            uassertStatusOK(cmdResponse.commandStatus);
+
+            auto shardCollResponse = ShardsvrShardCollectionResponse::parse(
+                IDLParserErrorContext("ShardsvrShardCollectionResponse"), cmdResponse.response);
+            auto uuid = std::move(shardCollResponse.getCollectionUUID());
+
+            result << "collectionsharded" << nss.ns();
+            if (uuid) {
+                result << "collectionUUID" << *uuid;
+            }
+
+            auto routingInfo =
+                uassertStatusOK(catalogCache->getCollectionRoutingInfoWithRefresh(opCtx, nss));
+            uassert(ErrorCodes::ConflictingOperationInProgress,
+                    "Collection was successfully written as sharded but got dropped before it "
+                    "could be evenly distributed",
+                    routingInfo.cm());
+
+            return true;
+        }
+
         // Step 3.
         validateShardKeyAgainstExistingIndexes(
             opCtx, nss, proposedKey, shardKeyPattern, primaryShard, conn, request);
 
         // Step 4.
-        boost::optional<UUID> uuid;
         if (request.getGetUUIDfromPrimaryShard()) {
             uuid = getUUIDFromPrimaryShard(nss, conn);
         } else {
             uuid = UUID::gen();
         }
 
-        // isEmpty is used by multiple steps below.
-        bool isEmpty = (conn->count(nss.ns()) == 0);
-
         // Step 5.
-        std::vector<BSONObj> initSplits;  // there will be at most numShards-1 of these
-        std::vector<BSONObj> allSplits;   // all of the initial desired split points
-        determinePresplittingPoints(opCtx,
-                                    numShards,
-                                    isEmpty,
-                                    proposedKey,
-                                    shardKeyPattern,
-                                    request,
-                                    &initSplits,
-                                    &allSplits);
+        std::vector<BSONObj> initialSplitPoints;  // there will be at most numShards-1 of these
+        std::vector<BSONObj> finalSplitPoints;    // all of the desired split points
+        if (request.getInitialSplitPoints()) {
+            initialSplitPoints = std::move(*request.getInitialSplitPoints());
+        } else {
+            InitialSplitPolicy::calculateHashedSplitPointsForEmptyCollection(
+                shardKeyPattern,
+                isEmpty,
+                numShards,
+                request.getNumInitialChunks(),
+                &initialSplitPoints,
+                &finalSplitPoints);
+        }
 
         LOG(0) << "CMD: shardcollection: " << cmdObj;
 
@@ -862,7 +835,7 @@ public:
         // were specified in the request, i.e., by mapReduce. Otherwise, all the initial chunks are
         // placed on the primary shard, and may be distributed across shards through migrations
         // (below) if using a hashed shard key.
-        const bool distributeInitialChunks = request.getInitialSplitPoints().is_initialized();
+        const bool distributeInitialChunks = bool(request.getInitialSplitPoints());
 
         // Step 6. Actually shard the collection.
         catalogManager->shardCollection(opCtx,
@@ -871,7 +844,7 @@ public:
                                         shardKeyPattern,
                                         *request.getCollation(),
                                         request.getUnique(),
-                                        initSplits,
+                                        initialSplitPoints,
                                         distributeInitialChunks,
                                         primaryShardId);
         result << "collectionsharded" << nss.ns();
@@ -888,7 +861,7 @@ public:
 
         // Step 7. Migrate initial chunks to distribute them across shards.
         migrateAndFurtherSplitInitialChunks(
-            opCtx, nss, numShards, shardIds, isEmpty, shardKeyPattern, allSplits);
+            opCtx, nss, numShards, shardIds, isEmpty, shardKeyPattern, finalSplitPoints);
 
         return true;
     }

@@ -34,11 +34,8 @@
 namespace mongo {
 
 /**
- * Part of the change stream API machinery used to look up the post-image of a document. Uses
- * the "documentKey" field of the input to look up the new version of the document.
- *
- * Uses the ExpressionContext to determine what collection to look up into.
- * TODO SERVER-29134 When we allow change streams on multiple collections, this will need to change.
+ * Part of the change stream API machinery used to look up the post-image of a document. Uses the
+ * "documentKey" field of the input to look up the new version of the document.
  */
 class DocumentSourceLookupChangePostImage final : public DocumentSource {
 public:
@@ -77,7 +74,7 @@ public:
         return constraints;
     }
 
-    GetDepsReturn getDependencies(DepsTracker* deps) const {
+    DepsTracker::State getDependencies(DepsTracker* deps) const {
         // The namespace is not technically needed yet, but we will if there is more than one
         // collection involved.
         deps->fields.insert(DocumentSourceChangeStream::kNamespaceField.toString());
@@ -86,7 +83,7 @@ public:
         deps->fields.insert(DocumentSourceChangeStream::kIdField.toString());
         // This stage does not restrict the output fields to a finite set, and has no impact on
         // whether metadata is available or needed.
-        return SEE_NEXT;
+        return DepsTracker::State::SEE_NEXT;
     }
 
     /**

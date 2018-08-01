@@ -35,18 +35,18 @@
 #include "mongo/bson/bsontypes.h"
 #include "mongo/bson/json.h"
 #include "mongo/client/mongo_uri.h"
+#include "mongo/db/service_context_test_fixture.h"
 #include "mongo/unittest/unittest.h"
 
 #include <boost/filesystem/operations.hpp>
 
+namespace mongo {
 namespace {
-using mongo::MongoURI;
-
 struct URITestCase {
     std::string URI;
     std::string uname;
     std::string password;
-    mongo::ConnectionString::ConnectionType type;
+    ConnectionString::ConnectionType type;
     std::string setname;
     size_t numservers;
     size_t numOptions;
@@ -57,8 +57,8 @@ struct InvalidURITestCase {
     std::string URI;
 };
 
-const mongo::ConnectionString::ConnectionType kMaster = mongo::ConnectionString::MASTER;
-const mongo::ConnectionString::ConnectionType kSet = mongo::ConnectionString::SET;
+const ConnectionString::ConnectionType kMaster = ConnectionString::MASTER;
+const ConnectionString::ConnectionType kSet = ConnectionString::SET;
 
 const URITestCase validCases[] = {
 
@@ -407,34 +407,34 @@ const InvalidURITestCase invalidCases[] = {
 };
 
 // Helper Method to take a filename for a json file and return the array of tests inside of it
-mongo::BSONObj getBsonFromJsonFile(std::string fileName) {
+BSONObj getBsonFromJsonFile(std::string fileName) {
     boost::filesystem::path directoryPath = boost::filesystem::current_path();
     boost::filesystem::path filePath(directoryPath / "src" / "mongo" / "client" /
                                      "mongo_uri_tests" / fileName);
     std::string filename(filePath.string());
     std::ifstream infile(filename.c_str());
     std::string data((std::istreambuf_iterator<char>(infile)), std::istreambuf_iterator<char>());
-    mongo::BSONObj obj = mongo::fromjson(data);
-    ASSERT_TRUE(obj.valid(mongo::BSONVersion::kLatest));
+    BSONObj obj = fromjson(data);
+    ASSERT_TRUE(obj.valid(BSONVersion::kLatest));
     ASSERT_TRUE(obj.hasField("tests"));
-    mongo::BSONObj arr = obj.getField("tests").embeddedObject().getOwned();
+    BSONObj arr = obj.getField("tests").embeddedObject().getOwned();
     ASSERT_TRUE(arr.couldBeArray());
     return arr;
 }
 
 // Helper method to take a BSONElement and either extract its string or return an empty string
-std::string returnStringFromElementOrNull(mongo::BSONElement element) {
+std::string returnStringFromElementOrNull(BSONElement element) {
     ASSERT_TRUE(!element.eoo());
-    if (element.type() == mongo::jstNULL) {
+    if (element.type() == jstNULL) {
         return std::string();
     }
-    ASSERT_EQ(element.type(), mongo::String);
+    ASSERT_EQ(element.type(), String);
     return element.String();
 }
 
 // Helper method to take a valid test case, parse() it, and assure the output is correct
 void testValidURIFormat(URITestCase testCase) {
-    mongo::unittest::log() << "Testing URI: " << testCase.URI << '\n';
+    unittest::log() << "Testing URI: " << testCase.URI << '\n';
     std::string errMsg;
     const auto cs_status = MongoURI::parse(testCase.URI);
     ASSERT_OK(cs_status);
@@ -462,13 +462,13 @@ TEST(MongoURI, InvalidURIs) {
 
     for (size_t i = 0; i != numCases; ++i) {
         const InvalidURITestCase testCase = invalidCases[i];
-        mongo::unittest::log() << "Testing URI: " << testCase.URI << '\n';
+        unittest::log() << "Testing URI: " << testCase.URI << '\n';
         auto cs_status = MongoURI::parse(testCase.URI);
         ASSERT_NOT_OK(cs_status);
     }
 }
 
-TEST(MongoURI, ValidButBadURIsFailToConnect) {
+TEST_F(ServiceContextTest, ValidButBadURIsFailToConnect) {
     // "invalid" is a TLD that cannot exit on the public internet (see rfc2606). It should always
     // parse as a valid URI, but connecting should always fail.
     auto sw_uri = MongoURI::parse("mongodb://user:pass@hostname.invalid:12345");
@@ -477,7 +477,7 @@ TEST(MongoURI, ValidButBadURIsFailToConnect) {
     ASSERT_TRUE(uri.isValid());
 
     std::string errmsg;
-    auto dbclient = uri.connect(mongo::StringData(), errmsg);
+    auto dbclient = uri.connect(StringData(), errmsg);
     ASSERT_EQ(dbclient, static_cast<decltype(dbclient)>(nullptr));
 }
 
@@ -494,7 +494,7 @@ TEST(MongoURI, CloneURIForServer) {
     auto& uriOptions = uri.getOptions();
     ASSERT_EQ(uriOptions.at("ssl"), "true");
 
-    auto clonedURI = uri.cloneURIForServer(mongo::HostAndPort{"localhost:27020"});
+    auto clonedURI = uri.cloneURIForServer(HostAndPort{"localhost:27020"});
 
     ASSERT_EQ(clonedURI.type(), kMaster);
     ASSERT_TRUE(clonedURI.getSetName().empty());
@@ -524,7 +524,7 @@ TEST(MongoURI, specTests) {
         const auto testBson = getBsonFromJsonFile(file);
 
         for (const auto& testElement : testBson) {
-            ASSERT_EQ(testElement.type(), mongo::Object);
+            ASSERT_EQ(testElement.type(), Object);
             const auto test = testElement.Obj();
 
             // First extract the valid field and the uri field
@@ -535,13 +535,13 @@ TEST(MongoURI, specTests) {
 
             const auto uriDoc = test.getField("uri");
             ASSERT_FALSE(uriDoc.eoo());
-            ASSERT_EQ(uriDoc.type(), mongo::String);
+            ASSERT_EQ(uriDoc.type(), String);
             const auto uri = uriDoc.String();
 
             if (!valid) {
                 // This uri string is invalid --> parse the uri and ensure it fails
                 const InvalidURITestCase testCase = {uri};
-                mongo::unittest::log() << "Testing URI: " << testCase.URI << '\n';
+                unittest::log() << "Testing URI: " << testCase.URI << '\n';
                 auto cs_status = MongoURI::parse(testCase.URI);
                 ASSERT_NOT_OK(cs_status);
             } else {
@@ -552,8 +552,8 @@ TEST(MongoURI, specTests) {
 
                 const auto auth = test.getField("auth");
                 ASSERT_FALSE(auth.eoo());
-                if (auth.type() != mongo::jstNULL) {
-                    ASSERT_EQ(auth.type(), mongo::Object);
+                if (auth.type() != jstNULL) {
+                    ASSERT_EQ(auth.type(), Object);
                     const auto authObj = auth.embeddedObject();
                     database = returnStringFromElementOrNull(authObj.getField("db"));
                     username = returnStringFromElementOrNull(authObj.getField("username"));
@@ -563,22 +563,22 @@ TEST(MongoURI, specTests) {
                 // parse the hosts
                 const auto hosts = test.getField("hosts");
                 ASSERT_FALSE(hosts.eoo());
-                ASSERT_EQ(hosts.type(), mongo::Array);
+                ASSERT_EQ(hosts.type(), Array);
                 const auto numHosts = static_cast<size_t>(hosts.Obj().nFields());
 
                 // parse the options
-                mongo::ConnectionString::ConnectionType connectionType = kMaster;
+                ConnectionString::ConnectionType connectionType = kMaster;
                 size_t numOptions = 0;
                 std::string setName;
                 const auto optionsElement = test.getField("options");
                 ASSERT_FALSE(optionsElement.eoo());
-                if (optionsElement.type() != mongo::jstNULL) {
-                    ASSERT_EQ(optionsElement.type(), mongo::Object);
+                if (optionsElement.type() != jstNULL) {
+                    ASSERT_EQ(optionsElement.type(), Object);
                     const auto optionsObj = optionsElement.Obj();
                     numOptions = optionsObj.nFields();
                     const auto replsetElement = optionsObj.getField("replicaSet");
                     if (!replsetElement.eoo()) {
-                        ASSERT_EQ(replsetElement.type(), mongo::String);
+                        ASSERT_EQ(replsetElement.type(), String);
                         setName = replsetElement.String();
                         connectionType = kSet;
                     }
@@ -600,9 +600,9 @@ TEST(MongoURI, specTests) {
 }
 
 TEST(MongoURI, srvRecordTest) {
-    using namespace mongo;
     enum Expectation : bool { success = true, failure = false };
     const struct {
+        int lineNumber;
         std::string uri;
         std::string user;
         std::string password;
@@ -612,7 +612,8 @@ TEST(MongoURI, srvRecordTest) {
         Expectation expectation;
     } tests[] = {
         // Test some non-SRV URIs to make sure that they do not perform expansions
-        {"mongodb://test1.test.build.10gen.cc:12345/",
+        {__LINE__,
+         "mongodb://test1.test.build.10gen.cc:12345/",
          "",
          "",
          "",
@@ -620,7 +621,8 @@ TEST(MongoURI, srvRecordTest) {
          {},
          success},
 
-        {"mongodb://test6.test.build.10gen.cc:12345/",
+        {__LINE__,
+         "mongodb://test6.test.build.10gen.cc:12345/",
          "",
          "",
          "",
@@ -629,7 +631,8 @@ TEST(MongoURI, srvRecordTest) {
          success},
 
         // Test a sample URI against each provided testing DNS entry
-        {"mongodb+srv://test1.test.build.10gen.cc/",
+        {__LINE__,
+         "mongodb+srv://test1.test.build.10gen.cc/",
          "",
          "",
          "",
@@ -638,7 +641,8 @@ TEST(MongoURI, srvRecordTest) {
          success},
 
         // Test a sample URI against each provided testing DNS entry
-        {"mongodb+srv://test1.test.build.10gen.cc/?ssl=false",
+        {__LINE__,
+         "mongodb+srv://test1.test.build.10gen.cc/?ssl=false",
          "",
          "",
          "",
@@ -646,7 +650,36 @@ TEST(MongoURI, srvRecordTest) {
          {{"ssl", "false"}},
          success},
 
-        {"mongodb+srv://user:password@test2.test.build.10gen.cc/"
+        // Test a sample URI against the need for deep DNS relation
+        {__LINE__,
+         "mongodb+srv://test18.test.build.10gen.cc/?replicaSet=repl0",
+         "",
+         "",
+         "",
+         {
+             {"localhost.sub.test.build.10gen.cc.", 27017},
+         },
+         {
+             {"ssl", "true"}, {"replicaSet", "repl0"},
+         },
+         success},
+
+        // Test a sample URI with FQDN against the need for deep DNS relation
+        {__LINE__,
+         "mongodb+srv://test18.test.build.10gen.cc./?replicaSet=repl0",
+         "",
+         "",
+         "",
+         {
+             {"localhost.sub.test.build.10gen.cc.", 27017},
+         },
+         {
+             {"ssl", "true"}, {"replicaSet", "repl0"},
+         },
+         success},
+
+        {__LINE__,
+         "mongodb+srv://user:password@test2.test.build.10gen.cc/"
          "database?someOption=someValue&someOtherOption=someOtherValue",
          "user",
          "password",
@@ -656,7 +689,8 @@ TEST(MongoURI, srvRecordTest) {
          success},
 
 
-        {"mongodb+srv://user:password@test3.test.build.10gen.cc/"
+        {__LINE__,
+         "mongodb+srv://user:password@test3.test.build.10gen.cc/"
          "database?someOption=someValue&someOtherOption=someOtherValue",
          "user",
          "password",
@@ -666,7 +700,8 @@ TEST(MongoURI, srvRecordTest) {
          success},
 
 
-        {"mongodb+srv://user:password@test5.test.build.10gen.cc/"
+        {__LINE__,
+         "mongodb+srv://user:password@test5.test.build.10gen.cc/"
          "database?someOption=someValue&someOtherOption=someOtherValue",
          "user",
          "password",
@@ -679,7 +714,8 @@ TEST(MongoURI, srvRecordTest) {
           {"ssl", "true"}},
          success},
 
-        {"mongodb+srv://user:password@test5.test.build.10gen.cc/"
+        {__LINE__,
+         "mongodb+srv://user:password@test5.test.build.10gen.cc/"
          "database?someOption=someValue&authSource=anotherDB&someOtherOption=someOtherValue",
          "user",
          "password",
@@ -693,11 +729,19 @@ TEST(MongoURI, srvRecordTest) {
           {"ssl", "true"}},
          success},
 
-        {"mongodb+srv://test6.test.build.10gen.cc/", "", "", "", {}, {}, failure},
+        {__LINE__, "mongodb+srv://test6.test.build.10gen.cc/", "", "", "", {}, {}, failure},
 
-        {"mongodb+srv://test6.test.build.10gen.cc/database", "", "", "database", {}, {}, failure},
+        {__LINE__,
+         "mongodb+srv://test6.test.build.10gen.cc/database",
+         "",
+         "",
+         "database",
+         {},
+         {},
+         failure},
 
-        {"mongodb+srv://test6.test.build.10gen.cc/?authSource=anotherDB",
+        {__LINE__,
+         "mongodb+srv://test6.test.build.10gen.cc/?authSource=anotherDB",
          "",
          "",
          "",
@@ -705,7 +749,8 @@ TEST(MongoURI, srvRecordTest) {
          {},
          failure},
 
-        {"mongodb+srv://test6.test.build.10gen.cc/?irrelevantOption=irrelevantValue",
+        {__LINE__,
+         "mongodb+srv://test6.test.build.10gen.cc/?irrelevantOption=irrelevantValue",
          "",
          "",
          "",
@@ -714,7 +759,8 @@ TEST(MongoURI, srvRecordTest) {
          failure},
 
 
-        {"mongodb+srv://test6.test.build.10gen.cc/"
+        {__LINE__,
+         "mongodb+srv://test6.test.build.10gen.cc/"
          "?irrelevantOption=irrelevantValue&authSource=anotherDB",
          "",
          "",
@@ -723,7 +769,8 @@ TEST(MongoURI, srvRecordTest) {
          {},
          failure},
 
-        {"mongodb+srv://test7.test.build.10gen.cc./?irrelevantOption=irrelevantValue",
+        {__LINE__,
+         "mongodb+srv://test7.test.build.10gen.cc./?irrelevantOption=irrelevantValue",
          "",
          "",
          "",
@@ -731,11 +778,12 @@ TEST(MongoURI, srvRecordTest) {
          {},
          failure},
 
-        {"mongodb+srv://test7.test.build.10gen.cc./", "", "", "", {}, {}, failure},
+        {__LINE__, "mongodb+srv://test7.test.build.10gen.cc./", "", "", "", {}, {}, failure},
 
-        {"mongodb+srv://test8.test.build.10gen.cc./", "", "", "", {}, {}, failure},
+        {__LINE__, "mongodb+srv://test8.test.build.10gen.cc./", "", "", "", {}, {}, failure},
 
-        {"mongodb+srv://test10.test.build.10gen.cc./?irrelevantOption=irrelevantValue",
+        {__LINE__,
+         "mongodb+srv://test10.test.build.10gen.cc./?irrelevantOption=irrelevantValue",
          "",
          "",
          "",
@@ -743,7 +791,8 @@ TEST(MongoURI, srvRecordTest) {
          {},
          failure},
 
-        {"mongodb+srv://test11.test.build.10gen.cc./?irrelevantOption=irrelevantValue",
+        {__LINE__,
+         "mongodb+srv://test11.test.build.10gen.cc./?irrelevantOption=irrelevantValue",
          "",
          "",
          "",
@@ -751,36 +800,39 @@ TEST(MongoURI, srvRecordTest) {
          {},
          failure},
 
-        {"mongodb+srv://test12.test.build.10gen.cc./", "", "", "", {}, {}, failure},
-        {"mongodb+srv://test13.test.build.10gen.cc./", "", "", "", {}, {}, failure},
-        {"mongodb+srv://test14.test.build.10gen.cc./", "", "", "", {}, {}, failure},
-        {"mongodb+srv://test15.test.build.10gen.cc./", "", "", "", {}, {}, failure},
-        {"mongodb+srv://test16.test.build.10gen.cc./", "", "", "", {}, {}, failure},
-        {"mongodb+srv://test17.test.build.10gen.cc./", "", "", "", {}, {}, failure},
-        {"mongodb+srv://test18.test.build.10gen.cc./", "", "", "", {}, {}, failure},
-        {"mongodb+srv://test19.test.build.10gen.cc./", "", "", "", {}, {}, failure},
+        {__LINE__, "mongodb+srv://test12.test.build.10gen.cc./", "", "", "", {}, {}, failure},
+        {__LINE__, "mongodb+srv://test13.test.build.10gen.cc./", "", "", "", {}, {}, failure},
+        {__LINE__, "mongodb+srv://test14.test.build.10gen.cc./", "", "", "", {}, {}, failure},
+        {__LINE__, "mongodb+srv://test15.test.build.10gen.cc./", "", "", "", {}, {}, failure},
+        {__LINE__, "mongodb+srv://test16.test.build.10gen.cc./", "", "", "", {}, {}, failure},
+        {__LINE__, "mongodb+srv://test17.test.build.10gen.cc./", "", "", "", {}, {}, failure},
+        {__LINE__, "mongodb+srv://test19.test.build.10gen.cc./", "", "", "", {}, {}, failure},
 
-        {"mongodb+srv://test12.test.build.10gen.cc/", "", "", "", {}, {}, failure},
-        {"mongodb+srv://test13.test.build.10gen.cc/", "", "", "", {}, {}, failure},
-        {"mongodb+srv://test14.test.build.10gen.cc/", "", "", "", {}, {}, failure},
-        {"mongodb+srv://test15.test.build.10gen.cc/", "", "", "", {}, {}, failure},
-        {"mongodb+srv://test16.test.build.10gen.cc/", "", "", "", {}, {}, failure},
-        {"mongodb+srv://test17.test.build.10gen.cc/", "", "", "", {}, {}, failure},
-        {"mongodb+srv://test18.test.build.10gen.cc/", "", "", "", {}, {}, failure},
-        {"mongodb+srv://test19.test.build.10gen.cc/", "", "", "", {}, {}, failure},
+        {__LINE__, "mongodb+srv://test12.test.build.10gen.cc/", "", "", "", {}, {}, failure},
+        {__LINE__, "mongodb+srv://test13.test.build.10gen.cc/", "", "", "", {}, {}, failure},
+        {__LINE__, "mongodb+srv://test14.test.build.10gen.cc/", "", "", "", {}, {}, failure},
+        {__LINE__, "mongodb+srv://test15.test.build.10gen.cc/", "", "", "", {}, {}, failure},
+        {__LINE__, "mongodb+srv://test16.test.build.10gen.cc/", "", "", "", {}, {}, failure},
+        {__LINE__, "mongodb+srv://test17.test.build.10gen.cc/", "", "", "", {}, {}, failure},
+        {__LINE__, "mongodb+srv://test19.test.build.10gen.cc/", "", "", "", {}, {}, failure},
     };
 
     for (const auto& test : tests) {
         auto rs = MongoURI::parse(test.uri);
         if (test.expectation == failure) {
-            ASSERT_FALSE(rs.getStatus().isOK()) << "Failing URI: " << test.uri;
+            ASSERT_FALSE(rs.getStatus().isOK()) << "Failing URI: " << test.uri
+                                                << " data on line: " << test.lineNumber;
             continue;
         }
-        ASSERT_OK(rs.getStatus());
+        ASSERT_OK(rs.getStatus()) << "Failed on URI: " << test.uri
+                                  << " data on line: " << test.lineNumber;
         auto rv = rs.getValue();
-        ASSERT_EQ(rv.getUser(), test.user);
-        ASSERT_EQ(rv.getPassword(), test.password);
-        ASSERT_EQ(rv.getDatabase(), test.database);
+        ASSERT_EQ(rv.getUser(), test.user) << "Failed on URI: " << test.uri
+                                           << " data on line: " << test.lineNumber;
+        ASSERT_EQ(rv.getPassword(), test.password) << "Failed on URI: " << test.uri
+                                                   << " data on line : " << test.lineNumber;
+        ASSERT_EQ(rv.getDatabase(), test.database) << "Failed on URI: " << test.uri
+                                                   << " data on line : " << test.lineNumber;
         std::vector<std::pair<std::string, std::string>> options(begin(rv.getOptions()),
                                                                  end(rv.getOptions()));
         std::sort(begin(options), end(options));
@@ -790,15 +842,18 @@ TEST(MongoURI, srvRecordTest) {
 
         for (std::size_t i = 0; i < std::min(options.size(), expectedOptions.size()); ++i) {
             if (options[i] != expectedOptions[i]) {
-                mongo::unittest::log() << "Option: \"" << options[i].first << "="
-                                       << options[i].second << "\" doesn't equal: \""
-                                       << expectedOptions[i].first << "="
-                                       << expectedOptions[i].second << "\"" << std::endl;
-                std::cerr << "Failing URI: \"" << test.uri << "\"" << std::endl;
+                unittest::log() << "Option: \"" << options[i].first << "=" << options[i].second
+                                << "\" doesn't equal: \"" << expectedOptions[i].first << "="
+                                << expectedOptions[i].second << "\""
+                                << " data on line: " << test.lineNumber << std::endl;
+                std::cerr << "Failing URI: \"" << test.uri << "\""
+                          << " data on line: " << test.lineNumber << std::endl;
                 ASSERT(false);
             }
         }
-        ASSERT_EQ(options.size(), expectedOptions.size()) << "Failing URI: " << test.uri;
+        ASSERT_EQ(options.size(), expectedOptions.size()) << "Failing URI: "
+                                                          << " data on line: " << test.lineNumber
+                                                          << test.uri;
 
         std::vector<HostAndPort> hosts(begin(rv.getServers()), end(rv.getServers()));
         std::sort(begin(hosts), end(hosts));
@@ -806,10 +861,15 @@ TEST(MongoURI, srvRecordTest) {
         std::sort(begin(expectedHosts), end(expectedHosts));
 
         for (std::size_t i = 0; i < std::min(hosts.size(), expectedHosts.size()); ++i) {
-            ASSERT_EQ(hosts[i], expectedHosts[i]);
+            ASSERT_EQ(hosts[i], expectedHosts[i]) << "Failed on URI: " << test.uri
+                                                  << " at host number" << i
+                                                  << " data on line: " << test.lineNumber;
         }
-        ASSERT_TRUE(hosts.size() == expectedHosts.size());
+        ASSERT_TRUE(hosts.size() == expectedHosts.size())
+            << "Failed on URI: " << test.uri << " Found " << hosts.size() << " hosts, expected "
+            << expectedHosts.size() << " data on line: " << test.lineNumber;
     }
 }
 
 }  // namespace
+}  // namespace mongo

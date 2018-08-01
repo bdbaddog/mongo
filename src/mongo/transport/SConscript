@@ -74,7 +74,6 @@ env.Library(
     ],
     LIBDEPS_PRIVATE=[
         'transport_layer',
-        '$BUILD_DIR/mongo/db/service_context_noop_init',
     ]
 )
 
@@ -86,7 +85,6 @@ tlEnv.CppUnitTest(
     LIBDEPS=[
         'transport_layer',
         '$BUILD_DIR/mongo/base',
-        '$BUILD_DIR/mongo/db/service_context_noop_init',
         '$BUILD_DIR/mongo/rpc/protocol',
         '$BUILD_DIR/mongo/util/net/socket',
     ],
@@ -189,8 +187,7 @@ env.CppUnitTest(
         'transport_layer_mock',
         '$BUILD_DIR/mongo/db/dbmessage',
         '$BUILD_DIR/mongo/db/service_context',
-        '$BUILD_DIR/mongo/rpc/command_reply',
-        '$BUILD_DIR/mongo/rpc/command_request',
+        '$BUILD_DIR/mongo/rpc/rpc',
         '$BUILD_DIR/mongo/unittest/unittest',
         '$BUILD_DIR/mongo/util/clock_source_mock',
     ],

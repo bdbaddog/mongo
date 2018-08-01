@@ -80,7 +80,8 @@ public:
                             Collection* coll,
                             const NamespaceString& collectionName,
                             const CollectionOptions& options,
-                            const BSONObj& idIndex) final {}
+                            const BSONObj& idIndex,
+                            const OplogSlot& createOpTime) final {}
 
     void onCollMod(OperationContext* opCtx,
                    const NamespaceString& nss,
@@ -130,7 +131,7 @@ public:
                        const NamespaceString& collectionName,
                        OptionalCollectionUUID uuid) final {}
 
-    void onTransactionCommit(OperationContext* opCtx) final {}
+    void onTransactionCommit(OperationContext* opCtx, bool wasPrepared) final {}
 
     void onTransactionPrepare(OperationContext* opCtx) final {}
 

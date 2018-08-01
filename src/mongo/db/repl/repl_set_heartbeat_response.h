@@ -57,35 +57,20 @@ public:
     /**
      * Appends all non-default values to "builder".
      */
-    void addToBSON(BSONObjBuilder* builder, bool isProtocolVersionV1) const;
+    void addToBSON(BSONObjBuilder* builder) const;
 
     /**
      * Returns a BSONObj consisting of all non-default values to "builder".
      */
-    BSONObj toBSON(bool isProtocolVersionV1) const;
+    BSONObj toBSON() const;
 
     /**
      * Returns toBSON().toString()
      */
     const std::string toString() const {
-        return toBSON(true).toString();
+        return toBSON().toString();
     }
 
-    bool hasDataSet() const {
-        return _hasDataSet;
-    }
-    bool hasData() const {
-        return _hasData;
-    }
-    bool isMismatched() const {
-        return _mismatch;
-    }
-    bool isReplSet() const {
-        return _isReplSet;
-    }
-    bool isStateDisagreement() const {
-        return _stateDisagreement;
-    }
     const std::string& getReplicaSetName() const {
         return _setName;
     }
@@ -97,17 +82,6 @@ public:
         return _electionTimeSet;
     }
     Timestamp getElectionTime() const;
-    bool hasIsElectable() const {
-        return _electableSet;
-    }
-    bool isElectable() const;
-    const std::string& getHbMsg() const {
-        return _hbmsg;
-    }
-    bool hasTime() const {
-        return _timeSet;
-    }
-    Seconds getTime() const;
     const HostAndPort& getSyncingTo() const {
         return _syncingTo;
     }
@@ -135,34 +109,6 @@ public:
     OpTime getDurableOpTime() const;
 
     /**
-     * Sets _mismatch to true.
-     */
-    void noteMismatched() {
-        _mismatch = true;
-    }
-
-    /**
-     * Sets _isReplSet to true.
-     */
-    void noteReplSet() {
-        _isReplSet = true;
-    }
-
-    /**
-     * Sets _stateDisagreement to true.
-     */
-    void noteStateDisagreement() {
-        _stateDisagreement = true;
-    }
-
-    /**
-     * Sets _hasData to true, and _hasDataSet to true to indicate _hasData has been modified
-     */
-    void noteHasData() {
-        _hasDataSet = _hasData = true;
-    }
-
-    /**
      * Sets _setName to "name".
      */
     void setSetName(std::string name) {
@@ -183,31 +129,6 @@ public:
     void setElectionTime(Timestamp time) {
         _electionTimeSet = true;
         _electionTime = time;
-    }
-
-    /**
-     * Sets _electable to "electable" and sets _electableSet to true to indicate
-     * that the value of _electable has been modified.
-     */
-    void setElectable(bool electable) {
-        _electableSet = true;
-        _electable = electable;
-    }
-
-    /**
-     * Sets _hbmsg to "hbmsg".
-     */
-    void setHbMsg(std::string hbmsg) {
-        _hbmsg = hbmsg;
-    }
-
-    /**
-     * Sets the optional "time" field of the response to "theTime", which is
-     * a count of seconds since the UNIX epoch.
-     */
-    void setTime(Seconds theTime) {
-        _timeSet = true;
-        _time = theTime;
     }
 
     /**
@@ -252,31 +173,17 @@ private:
     bool _electionTimeSet = false;
     Timestamp _electionTime;
 
-    bool _timeSet = false;
-    Seconds _time = Seconds(0);  // Seconds since UNIX epoch.
-
     bool _appliedOpTimeSet = false;
     OpTime _appliedOpTime;
 
     bool _durableOpTimeSet = false;
     OpTime _durableOpTime;
 
-    bool _electableSet = false;
-    bool _electable = false;
-
-    bool _hasDataSet = false;
-    bool _hasData = false;
-
-    bool _mismatch = false;
-    bool _isReplSet = false;
-    bool _stateDisagreement = false;
-
     bool _stateSet = false;
     MemberState _state;
 
     int _configVersion = -1;
     std::string _setName;
-    std::string _hbmsg;
     HostAndPort _syncingTo;
 
     bool _configSet = false;

@@ -35,7 +35,7 @@
 #include "mongo/crypto/sha256_block.h"
 #include "mongo/db/logical_session_cache.h"
 #include "mongo/db/pipeline/document_source.h"
-#include "mongo/db/pipeline/document_sources_gen.h"
+#include "mongo/db/pipeline/document_source_list_sessions_gen.h"
 #include "mongo/db/pipeline/lite_parsed_document_source.h"
 
 namespace mongo {
@@ -81,8 +81,9 @@ public:
 
         void assertSupportsReadConcern(const repl::ReadConcernArgs& readConcern) const {
             uassert(ErrorCodes::InvalidOptions,
-                    str::stream() << "Aggregation stage " << kStageName
-                                  << " requires read concern local but found "
+                    str::stream() << "Aggregation stage " << kStageName << " cannot run with a "
+                                  << "readConcern other than 'local', or in a multi-document "
+                                  << "transaction. Current readConcern: "
                                   << readConcern.toString(),
                     readConcern.getLevel() == repl::ReadConcernLevel::kLocalReadConcern);
         }

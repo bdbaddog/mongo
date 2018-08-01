@@ -122,17 +122,16 @@ StatusWith<std::tuple<bool, std::string>> SASLPlainServerMechanism::stepImpl(
                       mongoutils::str::stream() << "Incorrectly formatted PLAIN client message");
     }
 
-    User* userObj;
     // The authentication database is also the source database for the user.
-    Status status = authManager->acquireUser(
-        opCtx, UserName(ServerMechanismBase::_principalName, _authenticationDatabase), &userObj);
+    auto swUser = authManager->acquireUser(
+        opCtx, UserName(ServerMechanismBase::_principalName, _authenticationDatabase));
 
-    if (!status.isOK()) {
-        return status;
+    if (!swUser.isOK()) {
+        return swUser.getStatus();
     }
 
+    auto userObj = std::move(swUser.getValue());
     const auto creds = userObj->getCredentials();
-    authManager->releaseUser(userObj);
 
     const auto sha256Status = trySCRAM<SHA256Block>(creds, pwd->c_str());
     if (!sha256Status.isOK()) {
@@ -157,12 +156,7 @@ StatusWith<std::tuple<bool, std::string>> SASLPlainServerMechanism::stepImpl(
     return std::make_tuple(true, std::string());
 }
 
-MONGO_INITIALIZER_WITH_PREREQUISITES(SASLPLAINServerMechanism,
-                                     ("CreateSASLServerMechanismRegistry"))
-(::mongo::InitializerContext* context) {
-    auto& registry = SASLServerMechanismRegistry::get(getGlobalServiceContext());
-    registry.registerFactory<PLAINServerFactory>();
-    return Status::OK();
-}
-
+namespace {
+GlobalSASLMechanismRegisterer<PLAINServerFactory> plainRegisterer;
+}  // namespace
 }  // namespace mongo

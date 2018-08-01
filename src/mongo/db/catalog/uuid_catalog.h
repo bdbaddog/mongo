@@ -73,7 +73,8 @@ public:
                             Collection* coll,
                             const NamespaceString& collectionName,
                             const CollectionOptions& options,
-                            const BSONObj& idIndex) override;
+                            const BSONObj& idIndex,
+                            const OplogSlot& createOpTime) override;
     void onCollMod(OperationContext* opCtx,
                    const NamespaceString& nss,
                    OptionalCollectionUUID uuid,
@@ -113,7 +114,7 @@ public:
     void onEmptyCapped(OperationContext* opCtx,
                        const NamespaceString& collectionName,
                        OptionalCollectionUUID uuid) override {}
-    void onTransactionCommit(OperationContext* opCtx) override {}
+    void onTransactionCommit(OperationContext* opCtx, bool wasPrepared) override {}
     void onTransactionPrepare(OperationContext* opCtx) override {}
     void onTransactionAbort(OperationContext* opCtx) override {}
     void onReplicationRollback(OperationContext* opCtx,
@@ -180,15 +181,20 @@ public:
 
     /**
      * Puts the catalog in closed state. In this state, the lookupNSSByUUID method will fall back
-     * to the pre-close state to resolve queries for currently unknown UUIDs. This allows
-     * authorization, which needs to do lookups outside of database locks, to proceed.
+     * to the pre-close state to resolve queries for currently unknown UUIDs. This allows processes,
+     * like authorization and replication, which need to do lookups outside of database locks, to
+     * proceed.
+     *
+     * Must be called with the global lock acquired in exclusive mode.
      */
-    void onCloseCatalog();
+    void onCloseCatalog(OperationContext* opCtx);
 
     /**
      * Puts the catatlog back in open state, removing the pre-close state. See onCloseCatalog.
+     *
+     * Must be called with the global lock acquired in exclusive mode.
      */
-    void onOpenCatalog();
+    void onOpenCatalog(OperationContext* opCtx);
 
     /**
      * Return the UUID lexicographically preceding `uuid` in the database named by `db`.
@@ -207,6 +213,8 @@ public:
 private:
     const std::vector<CollectionUUID>& _getOrdering_inlock(const StringData& db,
                                                            const stdx::lock_guard<stdx::mutex>&);
+    void _registerUUIDCatalogEntry_inlock(CollectionUUID uuid, Collection* coll);
+    Collection* _removeUUIDCatalogEntry_inlock(CollectionUUID uuid);
 
     mutable mongo::stdx::mutex _catalogLock;
     /**

@@ -31,8 +31,8 @@
 #include "mongo/scripting/mozjs/mongo.h"
 
 #include "mongo/bson/simple_bsonelement_comparator.h"
+#include "mongo/client/dbclient_base.h"
 #include "mongo/client/dbclient_rs.h"
-#include "mongo/client/dbclientinterface.h"
 #include "mongo/client/global_conn_pool.h"
 #include "mongo/client/mongo_uri.h"
 #include "mongo/client/native_sasl_client_session.h"
@@ -62,36 +62,26 @@ namespace mozjs {
 const JSFunctionSpec MongoBase::methods[] = {
     MONGO_ATTACH_JS_CONSTRAINED_METHOD_NO_PROTO(auth, MongoExternalInfo),
     MONGO_ATTACH_JS_CONSTRAINED_METHOD_NO_PROTO(close, MongoExternalInfo),
-    MONGO_ATTACH_JS_CONSTRAINED_METHOD_NO_PROTO(
-        copyDatabaseWithSCRAM, MongoLocalInfo, MongoExternalInfo),
-    MONGO_ATTACH_JS_CONSTRAINED_METHOD_NO_PROTO(cursorFromId, MongoLocalInfo, MongoExternalInfo),
-    MONGO_ATTACH_JS_CONSTRAINED_METHOD_NO_PROTO(
-        cursorHandleFromId, MongoLocalInfo, MongoExternalInfo),
-    MONGO_ATTACH_JS_CONSTRAINED_METHOD_NO_PROTO(find, MongoLocalInfo, MongoExternalInfo),
-    MONGO_ATTACH_JS_CONSTRAINED_METHOD_NO_PROTO(
-        getClientRPCProtocols, MongoLocalInfo, MongoExternalInfo),
-    MONGO_ATTACH_JS_CONSTRAINED_METHOD_NO_PROTO(
-        getServerRPCProtocols, MongoLocalInfo, MongoExternalInfo),
-    MONGO_ATTACH_JS_CONSTRAINED_METHOD_NO_PROTO(insert, MongoLocalInfo, MongoExternalInfo),
-    MONGO_ATTACH_JS_CONSTRAINED_METHOD_NO_PROTO(
-        isReplicaSetConnection, MongoLocalInfo, MongoExternalInfo),
+    MONGO_ATTACH_JS_CONSTRAINED_METHOD_NO_PROTO(copyDatabaseWithSCRAM, MongoExternalInfo),
+    MONGO_ATTACH_JS_CONSTRAINED_METHOD_NO_PROTO(cursorFromId, MongoExternalInfo),
+    MONGO_ATTACH_JS_CONSTRAINED_METHOD_NO_PROTO(cursorHandleFromId, MongoExternalInfo),
+    MONGO_ATTACH_JS_CONSTRAINED_METHOD_NO_PROTO(find, MongoExternalInfo),
+    MONGO_ATTACH_JS_CONSTRAINED_METHOD_NO_PROTO(getClientRPCProtocols, MongoExternalInfo),
+    MONGO_ATTACH_JS_CONSTRAINED_METHOD_NO_PROTO(getServerRPCProtocols, MongoExternalInfo),
+    MONGO_ATTACH_JS_CONSTRAINED_METHOD_NO_PROTO(insert, MongoExternalInfo),
+    MONGO_ATTACH_JS_CONSTRAINED_METHOD_NO_PROTO(isReplicaSetConnection, MongoExternalInfo),
     MONGO_ATTACH_JS_CONSTRAINED_METHOD_NO_PROTO(_markNodeAsFailed, MongoExternalInfo),
-    MONGO_ATTACH_JS_CONSTRAINED_METHOD_NO_PROTO(logout, MongoLocalInfo, MongoExternalInfo),
-    MONGO_ATTACH_JS_CONSTRAINED_METHOD_NO_PROTO(remove, MongoLocalInfo, MongoExternalInfo),
-    MONGO_ATTACH_JS_CONSTRAINED_METHOD_NO_PROTO(runCommand, MongoLocalInfo, MongoExternalInfo),
-    MONGO_ATTACH_JS_CONSTRAINED_METHOD_NO_PROTO(
-        runCommandWithMetadata, MongoLocalInfo, MongoExternalInfo),
-    MONGO_ATTACH_JS_CONSTRAINED_METHOD_NO_PROTO(
-        setClientRPCProtocols, MongoLocalInfo, MongoExternalInfo),
-    MONGO_ATTACH_JS_CONSTRAINED_METHOD_NO_PROTO(update, MongoLocalInfo, MongoExternalInfo),
-    MONGO_ATTACH_JS_CONSTRAINED_METHOD_NO_PROTO(
-        getMinWireVersion, MongoLocalInfo, MongoExternalInfo),
-    MONGO_ATTACH_JS_CONSTRAINED_METHOD_NO_PROTO(
-        getMaxWireVersion, MongoLocalInfo, MongoExternalInfo),
-    MONGO_ATTACH_JS_CONSTRAINED_METHOD_NO_PROTO(
-        isReplicaSetMember, MongoLocalInfo, MongoExternalInfo),
-    MONGO_ATTACH_JS_CONSTRAINED_METHOD_NO_PROTO(isMongos, MongoLocalInfo, MongoExternalInfo),
-    MONGO_ATTACH_JS_CONSTRAINED_METHOD_NO_PROTO(_startSession, MongoLocalInfo, MongoExternalInfo),
+    MONGO_ATTACH_JS_CONSTRAINED_METHOD_NO_PROTO(logout, MongoExternalInfo),
+    MONGO_ATTACH_JS_CONSTRAINED_METHOD_NO_PROTO(remove, MongoExternalInfo),
+    MONGO_ATTACH_JS_CONSTRAINED_METHOD_NO_PROTO(runCommand, MongoExternalInfo),
+    MONGO_ATTACH_JS_CONSTRAINED_METHOD_NO_PROTO(runCommandWithMetadata, MongoExternalInfo),
+    MONGO_ATTACH_JS_CONSTRAINED_METHOD_NO_PROTO(setClientRPCProtocols, MongoExternalInfo),
+    MONGO_ATTACH_JS_CONSTRAINED_METHOD_NO_PROTO(update, MongoExternalInfo),
+    MONGO_ATTACH_JS_CONSTRAINED_METHOD_NO_PROTO(getMinWireVersion, MongoExternalInfo),
+    MONGO_ATTACH_JS_CONSTRAINED_METHOD_NO_PROTO(getMaxWireVersion, MongoExternalInfo),
+    MONGO_ATTACH_JS_CONSTRAINED_METHOD_NO_PROTO(isReplicaSetMember, MongoExternalInfo),
+    MONGO_ATTACH_JS_CONSTRAINED_METHOD_NO_PROTO(isMongos, MongoExternalInfo),
+    MONGO_ATTACH_JS_CONSTRAINED_METHOD_NO_PROTO(_startSession, MongoExternalInfo),
     JS_FS_END,
 };
 
@@ -156,12 +146,7 @@ void setHiddenMongo(JSContext* cx,
         JS::RootedObject newMongo(cx);
 
         auto scope = getScope(cx);
-        auto isLocalInfo = scope->getProto<MongoLocalInfo>().instanceOf(args.thisv());
-        if (isLocalInfo) {
-            scope->getProto<MongoLocalInfo>().newObject(&newMongo);
-        } else {
-            scope->getProto<MongoExternalInfo>().newObject(&newMongo);
-        }
+        scope->getProto<MongoExternalInfo>().newObject(&newMongo);
 
         auto host = resPtr->getServerAddress();
         JS_SetPrivate(newMongo,
@@ -263,7 +248,6 @@ void MongoBase::Functions::runCommandWithMetadata::call(JSContext* cx, JS::CallA
 
     BSONObjBuilder mergedResultBob;
     mergedResultBob.append("commandReply", res->getCommandReply());
-    mergedResultBob.append("metadata", res->getMetadata());
 
     ValueReader(cx, args.rval()).fromBSON(mergedResultBob.obj(), nullptr, false);
     setHiddenMongo(cx, std::get<1>(resTuple), conn.get(), args);
@@ -713,27 +697,6 @@ void MongoBase::Functions::_markNodeAsFailed::call(JSContext* cx, JS::CallArgs a
                      Status{static_cast<ErrorCodes::Error>(code), reason});
 
     args.rval().setUndefined();
-}
-
-void MongoLocalInfo::construct(JSContext* cx, JS::CallArgs args) {
-    auto scope = getScope(cx);
-
-    if (args.length() != 0)
-        uasserted(ErrorCodes::BadValue, "local Mongo constructor takes no args");
-
-    auto opCtx = scope->getOpContext();
-    auto conn = DBDirectClientFactory::get(opCtx).create(opCtx);
-
-    JS::RootedObject thisv(cx);
-    scope->getProto<MongoLocalInfo>().newObject(&thisv);
-    ObjectWrapper o(cx, thisv);
-
-    JS_SetPrivate(thisv, scope->trackedNew<std::shared_ptr<DBClientBase>>(conn.release()));
-
-    o.setBoolean(InternedString::slaveOk, false);
-    o.setString(InternedString::host, "EMBEDDED");
-
-    args.rval().setObjectOrNull(thisv);
 }
 
 void MongoExternalInfo::construct(JSContext* cx, JS::CallArgs args) {

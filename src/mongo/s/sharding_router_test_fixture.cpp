@@ -44,7 +44,6 @@
 #include "mongo/db/query/collation/collator_factory_mock.h"
 #include "mongo/db/query/query_request.h"
 #include "mongo/db/repl/read_concern_args.h"
-#include "mongo/db/service_context_noop.h"
 #include "mongo/executor/network_interface_mock.h"
 #include "mongo/executor/task_executor_pool.h"
 #include "mongo/executor/thread_pool_task_executor_test_fixture.h"
@@ -94,12 +93,8 @@ std::unique_ptr<ShardingTaskExecutor> makeShardingTestExecutor(
 
 }  // namespace
 
-ShardingTestFixture::ShardingTestFixture() = default;
-
-ShardingTestFixture::~ShardingTestFixture() = default;
-
-void ShardingTestFixture::setUp() {
-    auto const service = serviceContext();
+ShardingTestFixture::ShardingTestFixture() {
+    auto const service = getServiceContext();
 
     // Configure the service context
     service->setFastClockSource(stdx::make_unique<ClockSourceMock>());
@@ -108,8 +103,7 @@ void ShardingTestFixture::setUp() {
 
     CollatorFactoryInterface::set(service, stdx::make_unique<CollatorFactoryMock>());
     _transportSession = transport::MockSession::create(nullptr);
-    _client = service->makeClient("ShardingTestFixture", _transportSession);
-    _opCtx = _client->makeOperationContext();
+    _opCtx = makeOperationContext();
 
     // Set up executor pool used for most operations.
     auto makeMetadataHookList = [&] {
@@ -194,16 +188,9 @@ void ShardingTestFixture::setUp() {
                _mockNetwork);
 }
 
-void ShardingTestFixture::tearDown() {
-    CatalogCacheLoader::clearForTests(serviceContext());
 
-    Grid::get(operationContext())->getExecutorPool()->shutdownAndJoin();
-    Grid::get(operationContext())->catalogClient()->shutDown(_opCtx.get());
-    Grid::get(operationContext())->clearForUnitTests();
-
-    _transportSession.reset();
-    _opCtx.reset();
-    _client.reset();
+ShardingTestFixture::~ShardingTestFixture() {
+    CatalogCacheLoader::clearForTests(getServiceContext());
 }
 
 void ShardingTestFixture::shutdownExecutor() {
@@ -241,10 +228,6 @@ DistLockManagerMock* ShardingTestFixture::distLock() const {
     invariant(_distLockManager);
 
     return _distLockManager;
-}
-
-ServiceContext* ShardingTestFixture::serviceContext() const {
-    return getGlobalServiceContext();
 }
 
 OperationContext* ShardingTestFixture::operationContext() const {
@@ -405,7 +388,8 @@ void ShardingTestFixture::expectConfigCollectionInsert(const HostAndPort& config
                       actualChangeLog.getClientAddr());
         ASSERT_BSONOBJ_EQ(detail, actualChangeLog.getDetails());
         ASSERT_EQUALS(ns, actualChangeLog.getNS());
-        ASSERT_EQUALS(network()->getHostName(), actualChangeLog.getServer());
+        const std::string expectedServer = str::stream() << network()->getHostName() << ":27017";
+        ASSERT_EQUALS(expectedServer, actualChangeLog.getServer());
         ASSERT_EQUALS(timestamp, actualChangeLog.getTime());
         ASSERT_EQUALS(what, actualChangeLog.getWhat());
 
@@ -418,7 +402,9 @@ void ShardingTestFixture::expectConfigCollectionInsert(const HostAndPort& config
         const std::string timePiece = changeId.substr(firstDash + 1, lastDash - firstDash - 1);
         const std::string oidPiece = changeId.substr(lastDash + 1);
 
-        ASSERT_EQUALS(Grid::get(operationContext())->getNetwork()->getHostName(), serverPiece);
+        const std::string expectedServerPiece = str::stream()
+            << Grid::get(operationContext())->getNetwork()->getHostName() << ":27017";
+        ASSERT_EQUALS(expectedServerPiece, serverPiece);
         ASSERT_EQUALS(timestamp.toString(), timePiece);
 
         OID generatedOID;

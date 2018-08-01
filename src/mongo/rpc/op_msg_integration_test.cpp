@@ -28,7 +28,7 @@
 
 #include "mongo/platform/basic.h"
 
-#include "mongo/client/dbclientinterface.h"
+#include "mongo/client/dbclient_connection.h"
 #include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/rpc/op_msg.h"
 #include "mongo/unittest/integration_test.h"
@@ -163,6 +163,38 @@ TEST(OpMsg, CloseConnectionOnFireAndForgetNotMasterError) {
         break;
     }
     ASSERT(foundSecondary);
+}
+
+TEST(OpMsg, DocumentSequenceReturnsWork) {
+    std::string errMsg;
+    auto conn = std::unique_ptr<DBClientBase>(
+        unittest::getFixtureConnectionString().connect("integration_test", errMsg));
+    uassert(ErrorCodes::SocketException, errMsg, conn);
+
+    auto opMsgRequest = OpMsgRequest::fromDBAndBody("admin", BSON("echo" << 1));
+    opMsgRequest.sequences.push_back({"example", {BSON("a" << 1), BSON("b" << 2)}});
+    auto request = opMsgRequest.serialize();
+
+    Message reply;
+    ASSERT(conn->call(request, reply));
+
+    auto opMsgReply = OpMsg::parse(reply);
+    ASSERT_EQ(opMsgReply.sequences.size(), 1u);
+
+    auto sequence = opMsgReply.getSequence("example");
+    ASSERT(sequence);
+    ASSERT_EQ(sequence->objs.size(), 2u);
+
+    auto checkSequence = [](auto& bson, auto key, auto val) {
+        ASSERT(bson.hasField(key));
+        ASSERT_EQ(bson[key].Int(), val);
+    };
+    checkSequence(sequence->objs[0], "a", 1);
+    checkSequence(sequence->objs[1], "b", 2);
+
+    ASSERT_BSONOBJ_EQ(opMsgReply.body.getObjectField("echo"),
+                      BSON("echo" << 1 << "$db"
+                                  << "admin"));
 }
 
 }  // namespace mongo

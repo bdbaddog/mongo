@@ -51,7 +51,6 @@
 #include "mongo/db/op_observer.h"
 #include "mongo/db/repl/drop_pending_collection_reaper.h"
 #include "mongo/db/repl/oplog.h"
-#include "mongo/db/repl/repl_set_heartbeat_args.h"
 #include "mongo/db/repl/repl_set_heartbeat_args_v1.h"
 #include "mongo/db/repl/repl_set_heartbeat_response.h"
 #include "mongo/db/repl/replication_coordinator.h"
@@ -135,12 +134,12 @@ public:
 
             uassertStatusOK(status);
             return true;
-        } else if (cmdObj.hasElement("getLastStableCheckpointTimestamp")) {
+        } else if (cmdObj.hasElement("getLastStableRecoveryTimestamp")) {
             boost::optional<Timestamp> ts =
                 StorageInterface::get(getGlobalServiceContext())
-                    ->getLastStableCheckpointTimestamp(getGlobalServiceContext());
+                    ->getLastStableRecoveryTimestamp(getGlobalServiceContext());
             if (ts) {
-                result.append("lastStableCheckpointTimestamp", ts.get());
+                result.append("lastStableRecoveryTimestamp", ts.get());
             }
             return true;
         }
@@ -637,12 +636,6 @@ bool replHasDatabases(OperationContext* opCtx) {
     return false;
 }
 
-const std::string kHeartbeatConfigVersion = "configVersion";
-
-bool isHeartbeatRequestV1(const BSONObj& cmdObj) {
-    return cmdObj.hasField(kHeartbeatConfigVersion);
-}
-
 }  // namespace
 
 MONGO_FAIL_POINT_DEFINE(rsDelayHeartbeatResponse);
@@ -671,40 +664,13 @@ public:
             uassertStatusOK(status);
         }
 
-        // Process heartbeat based on the version of request. The missing fields in mismatched
-        // version will be empty.
-        if (isHeartbeatRequestV1(cmdObj)) {
-            ReplSetHeartbeatArgsV1 args;
-            status = args.initialize(cmdObj);
-            if (status.isOK()) {
-                ReplSetHeartbeatResponse response;
-                status = ReplicationCoordinator::get(opCtx)->processHeartbeatV1(args, &response);
-                if (status.isOK())
-                    response.addToBSON(&result, true);
-
-                LOG_FOR_HEARTBEATS(2) << "Processed heartbeat from "
-                                      << cmdObj.getStringField("from")
-                                      << " and generated response, " << response;
-                uassertStatusOK(status);
-                return true;
-            }
-            // else: fall through to old heartbeat protocol as it is likely that
-            // a new node just joined the set
-        }
-
-        ReplSetHeartbeatArgs args;
-        status = args.initialize(cmdObj);
-        uassertStatusOK(status);
-
-        // ugh.
-        if (args.getCheckEmpty()) {
-            result.append("hasData", replHasDatabases(opCtx));
-        }
+        ReplSetHeartbeatArgsV1 args;
+        uassertStatusOK(args.initialize(cmdObj));
 
         ReplSetHeartbeatResponse response;
-        status = ReplicationCoordinator::get(opCtx)->processHeartbeat(args, &response);
+        status = ReplicationCoordinator::get(opCtx)->processHeartbeatV1(args, &response);
         if (status.isOK())
-            response.addToBSON(&result, false);
+            response.addToBSON(&result);
 
         LOG_FOR_HEARTBEATS(2) << "Processed heartbeat from " << cmdObj.getStringField("from")
                               << " and generated response, " << response;
@@ -712,72 +678,6 @@ public:
         return true;
     }
 } cmdReplSetHeartbeat;
-
-/** the first cmd called by a node seeking election and it's a basic sanity
-    test: do any of the nodes it can reach know that it can't be the primary?
-    */
-class CmdReplSetFresh : public ReplSetCommand {
-public:
-    CmdReplSetFresh() : ReplSetCommand("replSetFresh") {}
-
-    virtual bool run(OperationContext* opCtx,
-                     const string&,
-                     const BSONObj& cmdObj,
-                     BSONObjBuilder& result) {
-        Status status = ReplicationCoordinator::get(opCtx)->checkReplEnabledForCommand(&result);
-        uassertStatusOK(status);
-
-        ReplicationCoordinator::ReplSetFreshArgs parsedArgs;
-        parsedArgs.id = cmdObj["id"].Int();
-        parsedArgs.setName = cmdObj["set"].String();
-        parsedArgs.who = HostAndPort(cmdObj["who"].String());
-        BSONElement cfgverElement = cmdObj["cfgver"];
-        uassert(28525,
-                str::stream() << "Expected cfgver argument to replSetFresh command to have "
-                                 "numeric type, but found "
-                              << typeName(cfgverElement.type()),
-                cfgverElement.isNumber());
-        parsedArgs.cfgver = cfgverElement.safeNumberLong();
-        parsedArgs.opTime = Timestamp(cmdObj["opTime"].Date());
-
-        status = ReplicationCoordinator::get(opCtx)->processReplSetFresh(parsedArgs, &result);
-        uassertStatusOK(status);
-        return true;
-    }
-} cmdReplSetFresh;
-
-class CmdReplSetElect : public ReplSetCommand {
-public:
-    CmdReplSetElect() : ReplSetCommand("replSetElect") {}
-
-private:
-    virtual bool run(OperationContext* opCtx,
-                     const string&,
-                     const BSONObj& cmdObj,
-                     BSONObjBuilder& result) {
-        DEV log() << "received elect msg " << cmdObj.toString();
-        else LOG(2) << "received elect msg " << cmdObj.toString();
-
-        Status status = ReplicationCoordinator::get(opCtx)->checkReplEnabledForCommand(&result);
-        uassertStatusOK(status);
-
-        ReplicationCoordinator::ReplSetElectArgs parsedArgs;
-        parsedArgs.set = cmdObj["set"].String();
-        parsedArgs.whoid = cmdObj["whoid"].Int();
-        BSONElement cfgverElement = cmdObj["cfgver"];
-        uassert(28526,
-                str::stream() << "Expected cfgver argument to replSetElect command to have "
-                                 "numeric type, but found "
-                              << typeName(cfgverElement.type()),
-                cfgverElement.isNumber());
-        parsedArgs.cfgver = cfgverElement.safeNumberLong();
-        parsedArgs.round = cmdObj["round"].OID();
-
-        status = ReplicationCoordinator::get(opCtx)->processReplSetElect(parsedArgs, &result);
-        uassertStatusOK(status);
-        return true;
-    }
-} cmdReplSetElect;
 
 class CmdReplSetStepUp : public ReplSetCommand {
 public:

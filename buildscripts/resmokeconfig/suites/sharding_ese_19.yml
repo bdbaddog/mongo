@@ -18,7 +18,7 @@ selector:
   roots:
   - jstests/sharding/min_optime_recovery_on_successful_move_chunk_commit.js
   - jstests/sharding/version1.js
-  - jstests/sharding/hash_skey_split.js
+  - jstests/sharding/initial_split_validate_shard_collections.js
   - jstests/sharding/stale_version_write.js
   - jstests/sharding/moveChunk_recipient_rejects_chunk_if_UUID_mismatch.js
   - jstests/sharding/missing_key.js
@@ -32,7 +32,6 @@ selector:
   - jstests/sharding/database_versioning_safe_secondary_reads.js
   - jstests/sharding/replication_with_undefined_shard_key.js
   - jstests/sharding/min_optime_recovery_on_failed_move_chunk_commit.js
-  - jstests/sharding/crash_mongos_against_upgraded_cluster.js
   - jstests/sharding/change_stream_lookup_single_shard_cluster.js
   - jstests/sharding/copydb_from_mongos.js
   - jstests/sharding/max_time_ms_sharded_new_commands.js

@@ -197,27 +197,6 @@
                                 res, [ErrorCodes.JSInterpreterFailure, kFakeErrCode]));
     });
 
-    tests.push(function errObject() {
-        // Some functions throw an Error with a code property attached.
-        let threw = false;
-        let res = null;
-        try {
-            db.eval("this is a syntax error");
-        } catch (e) {
-            threw = true;
-            res = e;
-        }
-        assert(threw);
-        assert(res instanceof Error);
-        assert(res.hasOwnProperty("code"));
-        assert.throws(() => assert.commandWorked(res));
-        assert.throws(() => assert.commandWorkedIgnoringWriteErrors(res));
-        assert.doesNotThrow(() => assert.commandFailed(res));
-        assert.doesNotThrow(() => assert.commandFailedWithCode(res, ErrorCodes.InternalError));
-        assert.doesNotThrow(
-            () => assert.commandFailedWithCode(res, [ErrorCodes.InternalError, kFakeErrCode]));
-    });
-
     tests.push(function crudInsertOneOk() {
         const res = db.coll.insertOne({_id: 2});
         assert(res.hasOwnProperty("acknowledged"));
@@ -320,6 +299,32 @@
 
         assert.doesNotThrow(() => {
             assert.commandWorkedIgnoringWriteConcernErrors(result);
+        });
+    });
+
+    tests.push(function invalidResponsesAttemptToProvideInformationToCommandWorks() {
+        const invalidResponses = [undefined, 'not a valid response', 42];
+
+        invalidResponses.forEach((invalidRes) => {
+            const error = assert.throws(() => {
+                assert.commandWorked(invalidRes);
+            });
+
+            assert.gte(error.message.indexOf(invalidRes), 0);
+            assert.gte(error.message.indexOf(typeof invalidRes), 0);
+        });
+    });
+
+    tests.push(function invalidResponsesAttemptToProvideInformationCommandFailed() {
+        const invalidResponses = [undefined, 'not a valid response', 42];
+
+        invalidResponses.forEach((invalidRes) => {
+            const error = assert.throws(() => {
+                assert.commandFailed(invalidRes);
+            });
+
+            assert.gte(error.message.indexOf(invalidRes), 0);
+            assert.gte(error.message.indexOf(typeof invalidRes), 0);
         });
     });
 

@@ -143,6 +143,7 @@ var BackupRestoreTest = function(options) {
                 'database_versioning.js',
                 'findAndModify_update_grow.js',  // can cause OOM kills on test hosts
                 'multi_statement_transaction_atomicity_isolation.js',
+                'multi_statement_transaction_atomicity_isolation_multi_db.js',
                 'multi_statement_transaction_atomicity_isolation_repeated_reads.js',
                 'multi_statement_transaction_simple.js',
                 'multi_statement_transaction_simple_repeated_reads.js',
@@ -256,7 +257,7 @@ var BackupRestoreTest = function(options) {
         var nodes = rst.startSet();
 
         // Initialize replica set using default timeout. This should give us sufficient time to
-        // allocate 1GB oplogs on slow test hosts with mmapv1.
+        // allocate 1GB oplogs on slow test hosts.
         rst.initiate();
         rst.awaitNodesAgreeOnPrimary();
         var primary = rst.getPrimary();

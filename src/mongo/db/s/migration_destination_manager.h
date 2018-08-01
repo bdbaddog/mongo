@@ -38,7 +38,7 @@
 #include "mongo/client/connection_string.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/s/active_migrations_registry.h"
-#include "mongo/db/s/collection_sharding_state.h"
+#include "mongo/db/s/collection_sharding_runtime.h"
 #include "mongo/db/s/migration_session_id.h"
 #include "mongo/db/s/session_catalog_migration_destination.h"
 #include "mongo/s/shard_id.h"
@@ -51,6 +51,7 @@
 namespace mongo {
 
 class OperationContext;
+class StartChunkCloneRequest;
 class Status;
 struct WriteConcernOptions;
 
@@ -99,15 +100,10 @@ public:
     /**
      * Returns OK if migration started successfully.
      */
-    Status start(const NamespaceString& nss,
+    Status start(OperationContext* opCtx,
+                 const NamespaceString& nss,
                  ScopedReceiveChunk scopedReceiveChunk,
-                 const MigrationSessionId& sessionId,
-                 const ConnectionString& fromShardConnString,
-                 const ShardId& fromShard,
-                 const ShardId& toShard,
-                 const BSONObj& min,
-                 const BSONObj& max,
-                 const BSONObj& shardKeyPattern,
+                 StartChunkCloneRequest cloneRequest,
                  const OID& epoch,
                  const WriteConcernOptions& writeConcern);
 
@@ -116,7 +112,7 @@ public:
      */
     static void cloneDocumentsFromDonor(
         OperationContext* opCtx,
-        stdx::function<void(OperationContext*, BSONObjIterator)> insertBatchFn,
+        stdx::function<void(OperationContext*, BSONObj)> insertBatchFn,
         stdx::function<BSONObj(OperationContext*)> fetchBatchFn);
 
     /**
@@ -133,6 +129,13 @@ public:
 
     Status startCommit(const MigrationSessionId& sessionId);
 
+    /**
+     * Creates the collection nss on the shard and clones the indexes and options from fromShardId.
+     */
+    static void cloneCollectionIndexesAndOptions(OperationContext* opCtx,
+                                                 const NamespaceString& nss,
+                                                 const ShardId& fromShardId);
+
 private:
     /**
      * These log the argument msg; then, under lock, move msg to _errmsg and set the state to FAIL.
@@ -144,35 +147,13 @@ private:
     /**
      * Thread which drives the migration apply process on the recipient side.
      */
-    void _migrateThread(BSONObj min,
-                        BSONObj max,
-                        BSONObj shardKeyPattern,
-                        ConnectionString fromShardConnString,
-                        OID epoch,
-                        WriteConcernOptions writeConcern);
+    void _migrateThread();
 
-    void _migrateDriver(OperationContext* opCtx,
-                        const BSONObj& min,
-                        const BSONObj& max,
-                        const BSONObj& shardKeyPattern,
-                        const ConnectionString& fromShardConnString,
-                        const OID& epoch,
-                        const WriteConcernOptions& writeConcern);
+    void _migrateDriver(OperationContext* opCtx);
 
-    bool _applyMigrateOp(OperationContext* opCtx,
-                         const NamespaceString& ns,
-                         const BSONObj& min,
-                         const BSONObj& max,
-                         const BSONObj& shardKeyPattern,
-                         const BSONObj& xfer,
-                         repl::OpTime* lastOpApplied);
+    bool _applyMigrateOp(OperationContext* opCtx, const BSONObj& xfer, repl::OpTime* lastOpApplied);
 
-    bool _flushPendingWrites(OperationContext* opCtx,
-                             const std::string& ns,
-                             BSONObj min,
-                             BSONObj max,
-                             const repl::OpTime& lastOpApplied,
-                             const WriteConcernOptions& writeConcern);
+    bool _flushPendingWrites(OperationContext* opCtx, const repl::OpTime& lastOpApplied);
 
     /**
      * Remembers a chunk range between 'min' and 'max' as a range which will have data migrated
@@ -180,16 +161,14 @@ private:
      * it schedules deletion of any documents in the range, so that process must be seen to be
      * complete before migrating any new documents in.
      */
-    CollectionShardingState::CleanupNotification _notePending(OperationContext*,
-                                                              NamespaceString const&,
-                                                              OID const&,
-                                                              ChunkRange const&);
+    CollectionShardingRuntime::CleanupNotification _notePending(OperationContext*,
+                                                                ChunkRange const&);
 
     /**
      * Stops tracking a chunk range between 'min' and 'max' that previously was having data
      * migrated into it, and schedules deletion of any such documents already migrated in.
      */
-    void _forgetPending(OperationContext*, NamespaceString const&, OID const&, ChunkRange const&);
+    void _forgetPending(OperationContext*, ChunkRange const&);
 
     /**
      * Checks whether the MigrationDestinationManager is currently handling a migration by checking
@@ -218,6 +197,10 @@ private:
     BSONObj _min;
     BSONObj _max;
     BSONObj _shardKeyPattern;
+
+    OID _epoch;
+
+    WriteConcernOptions _writeConcern;
 
     // Set to true once we have accepted the chunk as pending into our metadata. Used so that on
     // failure we can perform the appropriate cleanup.

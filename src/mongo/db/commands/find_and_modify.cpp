@@ -256,7 +256,7 @@ public:
     Status explain(OperationContext* opCtx,
                    const OpMsgRequest& request,
                    ExplainOptions::Verbosity verbosity,
-                   BSONObjBuilder* out) const override {
+                   rpc::ReplyBuilderInterface* result) const override {
         std::string dbName = request.getDatabase().toString();
         const BSONObj& cmdObj = request.body;
         const auto args(uassertStatusOK(FindAndModifyRequest::parseFromBSON(
@@ -288,7 +288,8 @@ public:
             const auto exec =
                 uassertStatusOK(getExecutorDelete(opCtx, opDebug, collection, &parsedDelete));
 
-            Explain::explainStages(exec.get(), collection, verbosity, out);
+            auto bodyBuilder = result->getBodyBuilder();
+            Explain::explainStages(exec.get(), collection, verbosity, &bodyBuilder);
         } else {
             UpdateRequest request(nsString);
             UpdateLifecycleImpl updateLifecycle(nsString);
@@ -312,7 +313,8 @@ public:
             const auto exec =
                 uassertStatusOK(getExecutorUpdate(opCtx, opDebug, collection, &parsedUpdate));
 
-            Explain::explainStages(exec.get(), collection, verbosity, out);
+            auto bodyBuilder = result->getBodyBuilder();
+            Explain::explainStages(exec.get(), collection, verbosity, &bodyBuilder);
         }
 
         return Status::OK();
@@ -417,7 +419,7 @@ public:
                 opDebug->setPlanSummaryMetrics(summaryStats);
 
                 // Fill out OpDebug with the number of deleted docs.
-                opDebug->ndeleted = getDeleteStats(exec.get())->docsDeleted;
+                opDebug->additiveMetrics.ndeleted = getDeleteStats(exec.get())->docsDeleted;
 
                 if (curOp->shouldDBProfile()) {
                     BSONObjBuilder execStatsBob;
@@ -463,7 +465,7 @@ public:
                 // Create the collection if it does not exist when performing an upsert because the
                 // update stage does not create its own collection
                 if (!collection && args.isUpsert()) {
-                    uassert(ErrorCodes::NamespaceNotFound,
+                    uassert(ErrorCodes::OperationNotSupportedInTransaction,
                             str::stream() << "Cannot create namespace " << nsString.ns()
                                           << " in multi-document transaction.",
                             !inTransaction);

@@ -51,7 +51,6 @@ const auto assert_negotiated = [](ProtocolSet fst, ProtocolSet snd, Protocol pro
 TEST(Protocol, SuccessfulNegotiation) {
     assert_negotiated(supports::kAll, supports::kAll, Protocol::kOpMsg);
     assert_negotiated(supports::kAll, supports::kOpMsgOnly, Protocol::kOpMsg);
-    assert_negotiated(supports::kAll, supports::kOpCommandOnly, Protocol::kOpCommandV1);
     assert_negotiated(supports::kAll, supports::kOpQueryOnly, Protocol::kOpQuery);
 }
 
@@ -63,21 +62,21 @@ const auto assert_not_negotiated = [](ProtocolSet fst, ProtocolSet snd) {
 };
 
 TEST(Protocol, FailedNegotiation) {
-    assert_not_negotiated(supports::kOpQueryOnly, supports::kOpCommandOnly);
+    assert_not_negotiated(supports::kOpQueryOnly, supports::kOpMsgOnly);
     assert_not_negotiated(supports::kAll, supports::kNone);
     assert_not_negotiated(supports::kOpQueryOnly, supports::kNone);
-    assert_not_negotiated(supports::kOpCommandOnly, supports::kNone);
+    assert_not_negotiated(supports::kOpMsgOnly, supports::kNone);
 }
 
 TEST(Protocol, parseProtocolSetFromIsMasterReply) {
     {
-        // MongoDB 3.8
-        auto mongod38 =
+        // MongoDB 4.0
+        auto mongod40 =
             BSON("maxWireVersion" << static_cast<int>(WireVersion::REPLICA_SET_TRANSACTIONS)
                                   << "minWireVersion"
                                   << static_cast<int>(WireVersion::RELEASE_2_4_AND_BEFORE));
 
-        ASSERT_EQ(assertGet(parseProtocolSetFromIsMasterReply(mongod38)).protocolSet,
+        ASSERT_EQ(assertGet(parseProtocolSetFromIsMasterReply(mongod40)).protocolSet,
                   supports::kAll);
     }
     {
@@ -98,7 +97,7 @@ TEST(Protocol, parseProtocolSetFromIsMasterReply) {
                                   << static_cast<int>(WireVersion::RELEASE_2_4_AND_BEFORE));
 
         ASSERT_EQ(assertGet(parseProtocolSetFromIsMasterReply(mongod32)).protocolSet,
-                  supports::kOpQueryOnly | supports::kOpCommandOnly);
+                  supports::kOpQueryOnly);  // This used to also include OP_COMMAND.
     }
     {
         // MongoDB 3.2 (mongos)
@@ -283,20 +282,19 @@ TEST(Protocol, validateWireVersion) {
 
 // A mongos is unable to communicate with a fully upgraded cluster with a higher wire version.
 TEST(Protocol, validateWireVersionFailsForUpgradedServerNode) {
-    // Server is fully upgraded higher than the latest wire version.
-    auto msg =
-        BSON("minWireVersion" << static_cast<int>(WireVersion::FUTURE_WIRE_VERSION_FOR_TESTING)
-                              << "maxWireVersion"
-                              << static_cast<int>(WireVersion::FUTURE_WIRE_VERSION_FOR_TESTING));
+    // Server is fully upgraded to the latest wire version.
+    auto msg = BSON("minWireVersion" << static_cast<int>(WireVersion::LATEST_WIRE_VERSION)
+                                     << "maxWireVersion"
+                                     << static_cast<int>(WireVersion::LATEST_WIRE_VERSION));
     auto swReply = parseProtocolSetFromIsMasterReply(msg);
     ASSERT_OK(swReply.getStatus());
 
-    // The client (this mongos server) only has latest wire version.
-    ASSERT_EQUALS(
-        mongo::ErrorCodes::IncompatibleWithUpgradedServer,
-        validateWireVersion({WireVersion::LATEST_WIRE_VERSION, WireVersion::LATEST_WIRE_VERSION},
-                            swReply.getValue().version)
-            .code());
+    // The client (this mongos server) only has the previous wire version.
+    ASSERT_EQUALS(mongo::ErrorCodes::IncompatibleWithUpgradedServer,
+                  validateWireVersion(
+                      {WireVersion::LATEST_WIRE_VERSION - 1, WireVersion::LATEST_WIRE_VERSION - 1},
+                      swReply.getValue().version)
+                      .code());
 }
 
 }  // namespace

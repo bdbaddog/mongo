@@ -1,5 +1,5 @@
 // Test parsing of readConcern level 'snapshot'.
-// @tags: [requires_replication]
+// @tags: [requires_replication, uses_transactions]
 (function() {
     "use strict";
 
@@ -140,7 +140,7 @@
     // readConcern 'snapshot' is not supported by non-CRUD commands.
     assert.commandFailedWithCode(
         sessionDb.runCommand({createIndexes: collName, indexes: [{key: {a: 1}, name: "a_1"}]}),
-        50768);
+        ErrorCodes.OperationNotSupportedInTransaction);
     assert.commandWorked(session.abortTransaction_forTesting());
     session.endSession();
     rst.stopSet();

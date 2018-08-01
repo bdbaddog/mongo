@@ -35,7 +35,6 @@
 #include "mongo/base/disallow_copying.h"
 #include "mongo/base/status.h"
 #include "mongo/db/repl/repl_set_config.h"
-#include "mongo/db/repl/repl_set_heartbeat_args.h"
 #include "mongo/db/repl/repl_set_heartbeat_args_v1.h"
 #include "mongo/db/repl/repl_set_heartbeat_response.h"
 #include "mongo/db/repl/scatter_gather_algorithm.h"
@@ -85,30 +84,18 @@ std::vector<RemoteCommandRequest> QuorumChecker::getRequests() const {
     }
 
     BSONObj hbRequest;
-    if (_term == OpTime::kUninitializedTerm) {
-        ReplSetHeartbeatArgs hbArgs;
-        hbArgs.setSetName(_rsConfig->getReplSetName());
-        hbArgs.setProtocolVersion(1);
-        hbArgs.setConfigVersion(_rsConfig->getConfigVersion());
-        hbArgs.setHeartbeatVersion(1);
-        hbArgs.setCheckEmpty(isInitialConfig);
-        hbArgs.setSenderHost(myConfig.getHostAndPort());
-        hbArgs.setSenderId(myConfig.getId());
-        hbRequest = hbArgs.toBSON();
-
-    } else {
-        ReplSetHeartbeatArgsV1 hbArgs;
-        hbArgs.setSetName(_rsConfig->getReplSetName());
-        hbArgs.setConfigVersion(_rsConfig->getConfigVersion());
-        hbArgs.setHeartbeatVersion(1);
-        if (isInitialConfig) {
-            hbArgs.setCheckEmpty();
-        }
-        hbArgs.setSenderHost(myConfig.getHostAndPort());
-        hbArgs.setSenderId(myConfig.getId());
-        hbArgs.setTerm(_term);
-        hbRequest = hbArgs.toBSON();
+    invariant(_term != OpTime::kUninitializedTerm);
+    ReplSetHeartbeatArgsV1 hbArgs;
+    hbArgs.setSetName(_rsConfig->getReplSetName());
+    hbArgs.setConfigVersion(_rsConfig->getConfigVersion());
+    hbArgs.setHeartbeatVersion(1);
+    if (isInitialConfig) {
+        hbArgs.setCheckEmpty();
     }
+    hbArgs.setSenderHost(myConfig.getHostAndPort());
+    hbArgs.setSenderId(myConfig.getId());
+    hbArgs.setTerm(_term);
+    hbRequest = hbArgs.toBSON();
 
     // Send a bunch of heartbeat requests.
     // Schedule an operation when a "sufficient" number of them have completed, and use that
@@ -239,7 +226,7 @@ void QuorumChecker::_tabulateHeartbeatResponse(const RemoteCommandRequest& reque
 
     if (_rsConfig->hasReplicaSetId()) {
         StatusWith<rpc::ReplSetMetadata> replMetadata =
-            rpc::ReplSetMetadata::readFromMetadata(response.metadata);
+            rpc::ReplSetMetadata::readFromMetadata(response.data);
         if (replMetadata.isOK() && replMetadata.getValue().getReplicaSetId().isSet() &&
             _rsConfig->getReplicaSetId() != replMetadata.getValue().getReplicaSetId()) {
             std::string message = str::stream()
@@ -249,15 +236,6 @@ void QuorumChecker::_tabulateHeartbeatResponse(const RemoteCommandRequest& reque
             _vetoStatus = Status(ErrorCodes::NewReplicaSetConfigurationIncompatible, message);
             warning() << message;
         }
-    }
-
-    const bool isInitialConfig = _rsConfig->getConfigVersion() == 1;
-    if (isInitialConfig && hbResp.hasData()) {
-        std::string message = str::stream() << "'" << request.target.toString()
-                                            << "' has data already, cannot initiate set.";
-        _vetoStatus = Status(ErrorCodes::CannotInitializeNodeWithData, message);
-        warning() << message;
-        return;
     }
 
     for (int i = 0; i < _rsConfig->getNumMembers(); ++i) {
@@ -302,9 +280,10 @@ bool QuorumChecker::hasReceivedSufficientResponses() const {
 Status checkQuorumGeneral(executor::TaskExecutor* executor,
                           const ReplSetConfig& rsConfig,
                           const int myIndex,
-                          long long term) {
+                          long long term,
+                          std::string logMessage) {
     auto checker = std::make_shared<QuorumChecker>(&rsConfig, myIndex, term);
-    ScatterGatherRunner runner(checker, executor);
+    ScatterGatherRunner runner(checker, executor, std::move(logMessage));
     Status status = runner.run();
     if (!status.isOK()) {
         return status;
@@ -318,7 +297,7 @@ Status checkQuorumForInitiate(executor::TaskExecutor* executor,
                               const int myIndex,
                               long long term) {
     invariant(rsConfig.getConfigVersion() == 1);
-    return checkQuorumGeneral(executor, rsConfig, myIndex, term);
+    return checkQuorumGeneral(executor, rsConfig, myIndex, term, "initiate quorum check");
 }
 
 Status checkQuorumForReconfig(executor::TaskExecutor* executor,
@@ -326,7 +305,7 @@ Status checkQuorumForReconfig(executor::TaskExecutor* executor,
                               const int myIndex,
                               long long term) {
     invariant(rsConfig.getConfigVersion() > 1);
-    return checkQuorumGeneral(executor, rsConfig, myIndex, term);
+    return checkQuorumGeneral(executor, rsConfig, myIndex, term, "reconfig quorum check");
 }
 
 }  // namespace repl

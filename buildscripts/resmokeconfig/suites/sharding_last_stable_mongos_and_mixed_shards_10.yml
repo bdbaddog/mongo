@@ -30,8 +30,7 @@ selector:
   - jstests/sharding/create_idx_empty_primary.js
   - jstests/sharding/clone_catalog_data.js
   - jstests/sharding/coll_epoch_test0.js
-  - jstests/sharding/shard7.js
-  - jstests/sharding/hash_skey_split.js
+  - jstests/sharding/initial_split_validate_shard_collections.js
   - jstests/sharding/conn_pool_stats.js
   - jstests/sharding/tag_range.js
   - jstests/sharding/replication_with_undefined_shard_key.js
@@ -41,7 +40,6 @@ selector:
   - jstests/sharding/bulk_insert.js
   - jstests/sharding/mrShardedOutput.js
   - jstests/sharding/authConnectionHook.js
-  - jstests/sharding/change_stream_update_lookup_collation.js
   - jstests/sharding/oplog_document_key.js
   - jstests/sharding/top_chunk_split.js
   - jstests/sharding/split_large_key.js

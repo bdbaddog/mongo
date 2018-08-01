@@ -2,14 +2,17 @@
 //
 // This test attempts to perform write operations and get latency statistics using the $collStats
 // stage. The former operation must be routed to the primary in a replica set, whereas the latter
-// may be routed to a secondary. Additionally, it is incompatible with the mobile storage engine
-// because it uses parallelCollectionScan.
+// may be routed to a secondary. This is incompatible with embedded right now since the command
+// compact does not exist on such storage engines.
 //
 // @tags: [
 //     assumes_read_preference_unchanged,
 //     requires_collstats,
 //     incompatible_with_embedded,
 // ]
+//
+// TODO (SERVER-36055): Correct error code reported when run on mobile, and then we can remove the
+// tag incompatible_with_embedded.
 
 (function() {
     "use strict";
@@ -112,19 +115,18 @@
     }
     lastHistogram = assertHistogramDiffEq(testColl, lastHistogram, numRecords, 0, 0);
 
-    // ParallelCollectionScan
-    assert.commandWorked(
-        testDB.runCommand({parallelCollectionScan: testColl.getName(), numCursors: 1}));
-    lastHistogram = assertHistogramDiffEq(testColl, lastHistogram, 0, 0, 1);
-
     // FindAndModify
     testColl.findAndModify({query: {}, update: {pt: {type: "Point", coordinates: [0, 0]}}});
     lastHistogram = assertHistogramDiffEq(testColl, lastHistogram, 0, 1, 0);
 
     // CreateIndex
     assert.commandWorked(testColl.createIndex({pt: "2dsphere"}));
-    // TODO SERVER-24705: createIndex is not currently counted in Top.
-    lastHistogram = assertHistogramDiffEq(testColl, lastHistogram, 0, 0, 0);
+    // The createIndex shell helper is run as an insert when writeMode is not "commands".
+    if (testDB.getMongo().writeMode() === "commands") {
+        lastHistogram = assertHistogramDiffEq(testColl, lastHistogram, 0, 0, 1);
+    } else {
+        lastHistogram = assertHistogramDiffEq(testColl, lastHistogram, 0, 1, 0);
+    }
 
     // $geoNear aggregation stage
     assert.commandWorked(testDB.runCommand({

@@ -34,7 +34,6 @@
 
 #include "mongo/base/error_codes.h"
 #include "mongo/base/init.h"
-#include "mongo/client/dbclientinterface.h"
 #include "mongo/db/audit.h"
 #include "mongo/db/background.h"
 #include "mongo/db/catalog/collection.h"
@@ -425,7 +424,7 @@ Status MultiIndexBlockImpl::insertAllDocumentsInCollection(std::set<RecordId>* d
             n++;
             retries = 0;
         } catch (const WriteConflictException&) {
-            CurOp::get(_opCtx)->debug().writeConflicts++;
+            CurOp::get(_opCtx)->debug().additiveMetrics.incrementWriteConflicts(1);
             retries++;  // logAndBackoff expects this to be 1 on first call.
             WriteConflictException::logAndBackoff(
                 retries, "index creation", _collection->ns().ns());

@@ -35,7 +35,6 @@
 
 #include "mongo/base/init.h"
 #include "mongo/base/initializer.h"
-#include "mongo/client/dbclientinterface.h"
 #include "mongo/db/auth/authorization_manager.h"
 #include "mongo/db/auth/authorization_manager_global.h"
 #include "mongo/db/catalog/index_create.h"
@@ -49,8 +48,7 @@
 #include "mongo/db/repl/replication_coordinator_mock.h"
 #include "mongo/db/repl/storage_interface_mock.h"
 #include "mongo/db/service_context.h"
-#include "mongo/db/service_context_d.h"
-#include "mongo/db/service_context_registrar.h"
+#include "mongo/db/service_entry_point_mongod.h"
 #include "mongo/db/wire_version.h"
 #include "mongo/dbtests/framework.h"
 #include "mongo/scripting/engine.h"
@@ -167,10 +165,12 @@ int dbtestsMain(int argc, char** argv, char** envp) {
 
     mongo::runGlobalInitializersOrDie(argc, argv, envp);
     serverGlobalParams.featureCompatibility.setVersion(
-        ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo40);
+        ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo42);
     repl::ReplSettings replSettings;
     replSettings.setOplogSizeBytes(10 * 1024 * 1024);
+    setGlobalServiceContext(ServiceContext::make());
     ServiceContext* service = getGlobalServiceContext();
+    service->setServiceEntryPoint(std::make_unique<ServiceEntryPointMongod>(service));
 
     auto logicalClock = stdx::make_unique<LogicalClock>(service);
     LogicalClock::set(service, std::move(logicalClock));

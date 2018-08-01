@@ -46,6 +46,7 @@
 #include "mongo/db/query/datetime/date_time_support.h"
 #include "mongo/db/query/explain_options.h"
 #include "mongo/db/query/tailable_mode.h"
+#include "mongo/db/server_options.h"
 #include "mongo/util/intrusive_counter.h"
 #include "mongo/util/string_map.h"
 #include "mongo/util/uuid.h"
@@ -184,6 +185,14 @@ public:
      */
     bool isTailableAwaitData() const {
         return tailableMode == TailableModeEnum::kTailableAndAwaitData;
+    }
+
+    /**
+     * Sets the resolved definition for an involved namespace.
+     */
+    void setResolvedNamespace_forTest(const NamespaceString& nss,
+                                      ResolvedNamespace resolvedNamespace) {
+        _resolvedNamespaces[nss.coll()] = std::move(resolvedNamespace);
     }
 
     // The explain verbosity requested by the user, or boost::none if no explain was requested.

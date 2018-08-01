@@ -32,7 +32,6 @@
 
 #include "mongo/db/s/shard_metadata_util.h"
 
-#include "mongo/client/dbclientinterface.h"
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/ops/write_ops.h"
 #include "mongo/db/write_concern_options.h"
@@ -366,7 +365,7 @@ Status updateShardChunks(OperationContext* opCtx,
          *
          */
         for (auto& chunk : chunks) {
-            invariant(chunk.getVersion().hasEqualEpoch(currEpoch));
+            invariant(chunk.getVersion().epoch() == currEpoch);
 
             // Delete any overlapping chunk ranges. Overlapping chunks will have a min value
             // ("_id") between (chunk.min, chunk.max].

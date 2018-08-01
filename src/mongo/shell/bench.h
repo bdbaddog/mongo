@@ -31,8 +31,10 @@
 #include <boost/optional.hpp>
 #include <string>
 
-#include "mongo/client/dbclientinterface.h"
+#include "mongo/base/shim.h"
+#include "mongo/client/dbclient_base.h"
 #include "mongo/db/jsobj.h"
+#include "mongo/db/logical_session_id.h"
 #include "mongo/platform/atomic_word.h"
 #include "mongo/stdx/condition_variable.h"
 #include "mongo/stdx/mutex.h"
@@ -59,11 +61,35 @@ enum class OpType {
     CPULOAD
 };
 
+class BenchRunConfig;
+struct BenchRunStats;
+class BsonTemplateEvaluator;
+class LogicalSessionIdToClient;
+
 /**
  * Object representing one operation passed to benchRun
  */
 struct BenchRunOp {
-public:
+    struct State {
+        State(PseudoRandom* rng_,
+              BsonTemplateEvaluator* bsonTemplateEvaluator_,
+              BenchRunStats* stats_)
+            : rng(rng_), bsonTemplateEvaluator(bsonTemplateEvaluator_), stats(stats_) {}
+
+        PseudoRandom* rng;
+        BsonTemplateEvaluator* bsonTemplateEvaluator;
+        BenchRunStats* stats;
+
+        // Transaction state
+        TxnNumber txnNumber = 0;
+        bool inProgressMultiStatementTxn = false;
+    };
+
+    void executeOnce(DBClientBase* conn,
+                     const boost::optional<LogicalSessionIdToClient>& lsid,
+                     const BenchRunConfig& config,
+                     State* state) const;
+
     int batchSize = 0;
     BSONElement check;
     BSONObj command;
@@ -96,6 +122,20 @@ public:
     BSONObj writeConcern;
     BSONObj value;
 
+    // Only used for find cmds when set greater than 0. A find operation will retrieve the latest
+    // cluster time from the oplog and randomly chooses a time between that timestamp and
+    // 'useClusterTimeWithinSeconds' seconds in the past at which to read.
+    //
+    // Must be used with 'useSnapshotReads=true' BenchRunConfig because atClusterTime is only
+    // allowed within a transaction.
+    int useAClusterTimeWithinPastSeconds = 0;
+
+    // Delays getMore commands following a find cmd. A uniformly distributed random value between 0
+    // and maxRandomMillisecondDelayBeforeGetMore will be generated for each getMore call. Useful
+    // for keeping a snapshot read open for a longer time duration, say to simulate the basic
+    // resources that a snapshot transaction would hold for a time.
+    int maxRandomMillisecondDelayBeforeGetMore{0};
+
     // This is an owned copy of the raw operation. All unowned members point into this.
     BSONObj myBsonOp;
 };
@@ -114,6 +154,9 @@ public:
      * Caller owns the returned object, and is responsible for its deletion.
      */
     static BenchRunConfig* createFromBson(const BSONObj& args);
+
+    static MONGO_DECLARE_SHIM((const BenchRunConfig&)->std::unique_ptr<DBClientBase>)
+        createConnectionImpl;
 
     BenchRunConfig();
 
@@ -172,6 +215,11 @@ public:
      */
     bool useSnapshotReads{false};
 
+    /**
+     * How many milliseconds to sleep for if an operation fails, before continuing to the next op.
+     */
+    Milliseconds delayMillisOnFailedOperation{0};
+
     /// Base random seed for threads
     int64_t randomSeed;
 
@@ -199,6 +247,8 @@ public:
     bool breakOnTrap;
 
 private:
+    static std::function<std::unique_ptr<DBClientBase>(const BenchRunConfig&)> _factory;
+
     /// Initialize a config object to its default values.
     void initializeToDefaults();
 };
@@ -221,6 +271,10 @@ public:
      * Count one instance of the event, which took "timeMicros" microseconds.
      */
     void countOne(long long timeMicros) {
+        if (_numEvents == std::numeric_limits<long long>::max()) {
+            fassertFailedWithStatus(50874,
+                                    {ErrorCodes::Overflow, "Overflowed the events counter."});
+        }
         ++_numEvents;
         _totalTimeMicros += timeMicros;
     }
@@ -235,13 +289,13 @@ public:
     /**
      * Get the number of observed events.
      */
-    unsigned long long getNumEvents() const {
+    long long getNumEvents() const {
         return _numEvents;
     }
 
 private:
     long long _totalTimeMicros{0};
-    unsigned long long _numEvents{0};
+    long long _numEvents{0};
 };
 
 /**
@@ -455,7 +509,7 @@ private:
 
     BenchRunState& _brState;
 
-    const int64_t _randomSeed;
+    PseudoRandom _rng;
 
     // Dummy stats to use before observation period.
     BenchRunStats _statsBlackHole;

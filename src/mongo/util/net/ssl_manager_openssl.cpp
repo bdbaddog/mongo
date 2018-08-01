@@ -64,6 +64,7 @@
 #include <openssl/asn1.h>
 #include <openssl/asn1t.h>
 #include <openssl/evp.h>
+#include <openssl/ssl.h>
 #include <openssl/x509_vfy.h>
 #include <openssl/x509v3.h>
 #if defined(_WIN32)
@@ -169,7 +170,8 @@ IMPLEMENT_ASN1_ENCODE_FUNCTIONS_const_fname(ASN1_SEQUENCE_ANY, ASN1_SET_ANY, ASN
 #endif // MONGO_CONFIG_NEEDS_ASN1_ANY_DEFINITIONS
 // clang-format on
 
-#if OPENSSL_VERSION_NUMBER < 0x10100000L || defined(LIBRESSL_VERSION_NUMBER)
+#if OPENSSL_VERSION_NUMBER < 0x10100000L || \
+    (defined(LIBRESSL_VERSION_NUMBER) && LIBRESSL_VERSION_NUMBER < 0x2070000fL)
 // Copies of OpenSSL after 1.1.0 define new functions for interaction with
 // X509 structure. We must polyfill used definitions to interact with older
 // OpenSSL versions.
@@ -1234,8 +1236,37 @@ SSLConnectionInterface* SSLManagerOpenSSL::accept(Socket* socket,
     return sslConn.release();
 }
 
+
+void recordTLSVersion(const SSL* conn) {
+    int protocol = SSL_version(conn);
+
+    auto& counts = mongo::TLSVersionCounts::get(getGlobalServiceContext());
+    switch (protocol) {
+        case TLS1_VERSION:
+            counts.tls10.addAndFetch(1);
+            break;
+        case TLS1_1_VERSION:
+            counts.tls11.addAndFetch(1);
+            break;
+        case TLS1_2_VERSION:
+            counts.tls12.addAndFetch(1);
+            break;
+#ifdef TLS1_3_VERSION
+        case TLS1_3_VERSION:
+            counts.tls13.addAndFetch(1);
+            break;
+#endif
+        default:
+            // Do nothing
+            break;
+    }
+}
+
 StatusWith<boost::optional<SSLPeerInfo>> SSLManagerOpenSSL::parseAndValidatePeerCertificate(
     SSL* conn, const std::string& remoteHost) {
+
+    recordTLSVersion(conn);
+
     if (!_sslConfiguration.hasCA && isSSLServer)
         return {boost::none};
 

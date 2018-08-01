@@ -144,7 +144,7 @@ public:
 
     /**
      * Moves forward and returns the new data or boost::none if there is no more data.
-     * Continues returning boost::none once it reaches EOF.
+     * Continues returning boost::none once it reaches EOF unlike stl iterators.
      */
     virtual boost::optional<Record> next() = 0;
 
@@ -164,9 +164,10 @@ public:
     /**
      * Recovers from potential state changes in underlying data.
      *
-     * Returns false if it is invalid to continue using this iterator. This usually means that
-     * capped deletes have caught up to the position of this iterator and continuing could
-     * result in missed data.
+     * Returns false if it is invalid to continue using this Cursor. This usually means that
+     * capped deletes have caught up to the position of this Cursor and continuing could
+     * result in missed data. Note that Cursors, unlike iterators can continue to iterate past the
+     * "end"
      *
      * If the former position no longer exists, but it is safe to continue iterating, the
      * following call to next() will return the next closest position in the direction of the
@@ -266,9 +267,10 @@ public:
 };
 
 /**
- * A RecordStore provides an abstraction used for storing documents in a collection,
- * or entries in an index. In storage engines implementing the KVEngine, record stores
- * are also used for implementing catalogs.
+ * An abstraction used for storing documents in a collection or entries in an index.
+ *
+ * In storage engines implementing the KVEngine, record stores are also used for implementing
+ * catalogs.
  *
  * Many methods take an OperationContext parameter. This contains the RecoveryUnit, with
  * all RecordStore specific transaction information, as well as the LockState. Methods that take
@@ -371,20 +373,15 @@ public:
     virtual StatusWith<RecordId> insertRecord(OperationContext* opCtx,
                                               const char* data,
                                               int len,
-                                              Timestamp timestamp,
-                                              bool enforceQuota) = 0;
+                                              Timestamp timestamp) = 0;
 
     virtual Status insertRecords(OperationContext* opCtx,
                                  std::vector<Record>* records,
-                                 std::vector<Timestamp>* timestamps,
-                                 bool enforceQuota) {
+                                 std::vector<Timestamp>* timestamps) {
         int index = 0;
         for (auto& record : *records) {
-            StatusWith<RecordId> res = insertRecord(opCtx,
-                                                    record.data.data(),
-                                                    record.data.size(),
-                                                    (*timestamps)[index++],
-                                                    enforceQuota);
+            StatusWith<RecordId> res =
+                insertRecord(opCtx, record.data.data(), record.data.size(), (*timestamps)[index++]);
             if (!res.isOK())
                 return res.getStatus();
 
@@ -425,19 +422,11 @@ public:
      * @param notifier - Only used by record stores which do not support doc-locking. Called only
      *                   in the case of an in-place update. Called just before the in-place write
      *                   occurs.
-     * @return Status  - If a document move is required (MMAPv1 only) then a status of
-     *                   ErrorCodes::NeedsDocumentMove will be returned. On receipt of this status
-     *                   no update will be performed. It is the caller's responsibility to:
-     *                     1. Remove the existing document and associated index keys.
-     *                     2. Insert a new document and index keys.
-     *
-     * For capped record stores, the record size will never change.
      */
     virtual Status updateRecord(OperationContext* opCtx,
                                 const RecordId& oldLocation,
                                 const char* data,
                                 int len,
-                                bool enforceQuota,
                                 UpdateNotifier* notifier) = 0;
 
     /**
@@ -452,7 +441,7 @@ public:
     /**
      * Updates the record positioned at 'loc' in-place using the deltas described by 'damages'. The
      * 'damages' vector describes contiguous ranges of 'damageSource' from which to copy and apply
-     * byte-level changes to the data.
+     * byte-level changes to the data. Behavior is undefined for calling this on a non-existant loc.
      *
      * @return the updated version of the record. If unowned data is returned, then it is valid
      * until the next modification of this Record or the lock on the collection has been released.
@@ -496,17 +485,6 @@ public:
      */
     virtual std::unique_ptr<RecordCursor> getRandomCursor(OperationContext* opCtx) const {
         return {};
-    }
-
-    /**
-     * Returns many RecordCursors that partition the RecordStore into many disjoint sets.
-     * Iterating all returned RecordCursors is equivalent to iterating the full store.
-     */
-    virtual std::vector<std::unique_ptr<RecordCursor>> getManyCursors(
-        OperationContext* opCtx) const {
-        std::vector<std::unique_ptr<RecordCursor>> out(1);
-        out[0] = getCursor(opCtx);
-        return out;
     }
 
     // higher level

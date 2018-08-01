@@ -88,7 +88,8 @@ public:
                             Collection* coll,
                             const NamespaceString& collectionName,
                             const CollectionOptions& options,
-                            const BSONObj& idIndex) override;
+                            const BSONObj& idIndex,
+                            const OplogSlot& createOpTime) override;
 
     repl::OpTime onDropCollection(OperationContext* opCtx,
                                   const NamespaceString& collectionName,
@@ -165,9 +166,10 @@ void OpObserverMock::onCreateCollection(OperationContext* opCtx,
                                         Collection* coll,
                                         const NamespaceString& collectionName,
                                         const CollectionOptions& options,
-                                        const BSONObj& idIndex) {
+                                        const BSONObj& idIndex,
+                                        const OplogSlot& createOpTime) {
     _logOp(opCtx, collectionName, "create");
-    OpObserverNoop::onCreateCollection(opCtx, coll, collectionName, options, idIndex);
+    OpObserverNoop::onCreateCollection(opCtx, coll, collectionName, options, idIndex, createOpTime);
 }
 
 repl::OpTime OpObserverMock::onDropCollection(OperationContext* opCtx,
@@ -424,8 +426,7 @@ void _insertDocument(OperationContext* opCtx, const NamespaceString& nss, const 
 
         WriteUnitOfWork wuow(opCtx);
         OpDebug* const opDebug = nullptr;
-        bool enforceQuota = true;
-        ASSERT_OK(collection->insertDocument(opCtx, InsertStatement(doc), opDebug, enforceQuota));
+        ASSERT_OK(collection->insertDocument(opCtx, InsertStatement(doc), opDebug));
         wuow.commit();
     });
 }
@@ -459,7 +460,15 @@ TEST_F(RenameCollectionTest, RenameCollectionReturnsNotMasterIfNotPrimary) {
                   renameCollection(_opCtx.get(), _sourceNss, _targetNss, {}));
 }
 
-TEST_F(RenameCollectionTest, IndexNameTooLongForTargetCollection) {
+TEST_F(RenameCollectionTest, TargetCollectionNameTooLong) {
+    _createCollection(_opCtx.get(), _sourceNss);
+    const std::string targetCollectionName(NamespaceString::MaxNsCollectionLen, 'a');
+    NamespaceString longTargetNss(_sourceNss.db(), targetCollectionName);
+    ASSERT_EQUALS(ErrorCodes::InvalidLength,
+                  renameCollection(_opCtx.get(), _sourceNss, longTargetNss, {}));
+}
+
+TEST_F(RenameCollectionTest, LongIndexNameAllowedForTargetCollection) {
     ASSERT_GREATER_THAN(_targetNssDifferentDb.size(), _sourceNss.size());
     std::size_t longestIndexNameAllowedForSource =
         NamespaceString::MaxNsLen - 2U /*strlen(".$")*/ - _sourceNss.size();
@@ -470,11 +479,10 @@ TEST_F(RenameCollectionTest, IndexNameTooLongForTargetCollection) {
     _createCollection(_opCtx.get(), _sourceNss);
     const std::string indexName(longestIndexNameAllowedForSource, 'a');
     _createIndex(_opCtx.get(), _sourceNss, indexName);
-    ASSERT_EQUALS(ErrorCodes::InvalidLength,
-                  renameCollection(_opCtx.get(), _sourceNss, _targetNssDifferentDb, {}));
+    ASSERT_OK(renameCollection(_opCtx.get(), _sourceNss, _targetNssDifferentDb, {}));
 }
 
-TEST_F(RenameCollectionTest, IndexNameTooLongForTemporaryCollectionForRenameAcrossDatabase) {
+TEST_F(RenameCollectionTest, LongIndexNameAllowedForTemporaryCollectionForRenameAcrossDatabase) {
     ASSERT_GREATER_THAN(_targetNssDifferentDb.size(), _sourceNss.size());
     std::size_t longestIndexNameAllowedForTarget =
         NamespaceString::MaxNsLen - 2U /*strlen(".$")*/ - _targetNssDifferentDb.size();
@@ -490,8 +498,7 @@ TEST_F(RenameCollectionTest, IndexNameTooLongForTemporaryCollectionForRenameAcro
     _createCollection(_opCtx.get(), _sourceNss);
     const std::string indexName(longestIndexNameAllowedForTarget, 'a');
     _createIndex(_opCtx.get(), _sourceNss, indexName);
-    ASSERT_EQUALS(ErrorCodes::InvalidLength,
-                  renameCollection(_opCtx.get(), _sourceNss, _targetNssDifferentDb, {}));
+    ASSERT_OK(renameCollection(_opCtx.get(), _sourceNss, _targetNssDifferentDb, {}));
 }
 
 TEST_F(RenameCollectionTest, RenameCollectionAcrossDatabaseWithUuid) {

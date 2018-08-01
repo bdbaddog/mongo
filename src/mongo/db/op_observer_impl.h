@@ -69,7 +69,8 @@ public:
                             Collection* coll,
                             const NamespaceString& collectionName,
                             const CollectionOptions& options,
-                            const BSONObj& idIndex) override;
+                            const BSONObj& idIndex,
+                            const OplogSlot& createOpTime) override;
     void onCollMod(OperationContext* opCtx,
                    const NamespaceString& nss,
                    OptionalCollectionUUID uuid,
@@ -109,7 +110,7 @@ public:
     void onEmptyCapped(OperationContext* opCtx,
                        const NamespaceString& collectionName,
                        OptionalCollectionUUID uuid);
-    void onTransactionCommit(OperationContext* opCtx) override;
+    void onTransactionCommit(OperationContext* opCtx, bool wasPrepared) override;
     void onTransactionPrepare(OperationContext* opCtx) override;
     void onTransactionAbort(OperationContext* opCtx) override;
     void onReplicationRollback(OperationContext* opCtx,

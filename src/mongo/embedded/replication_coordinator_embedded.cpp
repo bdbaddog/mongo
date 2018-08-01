@@ -289,11 +289,6 @@ Status ReplicationCoordinatorEmbedded::processReplSetFreeze(int, BSONObjBuilder*
     UASSERT_NOT_IMPLEMENTED;
 }
 
-Status ReplicationCoordinatorEmbedded::processHeartbeat(const ReplSetHeartbeatArgs&,
-                                                        ReplSetHeartbeatResponse*) {
-    UASSERT_NOT_IMPLEMENTED;
-}
-
 Status ReplicationCoordinatorEmbedded::processReplSetReconfig(OperationContext*,
                                                               const ReplSetReconfigArgs&,
                                                               BSONObjBuilder*) {
@@ -307,16 +302,6 @@ Status ReplicationCoordinatorEmbedded::processReplSetInitiate(OperationContext*,
 }
 
 Status ReplicationCoordinatorEmbedded::abortCatchupIfNeeded() {
-    UASSERT_NOT_IMPLEMENTED;
-}
-
-Status ReplicationCoordinatorEmbedded::processReplSetFresh(const ReplSetFreshArgs&,
-                                                           BSONObjBuilder*) {
-    UASSERT_NOT_IMPLEMENTED;
-}
-
-Status ReplicationCoordinatorEmbedded::processReplSetElect(const ReplSetElectArgs&,
-                                                           BSONObjBuilder*) {
     UASSERT_NOT_IMPLEMENTED;
 }
 
@@ -376,10 +361,6 @@ Status ReplicationCoordinatorEmbedded::processReplSetRequestVotes(OperationConte
 void ReplicationCoordinatorEmbedded::prepareReplMetadata(const BSONObj&,
                                                          const OpTime&,
                                                          BSONObjBuilder*) const {
-    UASSERT_NOT_IMPLEMENTED;
-}
-
-bool ReplicationCoordinatorEmbedded::isV1ElectionProtocol() const {
     UASSERT_NOT_IMPLEMENTED;
 }
 

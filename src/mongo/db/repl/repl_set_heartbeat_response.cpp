@@ -50,13 +50,7 @@ namespace {
 const std::string kConfigFieldName = "config";
 const std::string kConfigVersionFieldName = "v";
 const std::string kElectionTimeFieldName = "electionTime";
-const std::string kHasDataFieldName = "hasData";
-const std::string kHasStateDisagreementFieldName = "stateDisagreement";
-const std::string kHbMessageFieldName = "hbmsg";
-const std::string kIsElectableFieldName = "e";
-const std::string kIsReplSetFieldName = "rs";
 const std::string kMemberStateFieldName = "state";
-const std::string kMismatchFieldName = "mismatch";
 const std::string kOkFieldName = "ok";
 const std::string kDurableOpTimeFieldName = "durableOpTime";
 const std::string kAppliedOpTimeFieldName = "opTime";
@@ -64,22 +58,12 @@ const std::string kPrimaryIdFieldName = "primaryId";
 const std::string kReplSetFieldName = "set";
 const std::string kSyncSourceFieldName = "syncingTo";
 const std::string kTermFieldName = "term";
-const std::string kTimeFieldName = "time";
 const std::string kTimestampFieldName = "ts";
 
 }  // namespace
 
-void ReplSetHeartbeatResponse::addToBSON(BSONObjBuilder* builder, bool isProtocolVersionV1) const {
-    if (_mismatch) {
-        *builder << kOkFieldName << 0.0;
-        *builder << kMismatchFieldName << _mismatch;
-        return;
-    }
-
+void ReplSetHeartbeatResponse::addToBSON(BSONObjBuilder* builder) const {
     builder->append(kOkFieldName, 1.0);
-    if (_timeSet) {
-        *builder << kTimeFieldName << durationCount<Seconds>(_time);
-    }
     if (_electionTimeSet) {
         builder->appendDate(kElectionTimeFieldName,
                             Date_t::fromMillisSinceEpoch(_electionTime.asLL()));
@@ -87,30 +71,17 @@ void ReplSetHeartbeatResponse::addToBSON(BSONObjBuilder* builder, bool isProtoco
     if (_configSet) {
         *builder << kConfigFieldName << _config.toBSON();
     }
-    if (_electableSet) {
-        *builder << kIsElectableFieldName << _electable;
-    }
-    if (_isReplSet) {
-        *builder << "rs" << _isReplSet;
-    }
-    if (_stateDisagreement) {
-        *builder << kHasStateDisagreementFieldName << _stateDisagreement;
-    }
     if (_stateSet) {
         builder->appendIntOrLL(kMemberStateFieldName, _state.s);
     }
     if (_configVersion != -1) {
         *builder << kConfigVersionFieldName << _configVersion;
     }
-    *builder << kHbMessageFieldName << _hbmsg;
     if (!_setName.empty()) {
         *builder << kReplSetFieldName << _setName;
     }
     if (!_syncingTo.empty()) {
         *builder << kSyncSourceFieldName << _syncingTo.toString();
-    }
-    if (_hasDataSet) {
-        builder->append(kHasDataFieldName, _hasData);
     }
     if (_term != -1) {
         builder->append(kTermFieldName, _term);
@@ -122,28 +93,22 @@ void ReplSetHeartbeatResponse::addToBSON(BSONObjBuilder* builder, bool isProtoco
         _durableOpTime.append(builder, kDurableOpTimeFieldName);
     }
     if (_appliedOpTimeSet) {
-        if (isProtocolVersionV1) {
-            _appliedOpTime.append(builder, kAppliedOpTimeFieldName);
-        } else {
-            builder->appendDate(kAppliedOpTimeFieldName,
-                                Date_t::fromMillisSinceEpoch(_appliedOpTime.getTimestamp().asLL()));
-        }
+        _appliedOpTime.append(builder, kAppliedOpTimeFieldName);
     }
 }
 
-BSONObj ReplSetHeartbeatResponse::toBSON(bool isProtocolVersionV1) const {
+BSONObj ReplSetHeartbeatResponse::toBSON() const {
     BSONObjBuilder builder;
-    addToBSON(&builder, isProtocolVersionV1);
+    addToBSON(&builder);
     return builder.obj();
 }
 
 Status ReplSetHeartbeatResponse::initialize(const BSONObj& doc, long long term) {
-    // Old versions set this even though they returned not "ok"
-    _mismatch = doc[kMismatchFieldName].trueValue();
-    if (_mismatch)
-        return Status(ErrorCodes::InconsistentReplicaSetNames, "replica set name doesn't match.");
+    auto status = getStatusFromCommandResult(doc);
+    if (!status.isOK()) {
+        return status;
+    }
 
-    // Old versions sometimes set the replica set name ("set") but ok:0
     const BSONElement replSetNameElement = doc[kReplSetFieldName];
     if (replSetNameElement.eoo()) {
         _setName.clear();
@@ -157,23 +122,9 @@ Status ReplSetHeartbeatResponse::initialize(const BSONObj& doc, long long term) 
         _setName = replSetNameElement.String();
     }
 
-    if (_setName.empty()) {
-        auto status = getStatusFromCommandResult(doc);
-        if (!status.isOK()) {
-            return status;
-        }
-    }
-
-    const BSONElement hasDataElement = doc[kHasDataFieldName];
-    _hasDataSet = !hasDataElement.eoo();
-    _hasData = hasDataElement.trueValue();
-
     const BSONElement electionTimeElement = doc[kElectionTimeFieldName];
     if (electionTimeElement.eoo()) {
         _electionTimeSet = false;
-    } else if (electionTimeElement.type() == bsonTimestamp) {
-        _electionTimeSet = true;
-        _electionTime = electionTimeElement.timestamp();
     } else if (electionTimeElement.type() == Date) {
         _electionTimeSet = true;
         _electionTime = Timestamp(electionTimeElement.date());
@@ -181,73 +132,27 @@ Status ReplSetHeartbeatResponse::initialize(const BSONObj& doc, long long term) 
         return Status(ErrorCodes::TypeMismatch,
                       str::stream() << "Expected \"" << kElectionTimeFieldName
                                     << "\" field in response to replSetHeartbeat "
-                                       "command to have type Date or Timestamp, but found type "
+                                       "command to have type Date, but found type "
                                     << typeName(electionTimeElement.type()));
     }
-
-    const BSONElement timeElement = doc[kTimeFieldName];
-    if (timeElement.eoo()) {
-        _timeSet = false;
-    } else if (timeElement.isNumber()) {
-        _timeSet = true;
-        _time = Seconds(timeElement.numberLong());
-    } else {
-        return Status(ErrorCodes::TypeMismatch,
-                      str::stream() << "Expected \"" << kTimeFieldName
-                                    << "\" field in response to replSetHeartbeat "
-                                       "command to have a numeric type, but found type "
-                                    << typeName(timeElement.type()));
-    }
-
-    _isReplSet = doc[kIsReplSetFieldName].trueValue();
 
     Status termStatus = bsonExtractIntegerField(doc, kTermFieldName, &_term);
     if (!termStatus.isOK() && termStatus != ErrorCodes::NoSuchKey) {
         return termStatus;
     }
 
-    Status status = bsonExtractOpTimeField(doc, kDurableOpTimeFieldName, &_durableOpTime);
+    status = bsonExtractOpTimeField(doc, kDurableOpTimeFieldName, &_durableOpTime);
     if (!status.isOK()) {
-        if (status != ErrorCodes::NoSuchKey) {
-            return status;
-        }
-    } else {
-        _durableOpTimeSet = true;
+        return status;
     }
+    _durableOpTimeSet = true;
 
-    // In order to support both the 3.0(V0) and 3.2(V1) heartbeats we must parse the OpTime
-    // field based on its type. If it is a Date, we parse it as the timestamp and use
-    // initialize's term argument to complete the OpTime type. If it is an Object, then it's
-    // V1 and we construct an OpTime out of its nested fields.
-    const BSONElement appliedOpTimeElement = doc[kAppliedOpTimeFieldName];
-    if (appliedOpTimeElement.eoo()) {
-        _appliedOpTimeSet = false;
-    } else if (appliedOpTimeElement.type() == bsonTimestamp) {
-        _appliedOpTimeSet = true;
-        _appliedOpTime = OpTime(appliedOpTimeElement.timestamp(), term);
-    } else if (appliedOpTimeElement.type() == Date) {
-        _appliedOpTimeSet = true;
-        _appliedOpTime = OpTime(Timestamp(appliedOpTimeElement.date()), term);
-    } else if (appliedOpTimeElement.type() == Object) {
-        Status status = bsonExtractOpTimeField(doc, kAppliedOpTimeFieldName, &_appliedOpTime);
-        _appliedOpTimeSet = true;
-        // since a v1 OpTime was in the response, the member must be part of a replset
-        _isReplSet = true;
-    } else {
-        return Status(ErrorCodes::TypeMismatch,
-                      str::stream() << "Expected \"" << kAppliedOpTimeFieldName
-                                    << "\" field in response to replSetHeartbeat "
-                                       "command to have type Date or Timestamp, but found type "
-                                    << typeName(appliedOpTimeElement.type()));
+    // In V1, heartbeats OpTime is type Object and we construct an OpTime out of its nested fields.
+    status = bsonExtractOpTimeField(doc, kAppliedOpTimeFieldName, &_appliedOpTime);
+    if (!status.isOK()) {
+        return status;
     }
-
-    const BSONElement electableElement = doc[kIsElectableFieldName];
-    if (electableElement.eoo()) {
-        _electableSet = false;
-    } else {
-        _electableSet = true;
-        _electable = electableElement.trueValue();
-    }
+    _appliedOpTimeSet = true;
 
     const BSONElement memberStateElement = doc[kMemberStateFieldName];
     if (memberStateElement.eoo()) {
@@ -273,22 +178,14 @@ Status ReplSetHeartbeatResponse::initialize(const BSONObj& doc, long long term) 
         _state = MemberState(static_cast<int>(stateInt));
     }
 
-    _stateDisagreement = doc[kHasStateDisagreementFieldName].trueValue();
-
-
-    // Not required for the case of uninitialized members -- they have no config
     const BSONElement configVersionElement = doc[kConfigVersionFieldName];
-
-    // If we have an optime then we must have a configVersion
-    if (_appliedOpTimeSet && configVersionElement.eoo()) {
+    if (configVersionElement.eoo()) {
         return Status(ErrorCodes::NoSuchKey,
                       str::stream() << "Response to replSetHeartbeat missing required \""
                                     << kConfigVersionFieldName
-                                    << "\" field even though initialized");
+                                    << "\" field");
     }
-
-    // If there is a "v" (config version) then it must be an int.
-    if (!configVersionElement.eoo() && configVersionElement.type() != NumberInt) {
+    if (configVersionElement.type() != NumberInt) {
         return Status(ErrorCodes::TypeMismatch,
                       str::stream() << "Expected \"" << kConfigVersionFieldName
                                     << "\" field in response to replSetHeartbeat to have "
@@ -296,19 +193,6 @@ Status ReplSetHeartbeatResponse::initialize(const BSONObj& doc, long long term) 
                                     << typeName(configVersionElement.type()));
     }
     _configVersion = configVersionElement.numberInt();
-
-    const BSONElement hbMsgElement = doc[kHbMessageFieldName];
-    if (hbMsgElement.eoo()) {
-        _hbmsg.clear();
-    } else if (hbMsgElement.type() != String) {
-        return Status(ErrorCodes::TypeMismatch,
-                      str::stream() << "Expected \"" << kHbMessageFieldName
-                                    << "\" field in response to replSetHeartbeat to have "
-                                       "type String, but found "
-                                    << typeName(hbMsgElement.type()));
-    } else {
-        _hbmsg = hbMsgElement.String();
-    }
 
     const BSONElement syncingToElement = doc[kSyncSourceFieldName];
     if (syncingToElement.eoo()) {
@@ -348,16 +232,6 @@ MemberState ReplSetHeartbeatResponse::getState() const {
 Timestamp ReplSetHeartbeatResponse::getElectionTime() const {
     invariant(_electionTimeSet);
     return _electionTime;
-}
-
-bool ReplSetHeartbeatResponse::isElectable() const {
-    invariant(_electableSet);
-    return _electable;
-}
-
-Seconds ReplSetHeartbeatResponse::getTime() const {
-    invariant(_timeSet);
-    return _time;
 }
 
 const ReplSetConfig& ReplSetHeartbeatResponse::getConfig() const {

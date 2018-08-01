@@ -37,6 +37,7 @@
 #include "mongo/base/init.h"
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/database.h"
+#include "mongo/db/catalog/database_holder.h"
 #include "mongo/db/client.h"
 #include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/db_raii.h"
@@ -57,11 +58,11 @@ namespace {
 std::set<NamespaceString> _backgroundThreadNamespaces;
 stdx::mutex _backgroundThreadMutex;
 
-class WiredTigerRecordStoreThread : public BackgroundJob {
+class OplogTruncaterThread : public BackgroundJob {
 public:
-    WiredTigerRecordStoreThread(const NamespaceString& ns)
+    OplogTruncaterThread(const NamespaceString& ns)
         : BackgroundJob(true /* deleteSelf */), _ns(ns) {
-        _name = std::string("WT RecordStoreThread: ") + _ns.toString();
+        _name = std::string("WT OplogTruncaterThread: ") + _ns.toString();
     }
 
     virtual std::string name() const {
@@ -77,39 +78,50 @@ public:
             return false;
         }
 
-        const ServiceContext::UniqueOperationContext opCtxPtr = cc().makeOperationContext();
-        OperationContext& opCtx = *opCtxPtr;
+        const ServiceContext::UniqueOperationContext opCtx = cc().makeOperationContext();
 
         try {
-            AutoGetDb autoDb(&opCtx, _ns.db(), MODE_IX);
-            Database* db = autoDb.getDb();
-            if (!db) {
-                LOG(2) << "no local database yet";
-                return false;
+            // A Global IX lock should be good enough to protect the oplog truncation from
+            // interruptions such as restartCatalog. PBWM, database lock or collection lock is not
+            // needed. This improves concurrency if oplog truncation takes long time.
+            ShouldNotConflictWithSecondaryBatchApplicationBlock shouldNotConflictBlock(
+                opCtx.get()->lockState());
+            Lock::GlobalLock lk(opCtx.get(), MODE_IX);
+
+            WiredTigerRecordStore* rs = nullptr;
+            {
+                // Release the database lock right away because we don't want to
+                // block other operations on the local database and given the
+                // fact that oplog collection is so special, Global IX lock can
+                // make sure the collection exists.
+                Lock::DBLock dbLock(opCtx.get(), _ns.db(), MODE_IX);
+                Database* db = DatabaseHolder::getDatabaseHolder().get(opCtx.get(), _ns.db());
+                if (!db) {
+                    LOG(2) << "no local database yet";
+                    return false;
+                }
+                // We need to hold the database lock while getting the collection. Otherwise a
+                // concurrent collection creation would write to the map in the Database object
+                // while we concurrently read the map.
+                Collection* collection = db->getCollection(opCtx.get(), _ns);
+                if (!collection) {
+                    LOG(2) << "no collection " << _ns;
+                    return false;
+                }
+                rs = checked_cast<WiredTigerRecordStore*>(collection->getRecordStore());
             }
 
-            Lock::CollectionLock collectionLock(opCtx.lockState(), _ns.ns(), MODE_IX);
-            Collection* collection = db->getCollection(&opCtx, _ns);
-            if (!collection) {
-                LOG(2) << "no collection " << _ns;
-                return false;
-            }
-
-            OldClientContext ctx(&opCtx, _ns.ns(), false);
-            WiredTigerRecordStore* rs =
-                checked_cast<WiredTigerRecordStore*>(collection->getRecordStore());
-
-            if (!rs->yieldAndAwaitOplogDeletionRequest(&opCtx)) {
+            if (!rs->yieldAndAwaitOplogDeletionRequest(opCtx.get())) {
                 return false;  // Oplog went away.
             }
-            rs->reclaimOplog(&opCtx);
+            rs->reclaimOplog(opCtx.get());
         } catch (const ExceptionForCat<ErrorCategory::Interruption>&) {
             return false;
         } catch (const std::exception& e) {
-            severe() << "error in WiredTigerRecordStoreThread: " << e.what();
-            fassertFailedNoTrace(!"error in WiredTigerRecordStoreThread");
+            severe() << "error in OplogTruncaterThread: " << e.what();
+            fassertFailedNoTrace(!"error in OplogTruncaterThread");
         } catch (...) {
-            fassertFailedNoTrace(!"unknown error in WiredTigerRecordStoreThread");
+            fassertFailedNoTrace(!"unknown error in OplogTruncaterThread");
         }
         return true;
     }
@@ -135,7 +147,7 @@ bool initRsOplogBackgroundThread(StringData ns) {
     }
 
     if (storageGlobalParams.repair || storageGlobalParams.readOnly) {
-        LOG(1) << "not starting WiredTigerRecordStoreThread for " << ns
+        LOG(1) << "not starting OplogTruncaterThread for " << ns
                << " because we are either in repair or read-only mode";
         return false;
     }
@@ -143,10 +155,10 @@ bool initRsOplogBackgroundThread(StringData ns) {
     stdx::lock_guard<stdx::mutex> lock(_backgroundThreadMutex);
     NamespaceString nss(ns);
     if (_backgroundThreadNamespaces.count(nss)) {
-        log() << "WiredTigerRecordStoreThread " << ns << " already started";
+        log() << "OplogTruncaterThread " << ns << " already started";
     } else {
-        log() << "Starting WiredTigerRecordStoreThread " << ns;
-        BackgroundJob* backgroundThread = new WiredTigerRecordStoreThread(nss);
+        log() << "Starting OplogTruncaterThread " << ns;
+        BackgroundJob* backgroundThread = new OplogTruncaterThread(nss);
         backgroundThread->go();
         _backgroundThreadNamespaces.insert(nss);
     }

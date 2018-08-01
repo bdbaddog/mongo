@@ -191,18 +191,16 @@ StatusWith<std::tuple<bool, std::string>> SaslSCRAMServerMechanism<Policy>::_fir
     }
 
     // The authentication database is also the source database for the user.
-    User* userObj;
     auto authManager = AuthorizationManager::get(opCtx->getServiceContext());
 
-    Status status = authManager->acquireUser(opCtx, user, &userObj);
-    if (!status.isOK()) {
-        return status;
+    auto swUser = authManager->acquireUser(opCtx, user);
+    if (!swUser.isOK()) {
+        return swUser.getStatus();
     }
+    auto userObj = std::move(swUser.getValue());
 
     User::CredentialData credentials = userObj->getCredentials();
     UserName userName = userObj->getName();
-
-    authManager->releaseUser(userObj);
 
     _scramCredentials = credentials.scram<HashBlock>();
 
@@ -342,13 +340,8 @@ StatusWith<std::tuple<bool, std::string>> SaslSCRAMServerMechanism<Policy>::_sec
 template class SaslSCRAMServerMechanism<SCRAMSHA1Policy>;
 template class SaslSCRAMServerMechanism<SCRAMSHA256Policy>;
 
-MONGO_INITIALIZER_WITH_PREREQUISITES(SASLSCRAMServerMechanism,
-                                     ("CreateSASLServerMechanismRegistry"))
-(::mongo::InitializerContext* context) {
-    auto& registry = SASLServerMechanismRegistry::get(getGlobalServiceContext());
-    registry.registerFactory<SCRAMSHA1ServerFactory>();
-    registry.registerFactory<SCRAMSHA256ServerFactory>();
-    return Status::OK();
-}
-
+namespace {
+GlobalSASLMechanismRegisterer<SCRAMSHA1ServerFactory> scramsha1Registerer;
+GlobalSASLMechanismRegisterer<SCRAMSHA256ServerFactory> scramsha256Registerer;
+}  // namespace
 }  // namespace mongo

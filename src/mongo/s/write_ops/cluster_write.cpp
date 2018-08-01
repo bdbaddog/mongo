@@ -36,11 +36,13 @@
 
 #include "mongo/base/status.h"
 #include "mongo/client/connpool.h"
+#include "mongo/client/dbclient_cursor.h"
 #include "mongo/db/lasterror.h"
 #include "mongo/db/write_concern_options.h"
 #include "mongo/s/balancer_configuration.h"
 #include "mongo/s/catalog/type_collection.h"
 #include "mongo/s/catalog_cache.h"
+#include "mongo/s/chunk_writes_tracker.h"
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/config_server_client.h"
 #include "mongo/s/grid.h"
@@ -237,7 +239,7 @@ void ClusterWriter::write(OperationContext* opCtx,
 void updateChunkWriteStatsAndSplitIfNeeded(OperationContext* opCtx,
                                            ChunkManager* manager,
                                            Chunk chunk,
-                                           long dataWritten) {
+                                           long chunkBytesWritten) {
     // Disable lastError tracking so that any errors, which occur during auto-split do not get
     // bubbled up on the client connection doing a write
     LastError::Disabled disableLastError(&LastError::get(opCtx->getClient()));
@@ -249,11 +251,12 @@ void updateChunkWriteStatsAndSplitIfNeeded(OperationContext* opCtx,
     const bool maxIsInf =
         (0 == manager->getShardKeyPattern().getKeyPattern().globalMax().woCompare(chunk.getMax()));
 
-    const uint64_t chunkBytesWritten = chunk.addBytesWritten(dataWritten);
+    auto writesTracker = chunk.getWritesTracker();
+    writesTracker->addBytesWritten(chunkBytesWritten);
 
     const uint64_t desiredChunkSize = balancerConfig->getMaxChunkSizeBytes();
 
-    if (!chunk.shouldSplit(desiredChunkSize, minIsInf, maxIsInf)) {
+    if (!writesTracker->shouldSplit(desiredChunkSize)) {
         return;
     }
 
@@ -287,7 +290,8 @@ void updateChunkWriteStatsAndSplitIfNeeded(OperationContext* opCtx,
                 // The current desired chunk size will split the chunk into lots of small chunk and
                 // at the worst case this can result into thousands of chunks. So check and see if a
                 // bigger value can be used.
-                return std::min(chunkBytesWritten, balancerConfig->getMaxChunkSizeBytes());
+                return std::min((uint64_t)chunkBytesWritten,
+                                balancerConfig->getMaxChunkSizeBytes());
             } else {
                 return desiredChunkSize;
             }
@@ -306,7 +310,7 @@ void updateChunkWriteStatsAndSplitIfNeeded(OperationContext* opCtx,
             // No split points means there isn't enough data to split on; 1 split point means we
             // have
             // between half the chunk size to full chunk size so there is no need to split yet
-            chunk.clearBytesWritten();
+            writesTracker->clearBytesWritten();
             return;
         }
 
@@ -314,7 +318,7 @@ void updateChunkWriteStatsAndSplitIfNeeded(OperationContext* opCtx,
             // We don't want to reset _dataWritten since we want to check the other side right away
         } else {
             // We're splitting, so should wait a bit
-            chunk.clearBytesWritten();
+            writesTracker->clearBytesWritten();
         }
 
         // We assume that if the chunk being split is the first (or last) one on the collection,
@@ -400,7 +404,7 @@ void updateChunkWriteStatsAndSplitIfNeeded(OperationContext* opCtx,
         // Ensure the collection gets reloaded because of the move
         Grid::get(opCtx)->catalogCache()->invalidateShardedCollection(nss);
     } catch (const DBException& ex) {
-        chunk.clearBytesWritten();
+        chunk.getWritesTracker()->clearBytesWritten();
 
         if (ErrorCodes::isStaleShardVersionError(ex.code())) {
             log() << "Unable to auto-split chunk " << redact(chunkRange.toString()) << causedBy(ex)

@@ -19,6 +19,7 @@ env.Library(
 env.Library(
         target='key_generator',
         source=[
+            'all_paths_key_generator.cpp',
             'btree_key_generator.cpp',
             'expression_keys_private.cpp',
             'sort_key_generator.cpp',
@@ -30,6 +31,7 @@ env.Library(
             '$BUILD_DIR/mongo/db/geo/geoparser',
             '$BUILD_DIR/mongo/db/index_names',
             '$BUILD_DIR/mongo/db/mongohasher',
+            '$BUILD_DIR/mongo/db/projection_exec_agg',
             '$BUILD_DIR/mongo/db/query/collation/collator_interface',
             '$BUILD_DIR/third_party/s2/s2',
             'expression_params',
@@ -57,6 +59,7 @@ env.Library(
 env.CppUnitTest(
         target='key_generator_test',
         source=[
+            'all_paths_key_generator_test.cpp',
             '2d_key_generator_test.cpp',
             'btree_key_generator_test.cpp',
             'hash_key_generator_test.cpp',
@@ -85,7 +88,6 @@ serveronlyEnv.Library(
         '$BUILD_DIR/mongo/db/concurrency/write_conflict_exception',
         '$BUILD_DIR/mongo/db/repl/repl_coordinator_interface',
         '$BUILD_DIR/mongo/db/storage/encryption_hooks',
-        '$BUILD_DIR/mongo/db/storage/mmap_v1/btree',
         '$BUILD_DIR/mongo/db/storage/storage_options',
         '$BUILD_DIR/third_party/shim_snappy',
         'index_descriptor',
@@ -99,6 +101,7 @@ env.Library(
     target="index_access_methods",
     source=[
         "2d_access_method.cpp",
+        "all_paths_access_method.cpp",
         "btree_access_method.cpp",
         "fts_access_method.cpp",
         "hash_access_method.cpp",

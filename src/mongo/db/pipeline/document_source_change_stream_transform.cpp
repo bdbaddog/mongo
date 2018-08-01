@@ -86,8 +86,10 @@ DocumentSourceChangeStreamTransform::DocumentSourceChangeStreamTransform(
 
     // If the change stream spec includes a resumeToken with a shard key, populate the document key
     // cache with the field paths.
-    if (auto resumeAfter = spec.getResumeAfter()) {
-        ResumeToken token = resumeAfter.get();
+    auto resumeAfter = spec.getResumeAfter();
+    auto startAfter = spec.getStartAfter();
+    if (resumeAfter || startAfter) {
+        ResumeToken token = resumeAfter ? resumeAfter.get() : startAfter.get();
         ResumeTokenData tokenData = token.getData();
 
         if (!tokenData.documentKey.missing() && tokenData.uuid) {
@@ -403,15 +405,14 @@ Value DocumentSourceChangeStreamTransform::serialize(
     return Value(Document{{getSourceName(), changeStreamOptions}});
 }
 
-DocumentSource::GetDepsReturn DocumentSourceChangeStreamTransform::getDependencies(
-    DepsTracker* deps) const {
+DepsTracker::State DocumentSourceChangeStreamTransform::getDependencies(DepsTracker* deps) const {
     deps->fields.insert(repl::OplogEntry::kOpTypeFieldName.toString());
     deps->fields.insert(repl::OplogEntry::kTimestampFieldName.toString());
     deps->fields.insert(repl::OplogEntry::kNamespaceFieldName.toString());
     deps->fields.insert(repl::OplogEntry::kUuidFieldName.toString());
     deps->fields.insert(repl::OplogEntry::kObjectFieldName.toString());
     deps->fields.insert(repl::OplogEntry::kObject2FieldName.toString());
-    return DocumentSource::GetDepsReturn::EXHAUSTIVE_ALL;
+    return DepsTracker::State::EXHAUSTIVE_ALL;
 }
 
 DocumentSource::GetModPathsReturn DocumentSourceChangeStreamTransform::getModifiedPaths() const {

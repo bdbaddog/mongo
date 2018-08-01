@@ -476,6 +476,15 @@ void KVStorageEngine::endBackup(OperationContext* opCtx) {
     _inBackupMode = false;
 }
 
+StatusWith<std::vector<std::string>> KVStorageEngine::beginNonBlockingBackup(
+    OperationContext* opCtx) {
+    return _engine->beginNonBlockingBackup(opCtx);
+}
+
+void KVStorageEngine::endNonBlockingBackup(OperationContext* opCtx) {
+    return _engine->endNonBlockingBackup(opCtx);
+}
+
 bool KVStorageEngine::isDurable() const {
     return _engine->isDurable();
 }
@@ -543,14 +552,14 @@ StatusWith<Timestamp> KVStorageEngine::recoverToStableTimestamp(OperationContext
         wuow.commit();
     }
 
-    catalog::closeCatalog(opCtx);
+    auto state = catalog::closeCatalog(opCtx);
 
     StatusWith<Timestamp> swTimestamp = _engine->recoverToStableTimestamp(opCtx);
     if (!swTimestamp.isOK()) {
         return swTimestamp;
     }
 
-    catalog::openCatalog(opCtx);
+    catalog::openCatalog(opCtx, state);
 
     log() << "recoverToStableTimestamp successful. Stable Timestamp: " << swTimestamp.getValue();
     return {swTimestamp.getValue()};
@@ -560,8 +569,8 @@ boost::optional<Timestamp> KVStorageEngine::getRecoveryTimestamp() const {
     return _engine->getRecoveryTimestamp();
 }
 
-boost::optional<Timestamp> KVStorageEngine::getLastStableCheckpointTimestamp() const {
-    return _engine->getLastStableCheckpointTimestamp();
+boost::optional<Timestamp> KVStorageEngine::getLastStableRecoveryTimestamp() const {
+    return _engine->getLastStableRecoveryTimestamp();
 }
 
 bool KVStorageEngine::supportsReadConcernSnapshot() const {

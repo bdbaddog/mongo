@@ -36,7 +36,6 @@
 #include "mongo/db/operation_context.h"
 #include "mongo/db/operation_context_group.h"
 #include "mongo/db/service_context.h"
-#include "mongo/db/service_context_noop.h"
 #include "mongo/stdx/future.h"
 #include "mongo/stdx/memory.h"
 #include "mongo/stdx/thread.h"
@@ -77,7 +76,7 @@ std::ostream& operator<<(std::ostream& os, stdx::future_status futureStatus) {
 }
 
 TEST(OperationContextTest, NoSessionIdNoTransactionNumber) {
-    auto serviceCtx = stdx::make_unique<ServiceContextNoop>();
+    auto serviceCtx = ServiceContext::make();
     auto client = serviceCtx->makeClient("OperationContextTest");
     auto opCtx = client->makeOperationContext();
 
@@ -86,7 +85,7 @@ TEST(OperationContextTest, NoSessionIdNoTransactionNumber) {
 }
 
 TEST(OperationContextTest, SessionIdNoTransactionNumber) {
-    auto serviceCtx = stdx::make_unique<ServiceContextNoop>();
+    auto serviceCtx = ServiceContext::make();
     auto client = serviceCtx->makeClient("OperationContextTest");
     auto opCtx = client->makeOperationContext();
 
@@ -100,7 +99,7 @@ TEST(OperationContextTest, SessionIdNoTransactionNumber) {
 }
 
 TEST(OperationContextTest, SessionIdAndTransactionNumber) {
-    auto serviceCtx = stdx::make_unique<ServiceContextNoop>();
+    auto serviceCtx = ServiceContext::make();
     auto client = serviceCtx->makeClient("OperationContextTest");
     auto opCtx = client->makeOperationContext();
 
@@ -113,7 +112,7 @@ TEST(OperationContextTest, SessionIdAndTransactionNumber) {
 }
 
 DEATH_TEST(OperationContextTest, SettingSessionIdMoreThanOnceShouldCrash, "invariant") {
-    auto serviceCtx = stdx::make_unique<ServiceContextNoop>();
+    auto serviceCtx = ServiceContext::make();
     auto client = serviceCtx->makeClient("OperationContextTest");
     auto opCtx = client->makeOperationContext();
 
@@ -122,7 +121,7 @@ DEATH_TEST(OperationContextTest, SettingSessionIdMoreThanOnceShouldCrash, "invar
 }
 
 DEATH_TEST(OperationContextTest, SettingTransactionNumberMoreThanOnceShouldCrash, "invariant") {
-    auto serviceCtx = stdx::make_unique<ServiceContextNoop>();
+    auto serviceCtx = ServiceContext::make();
     auto client = serviceCtx->makeClient("OperationContextTest");
     auto opCtx = client->makeOperationContext();
 
@@ -133,7 +132,7 @@ DEATH_TEST(OperationContextTest, SettingTransactionNumberMoreThanOnceShouldCrash
 }
 
 DEATH_TEST(OperationContextTest, SettingTransactionNumberWithoutSessionIdShouldCrash, "invariant") {
-    auto serviceCtx = stdx::make_unique<ServiceContextNoop>();
+    auto serviceCtx = ServiceContext::make();
     auto client = serviceCtx->makeClient("OperationContextTest");
     auto opCtx = client->makeOperationContext();
 
@@ -144,12 +143,12 @@ TEST(OperationContextTest, OpCtxGroup) {
     OperationContextGroup group1;
     ASSERT_TRUE(group1.isEmpty());
     {
-        auto serviceCtx1 = stdx::make_unique<ServiceContextNoop>();
+        auto serviceCtx1 = ServiceContext::make();
         auto client1 = serviceCtx1->makeClient("OperationContextTest1");
         auto opCtx1 = group1.makeOperationContext(*client1);
         ASSERT_FALSE(group1.isEmpty());
 
-        auto serviceCtx2 = stdx::make_unique<ServiceContextNoop>();
+        auto serviceCtx2 = ServiceContext::make();
         auto client2 = serviceCtx2->makeClient("OperationContextTest2");
         {
             auto opCtx2 = group1.makeOperationContext(*client2);
@@ -170,7 +169,7 @@ TEST(OperationContextTest, OpCtxGroup) {
 
     OperationContextGroup group2;
     {
-        auto serviceCtx = stdx::make_unique<ServiceContextNoop>();
+        auto serviceCtx = ServiceContext::make();
         auto client = serviceCtx->makeClient("OperationContextTest1");
         auto opCtx2 = group2.adopt(client->makeOperationContext());
         ASSERT_FALSE(group2.isEmpty());
@@ -185,7 +184,7 @@ TEST(OperationContextTest, OpCtxGroup) {
     OperationContextGroup group3;
     OperationContextGroup group4;
     {
-        auto serviceCtx = stdx::make_unique<ServiceContextNoop>();
+        auto serviceCtx = ServiceContext::make();
         auto client3 = serviceCtx->makeClient("OperationContextTest3");
         auto opCtx3 = group3.makeOperationContext(*client3);
         auto p3 = opCtx3.opCtx();
@@ -204,7 +203,7 @@ TEST(OperationContextTest, OpCtxGroup) {
 class OperationDeadlineTests : public unittest::Test {
 public:
     void setUp() {
-        service = stdx::make_unique<ServiceContextNoop>();
+        service = ServiceContext::make();
         service->setFastClockSource(stdx::make_unique<SharedClockSourceAdapter>(mockClock));
         service->setPreciseClockSource(stdx::make_unique<SharedClockSourceAdapter>(mockClock));
         service->setTickSource(stdx::make_unique<TickSourceMock>());
@@ -212,13 +211,13 @@ public:
     }
 
     const std::shared_ptr<ClockSourceMock> mockClock = std::make_shared<ClockSourceMock>();
-    std::unique_ptr<ServiceContext> service;
+    ServiceContext::UniqueServiceContext service;
     ServiceContext::UniqueClient client;
 };
 
 TEST_F(OperationDeadlineTests, OperationDeadlineExpiration) {
     auto opCtx = client->makeOperationContext();
-    opCtx->setDeadlineAfterNowBy(Seconds{1});
+    opCtx->setDeadlineAfterNowBy(Seconds{1}, ErrorCodes::ExceededTimeLimit);
     mockClock->advance(Milliseconds{500});
     ASSERT_OK(opCtx->checkForInterruptNoAssert());
 
@@ -246,7 +245,7 @@ TEST_F(OperationDeadlineTests, OperationDeadlineExpiration) {
 template <typename D>
 void assertLargeRelativeDeadlineLikeInfinity(Client& client, D maxTime) {
     auto opCtx = client.makeOperationContext();
-    opCtx->setDeadlineAfterNowBy(maxTime);
+    opCtx->setDeadlineAfterNowBy(maxTime, ErrorCodes::ExceededTimeLimit);
     ASSERT_FALSE(opCtx->hasDeadline()) << "Tried to set maxTime to " << maxTime;
 }
 
@@ -275,7 +274,7 @@ TEST_F(OperationDeadlineTests, VeryLargeRelativeDeadlinesNanoseconds) {
     // Nanoseconds::max() is less than Microseconds::max(), so it is possible to set
     // a deadline of that duration.
     auto opCtx = client->makeOperationContext();
-    opCtx->setDeadlineAfterNowBy(Nanoseconds::max());
+    opCtx->setDeadlineAfterNowBy(Nanoseconds::max(), ErrorCodes::ExceededTimeLimit);
     ASSERT_TRUE(opCtx->hasDeadline());
     ASSERT_EQ(mockClock->now() + mockClock->getPrecision() +
                   duration_cast<Milliseconds>(Nanoseconds::max()),
@@ -284,7 +283,7 @@ TEST_F(OperationDeadlineTests, VeryLargeRelativeDeadlinesNanoseconds) {
 
 TEST_F(OperationDeadlineTests, WaitForMaxTimeExpiredCV) {
     auto opCtx = client->makeOperationContext();
-    opCtx->setDeadlineByDate(mockClock->now());
+    opCtx->setDeadlineByDate(mockClock->now(), ErrorCodes::ExceededTimeLimit);
     stdx::mutex m;
     stdx::condition_variable cv;
     stdx::unique_lock<stdx::mutex> lk(m);
@@ -293,7 +292,7 @@ TEST_F(OperationDeadlineTests, WaitForMaxTimeExpiredCV) {
 
 TEST_F(OperationDeadlineTests, WaitForMaxTimeExpiredCVWithWaitUntilSet) {
     auto opCtx = client->makeOperationContext();
-    opCtx->setDeadlineByDate(mockClock->now());
+    opCtx->setDeadlineByDate(mockClock->now(), ErrorCodes::ExceededTimeLimit);
     stdx::mutex m;
     stdx::condition_variable cv;
     stdx::unique_lock<stdx::mutex> lk(m);
@@ -324,7 +323,7 @@ TEST_F(OperationDeadlineTests, WaitForUntilExpiredCV) {
 
 TEST_F(OperationDeadlineTests, WaitForUntilExpiredCVWithMaxTimeSet) {
     auto opCtx = client->makeOperationContext();
-    opCtx->setDeadlineByDate(mockClock->now() + Seconds{10});
+    opCtx->setDeadlineByDate(mockClock->now() + Seconds{10}, ErrorCodes::ExceededTimeLimit);
     stdx::mutex m;
     stdx::condition_variable cv;
     stdx::unique_lock<stdx::mutex> lk(m);
@@ -344,7 +343,7 @@ TEST_F(OperationDeadlineTests, WaitForDurationExpired) {
 
 TEST_F(OperationDeadlineTests, DuringWaitMaxTimeExpirationDominatesUntilExpiration) {
     auto opCtx = client->makeOperationContext();
-    opCtx->setDeadlineByDate(mockClock->now());
+    opCtx->setDeadlineByDate(mockClock->now(), ErrorCodes::ExceededTimeLimit);
     stdx::mutex m;
     stdx::condition_variable cv;
     stdx::unique_lock<stdx::mutex> lk(m);
@@ -379,7 +378,7 @@ public:
         auto barrier = std::make_shared<unittest::Barrier>(2);
         auto task = stdx::packaged_task<bool()>([=] {
             if (maxTime < Date_t::max()) {
-                opCtx->setDeadlineByDate(maxTime);
+                opCtx->setDeadlineByDate(maxTime, ErrorCodes::ExceededTimeLimit);
             }
             auto predicate = [state] { return state->isSignaled; };
             stdx::unique_lock<stdx::mutex> lk(state->mutex);

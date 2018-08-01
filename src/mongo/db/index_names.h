@@ -30,6 +30,8 @@
 
 #include <string>
 
+#include "mongo/base/string_data.h"
+
 namespace mongo {
 
 class BSONObj;
@@ -46,6 +48,7 @@ class BSONObj;
  *    the data isn't what we expect.
  */
 enum IndexType {
+    INDEX_ALLPATHS,
     INDEX_BTREE,
     INDEX_2D,
     INDEX_HAYSTACK,
@@ -60,12 +63,13 @@ enum IndexType {
  */
 class IndexNames {
 public:
-    static const std::string GEO_2D;
-    static const std::string GEO_HAYSTACK;
-    static const std::string GEO_2DSPHERE;
-    static const std::string TEXT;
-    static const std::string HASHED;
+    static const std::string ALLPATHS;
     static const std::string BTREE;
+    static const std::string GEO_2D;
+    static const std::string GEO_2DSPHERE;
+    static const std::string GEO_HAYSTACK;
+    static const std::string HASHED;
+    static const std::string TEXT;
 
     /**
      * True if is a regular (non-plugin) index or uses a plugin that existed before 2.4.
@@ -88,7 +92,7 @@ public:
     /**
      * Convert an index name to an IndexType.
      */
-    static IndexType nameToType(const std::string& accessMethod);
+    static IndexType nameToType(StringData accesMethod);
 };
 
 }  // namespace mongo

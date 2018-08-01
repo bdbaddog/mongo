@@ -284,7 +284,6 @@ selector:
   - jstests/sharding/shard1.js
   - jstests/sharding/logical_time_metadata.js
   - jstests/sharding/hash_shard_unique_compound.js
-  - jstests/sharding/crash_mongos_against_upgraded_cluster.js
   - jstests/sharding/shard_existing.js
   - jstests/sharding/create_idx_empty_primary.js
   - jstests/sharding/sharded_profile.js
@@ -318,7 +317,7 @@ selector:
   - jstests/sharding/missing_key.js
   - jstests/sharding/database_versioning_safe_secondary_reads.js
   - jstests/sharding/split_large_key.js
-  - jstests/sharding/hash_skey_split.js
+  - jstests/sharding/initial_split_validate_shard_collections.js
   - jstests/sharding/replication_with_undefined_shard_key.js
   - jstests/sharding/keys_rotation_interval_sec.js
   - jstests/sharding/listshards.js
@@ -361,7 +360,6 @@ selector:
   - jstests/sharding/sharding_options.js
   - jstests/sharding/current_op_no_shards.js
   - jstests/sharding/config_rs_change.js
-  - jstests/sharding/user_flags_sharded.js
   - jstests/sharding/move_chunk_with_session_helper.js
   - jstests/sharding/movechunk_include.js
 

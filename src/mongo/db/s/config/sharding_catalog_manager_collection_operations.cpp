@@ -49,14 +49,15 @@
 #include "mongo/db/operation_context.h"
 #include "mongo/db/query/collation/collator_factory_interface.h"
 #include "mongo/db/repl/repl_client_info.h"
+#include "mongo/db/s/config/initial_split_policy.h"
 #include "mongo/executor/network_interface.h"
 #include "mongo/executor/task_executor.h"
 #include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/s/balancer_configuration.h"
-#include "mongo/s/catalog/sharding_catalog_client.h"
 #include "mongo/s/catalog/sharding_catalog_client_impl.h"
 #include "mongo/s/catalog/type_collection.h"
 #include "mongo/s/catalog/type_database.h"
+#include "mongo/s/catalog/type_tags.h"
 #include "mongo/s/client/shard.h"
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/grid.h"
@@ -128,123 +129,6 @@ boost::optional<UUID> checkCollectionOptions(OperationContext* opCtx,
 }
 
 }  // namespace
-
-/**
- * Creates and writes to the config server the first chunks for a newly sharded collection. Returns
- * the version generated for the collection.
- */
-ChunkVersion createFirstChunks(OperationContext* opCtx,
-                               const NamespaceString& nss,
-                               const ShardKeyPattern& shardKeyPattern,
-                               const ShardId& primaryShardId,
-                               const std::vector<BSONObj>& initPoints,
-                               const bool distributeInitialChunks) {
-
-    const KeyPattern keyPattern = shardKeyPattern.getKeyPattern();
-
-    vector<BSONObj> splitPoints;
-    vector<ShardId> shardIds;
-
-    if (initPoints.empty()) {
-        // If no split points were specified use the shard's data distribution to determine them
-        auto primaryShard =
-            uassertStatusOK(Grid::get(opCtx)->shardRegistry()->getShard(opCtx, primaryShardId));
-
-        auto result = uassertStatusOK(primaryShard->runCommandWithFixedRetryAttempts(
-            opCtx,
-            ReadPreferenceSetting{ReadPreference::PrimaryPreferred},
-            nss.db().toString(),
-            BSON("count" << nss.coll()),
-            Shard::RetryPolicy::kIdempotent));
-
-        long long numObjects = 0;
-        uassertStatusOK(result.commandStatus);
-        uassertStatusOK(bsonExtractIntegerField(result.response, "n", &numObjects));
-
-        // Refresh the balancer settings to ensure the chunk size setting, which is sent as part of
-        // the splitVector command and affects the number of chunks returned, has been loaded.
-        uassertStatusOK(Grid::get(opCtx)->getBalancerConfiguration()->refreshAndCheck(opCtx));
-
-        if (numObjects > 0) {
-            splitPoints = uassertStatusOK(shardutil::selectChunkSplitPoints(
-                opCtx,
-                primaryShardId,
-                nss,
-                shardKeyPattern,
-                ChunkRange(keyPattern.globalMin(), keyPattern.globalMax()),
-                Grid::get(opCtx)->getBalancerConfiguration()->getMaxChunkSizeBytes(),
-                0));
-        }
-
-        // If docs already exist for the collection, must use primary shard,
-        // otherwise defer to passed-in distribution option.
-        if (numObjects == 0 && distributeInitialChunks) {
-            Grid::get(opCtx)->shardRegistry()->getAllShardIdsNoReload(&shardIds);
-        } else {
-            shardIds.push_back(primaryShardId);
-        }
-    } else {
-        // Make sure points are unique and ordered
-        auto orderedPts = SimpleBSONObjComparator::kInstance.makeBSONObjSet();
-
-        for (const auto& initPoint : initPoints) {
-            orderedPts.insert(initPoint);
-        }
-
-        for (const auto& initPoint : orderedPts) {
-            splitPoints.push_back(initPoint);
-        }
-
-        if (distributeInitialChunks) {
-            Grid::get(opCtx)->shardRegistry()->getAllShardIdsNoReload(&shardIds);
-        } else {
-            shardIds.push_back(primaryShardId);
-        }
-    }
-
-    // This is the first chunk; start the versioning from scratch
-    const OID epoch = OID::gen();
-    ChunkVersion version(1, 0, epoch);
-
-    log() << "going to create " << splitPoints.size() + 1 << " chunk(s) for: " << nss
-          << " using new epoch " << version.epoch();
-
-    const auto validAfter = LogicalClock::get(opCtx)->getClusterTime().asTimestamp();
-
-    for (unsigned i = 0; i <= splitPoints.size(); i++) {
-        const BSONObj min = (i == 0) ? keyPattern.globalMin() : splitPoints[i - 1];
-        const BSONObj max = (i < splitPoints.size()) ? splitPoints[i] : keyPattern.globalMax();
-
-        // The correct version must be returned as part of this call so only increment for versions,
-        // which get written
-        if (i > 0) {
-            version.incMinor();
-        }
-
-        ChunkType chunk;
-        chunk.setNS(nss);
-        chunk.setMin(min);
-        chunk.setMax(max);
-        chunk.setVersion(version);
-
-        // It's possible there are no split points or fewer split points than total number of
-        // shards, and we need to be sure that at least one chunk is placed on the primary shard.
-        auto shardId = (i == 0) ? primaryShardId : shardIds[i % shardIds.size()];
-        chunk.setShard(shardId);
-
-        std::vector<ChunkHistory> initialHistory;
-        initialHistory.emplace_back(ChunkHistory(validAfter, shardId));
-        chunk.setHistory(std::move(initialHistory));
-
-        uassertStatusOK(Grid::get(opCtx)->catalogClient()->insertConfigDocument(
-            opCtx,
-            ChunkType::ConfigNS,
-            chunk.toConfigBSON(),
-            ShardingCatalogClient::kMajorityWriteConcern));
-    }
-
-    return version;
-}
 
 void checkForExistingChunks(OperationContext* opCtx, const NamespaceString& nss) {
     BSONObjBuilder countBuilder;
@@ -384,6 +268,18 @@ Status ShardingCatalogManager::dropCollection(OperationContext* opCtx, const Nam
 
     LOG(1) << "dropCollection " << nss.ns() << " chunk data deleted";
 
+    // Remove tag data
+    result = catalogClient->removeConfigDocuments(opCtx,
+                                                  TagsType::ConfigNS,
+                                                  BSON(TagsType::ns(nss.ns())),
+                                                  ShardingCatalogClient::kMajorityWriteConcern);
+
+    if (!result.isOK()) {
+        return result;
+    }
+
+    LOG(1) << "dropCollection " << nss.ns() << " tag data deleted";
+
     // Mark the collection as dropped
     CollectionType coll;
     coll.setNs(nss);
@@ -469,7 +365,7 @@ void ShardingCatalogManager::shardCollection(OperationContext* opCtx,
                                              const ShardKeyPattern& fieldsAndOrder,
                                              const BSONObj& defaultCollation,
                                              bool unique,
-                                             const vector<BSONObj>& initPoints,
+                                             const vector<BSONObj>& splitPoints,
                                              const bool distributeInitialChunks,
                                              const ShardId& dbPrimaryShardId) {
     const auto catalogClient = Grid::get(opCtx)->catalogClient();
@@ -489,17 +385,13 @@ void ShardingCatalogManager::shardCollection(OperationContext* opCtx,
             uuid->appendToBuilder(&collectionDetail, "uuid");
         }
         collectionDetail.append("primary", primaryShard->toString());
-        collectionDetail.append("numChunks", static_cast<int>(initPoints.size() + 1));
-        catalogClient
-            ->logChange(opCtx,
-                        "shardCollection.start",
-                        nss.ns(),
-                        collectionDetail.obj(),
-                        ShardingCatalogClient::kMajorityWriteConcern)
-            .transitional_ignore();
+        collectionDetail.append("numChunks", static_cast<int>(splitPoints.size() + 1));
+        uassertStatusOK(catalogClient->logChange(opCtx,
+                                                 "shardCollection.start",
+                                                 nss.ns(),
+                                                 collectionDetail.obj(),
+                                                 ShardingCatalogClient::kMajorityWriteConcern));
     }
-
-    // const NamespaceString nss(ns);
 
     // Construct the collection default collator.
     std::unique_ptr<CollatorInterface> defaultCollator;
@@ -508,20 +400,16 @@ void ShardingCatalogManager::shardCollection(OperationContext* opCtx,
                                               ->makeFromBSON(defaultCollation));
     }
 
-    const auto& collVersion = createFirstChunks(
-        opCtx, nss, fieldsAndOrder, dbPrimaryShardId, initPoints, distributeInitialChunks);
+    const auto initialChunks = InitialSplitPolicy::writeFirstChunksToConfig(
+        opCtx, nss, fieldsAndOrder, dbPrimaryShardId, splitPoints, distributeInitialChunks);
 
     {
         CollectionType coll;
         coll.setNs(nss);
-        if (uuid) {
+        if (uuid)
             coll.setUUID(*uuid);
-        }
-        coll.setEpoch(collVersion.epoch());
-
-        // TODO(schwerin): The following isn't really a date, but is stored as one in-memory and in
-        // config.collections, as a historical oddity.
-        coll.setUpdatedAt(Date_t::fromMillisSinceEpoch(collVersion.toLong()));
+        coll.setEpoch(initialChunks.collVersion().epoch());
+        coll.setUpdatedAt(Date_t::fromMillisSinceEpoch(initialChunks.collVersion().toLong()));
         coll.setKeyPattern(fieldsAndOrder.toBSON());
         coll.setDefaultCollation(defaultCollator ? defaultCollator->getSpec().toBSON() : BSONObj());
         coll.setUnique(unique);
@@ -534,14 +422,12 @@ void ShardingCatalogManager::shardCollection(OperationContext* opCtx,
     invariant(!shard->isConfig());
 
     // Tell the primary mongod to refresh its data
-    // TODO:  Think the real fix here is for mongos to just
-    //        assume that all collections are sharded, when we get there
     SetShardVersionRequest ssv = SetShardVersionRequest::makeForVersioningNoPersist(
         shardRegistry->getConfigServerConnectionString(),
         dbPrimaryShardId,
         primaryShard->getConnString(),
         nss,
-        collVersion,
+        initialChunks.collVersion(),
         true /* isAuthoritative */,
         true /* forceRefresh */);
 
@@ -562,9 +448,9 @@ void ShardingCatalogManager::shardCollection(OperationContext* opCtx,
         ->logChange(opCtx,
                     "shardCollection.end",
                     nss.ns(),
-                    BSON("version" << collVersion.toString()),
+                    BSON("version" << initialChunks.collVersion().toString()),
                     ShardingCatalogClient::kMajorityWriteConcern)
-        .transitional_ignore();
+        .ignore();
 }
 
 void ShardingCatalogManager::generateUUIDsForExistingShardedCollections(OperationContext* opCtx) {

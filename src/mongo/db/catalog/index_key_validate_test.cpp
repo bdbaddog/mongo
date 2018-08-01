@@ -29,12 +29,14 @@
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/catalog/index_key_validate.h"
+#include "mongo/db/commands/test_commands_enabled.h"
 
 #include <limits>
 
 #include "mongo/bson/bsonmisc.h"
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/db/index/index_descriptor.h"
+#include "mongo/db/query/query_knobs.h"
 #include "mongo/unittest/unittest.h"
 
 namespace mongo {
@@ -43,6 +45,31 @@ namespace {
 
 using IndexVersion = IndexDescriptor::IndexVersion;
 using index_key_validate::validateKeyPattern;
+
+/**
+ * Helper class to ensure proper FCV & test commands enabled.
+ * TODO: Remove test command enabling/disabling in SERVER-36198
+ */
+class TestCommandQueryKnobGuard {
+
+public:
+    TestCommandQueryKnobGuard() {
+        _prevEnabled = getTestCommandsEnabled();
+        setTestCommandsEnabled(true);
+
+        _prevKnobEnabled = internalQueryAllowAllPathsIndexes.load();
+        internalQueryAllowAllPathsIndexes.store(true);
+    }
+
+    ~TestCommandQueryKnobGuard() {
+        setTestCommandsEnabled(_prevEnabled);
+        internalQueryAllowAllPathsIndexes.store(_prevKnobEnabled);
+    }
+
+private:
+    bool _prevEnabled;
+    bool _prevKnobEnabled;
+};
 
 TEST(IndexKeyValidateTest, KeyElementValueOfSmallPositiveIntSucceeds) {
     for (auto indexVersion : IndexDescriptor::getSupportedIndexVersions()) {
@@ -233,6 +260,64 @@ TEST(IndexKeyValidateTest, KeyElementNameTextSucceedsOnTextIndex) {
                                               << "text"),
                                      indexVersion));
     }
+}
+
+TEST(IndexKeyValidateTest, KeyElementNameAllPathsSucceedsOnSubPath) {
+    TestCommandQueryKnobGuard guard;
+    ASSERT_OK(validateKeyPattern(BSON("a.$**" << 1), IndexVersion::kV2));
+}
+
+TEST(IndexKeyValidateTest, KeyElementNameAllPathsSucceeds) {
+    TestCommandQueryKnobGuard guard;
+    ASSERT_OK(validateKeyPattern(BSON("$**" << 1), IndexVersion::kV2));
+}
+
+TEST(IndexKeyValidateTest, KeyElementNameAllPathsFailsOnRepeat) {
+    TestCommandQueryKnobGuard guard;
+    auto status = validateKeyPattern(BSON("$**.$**" << 1), IndexVersion::kV2);
+    ASSERT_NOT_OK(status);
+    ASSERT_EQ(status, ErrorCodes::CannotCreateIndex);
+}
+
+TEST(IndexKeyValidateTest, KeyElementNameAllPathsFailsOnSubPathRepeat) {
+    TestCommandQueryKnobGuard guard;
+    auto status = validateKeyPattern(BSON("a.$**.$**" << 1), IndexVersion::kV2);
+    ASSERT_NOT_OK(status);
+    ASSERT_EQ(status, ErrorCodes::CannotCreateIndex);
+}
+
+TEST(IndexKeyValidateTest, KeyElementNameAllPathsFailsOnCompound) {
+    TestCommandQueryKnobGuard guard;
+    auto status = validateKeyPattern(BSON("$**" << 1 << "a" << 1), IndexVersion::kV2);
+    ASSERT_NOT_OK(status);
+    ASSERT_EQ(status, ErrorCodes::CannotCreateIndex);
+}
+
+TEST(IndexKeyValidateTest, KeyElementNameAllPathsFailsOnIncorrectValue) {
+    TestCommandQueryKnobGuard guard;
+    auto status = validateKeyPattern(BSON("$**" << false), IndexVersion::kV2);
+    ASSERT_NOT_OK(status);
+    ASSERT_EQ(status, ErrorCodes::CannotCreateIndex);
+}
+
+TEST(IndexKeyValidateTest, KeyElementNameAllPathsFailsWhenValueIsPluginNameWithInvalidKeyName) {
+    // TODO: Remove test command enabling/disabling in SERVER-36198
+    TestCommandQueryKnobGuard guard;
+    auto status = validateKeyPattern(BSON("a"
+                                          << "allPaths"),
+                                     IndexVersion::kV2);
+    ASSERT_NOT_OK(status);
+    ASSERT_EQ(status, ErrorCodes::CannotCreateIndex);
+}
+
+TEST(IndexKeyValidateTest, KeyElementNameAllPathsFailsWhenValueIsPluginNameWithValidKeyName) {
+    // TODO: Remove test command enabling/disabling in SERVER-36198
+    TestCommandQueryKnobGuard guard;
+    auto status = validateKeyPattern(BSON("$**"
+                                          << "allPaths"),
+                                     IndexVersion::kV2);
+    ASSERT_NOT_OK(status);
+    ASSERT_EQ(status, ErrorCodes::CannotCreateIndex);
 }
 
 }  // namespace

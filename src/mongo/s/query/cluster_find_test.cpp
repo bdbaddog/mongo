@@ -32,6 +32,7 @@
 #include "mongo/db/logical_clock.h"
 #include "mongo/db/query/cursor_response.h"
 #include "mongo/db/query/query_request.h"
+#include "mongo/rpc/op_msg_rpc_impls.h"
 #include "mongo/s/catalog_cache_test_fixture.h"
 #include "mongo/s/query/cluster_find.h"
 #include "mongo/unittest/unittest.h"
@@ -65,9 +66,9 @@ protected:
         CatalogCacheTestFixture::setupNShards(numShards);
 
         // Set up a logical clock with an initial time.
-        auto logicalClock = stdx::make_unique<LogicalClock>(serviceContext());
+        auto logicalClock = stdx::make_unique<LogicalClock>(getServiceContext());
         logicalClock->setClusterTimeFromTrustedSource(kInMemoryLogicalTime);
-        LogicalClock::set(serviceContext(), std::move(logicalClock));
+        LogicalClock::set(getServiceContext(), std::move(logicalClock));
     }
 
     // The index of the shard expected to receive the response is used to prevent different shards
@@ -122,14 +123,16 @@ protected:
         auto cursorId = ClusterFind::runQuery(
             operationContext(), *cq, ReadPreferenceSetting(ReadPreference::PrimaryOnly), &batch);
 
-        BSONObjBuilder result;
-        CursorResponseBuilder firstBatch(/* firstBatch */ true, &result);
+        rpc::OpMsgReplyBuilder result;
+        CursorResponseBuilder::Options options;
+        options.isInitialResponse = true;
+        CursorResponseBuilder firstBatch(&result, options);
         for (const auto& obj : batch) {
             firstBatch.append(obj);
         }
         firstBatch.done(cursorId, nss.ns());
 
-        return result.obj();
+        return result.releaseBody();
     }
 
     void runFindCommandSuccessful(BSONObj cmd, bool isTargeted) {

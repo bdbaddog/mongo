@@ -39,6 +39,7 @@
 #include "mongo/base/init.h"
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/config.h"
+#include "mongo/db/commands/server_status.h"
 #include "mongo/db/server_parameters.h"
 #include "mongo/platform/overflow_arithmetic.h"
 #include "mongo/transport/session.h"
@@ -51,16 +52,6 @@
 namespace mongo {
 
 namespace {
-
-/**
- * Configurable via --setParameter disableNonSSLConnectionLogging=true. If false (default)
- * if the sslMode is set to preferSSL, we will log connections that are not using SSL.
- * If true, such log messages will be suppressed.
- */
-ExportedServerParameter<bool, ServerParameterType::kStartupOnly>
-    disableNonSSLConnectionLoggingParameter(ServerParameterSet::getGlobal(),
-                                            "disableNonSSLConnectionLogging",
-                                            &sslGlobalParams.disableNonSSLConnectionLogging);
 
 ExportedServerParameter<std::string, ServerParameterType::kStartupOnly>
     setDiffieHellmanParameterPEMFile(ServerParameterSet::getGlobal(),
@@ -85,7 +76,7 @@ public:
         if (!sslGlobalParams.sslCipherConfig.empty()) {
             return Status(
                 ErrorCodes::BadValue,
-                "opensslCipherConfig setParameter is incompatible with net.ssl.sslCipherConfig");
+                "opensslCipherConfig setParameter is incompatible with net.tls.tlsCipherConfig");
         }
         // Note that there is very little validation that we can do here.
         // OpenSSL exposes no API to validate a cipher config string. The only way to figure out
@@ -97,6 +88,51 @@ public:
         return Status::OK();
     }
 } openSSLCipherConfig;
+
+/**
+ * Configurable via --setParameter disableNonSSLConnectionLogging=true. If false (default)
+ * if the sslMode is set to preferSSL, we will log connections that are not using SSL.
+ * If true, such log messages will be suppressed.
+ */
+class DisableNonSSLConnectionLoggingParameter
+    : public ExportedServerParameter<bool, ServerParameterType::kStartupOnly> {
+public:
+    DisableNonSSLConnectionLoggingParameter()
+        : ExportedServerParameter<bool, ServerParameterType::kStartupOnly>(
+              ServerParameterSet::getGlobal(),
+              "disableNonSSLConnectionLogging",
+              &sslGlobalParams.disableNonSSLConnectionLogging) {}
+    Status validate(const bool& potentialNewValue) final {
+        warning() << "Option: disableNonSSLConnectionLogging is deprecated. Please use "
+                  << "disableNonTLSConnectionLogging instead.";
+        if (sslGlobalParams.disableNonSSLConnectionLoggingSet) {
+            return Status(ErrorCodes::BadValue,
+                          "Error parsing command line: Multiple occurrences of option "
+                          "disableNonTLSConnectionLogging");
+        }
+        sslGlobalParams.disableNonSSLConnectionLoggingSet = true;
+        return Status::OK();
+    }
+} disableNonSSLConnectionLogging;
+
+class DisableNonTLSConnectionLoggingParameter
+    : public ExportedServerParameter<bool, ServerParameterType::kStartupOnly> {
+public:
+    DisableNonTLSConnectionLoggingParameter()
+        : ExportedServerParameter<bool, ServerParameterType::kStartupOnly>(
+              ServerParameterSet::getGlobal(),
+              "disableNonTLSConnectionLogging",
+              &sslGlobalParams.disableNonSSLConnectionLogging) {}
+    Status validate(const bool& potentialNewValue) final {
+        if (sslGlobalParams.disableNonSSLConnectionLoggingSet) {
+            return Status(ErrorCodes::BadValue,
+                          "Error parsing command line: Multiple occurrences of option "
+                          "disableNonTLSConnectionLogging");
+        }
+        sslGlobalParams.disableNonSSLConnectionLoggingSet = true;
+        return Status::OK();
+    }
+} disableNonTLSConnectionLogging;
 
 #ifdef MONGO_CONFIG_SSL
 
@@ -192,7 +228,14 @@ std::string x509OidToShortName(const std::string& name) {
     return it->second;
 }
 #endif
+
+const auto getTLSVersionCounts = ServiceContext::declareDecoration<TLSVersionCounts>();
+
 }  // namespace
+
+TLSVersionCounts& TLSVersionCounts::get(ServiceContext* serviceContext) {
+    return getTLSVersionCounts(serviceContext);
+}
 
 MONGO_INITIALIZER_WITH_PREREQUISITES(SSLManagerLogger, ("SSLManager", "GlobalLogManager"))
 (InitializerContext*) {
@@ -206,6 +249,7 @@ MONGO_INITIALIZER_WITH_PREREQUISITES(SSLManagerLogger, ("SSLManager", "GlobalLog
             LOG(1) << "Server Certificate Expiration: " << config.serverCertificateExpirationDate;
         }
     }
+
     return Status::OK();
 }
 
@@ -683,6 +727,32 @@ std::string escapeRfc2253(StringData str) {
 
     return ret;
 }
+
+/**
+ * Status section of which tls versions connected to MongoDB and completed an SSL handshake.
+ * Note: Clients are only not counted if they try to connect to the server with a unsupported TLS
+ * version. They are still counted if the server rejects them for certificate issues in
+ * parseAndValidatePeerCertificate.
+ */
+class TLSVersionSatus : public ServerStatusSection {
+public:
+    TLSVersionSatus() : ServerStatusSection("transportSecurity") {}
+
+    bool includeByDefault() const final {
+        return true;
+    }
+
+    BSONObj generateSection(OperationContext* opCtx, const BSONElement& configElement) const final {
+        auto& counts = TLSVersionCounts::get(opCtx->getServiceContext());
+
+        BSONObjBuilder builder;
+        builder.append("1.0", counts.tls10.load());
+        builder.append("1.1", counts.tls11.load());
+        builder.append("1.2", counts.tls12.load());
+        return builder.obj();
+    }
+} tlsVersionStatus;
+
 
 #endif
 

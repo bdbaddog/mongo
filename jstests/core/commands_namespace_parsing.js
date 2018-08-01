@@ -54,8 +54,6 @@
     assert.commandWorked(isMaster);
     const isMongos = (isMaster.msg === "isdbgrid");
 
-    const isMMAPv1 = (jsTest.options().storageEngine === "mmapv1");
-
     db.commands_namespace_parsing.drop();
     assert.writeOK(db.commands_namespace_parsing.insert({a: 1}));
 
@@ -144,12 +142,6 @@
                                              isNotAdminCommand);
 
     if (!isMongos) {
-        // Test parallelCollectionScan fails with an invalid collection name.
-        assertFailsWithInvalidNamespacesForField("parallelCollectionScan",
-                                                 {parallelCollectionScan: "", numCursors: 10},
-                                                 isNotFullyQualified,
-                                                 isNotAdminCommand);
-
         // Test godinsert fails with an invalid collection name.
         assertFailsWithInvalidNamespacesForField(
             "godinsert", {godinsert: "", obj: {_id: 1}}, isNotFullyQualified, isNotAdminCommand);
@@ -319,13 +311,9 @@
         isNotAdminCommand);
 
     // Test reIndex fails with an invalid collection name.
-    assertFailsWithInvalidNamespacesForField(
-        "reIndex", {reIndex: ""}, isNotFullyQualified, isNotAdminCommand);
-
-    if (isMMAPv1 && !isMongos) {
-        // Test touch fails with an invalid collection name.
+    if (!isMongos) {
         assertFailsWithInvalidNamespacesForField(
-            "touch", {touch: "", data: true, index: true}, isNotFullyQualified, isNotAdminCommand);
+            "reIndex", {reIndex: ""}, isNotFullyQualified, isNotAdminCommand);
     }
 
     // Test collStats fails with an invalid collection name.

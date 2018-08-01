@@ -38,11 +38,8 @@
 #include "mongo/db/dbmessage.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/service_context.h"
-#include "mongo/db/service_context_noop.h"
-#include "mongo/db/service_context_registrar.h"
 #include "mongo/platform/atomic_word.h"
 #include "mongo/platform/random.h"
-#include "mongo/rpc/command_request.h"
 #include "mongo/rpc/factory.h"
 #include "mongo/rpc/message.h"
 #include "mongo/rpc/reply_builder_interface.h"
@@ -84,10 +81,6 @@ boost::optional<HostAndPort> extractHostInfo(const OpMsgRequest& request) {
     }
     return boost::none;
 }
-
-ServiceContextRegistrar serviceContextCreator([]() {
-    return std::make_unique<ServiceContextNoop>();
-});
 
 }  // namespace
 
@@ -142,7 +135,7 @@ private:
     HostSettingsMap _settings;
 };
 
-const ServiceContextNoop::Decoration<BridgeContext> BridgeContext::_get =
+const ServiceContext::Decoration<BridgeContext> BridgeContext::_get =
     ServiceContext::declareDecoration<BridgeContext>();
 
 BridgeContext* BridgeContext::get() {
@@ -294,7 +287,7 @@ DbResponse ServiceEntryPointBridge::handleRequest(OperationContext* opCtx, const
     boost::optional<OpMsgRequest> cmdRequest;
     if ((request.operation() == dbQuery &&
          NamespaceString(DbMessage(request).getns()).isCommand()) ||
-        request.operation() == dbCommand || request.operation() == dbMsg) {
+        request.operation() == dbMsg) {
         cmdRequest = rpc::opMsgRequestFromAnyProtocol(request);
 
         dest.extractHostInfo(*cmdRequest);
@@ -310,14 +303,12 @@ DbResponse ServiceEntryPointBridge::handleRequest(OperationContext* opCtx, const
         invariant(!isFireAndForgetCommand);
 
         auto replyBuilder = rpc::makeReplyBuilder(rpc::protocolForMessage(request));
-        BSONObj metadata;
         BSONObj reply;
         StatusWith<BSONObj> commandReply(reply);
         if (!status->isOK()) {
             commandReply = StatusWith<BSONObj>(*status);
         }
-        return {
-            replyBuilder->setCommandReply(std::move(commandReply)).setMetadata(metadata).done()};
+        return {replyBuilder->setCommandReply(std::move(commandReply)).done()};
     }
 
 
@@ -356,10 +347,10 @@ DbResponse ServiceEntryPointBridge::handleRequest(OperationContext* opCtx, const
     uassertStatusOK(dest->sinkMessage(request));
 
     // Send the message we received from 'source' to 'dest'. 'dest' returns a response for
-    // OP_QUERY, OP_GET_MORE, and OP_COMMAND messages that we respond with.
+    // OP_QUERY, OP_GET_MORE, and OP_MSG messages that we respond with.
     if (!isFireAndForgetCommand &&
         (request.operation() == dbQuery || request.operation() == dbGetMore ||
-         request.operation() == dbCommand || request.operation() == dbMsg)) {
+         request.operation() == dbMsg)) {
         // TODO dbMsg moreToCome
         // Forward the message to 'dest' and receive its reply in 'response'.
         auto response = uassertStatusOK(dest->sourceMessage());
@@ -419,6 +410,7 @@ int bridgeMain(int argc, char** argv, char** envp) {
     runGlobalInitializersOrDie(argc, argv, envp);
     startSignalProcessingThread(LogFileStatus::kNoLogFileToRotate);
 
+    setGlobalServiceContext(ServiceContext::make());
     auto serviceContext = getGlobalServiceContext();
     serviceContext->setServiceEntryPoint(std::make_unique<ServiceEntryPointBridge>(serviceContext));
     serviceContext->setServiceExecutor(

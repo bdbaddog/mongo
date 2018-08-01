@@ -66,8 +66,10 @@ public:
 
     virtual void deleteRecord(OperationContext* opCtx, const RecordId& dl);
 
-    virtual StatusWith<RecordId> insertRecord(
-        OperationContext* opCtx, const char* data, int len, Timestamp, bool enforceQuota);
+    virtual StatusWith<RecordId> insertRecord(OperationContext* opCtx,
+                                              const char* data,
+                                              int len,
+                                              Timestamp);
 
     virtual Status insertRecordsWithDocWriter(OperationContext* opCtx,
                                               const DocWriter* const* docs,
@@ -79,7 +81,6 @@ public:
                                 const RecordId& oldLocation,
                                 const char* data,
                                 int len,
-                                bool enforceQuota,
                                 UpdateNotifier* notifier);
 
     virtual bool updateWithDamagesSupported() const;
@@ -108,8 +109,6 @@ public:
                                    double scale) const;
 
     virtual Status touch(OperationContext* opCtx, BSONObjBuilder* output) const;
-
-    virtual void increaseStorageSize(OperationContext* opCtx, int size, bool enforceQuota);
 
     virtual int64_t storageSize(OperationContext* opCtx,
                                 BSONObjBuilder* extraInfo = NULL,

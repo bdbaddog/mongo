@@ -30,7 +30,7 @@
 
 #include "vm/PosixNSPR.h"
 
-#include "mongo/client/dbclientcursor.h"
+#include "mongo/client/dbclient_cursor.h"
 #include "mongo/scripting/mozjs/engine.h"
 #include "mongo/stdx/condition_variable.h"
 #include "mongo/stdx/functional.h"
@@ -121,8 +121,6 @@ public:
     void registerOperation(OperationContext* opCtx) override;
 
     void unregisterOperation() override;
-
-    void localConnectForDbEval(OperationContext* opCtx, const char* dbName) override;
 
     void externalSetup() override;
 

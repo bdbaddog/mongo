@@ -34,6 +34,7 @@
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/commands/test_commands_enabled.h"
+#include "mongo/db/commands/txn_cmds_gen.h"
 #include "mongo/db/op_observer.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/repl/repl_client_info.h"
@@ -73,6 +74,9 @@ public:
              const std::string& dbname,
              const BSONObj& cmdObj,
              BSONObjBuilder& result) override {
+        IDLParserErrorContext ctx("commitTransaction");
+        auto cmd = CommitTransaction::parse(ctx, cmdObj);
+
         auto session = OperationContextSession::get(opCtx);
         uassert(
             ErrorCodes::CommandFailed, "commitTransaction must be run within a session", session);
@@ -91,7 +95,14 @@ public:
                 "Transaction isn't in progress",
                 session->inMultiDocumentTransaction());
 
-        session->commitTransaction(opCtx);
+        auto optionalCommitTimestamp = cmd.getCommitTimestamp();
+        if (optionalCommitTimestamp) {
+            // commitPreparedTransaction will throw if the transaction is not prepared.
+            session->commitPreparedTransaction(opCtx, optionalCommitTimestamp.get());
+        } else {
+            // commitUnpreparedTransaction will throw if the transaction is prepared.
+            session->commitUnpreparedTransaction(opCtx);
+        }
 
         return true;
     }
@@ -136,7 +147,9 @@ public:
                 "Transaction isn't in progress",
                 session->inMultiDocumentTransaction());
 
-        session->prepareTransaction(opCtx);
+        // Add prepareTimestamp to the command response.
+        auto timestamp = session->prepareTransaction(opCtx);
+        result.append("prepareTimestamp", timestamp);
         return true;
     }
 };

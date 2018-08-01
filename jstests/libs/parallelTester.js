@@ -248,7 +248,6 @@ if (typeof _threadInject != "undefined") {
             // databases, with the exception of tests which modify slowms or the profiler's sampling
             // rate, since those affect profile settings globally.
             parallelFilesDir + "/apitest_db_profile_level.js",
-            parallelFilesDir + "/evalb.js",
             parallelFilesDir + "/geo_s2cursorlimitskip.js",
             parallelFilesDir + "/profile1.js",
             parallelFilesDir + "/profile2.js",
@@ -265,7 +264,7 @@ if (typeof _threadInject != "undefined") {
             parallelFilesDir + "/profile_list_indexes.js",
             parallelFilesDir + "/profile_mapreduce.js",
             parallelFilesDir + "/profile_no_such_db.js",
-            parallelFilesDir + "/profile_parallel_collection_scan.js",
+            parallelFilesDir + "/profile_query_hash.js",
             parallelFilesDir + "/profile_repair_cursor.js",
             parallelFilesDir + "/profile_sampling.js",
             parallelFilesDir + "/profile_update.js",

@@ -162,6 +162,19 @@ const RecordId& IndexCatalogEntryImpl::head(OperationContext* opCtx) const {
 }
 
 bool IndexCatalogEntryImpl::isReady(OperationContext* opCtx) const {
+    auto session = OperationContextSession::get(opCtx);
+    // For multi-document transactions, we can open a snapshot prior to checking the
+    // minimumSnapshotVersion on a collection.  This means we are unprotected from reading
+    // out-of-sync index catalog entries.  To fix this, we uassert if we detect that the
+    // in-memory catalog is out-of-sync with the on-disk catalog.
+    if (session && session->inMultiDocumentTransaction()) {
+        if (!_catalogIsPresent(opCtx) || _catalogIsReady(opCtx) != _isReady) {
+            uasserted(ErrorCodes::SnapshotUnavailable,
+                      str::stream() << "Unable to read from a snapshot due to pending collection"
+                                       " catalog changes; please retry the operation.");
+        }
+    }
+
     DEV invariant(_isReady == _catalogIsReady(opCtx));
     return _isReady;
 }
@@ -347,6 +360,10 @@ bool IndexCatalogEntryImpl::_catalogIsReady(OperationContext* opCtx) const {
 
 RecordId IndexCatalogEntryImpl::_catalogHead(OperationContext* opCtx) const {
     return _collection->getIndexHead(opCtx, _descriptor->indexName());
+}
+
+bool IndexCatalogEntryImpl::_catalogIsPresent(OperationContext* opCtx) const {
+    return _collection->isIndexPresent(opCtx, _descriptor->indexName());
 }
 
 bool IndexCatalogEntryImpl::_catalogIsMultikey(OperationContext* opCtx,

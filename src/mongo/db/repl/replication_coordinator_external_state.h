@@ -110,12 +110,6 @@ public:
     virtual ThreadPool* getDbWorkThreadPool() const = 0;
 
     /**
-     * Runs the repair database command on the "local" db, if the storage engine is MMapV1.
-     * Note: Used after initial sync to compact the database files.
-     */
-    virtual Status runRepairOnLocalDB(OperationContext* opCtx) = 0;
-
-    /**
      * Creates the oplog, writes the first entry and stores the replica set config document.
      */
     virtual Status initializeReplSetStorage(OperationContext* opCtx, const BSONObj& config) = 0;
@@ -141,13 +135,12 @@ public:
      * state. See the call site in ReplicationCoordinatorImpl for details about when and how it is
      * called.
      *
-     * Among other things, this writes a message about our transition to primary to the oplog if
-     * isV1 and and returns the optime of that message. If !isV1, returns the optime of the last op
-     * in the oplog.
+     * Among other things, this writes a message about our transition to primary to the oplog and
+     * returns the optime of that message.
      *
      * Throws on errors.
      */
-    virtual OpTime onTransitionToPrimary(OperationContext* opCtx, bool isV1ElectionProtocol) = 0;
+    virtual OpTime onTransitionToPrimary(OperationContext* opCtx) = 0;
 
     /**
      * Simple wrapper around SyncSourceFeedback::forwardSlaveProgress.  Signals to the
@@ -287,9 +280,15 @@ public:
 
     /**
      * Returns maximum number of times that the oplog fetcher will consecutively restart the oplog
-     * tailing query on non-cancellation errors.
+     * tailing query on non-cancellation errors during steady state replication.
      */
-    virtual std::size_t getOplogFetcherMaxFetcherRestarts() const = 0;
+    virtual std::size_t getOplogFetcherSteadyStateMaxFetcherRestarts() const = 0;
+
+    /**
+     * Returns maximum number of times that the oplog fetcher will consecutively restart the oplog
+     * tailing query on non-cancellation errors during initial sync.
+     */
+    virtual std::size_t getOplogFetcherInitialSyncMaxFetcherRestarts() const = 0;
 
     /*
      * Creates noop writer instance. Setting the _noopWriter member is not protected by a guard,

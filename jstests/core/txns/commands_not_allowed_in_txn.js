@@ -50,7 +50,7 @@
             startTransaction: true,
             autocommit: false
         })),
-                                     [50767, 50768, 50851]);
+                                     ErrorCodes.OperationNotSupportedInTransaction);
         assert.commandFailedWithCode(sessionDb.adminCommand({
             commitTransaction: 1,
             txnNumber: NumberLong(txnNumber),
@@ -75,7 +75,7 @@
                 {},
                 command,
                 {txnNumber: NumberLong(txnNumber), stmtId: NumberInt(1), autocommit: false})),
-            [50767, 50768, 50851]);
+            ErrorCodes.OperationNotSupportedInTransaction);
         assert.commandWorked(sessionDb.adminCommand({
             commitTransaction: 1,
             txnNumber: NumberLong(txnNumber),
@@ -94,11 +94,8 @@
         {count: collName, query: {a: 1}},
         {applyOps: [{op: "u", ns: testColl.getFullName(), o2: {_id: 0}, o: {$set: {a: 5}}}]},
         {explain: {find: collName}},
-        {eval: "function() {return 1;}"},
-        {"$eval": "function() {return 1;}"},
         {filemd5: 1, root: "fs"},
         {mapReduce: collName, map: function() {}, reduce: function(key, vals) {}, out: "out"},
-        {parallelCollectionScan: collName, numCursors: 1},
     ];
 
     sessionCommands.forEach(testCommand);
@@ -109,6 +106,10 @@
     //
 
     const nonSessionCommands = [
+        {isMaster: 1},
+        {buildInfo: 1},
+        {ping: 1},
+        {listCommands: 1},
         {create: "create_collection", writeConcern: {w: "majority"}},
         {drop: "drop_collection", writeConcern: {w: "majority"}},
         {
@@ -124,7 +125,7 @@
         setup();
         assert.commandFailedWithCode(
             sessionDb.runCommand(Object.assign({}, command, {txnNumber: NumberLong(++txnNumber)})),
-            50768);
+            [50768, 50889]);
     });
 
     //

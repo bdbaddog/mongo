@@ -44,7 +44,6 @@
 #include "mongo/db/repl/repl_settings.h"
 #include "mongo/db/server_options.h"
 #include "mongo/db/server_options_server_helpers.h"
-#include "mongo/db/storage/mmap_v1/mmap_v1_options.h"
 #include "mongo/util/log.h"
 #include "mongo/util/mongoutils/str.h"
 #include "mongo/util/net/ssl_options.h"
@@ -68,15 +67,6 @@ Status addMongodOptions(moe::OptionSection* options) {
     moe::OptionSection windows_scm_options("Windows Service Control Manager options");
 
     ret = addWindowsServerOptions(&windows_scm_options);
-    if (!ret.isOK()) {
-        return ret;
-    }
-#endif
-
-#ifdef MONGO_CONFIG_SSL
-    moe::OptionSection ssl_options("SSL options");
-
-    ret = addSSLServerOptions(&ssl_options);
     if (!ret.isOK()) {
         return ret;
     }
@@ -222,42 +212,6 @@ Status addMongodOptions(moe::OptionSection* options) {
         .setSources(moe::SourceAllLegacy);
 
     storage_options
-        .addOptionChaining("storage.mmapv1.preallocDataFiles",
-                           "",
-                           moe::Bool,
-                           "disable data file preallocation - will often hurt performance",
-                           "storage.preallocDataFiles")
-        .setSources(moe::SourceYAMLConfig);
-
-    storage_options
-        .addOptionChaining("storage.mmapv1.nsSize",
-                           "nssize",
-                           moe::Int,
-                           ".ns file size (in MB) for new databases",
-                           "storage.nsSize")
-        .setDefault(moe::Value(16));
-
-    storage_options
-        .addOptionChaining("storage.mmapv1.quota.enforced",
-                           "quota",
-                           moe::Switch,
-                           "limits each database to a certain number of files (8 default)",
-                           "storage.quota.enforced")
-        .incompatibleWith("keyFile");
-
-    storage_options.addOptionChaining("storage.mmapv1.quota.maxFilesPerDB",
-                                      "quotaFiles",
-                                      moe::Int,
-                                      "number of files allowed per db, implies --quota",
-                                      "storage.quota.maxFilesPerDB");
-
-    storage_options.addOptionChaining("storage.mmapv1.smallFiles",
-                                      "smallfiles",
-                                      moe::Switch,
-                                      "use a smaller default file size",
-                                      "storage.smallFiles");
-
-    storage_options
         .addOptionChaining("storage.syncPeriodSecs",
                            "syncdelay",
                            moe::Double,
@@ -271,11 +225,6 @@ Status addMongodOptions(moe::OptionSection* options) {
 
     storage_options.addOptionChaining("repair", "repair", moe::Switch, "run repair on all dbs")
         .setSources(moe::SourceAllLegacy);
-
-    storage_options.addOptionChaining("storage.repairPath",
-                                      "repairpath",
-                                      moe::String,
-                                      "root directory for repair files - defaults to dbpath");
 
     // Javascript Options
 
@@ -318,36 +267,6 @@ Status addMongodOptions(moe::OptionSection* options) {
     // Way to enable or disable journaling in JSON Config
     general_options.addOptionChaining("storage.journal.enabled", "", moe::Bool, "enable journaling")
         .setSources(moe::SourceYAMLConfig);
-
-    // Two ways to set durability diagnostic options.  durOptions is deprecated
-    storage_options
-        .addOptionChaining("storage.mmapv1.journal.debugFlags",
-                           "journalOptions",
-                           moe::Int,
-                           "journal diagnostic options",
-                           "storage.journal.debugFlags")
-        .incompatibleWith("durOptions");
-
-    storage_options
-        .addOptionChaining("durOptions", "durOptions", moe::Int, "durability diagnostic options")
-        .hidden()
-        .setSources(moe::SourceAllLegacy)
-        .incompatibleWith("storage.mmapv1.journal.debugFlags");
-
-    storage_options.addOptionChaining("storage.journal.commitIntervalMs",
-                                      "journalCommitInterval",
-                                      moe::Int,
-                                      "how often to group/batch commit (ms)",
-                                      "storage.mmapv1.journal.commitIntervalMs");
-
-    // Deprecated option that we don't want people to use for performance reasons
-    storage_options
-        .addOptionChaining("storage.mmapv1.journal.nopreallocj",
-                           "nopreallocj",
-                           moe::Switch,
-                           "don't preallocate journal files")
-        .hidden()
-        .setSources(moe::SourceAll);
 
 #if defined(__linux__)
     general_options.addOptionChaining(
@@ -478,9 +397,6 @@ Status addMongodOptions(moe::OptionSection* options) {
     options->addSection(replication_options).transitional_ignore();
     options->addSection(rs_options).transitional_ignore();
     options->addSection(sharding_options).transitional_ignore();
-#ifdef MONGO_CONFIG_SSL
-    options->addSection(ssl_options).transitional_ignore();
-#endif
     options->addSection(storage_options).transitional_ignore();
 
     // The following are legacy options that are disallowed in the JSON config file
@@ -616,13 +532,6 @@ Status canonicalizeMongodOptions(moe::Environment* params) {
         return ret;
     }
 
-#ifdef MONGO_CONFIG_SSL
-    ret = canonicalizeSSLServerOptions(params);
-    if (!ret.isOK()) {
-        return ret;
-    }
-#endif
-
     // "storage.journal.enabled" comes from the config file, so override it if any of "journal",
     // "nojournal", "dur", and "nodur" are set, since those come from the command line.
     if (params->count("journal")) {
@@ -670,24 +579,6 @@ Status canonicalizeMongodOptions(moe::Environment* params) {
         }
     }
 
-    // "storage.mmapv1.journal.durOptions" comes from the config file, so override it
-    // if "durOptions" is set since that comes from the command line.
-    if (params->count("durOptions")) {
-        int durOptions;
-        Status ret = params->get("durOptions", &durOptions);
-        if (!ret.isOK()) {
-            return ret;
-        }
-        ret = params->remove("durOptions");
-        if (!ret.isOK()) {
-            return ret;
-        }
-        ret = params->set("storage.mmapv1.journal.debugFlags", moe::Value(durOptions));
-        if (!ret.isOK()) {
-            return ret;
-        }
-    }
-
     // "security.authorization" comes from the config file, so override it if "auth" is
     // set since those come from the command line.
     if (params->count("auth")) {
@@ -699,20 +590,6 @@ Status canonicalizeMongodOptions(moe::Environment* params) {
             return ret;
         }
         ret = params->remove("auth");
-        if (!ret.isOK()) {
-            return ret;
-        }
-    }
-
-    // "storage.mmapv1.preallocDataFiles" comes from the config file, so override it if "noprealloc"
-    // is set since that comes from the command line.
-    if (params->count("noprealloc")) {
-        Status ret = params->set("storage.mmapv1.preallocDataFiles",
-                                 moe::Value(!(*params)["noprealloc"].as<bool>()));
-        if (!ret.isOK()) {
-            return ret;
-        }
-        ret = params->remove("noprealloc");
         if (!ret.isOK()) {
             return ret;
         }
@@ -935,13 +812,6 @@ Status storeMongodOptions(const moe::Environment& params) {
     if (params.count("cpu")) {
         serverGlobalParams.cpu = params["cpu"].as<bool>();
     }
-    if (params.count("storage.mmapv1.quota.enforced")) {
-        mmapv1GlobalOptions.quota = params["storage.mmapv1.quota.enforced"].as<bool>();
-    }
-    if (params.count("storage.mmapv1.quota.maxFilesPerDB")) {
-        mmapv1GlobalOptions.quota = true;
-        mmapv1GlobalOptions.quotaFiles = params["storage.mmapv1.quota.maxFilesPerDB"].as<int>() - 1;
-    }
 
     if (params.count("storage.journal.enabled")) {
         storageGlobalParams.dur = params["storage.journal.enabled"].as<bool>();
@@ -961,12 +831,6 @@ Status storeMongodOptions(const moe::Environment& params) {
                                         << "ms)");
         }
     }
-    if (params.count("storage.mmapv1.journal.debugFlags")) {
-        mmapv1GlobalOptions.journalOptions = params["storage.mmapv1.journal.debugFlags"].as<int>();
-    }
-    if (params.count("storage.mmapv1.journal.nopreallocj")) {
-        mmapv1GlobalOptions.preallocj = !params["storage.mmapv1.journal.nopreallocj"].as<bool>();
-    }
 
     if (params.count("security.javascriptEnabled")) {
         mongodGlobalParams.scriptingEnabled = params["security.javascriptEnabled"].as<bool>();
@@ -982,14 +846,6 @@ Status storeMongodOptions(const moe::Environment& params) {
                       intermediates.end(),
                       std::back_inserter(*mongodGlobalParams.whitelistedClusterNetwork));
         }
-    }
-
-    if (params.count("storage.mmapv1.preallocDataFiles")) {
-        mmapv1GlobalOptions.prealloc = params["storage.mmapv1.preallocDataFiles"].as<bool>();
-        log() << "note: noprealloc may hurt performance in many applications" << endl;
-    }
-    if (params.count("storage.mmapv1.smallFiles")) {
-        mmapv1GlobalOptions.smallfiles = params["storage.mmapv1.smallFiles"].as<bool>();
     }
 
     if (params.count("repair") && params["repair"].as<bool>() == true) {
@@ -1028,14 +884,6 @@ Status storeMongodOptions(const moe::Environment& params) {
         serverGlobalParams.indexBuildRetry = params["storage.indexBuildRetry"].as<bool>();
     }
 
-    if (params.count("storage.mmapv1.nsSize")) {
-        int x = params["storage.mmapv1.nsSize"].as<int>();
-        if (x <= 0 || x > (0x7fffffff / 1024 / 1024)) {
-            return Status(ErrorCodes::BadValue, "bad --nssize arg");
-        }
-        mmapv1GlobalOptions.lenForNewNsFiles = x * 1024 * 1024;
-        verify(mmapv1GlobalOptions.lenForNewNsFiles > 0);
-    }
     if (params.count("replication.oplogSizeMB")) {
         long long x = params["replication.oplogSizeMB"].as<int>();
         if (x <= 0) {
@@ -1133,23 +981,6 @@ Status storeMongodOptions(const moe::Environment& params) {
         storageGlobalParams.dbpath = currentPath.root_name().string() + storageGlobalParams.dbpath;
     }
 #endif
-
-    // needs to be after things like --configsvr parsing, thus here.
-    if (params.count("storage.repairPath")) {
-        storageGlobalParams.repairpath = params["storage.repairPath"].as<std::string>();
-        if (!storageGlobalParams.repairpath.size()) {
-            return Status(ErrorCodes::BadValue, "repairpath is empty");
-        }
-
-        if (storageGlobalParams.dur &&
-            !str::startsWith(storageGlobalParams.repairpath, storageGlobalParams.dbpath)) {
-            return Status(ErrorCodes::BadValue,
-                          "You must use a --repairpath that is a subdirectory of --dbpath when "
-                          "using journaling");
-        }
-    } else {
-        storageGlobalParams.repairpath = storageGlobalParams.dbpath;
-    }
 
     // Check if we are 32 bit and have not explicitly specified any journaling options
     if (sizeof(void*) == 4 && !params.count("storage.journal.enabled")) {

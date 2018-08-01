@@ -103,23 +103,11 @@ public:
             }
         }
 
-        auto restoreOplogPointerGuard = MakeGuard([opCtx]() {
-            auto db = DatabaseHolder::getDatabaseHolder().openDb(
-                opCtx, NamespaceString::kRsOplogNamespace.db());
-            invariant(db, "failed to reopen database after early exit from restartCatalog");
-
-            auto oplog = db->getCollection(opCtx, NamespaceString::kRsOplogNamespace);
-            invariant(oplog, "failed to get oplog after early exit from restartCatalog");
-            repl::establishOplogCollectionForLogging(opCtx, oplog);
-        });
-
         log() << "Closing database catalog";
-        catalog::closeCatalog(opCtx);
-
-        restoreOplogPointerGuard.Dismiss();
+        auto state = catalog::closeCatalog(opCtx);
 
         log() << "Reopening database catalog";
-        catalog::openCatalog(opCtx);
+        catalog::openCatalog(opCtx, state);
 
         return true;
     }

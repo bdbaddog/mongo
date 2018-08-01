@@ -50,9 +50,17 @@
 #include "mongo/db/pipeline/document_source_unwind.h"
 #include "mongo/db/pipeline/expression.h"
 #include "mongo/db/pipeline/expression_context.h"
+#include "mongo/util/fail_point_service.h"
 #include "mongo/util/mongoutils/str.h"
 
 namespace mongo {
+
+/**
+ * Enabling the disablePipelineOptimization fail point will stop the aggregate command from
+ * attempting to optimize the pipeline or the pipeline stages. Neither DocumentSource::optimizeAt()
+ * nor DocumentSource::optimize() will be attempted.
+ */
+MONGO_FAIL_POINT_DEFINE(disablePipelineOptimization);
 
 using boost::intrusive_ptr;
 using std::endl;
@@ -232,7 +240,7 @@ void Pipeline::validateCommon() const {
                 !(constraints.hostRequirement == HostTypeRequirement::kMongoS && !pCtx->inMongos));
 
         if (pCtx->inMultiDocumentTransaction) {
-            uassert(50742,
+            uassert(ErrorCodes::OperationNotSupportedInTransaction,
                     str::stream() << "Stage not supported inside of a multi-document transaction: "
                                   << stage->getSourceName(),
                     constraints.isAllowedInTransaction());
@@ -241,6 +249,11 @@ void Pipeline::validateCommon() const {
 }
 
 void Pipeline::optimizePipeline() {
+    // If the disablePipelineOptimization failpoint is enabled, the pipeline won't be optimized.
+    if (MONGO_FAIL_POINT(disablePipelineOptimization)) {
+        return;
+    }
+
     SourceContainer optimizedSources;
 
     SourceContainer::iterator itr = _sources.begin();
@@ -315,6 +328,11 @@ void Pipeline::dispose(OperationContext* opCtx) {
     } catch (...) {
         std::terminate();
     }
+}
+
+bool Pipeline::usedDisk() {
+    return std::any_of(
+        _sources.begin(), _sources.end(), [](const auto& stage) { return stage->usedDisk(); });
 }
 
 std::unique_ptr<Pipeline, PipelineDeleter> Pipeline::splitForSharded() {
@@ -487,11 +505,11 @@ DepsTracker Pipeline::getDependencies(DepsTracker::MetadataAvailable metadataAva
     bool knowAllMeta = false;
     for (auto&& source : _sources) {
         DepsTracker localDeps(deps.getMetadataAvailable());
-        DocumentSource::GetDepsReturn status = source->getDependencies(&localDeps);
+        DepsTracker::State status = source->getDependencies(&localDeps);
 
         deps.vars.insert(localDeps.vars.begin(), localDeps.vars.end());
 
-        if ((skipFieldsAndMetadataDeps |= (status == DocumentSource::NOT_SUPPORTED))) {
+        if ((skipFieldsAndMetadataDeps |= (status == DepsTracker::State::NOT_SUPPORTED))) {
             // Assume this stage needs everything. We may still know something about our
             // dependencies if an earlier stage returned EXHAUSTIVE_FIELDS or EXHAUSTIVE_META. If
             // this scope has variables, we need to keep enumerating the remaining stages but will
@@ -507,14 +525,14 @@ DepsTracker Pipeline::getDependencies(DepsTracker::MetadataAvailable metadataAva
             deps.fields.insert(localDeps.fields.begin(), localDeps.fields.end());
             if (localDeps.needWholeDocument)
                 deps.needWholeDocument = true;
-            knowAllFields = status & DocumentSource::EXHAUSTIVE_FIELDS;
+            knowAllFields = status & DepsTracker::State::EXHAUSTIVE_FIELDS;
         }
 
         if (!knowAllMeta) {
             for (auto&& req : localDeps.getAllRequiredMetadataTypes()) {
                 deps.setNeedsMetadata(req, true);
             }
-            knowAllMeta = status & DocumentSource::EXHAUSTIVE_META;
+            knowAllMeta = status & DepsTracker::State::EXHAUSTIVE_META;
         }
 
         // If there are variables defined at this pipeline's scope, there may be dependencies upon

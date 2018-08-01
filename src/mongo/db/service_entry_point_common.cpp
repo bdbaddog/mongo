@@ -65,8 +65,10 @@
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/s/implicit_create_collection.h"
 #include "mongo/db/s/operation_sharding_state.h"
+#include "mongo/db/s/scoped_operation_completion_sharding_actions.h"
 #include "mongo/db/s/shard_filtering_metadata_refresh.h"
 #include "mongo/db/s/sharded_connection_info.h"
+#include "mongo/db/s/sharding_config_optime_gossip.h"
 #include "mongo/db/s/sharding_state.h"
 #include "mongo/db/service_entry_point_common.h"
 #include "mongo/db/session_catalog.h"
@@ -111,13 +113,12 @@ const StringMap<int> sessionCheckoutWhitelist = {{"abortTransaction", 1},
                                                  {"aggregate", 1},
                                                  {"applyOps", 1},
                                                  {"commitTransaction", 1},
+                                                 {"coordinateCommitTransaction", 1},
                                                  {"count", 1},
                                                  {"dbHash", 1},
                                                  {"delete", 1},
                                                  {"distinct", 1},
                                                  {"doTxn", 1},
-                                                 {"eval", 1},
-                                                 {"$eval", 1},
                                                  {"explain", 1},
                                                  {"filemd5", 1},
                                                  {"find", 1},
@@ -130,7 +131,6 @@ const StringMap<int> sessionCheckoutWhitelist = {{"abortTransaction", 1},
                                                  {"insert", 1},
                                                  {"killCursors", 1},
                                                  {"mapReduce", 1},
-                                                 {"parallelCollectionScan", 1},
                                                  {"prepareTransaction", 1},
                                                  {"refreshLogicalSessionCacheNow", 1},
                                                  {"update", 1}};
@@ -148,13 +148,13 @@ bool shouldActivateFailCommandFailPoint(const BSONObj& data, StringData cmdName)
     return false;
 }
 
-void generateLegacyQueryErrorResponse(const AssertionException* exception,
+void generateLegacyQueryErrorResponse(const AssertionException& exception,
                                       const QueryMessage& queryMessage,
                                       CurOp* curop,
                                       Message* response) {
-    curop->debug().errInfo = exception->toStatus();
+    curop->debug().errInfo = exception.toStatus();
 
-    log(LogComponent::kQuery) << "assertion " << exception->toString() << " ns:" << queryMessage.ns
+    log(LogComponent::kQuery) << "assertion " << exception.toString() << " ns:" << queryMessage.ns
                               << " query:" << (queryMessage.query.valid(BSONVersion::kLatest)
                                                    ? redact(queryMessage.query)
                                                    : "query object is corrupt");
@@ -163,20 +163,18 @@ void generateLegacyQueryErrorResponse(const AssertionException* exception,
                                   << " ntoreturn:" << queryMessage.ntoreturn;
     }
 
-    auto scex = exception->extraInfo<StaleConfigInfo>();
-
     BSONObjBuilder err;
-    err.append("$err", exception->reason());
-    err.append("code", exception->code());
-    if (scex) {
-        err.append("ok", 0.0);
-        err.append("ns", scex->getNss().ns());
-        scex->getVersionReceived().addToBSON(err, "vReceived");
-        scex->getVersionWanted().addToBSON(err, "vWanted");
+    err.append("$err", exception.reason());
+    err.append("code", exception.code());
+    err.append("ok", 0.0);
+    auto const extraInfo = exception.extraInfo();
+    if (extraInfo) {
+        extraInfo->serialize(&err);
     }
     BSONObj errObj = err.done();
 
-    if (scex) {
+    const bool isStaleConfig = exception.code() == ErrorCodes::StaleConfig;
+    if (isStaleConfig) {
         log(LogComponent::kQuery) << "stale version detected during query over " << queryMessage.ns
                                   << " : " << errObj;
     }
@@ -189,8 +187,9 @@ void generateLegacyQueryErrorResponse(const AssertionException* exception,
     QueryResult::View msgdata = bb.buf();
     QueryResult::View qr = msgdata;
     qr.setResultFlags(ResultFlag_ErrSet);
-    if (scex)
+    if (isStaleConfig) {
         qr.setResultFlags(qr.getResultFlags() | ResultFlag_ShardConfigStale);
+    }
     qr.msgdata().setLen(bb.len());
     qr.msgdata().setOperation(opReply);
     qr.setCursorId(0);
@@ -215,7 +214,7 @@ void generateErrorResponse(OperationContext* opCtx,
     // so we need to reset it to a clean state just to be sure.
     replyBuilder->reset();
     replyBuilder->setCommandReply(exception.toStatus(), extraFields);
-    replyBuilder->setMetadata(replyMetadata);
+    replyBuilder->getBodyBuilder().appendElements(replyMetadata);
 }
 
 BSONObj getErrorLabels(const boost::optional<OperationSessionInfoFromClient>& sessionOptions,
@@ -343,6 +342,12 @@ StatusWith<repl::ReadConcernArgs> _extractReadConcern(const CommandInvocation* i
     }
 
     if (!invocation->supportsReadConcern(readConcernArgs.getLevel())) {
+        // We must be in a transaction if the readConcern level was upconverted to snapshot and the
+        // command must support readConcern level snapshot in order to be supported in transactions.
+        if (upconvertToSnapshot) {
+            return {ErrorCodes::OperationNotSupportedInTransaction,
+                    str::stream() << "Command is not supported in a transaction"};
+        }
         return {ErrorCodes::InvalidOptions,
                 str::stream() << "Command does not support read concern "
                               << readConcernArgs.toString()};
@@ -457,7 +462,7 @@ void appendClusterAndOperationTime(OperationContext* opCtx,
 
 void invokeInTransaction(OperationContext* opCtx,
                          CommandInvocation* invocation,
-                         CommandReplyBuilder* replyBuilder) {
+                         rpc::ReplyBuilderInterface* replyBuilder) {
     auto session = OperationContextSession::get(opCtx);
     if (!session) {
         // Run the command directly if we're not in a transaction.
@@ -492,7 +497,6 @@ bool runCommandImpl(OperationContext* opCtx,
                     const boost::optional<OperationSessionInfoFromClient>& sessionOptions) {
     const Command* command = invocation->definition();
     auto bytesToReserve = command->reserveBytesForReply();
-
 // SERVER-22100: In Windows DEBUG builds, the CRT heap debugging overhead, in conjunction with the
 // additional memory pressure introduced by reply buffer pre-allocation, causes the concurrency
 // suite to run extremely slowly. As a workaround we do not pre-allocate in Windows DEBUG builds.
@@ -500,12 +504,11 @@ bool runCommandImpl(OperationContext* opCtx,
     if (kDebugBuild)
         bytesToReserve = 0;
 #endif
-
-    CommandReplyBuilder crb(replyBuilder->getInPlaceReplyBuilder(bytesToReserve));
+    replyBuilder->reserveBytes(bytesToReserve);
 
     if (!invocation->supportsWriteConcern()) {
         behaviors.uassertCommandDoesNotSpecifyWriteConcern(request.body);
-        invokeInTransaction(opCtx, invocation, &crb);
+        invokeInTransaction(opCtx, invocation, replyBuilder);
     } else {
         auto wcResult = uassertStatusOK(extractWriteConcern(opCtx, request.body));
         auto session = OperationContextSession::get(opCtx);
@@ -536,13 +539,13 @@ bool runCommandImpl(OperationContext* opCtx,
         };
 
         try {
-            invokeInTransaction(opCtx, invocation, &crb);
+            invokeInTransaction(opCtx, invocation, replyBuilder);
         } catch (const DBException&) {
             waitForWriteConcern(*extraFieldsBuilder);
             throw;
         }
 
-        waitForWriteConcern(crb.getBodyBuilder());
+        waitForWriteConcern(replyBuilder->getBodyBuilder());
 
         // Nothing in run() should change the writeConcern.
         dassert(SimpleBSONObjComparator::kInstance.evaluate(opCtx->getWriteConcern().toBSON() ==
@@ -552,32 +555,27 @@ bool runCommandImpl(OperationContext* opCtx,
     behaviors.waitForLinearizableReadConcern(opCtx);
 
     const bool ok = [&] {
-        auto body = crb.getBodyBuilder();
+        auto body = replyBuilder->getBodyBuilder();
         return CommandHelpers::extractOrAppendOk(body);
     }();
-    behaviors.attachCurOpErrInfo(opCtx, crb.getBodyBuilder().asTempObj());
+    behaviors.attachCurOpErrInfo(opCtx, replyBuilder->getBodyBuilder().asTempObj());
 
     if (!ok) {
-        auto response = crb.getBodyBuilder().asTempObj();
+        auto response = replyBuilder->getBodyBuilder().asTempObj();
         auto codeField = response["code"];
 
         if (codeField.isNumber()) {
             auto code = ErrorCodes::Error(codeField.numberInt());
             // Append the error labels for transient transaction errors.
             auto errorLabels = getErrorLabels(sessionOptions, command->getName(), code);
-            crb.getBodyBuilder().appendElements(errorLabels);
+            replyBuilder->getBodyBuilder().appendElements(errorLabels);
         }
     }
 
-    BSONObjBuilder metadataBob;
-    appendReplyMetadata(opCtx, request, &metadataBob);
+    auto commandBodyBob = replyBuilder->getBodyBuilder();
+    appendReplyMetadata(opCtx, request, &commandBodyBob);
+    appendClusterAndOperationTime(opCtx, &commandBodyBob, &commandBodyBob, startOperationTime);
 
-    {
-        auto commandBodyBob = crb.getBodyBuilder();
-        appendClusterAndOperationTime(opCtx, &commandBodyBob, &metadataBob, startOperationTime);
-    }
-
-    replyBuilder->setMetadata(metadataBob.obj());
     return ok;
 }
 
@@ -626,6 +624,7 @@ void execCommandDatabase(OperationContext* opCtx,
     auto startOperationTime = getClientOperationTime(opCtx);
     auto invocation = command->parse(opCtx, request);
     boost::optional<OperationSessionInfoFromClient> sessionOptions = boost::none;
+
     try {
         {
             stdx::lock_guard<Client> lk(*opCtx->getClient());
@@ -681,6 +680,10 @@ void execCommandDatabase(OperationContext* opCtx,
         // the Session. Do not check this if we are in DBDirectClient because the outer command is
         // responsible for checking out the Session.
         if (!opCtx->getClient()->isInDirectClient()) {
+            uassert(ErrorCodes::OperationNotSupportedInTransaction,
+                    str::stream() << "It is illegal to run command " << command->getName()
+                                  << " in a multi-document transaction.",
+                    shouldCheckoutSession || !autocommitVal || command->getName() == "doTxn");
             uassert(50768,
                     str::stream() << "It is illegal to provide a txnNumber for command "
                                   << command->getName(),
@@ -800,7 +803,7 @@ void execCommandDatabase(OperationContext* opCtx,
             uassert(40119,
                     "Illegal attempt to set operation deadline within DBDirectClient",
                     !opCtx->getClient()->isInDirectClient());
-            opCtx->setDeadlineAfterNowBy(Milliseconds{maxTimeMS});
+            opCtx->setDeadlineAfterNowBy(Milliseconds{maxTimeMS}, ErrorCodes::MaxTimeMSExpired);
         }
 
         auto& readConcernArgs = repl::ReadConcernArgs::get(opCtx);
@@ -849,10 +852,11 @@ void execCommandDatabase(OperationContext* opCtx,
             }
 
             // Handle config optime information that may have been sent along with the command.
-            uassertStatusOK(shardingState->updateConfigServerOpTimeFromMetadata(opCtx));
+            rpc::advanceConfigOptimeFromRequestMetadata(opCtx);
         }
 
         oss.setAllowImplicitCollectionCreation(allowImplicitCollectionCreationField);
+        ScopedOperationCompletionShardingActions operationCompletionShardingActions(opCtx);
 
         // Can throw
         opCtx->checkForInterrupt();  // May trigger maxTimeAlwaysTimeOut fail point.
@@ -882,8 +886,11 @@ void execCommandDatabase(OperationContext* opCtx,
                                 sessionOptions)) {
                 command->incrementCommandsFailed();
             }
-        } catch (DBException&) {
+        } catch (const DBException& e) {
             command->incrementCommandsFailed();
+            if (e.code() == ErrorCodes::Unauthorized) {
+                CommandHelpers::auditLogAuthEvent(opCtx, invocation.get(), request, e.code());
+            }
             throw;
         }
     } catch (const DBException& e) {
@@ -961,9 +968,9 @@ void curOpCommandSetup(OperationContext* opCtx, const OpMsgRequest& request) {
     curop->setNS_inlock(nss.ns());
 }
 
-DbResponse runCommands(OperationContext* opCtx,
-                       const Message& message,
-                       const ServiceEntryPointCommon::Hooks& behaviors) {
+DbResponse receivedCommands(OperationContext* opCtx,
+                            const Message& message,
+                            const ServiceEntryPointCommon::Hooks& behaviors) {
     auto replyBuilder = rpc::makeReplyBuilder(rpc::protocolForMessage(message));
     [&] {
         OpMsgRequest request;
@@ -1081,7 +1088,7 @@ DbResponse receivedQuery(OperationContext* opCtx,
         }
 
         dbResponse.response.reset();
-        generateLegacyQueryErrorResponse(&e, q, &op, &dbResponse.response);
+        generateLegacyQueryErrorResponse(e, q, &op, &dbResponse.response);
     }
 
     op.debug().responseLength = dbResponse.response.header().dataLen();
@@ -1286,7 +1293,7 @@ DbResponse ServiceEntryPointCommon::handleRequest(OperationContext* opCtx,
         if (nsString.isCommand()) {
             isCommand = true;
         }
-    } else if (op == dbCommand || op == dbMsg) {
+    } else if (op == dbMsg) {
         isCommand = true;
     }
 
@@ -1305,8 +1312,8 @@ DbResponse ServiceEntryPointCommon::handleRequest(OperationContext* opCtx,
     bool forceLog = false;
 
     DbResponse dbresponse;
-    if (op == dbMsg || op == dbCommand || (op == dbQuery && isCommand)) {
-        dbresponse = runCommands(opCtx, m, behaviors);
+    if (op == dbMsg || (op == dbQuery && isCommand)) {
+        dbresponse = receivedCommands(opCtx, m, behaviors);
     } else if (op == dbQuery) {
         invariant(!isCommand);
         dbresponse = receivedQuery(opCtx, nsString, c, m);

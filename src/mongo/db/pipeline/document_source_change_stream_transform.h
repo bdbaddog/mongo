@@ -30,8 +30,8 @@
 
 #include "mongo/db/pipeline/document_source.h"
 #include "mongo/db/pipeline/document_source_change_stream.h"
+#include "mongo/db/pipeline/document_source_change_stream_gen.h"
 #include "mongo/db/pipeline/document_source_match.h"
-#include "mongo/db/pipeline/document_sources_gen.h"
 #include "mongo/db/pipeline/field_path.h"
 
 namespace mongo {
@@ -45,7 +45,7 @@ public:
         const boost::intrusive_ptr<ExpressionContext>&, BSONObj changeStreamSpec);
 
     Document applyTransformation(const Document& input);
-    DocumentSource::GetDepsReturn getDependencies(DepsTracker* deps) const final;
+    DepsTracker::State getDependencies(DepsTracker* deps) const final;
     DocumentSource::GetModPathsReturn getModifiedPaths() const final;
 
     Value serialize(boost::optional<ExplainOptions::Verbosity> explain) const;

@@ -31,7 +31,7 @@
 #include <boost/optional.hpp>
 
 #include "mongo/base/disallow_copying.h"
-#include "mongo/db/s/collection_sharding_state.h"
+#include "mongo/db/s/collection_sharding_runtime.h"
 #include "mongo/db/s/migration_chunk_cloner_source.h"
 #include "mongo/s/request_types/move_chunk_request.h"
 #include "mongo/util/timer.h"
@@ -70,9 +70,9 @@ class MigrationSourceManager {
     MONGO_DISALLOW_COPYING(MigrationSourceManager);
 
 public:
-    static MigrationSourceManager* get(CollectionShardingState& css);
-    static MigrationSourceManager* get(CollectionShardingState* css) {
-        return get(*css);
+    static MigrationSourceManager* get(CollectionShardingRuntime& csr);
+    static MigrationSourceManager* get(CollectionShardingRuntime* csr) {
+        return get(*csr);
     }
 
     /**
@@ -234,6 +234,8 @@ private:
 
     // The statistics about a chunk migration to be included in moveChunk.commit
     BSONObj _recipientCloneCounts;
+
+    boost::optional<CollectionCriticalSection> _critSec;
 };
 
 }  // namespace mongo

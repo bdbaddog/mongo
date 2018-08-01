@@ -3566,26 +3566,6 @@ var authCommandsLib = {
           ]
         },
         {
-          testname: "eval",
-          command: {
-              $eval: function() {
-                  print("noop");
-              }
-          },
-          testcases: [
-              {
-                runOnDb: firstDbName,
-                roles: {__system: 1},
-                privileges: [{resource: {anyResource: true}, actions: ["anyAction"]}]
-              },
-              {
-                runOnDb: secondDbName,
-                roles: {__system: 1},
-                privileges: [{resource: {anyResource: true}, actions: ["anyAction"]}]
-              }
-          ]
-        },
-        {
           testname: "features",
           command: {features: 1},
           testcases: [
@@ -5117,6 +5097,7 @@ var authCommandsLib = {
         {
           testname: "reIndex",
           command: {reIndex: "x"},
+          skipSharded: true,
           setup: function(db) {
               db.x.save({});
           },
@@ -5189,21 +5170,6 @@ var authCommandsLib = {
           ]
         },
         {
-          testname: "replSetElect",
-          command: {replSetElect: 1},
-          skipSharded: true,
-          testcases: [
-              {
-                runOnDb: adminDbName,
-                roles: {__system: 1},
-                privileges: [{resource: {cluster: true}, actions: ["internal"]}],
-                expectFail: true
-              },
-              {runOnDb: firstDbName, roles: {}},
-              {runOnDb: secondDbName, roles: {}}
-          ]
-        },
-        {
           testname: "replSetFreeze",
           command: {replSetFreeze: "x"},
           skipSharded: true,
@@ -5212,21 +5178,6 @@ var authCommandsLib = {
                 runOnDb: adminDbName,
                 roles: roles_clusterManager,
                 privileges: [{resource: {cluster: true}, actions: ["replSetStateChange"]}],
-                expectFail: true
-              },
-              {runOnDb: firstDbName, roles: {}},
-              {runOnDb: secondDbName, roles: {}}
-          ]
-        },
-        {
-          testname: "replSetFresh",
-          command: {replSetFresh: "x"},
-          skipSharded: true,
-          testcases: [
-              {
-                runOnDb: adminDbName,
-                roles: {__system: 1},
-                privileges: [{resource: {cluster: true}, actions: ["internal"]}],
                 expectFail: true
               },
               {runOnDb: firstDbName, roles: {}},

@@ -55,27 +55,37 @@ public:
     virtual ~RecoveryUnit() {}
 
     /**
-     * These should be called through WriteUnitOfWork rather than directly.
+     * Marks the beginning of a unit of work. Each call must be matched with exactly one call to
+     * either commitUnitOfWork or abortUnitOfWork.
      *
-     * A call to 'beginUnitOfWork' marks the beginning of a unit of work. Each call to
-     * 'beginUnitOfWork' must be matched with exactly one call to either 'commitUnitOfWork' or
-     * 'abortUnitOfWork'. When 'abortUnitOfWork' is called, all changes made since the begin
-     * of the unit of work will be rolled back.
+     * Should be called through WriteUnitOfWork rather than directly.
      */
     virtual void beginUnitOfWork(OperationContext* opCtx) = 0;
+
+    /**
+     * Marks the end of a unit of work and commits all changes registered by calls to onCommit or
+     * registerChange, in order. Must be matched by exactly one preceding call to beginUnitOfWork.
+     *
+     * Should be called through WriteUnitOfWork rather than directly.
+     */
     virtual void commitUnitOfWork() = 0;
+
+    /**
+     * Marks the end of a unit of work and rolls back all changes registered by calls to onRollback
+     * or registerChange, in reverse order. Must be matched by exactly one preceding call to
+     * beginUnitOfWork.
+     *
+     * Should be called through WriteUnitOfWork rather than directly.
+     */
     virtual void abortUnitOfWork() = 0;
 
     /**
-     * Must be called after beginUnitOfWork and before calling either abortUnitOfWork or
-     * commitUnitOfWork. Transitions the current transaction (unit of work) to the
-     * "prepared" state. Must be overridden by storage engines that support prepared
-     * transactions.
+     * Transitions the active unit of work to the "prepared" state. Must be called after
+     * beginUnitOfWork and before calling either abortUnitOfWork or commitUnitOfWork. Must be
+     * overridden by storage engines that support prepared transactions.
      *
-     * Must be preceded by a call to setPrepareTimestamp().
+     * Must be preceded by a call to beginUnitOfWork and  setPrepareTimestamp, in that order.
      *
-     * It is not valid to call commitUnitOfWork() afterward without calling setCommitTimestamp()
-     * with a value greater than or equal to the prepare timestamp.
      * This cannot be called after setTimestamp or setCommitTimestamp.
      */
     virtual void prepareUnitOfWork() {
@@ -112,9 +122,8 @@ public:
     }
 
     /**
-     * When this is called, if there is an open transaction, it is closed. On return no
-     * transaction is active. This cannot be called inside of a WriteUnitOfWork, and should
-     * fail if it is.
+     * If there is an open transaction, it is closed. On return no transaction is active. This
+     * cannot be called inside of a WriteUnitOfWork, and should fail if it is.
      */
     virtual void abandonSnapshot() = 0;
 
@@ -179,7 +188,8 @@ public:
      * specified in the last setTimestamp() call in the transaction, at commit time.
      *
      * setTimestamp() will fail if a commit timestamp is set using setCommitTimestamp() and not
-     * yet cleared with clearCommitTimestamp().
+     * yet cleared with clearCommitTimestamp(). setTimestamp() will also fail if a prepareTimestamp
+     * has been set.
      */
     virtual Status setTimestamp(Timestamp timestamp) {
         return Status::OK();
@@ -187,14 +197,22 @@ public:
 
     /**
      * Sets a timestamp that will be assigned to all future writes on this RecoveryUnit until
-     * clearCommitTimestamp() is called. This must be called outside of a WUOW and setTimestamp()
-     * must not be called while a commit timestamp is set.
+     * clearCommitTimestamp() is called. This must be called either outside of a WUOW or on a
+     * prepared transaction after setPrepareTimestamp() is called. setTimestamp() must not be called
+     * while a commit timestamp is set.
      */
     virtual void setCommitTimestamp(Timestamp timestamp) {}
 
+    /**
+     * Clears the commit timestamp that was set by setCommitTimestamp(). This must be called outside
+     * of a WUOW. This must be called when a commit timestamp is set.
+     */
     virtual void clearCommitTimestamp() {}
 
-    virtual Timestamp getCommitTimestamp() {
+    /**
+     * Returns the commit timestamp. Can be called at any time.
+     */
+    virtual Timestamp getCommitTimestamp() const {
         return {};
     }
 
@@ -210,23 +228,45 @@ public:
     }
 
     /**
-     * When no read timestamp is provided to the recovery unit, the ReadSource indicates which
-     * external timestamp source to read from.
+     * Returns the prepare timestamp for the current transaction.
+     * Must be called after setPrepareTimestamp(), and cannot be called after setTimestamp() or
+     * setCommitTimestamp(). This must be called inside a WUOW.
+     */
+    virtual Timestamp getPrepareTimestamp() const {
+        uasserted(ErrorCodes::CommandNotSupported,
+                  "This storage engine does not support prepared transactions");
+    }
+
+    /**
+     * The ReadSource indicates which exteral or provided timestamp to read from for future
+     * transactions.
      */
     enum ReadSource {
-        // This is the default behavior and will read without a timestamp.
+        /**
+         * Do not read from a timestamp. This is the default.
+         */
         kUnset,
-        // Read without a timestamp explicitly.
+        /**
+         * Read without a timestamp explicitly.
+         */
         kNoTimestamp,
-        // Read from the majority all-commmitted timestamp.
+        /**
+         * Read from the majority all-commmitted timestamp.
+         */
         kMajorityCommitted,
-        // Read from the last applied timestamp. New transactions start at the most up-to-date
-        // timestamp.
+        /**
+         * Read from the last applied timestamp. New transactions start at the most up-to-date
+         * timestamp.
+         */
         kLastApplied,
-        // Read from the last applied timestamp. New transactions will always read from the same
-        // timestamp and never advance.
+        /**
+         * Read from the last applied timestamp. New transactions will always read from the same
+         * timestamp and never advance.
+         */
         kLastAppliedSnapshot,
-        // Read from the timestamp provided to setTimestampReadSource.
+        /**
+         * Read from the timestamp provided to setTimestampReadSource.
+         */
         kProvided
     };
 
@@ -323,50 +363,6 @@ public:
 
         registerChange(new OnCommitChange(std::move(callback)));
     }
-
-    //
-    // The remaining methods probably belong on DurRecoveryUnit rather than on the interface.
-    //
-
-    /**
-     * Declare that the data at [x, x + len) is being written.
-     */
-    virtual void* writingPtr(void* data, size_t len) = 0;
-
-    //
-    // Syntactic sugar
-    //
-
-    /**
-     * Declare write intent for an int
-     */
-    inline int& writingInt(int& d) {
-        return *writing(&d);
-    }
-
-    /**
-     * A templated helper for writingPtr.
-     */
-    template <typename T>
-    inline T* writing(T* x) {
-        writingPtr(x, sizeof(T));
-        return x;
-    }
-
-    /**
-     * Sets a flag that declares this RecoveryUnit will skip rolling back writes, for the
-     * duration of the current outermost WriteUnitOfWork.  This function can only be called
-     * between a pair of unnested beginUnitOfWork() / endUnitOfWork() calls.
-     * The flag is cleared when endUnitOfWork() is called.
-     * While the flag is set, rollback will skip rolling back writes, but custom rollback
-     * change functions are still called.  Clearly, this functionality should only be used when
-     * writing to temporary collections that can be cleaned up externally.  For example,
-     * foreground index builds write to a temporary collection; if something goes wrong that
-     * normally requires a rollback, we can instead clean up the index by dropping the entire
-     * index.
-     * Setting the flag may permit increased performance.
-     */
-    virtual void setRollbackWritesDisabled() = 0;
 
     virtual void setOrderedCommit(bool orderedCommit) = 0;
 

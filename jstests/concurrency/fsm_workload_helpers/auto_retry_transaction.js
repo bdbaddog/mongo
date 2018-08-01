@@ -35,28 +35,39 @@ var {withTxnAndAutoRetry} = (function() {
 
         do {
             session.startTransaction(txnOptions);
+            let hasCommitTxnError = false;
             hasTransientError = false;
 
             try {
                 func();
 
                 // commitTransaction() calls assert.commandWorked(), which may fail with a
-                // WriteConflict error response. We therefore suppress its doassert() output.
-                quietly(() => session.commitTransaction());
-            } catch (e) {
-                // Use the version of abortTransaction() that ignores errors. We ignore the error
-                // from abortTransaction because the transaction may have implicitly been aborted by
-                // the server already and will therefore return a NoSuchTransaction error response.
-                // We need to call abortTransaction() in order to update the mongo shell's state
-                // such that it agrees no transaction is currently in progress on this session.
-                session.abortTransaction();
-
-                if (!e.hasOwnProperty('errorLabels') ||
-                    !e.errorLabels.includes('TransientTransactionError')) {
+                // WriteConflict error response, which is ignored.
+                try {
+                    quietly(() => session.commitTransaction());
+                } catch (e) {
+                    hasCommitTxnError = true;
                     throw e;
                 }
+            } catch (e) {
+                if (!hasCommitTxnError) {
+                    // Use the version of abortTransaction() that ignores errors. We ignore the
+                    // error from abortTransaction because the transaction may have implicitly
+                    // been aborted by the server already and will therefore return a
+                    // NoSuchTransaction error response.
+                    // We need to call abortTransaction() in order to update the mongo shell's
+                    // state such that it agrees no transaction is currently in progress on this
+                    // session.
+                    session.abortTransaction();
+                }
 
-                hasTransientError = true;
+                if (e.hasOwnProperty('errorLabels') &&
+                    e.errorLabels.includes('TransientTransactionError')) {
+                    hasTransientError = true;
+                    continue;
+                }
+
+                throw e;
             }
         } while (hasTransientError);
     }

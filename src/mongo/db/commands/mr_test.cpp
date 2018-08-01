@@ -47,6 +47,7 @@
 #include "mongo/db/repl/replication_coordinator_mock.h"
 #include "mongo/db/repl/storage_interface_impl.h"
 #include "mongo/db/service_context_d_test_fixture.h"
+#include "mongo/rpc/factory.h"
 #include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/scripting/dbdirectclient_factory.h"
 #include "mongo/scripting/engine.h"
@@ -292,7 +293,8 @@ public:
                             Collection* coll,
                             const NamespaceString& collectionName,
                             const CollectionOptions& options,
-                            const BSONObj& idIndex) override;
+                            const BSONObj& idIndex,
+                            const OplogSlot& createOpTime) override;
 
     // Hook for onInserts. Defaults to a no-op function but may be overridden to inject exceptions
     // while mapReduce inserts its results into the temporary output collection.
@@ -315,7 +317,8 @@ void MapReduceOpObserver::onCreateCollection(OperationContext*,
                                              Collection*,
                                              const NamespaceString& collectionName,
                                              const CollectionOptions& options,
-                                             const BSONObj&) {
+                                             const BSONObj&,
+                                             const OplogSlot&) {
     if (!options.temp) {
         return;
     }
@@ -423,10 +426,9 @@ Status MapReduceCommandTest::_runCommand(StringData mapCode, StringData reduceCo
     ASSERT(command) << "Unable to look up mapReduce command";
 
     auto request = OpMsgRequest::fromDBAndBody(inputNss.db(), _makeCmdObj(mapCode, reduceCode));
-    BufBuilder bb;
-    CommandReplyBuilder crb(BSONObjBuilder{bb});
-    command->parse(_opCtx.get(), request)->run(_opCtx.get(), &crb);
-    auto status = getStatusFromCommandResult(crb.getBodyBuilder().asTempObj());
+    auto replyBuilder = rpc::makeReplyBuilder(rpc::Protocol::kOpMsg);
+    auto result = CommandHelpers::runCommandDirectly(_opCtx.get(), request);
+    auto status = getStatusFromCommandResult(result);
     if (!status.isOK()) {
         return status.withContext(str::stream() << "mapReduce command failed: " << request.body);
     }
@@ -464,8 +466,7 @@ TEST_F(MapReduceCommandTest, DropTemporaryCollectionsOnInsertError) {
 
     auto mapCode = "function() { emit(this._id, this._id); }"_sd;
     auto reduceCode = "function(k, v) { return Array.sum(v); }"_sd;
-    ASSERT_THROWS_CODE(
-        _runCommand(mapCode, reduceCode).ignore(), AssertionException, ErrorCodes::OperationFailed);
+    ASSERT_EQ(_runCommand(mapCode, reduceCode), ErrorCodes::OperationFailed);
 
     // Temporary collections created by mapReduce will be removed on failure if the server is able
     // to accept writes.
@@ -483,8 +484,7 @@ TEST_F(MapReduceCommandTest, PrimaryStepDownPreventsTemporaryCollectionDrops) {
 
     auto mapCode = "function() { emit(this._id, this._id); }"_sd;
     auto reduceCode = "function(k, v) { return Array.sum(v); }"_sd;
-    ASSERT_THROWS_CODE(
-        _runCommand(mapCode, reduceCode).ignore(), AssertionException, ErrorCodes::OperationFailed);
+    ASSERT_EQ(_runCommand(mapCode, reduceCode), ErrorCodes::OperationFailed);
 
     // Temporary collections should still be present because the server will not accept writes after
     // stepping down.

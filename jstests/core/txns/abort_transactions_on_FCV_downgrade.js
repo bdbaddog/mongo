@@ -8,7 +8,7 @@
     const collName = "abort_transactions_on_FCV_downgrade";
     const testDB = db.getSiblingDB(dbName);
     const adminDB = db.getSiblingDB("admin");
-    testDB[collName].drop();
+    testDB[collName].drop({writeConcern: {w: "majority"}});
 
     assert.commandWorked(testDB.runCommand({create: collName, writeConcern: {w: "majority"}}));
 
@@ -23,7 +23,7 @@
 
         jsTestLog("Attempt to drop the collection. This should fail due to the open transaction.");
         assert.commandFailedWithCode(testDB.runCommand({drop: collName, maxTimeMS: 1000}),
-                                     ErrorCodes.ExceededTimeLimit);
+                                     ErrorCodes.MaxTimeMSExpired);
 
         jsTestLog("Downgrade the featureCompatibilityVersion.");
         assert.commandWorked(testDB.adminCommand({setFeatureCompatibilityVersion: lastStableFCV}));

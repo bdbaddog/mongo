@@ -62,6 +62,7 @@
 #include "mongo/rpc/metadata/logical_time_metadata.h"
 #include "mongo/rpc/metadata/tracking_metadata.h"
 #include "mongo/rpc/op_msg.h"
+#include "mongo/rpc/op_msg_rpc_impls.h"
 #include "mongo/s/cannot_implicitly_create_collection_info.h"
 #include "mongo/s/catalog_cache.h"
 #include "mongo/s/client/parallel.h"
@@ -151,7 +152,7 @@ void appendRequiredFieldsToResponse(OperationContext* opCtx, BSONObjBuilder* res
 void execCommandClient(OperationContext* opCtx,
                        CommandInvocation* invocation,
                        const OpMsgRequest& request,
-                       CommandReplyBuilder* result) {
+                       rpc::ReplyBuilderInterface* result) {
     const Command* c = invocation->definition();
     ON_BLOCK_EXIT([opCtx, &result] {
         auto body = result->getBodyBuilder();
@@ -289,10 +290,11 @@ MONGO_FAIL_POINT_DEFINE(doNotRefreshShardsOnRetargettingError);
 void runCommand(OperationContext* opCtx,
                 const OpMsgRequest& request,
                 const NetworkOp opType,
-                BSONObjBuilder&& builder) {
+                rpc::ReplyBuilderInterface* replyBuilder) {
     auto const commandName = request.getCommandName();
     auto const command = CommandHelpers::findCommand(commandName);
     if (!command) {
+        auto builder = replyBuilder->getBodyBuilder();
         ON_BLOCK_EXIT([opCtx, &builder] { appendRequiredFieldsToResponse(opCtx, &builder); });
         CommandHelpers::appendCommandStatusNoThrow(
             builder,
@@ -317,7 +319,7 @@ void runCommand(OperationContext* opCtx,
     const int maxTimeMS = uassertStatusOK(
         QueryRequest::parseMaxTimeMS(request.body[QueryRequest::cmdOptionMaxTimeMS]));
     if (maxTimeMS > 0 && command->getLogicalOp() != LogicalOp::opGetMore) {
-        opCtx->setDeadlineAfterNowBy(Milliseconds{maxTimeMS});
+        opCtx->setDeadlineAfterNowBy(Milliseconds{maxTimeMS}, ErrorCodes::MaxTimeMSExpired);
     }
     opCtx->checkForInterrupt();  // May trigger maxTimeAlwaysTimeOut fail point.
 
@@ -331,6 +333,14 @@ void runCommand(OperationContext* opCtx,
 
     // Fill out all currentOp details.
     CurOp::get(opCtx)->setGenericOpRequestDetails(opCtx, nss, command, request.body, opType);
+
+    auto& readConcernArgs = repl::ReadConcernArgs::get(opCtx);
+    auto readConcernParseStatus = readConcernArgs.initialize(request.body);
+    if (!readConcernParseStatus.isOK()) {
+        auto builder = replyBuilder->getBodyBuilder();
+        CommandHelpers::appendCommandStatusNoThrow(builder, readConcernParseStatus);
+        return;
+    }
 
     boost::optional<ScopedRouterSession> scopedSession;
     if (auto osi = initializeOperationSessionInfo(
@@ -348,18 +358,9 @@ void runCommand(OperationContext* opCtx,
             auto startTxnSetting = osi->getStartTransaction();
             bool startTransaction = startTxnSetting ? *startTxnSetting : false;
 
-            routerSession->beginOrContinueTxn(*txnNumber, startTransaction);
+            routerSession->beginOrContinueTxn(opCtx, *txnNumber, startTransaction);
         }
     }
-
-    auto& readConcernArgs = repl::ReadConcernArgs::get(opCtx);
-    auto readConcernParseStatus = readConcernArgs.initialize(request.body);
-    if (!readConcernParseStatus.isOK()) {
-        CommandHelpers::appendCommandStatusNoThrow(builder, readConcernParseStatus);
-        return;
-    }
-
-    CommandReplyBuilder crb(std::move(builder));
 
     try {
         for (int tries = 0;; ++tries) {
@@ -374,9 +375,9 @@ void runCommand(OperationContext* opCtx,
                           "unexpected change of namespace when retrying");
             }
 
-            crb.reset();
+            replyBuilder->reset();
             try {
-                execCommandClient(opCtx, invocation.get(), request, &crb);
+                execCommandClient(opCtx, invocation.get(), request, replyBuilder);
                 return;
             } catch (const ExceptionForCat<ErrorCategory::NeedRetargettingError>& ex) {
                 const auto staleNs = [&] {
@@ -390,25 +391,14 @@ void runCommand(OperationContext* opCtx,
                     }
                 }();
 
-                if (staleNs.isEmpty()) {
-                    // This should be impossible but older versions tried incorrectly to handle
-                    // it here.
-                    log() << "Received a stale config error with an empty namespace while "
-                             "executing "
-                          << redact(request.body) << " : " << redact(ex);
-                    throw;
-                }
-
                 // Send setShardVersion on this thread's versioned connections to shards (to support
                 // commands that use the legacy (ShardConnection) versioning protocol).
                 if (!MONGO_FAIL_POINT(doNotRefreshShardsOnRetargettingError)) {
                     ShardConnection::checkMyConnectionVersions(opCtx, staleNs.ns());
                 }
 
-                // Mark collection entry in cache as stale.
-                if (staleNs.isValid()) {
-                    Grid::get(opCtx)->catalogCache()->invalidateShardedCollection(staleNs);
-                }
+                Grid::get(opCtx)->catalogCache()->invalidateShardedCollection(staleNs);
+
                 if (canRetry) {
                     continue;
                 }
@@ -432,12 +422,8 @@ void runCommand(OperationContext* opCtx,
         }
     } catch (const DBException& e) {
         command->incrementCommandsFailed();
-        CurOp::get(opCtx)->debug().errInfo = e.toStatus();
         LastError::get(opCtx->getClient()).setLastError(e.code(), e.reason());
-        crb.reset();
-        BSONObjBuilder bob = crb.getBodyBuilder();
-        CommandHelpers::appendCommandStatusNoThrow(bob, e.toStatus());
-        appendRequiredFieldsToResponse(opCtx, &bob);
+        throw;
     }
 }
 
@@ -493,7 +479,8 @@ DbResponse Strategy::queryOp(OperationContext* opCtx, const NamespaceString& nss
         uassert(50749,
                 "Illegal attempt to set operation deadline within DBDirectClient",
                 !opCtx->getClient()->isInDirectClient());
-        opCtx->setDeadlineAfterNowBy(Milliseconds{queryRequest.getMaxTimeMS()});
+        opCtx->setDeadlineAfterNowBy(Milliseconds{queryRequest.getMaxTimeMS()},
+                                     ErrorCodes::MaxTimeMSExpired);
     }
     opCtx->checkForInterrupt();  // May trigger maxTimeAlwaysTimeOut fail point.
 
@@ -569,7 +556,7 @@ DbResponse Strategy::clientCommand(OperationContext* opCtx, const Message& m) {
         std::string db = request.getDatabase().toString();
         try {
             LOG(3) << "Command begin db: " << db << " msg id: " << m.header().getId();
-            runCommand(opCtx, request, m.operation(), reply->getInPlaceReplyBuilder(0));
+            runCommand(opCtx, request, m.operation(), reply.get());
             LOG(3) << "Command end db: " << db << " msg id: " << m.header().getId();
         } catch (const DBException& ex) {
             LOG(1) << "Exception thrown while processing command on " << db
@@ -584,7 +571,7 @@ DbResponse Strategy::clientCommand(OperationContext* opCtx, const Message& m) {
             throw;
         }
         reply->reset();
-        auto bob = reply->getInPlaceReplyBuilder(0);
+        auto bob = reply->getBodyBuilder();
         CommandHelpers::appendCommandStatusNoThrow(bob, ex.toStatus());
         appendRequiredFieldsToResponse(opCtx, &bob);
     }
@@ -593,7 +580,6 @@ DbResponse Strategy::clientCommand(OperationContext* opCtx, const Message& m) {
         return {};  // Don't reply.
     }
 
-    reply->setMetadata(BSONObj());  // mongos doesn't use metadata but the API requires this call.
     return DbResponse{reply->done()};
 }
 
@@ -730,11 +716,10 @@ void Strategy::killCursors(OperationContext* opCtx, DbMessage* dbm) {
 }
 
 void Strategy::writeOp(OperationContext* opCtx, DbMessage* dbm) {
-    BufBuilder bb;
+    const auto& msg = dbm->msg();
+    rpc::OpMsgReplyBuilder reply;
     runCommand(opCtx,
                [&]() {
-                   const auto& msg = dbm->msg();
-
                    switch (msg.operation()) {
                        case dbInsert: {
                            return InsertOp::parseLegacy(msg).serialize({});
@@ -749,8 +734,8 @@ void Strategy::writeOp(OperationContext* opCtx, DbMessage* dbm) {
                            MONGO_UNREACHABLE;
                    }
                }(),
-               dbm->msg().operation(),
-               BSONObjBuilder{bb});  // built object is ignored
+               msg.operation(),
+               &reply);  // built object is ignored
 }
 
 void Strategy::explainFind(OperationContext* opCtx,
@@ -796,25 +781,14 @@ void Strategy::explainFind(OperationContext* opCtx,
                 }
             }();
 
-            if (staleNs.isEmpty()) {
-                // This should be impossible but older versions tried incorrectly to handle
-                // it here.
-                log() << "Received a stale config error with an empty namespace while "
-                         "executing "
-                      << redact(explainCmd) << " : " << redact(ex);
-                throw;
-            }
-
             // Send setShardVersion on this thread's versioned connections to shards (to support
             // commands that use the legacy (ShardConnection) versioning protocol).
             if (!MONGO_FAIL_POINT(doNotRefreshShardsOnRetargettingError)) {
                 ShardConnection::checkMyConnectionVersions(opCtx, staleNs.ns());
             }
 
-            // Mark collection entry in cache as stale.
-            if (staleNs.isValid()) {
-                Grid::get(opCtx)->catalogCache()->invalidateShardedCollection(staleNs);
-            }
+            Grid::get(opCtx)->catalogCache()->invalidateShardedCollection(staleNs);
+
             if (canRetry) {
                 continue;
             }

@@ -38,9 +38,10 @@ load("jstests/libs/analyze_plan.js");
             }
         });
         replTest.startSet();
-        // Cannot wait for a stable checkpoint with 'testingSnapshotBehaviorInIsolation' set.
+        // Cannot wait for a stable recovery timestamp with 'testingSnapshotBehaviorInIsolation'
+        // set.
         replTest.initiateWithAnyNodeAsPrimary(
-            null, "replSetInitiate", {doNotWaitForStableCheckpoint: true});
+            null, "replSetInitiate", {doNotWaitForStableRecoveryTimestamp: true});
 
         const session =
             replTest.getPrimary().getDB("test").getMongo().startSession({causalConsistency: false});
@@ -51,7 +52,7 @@ load("jstests/libs/analyze_plan.js");
             var res =
                 t.runCommand('find', {batchSize: 2, readConcern: {level: level}, maxTimeMS: 1000});
             assert.commandFailed(res);
-            assert.eq(res.code, ErrorCodes.ExceededTimeLimit);
+            assert.eq(res.code, ErrorCodes.MaxTimeMSExpired);
         }
 
         function getCursorForReadConcernLevel() {

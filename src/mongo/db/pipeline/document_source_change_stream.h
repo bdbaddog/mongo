@@ -29,9 +29,9 @@
 #pragma once
 
 #include "mongo/db/pipeline/document_source.h"
+#include "mongo/db/pipeline/document_source_change_stream_gen.h"
 #include "mongo/db/pipeline/document_source_match.h"
 #include "mongo/db/pipeline/document_source_single_document_transformation.h"
-#include "mongo/db/pipeline/document_sources_gen.h"
 #include "mongo/db/pipeline/field_path.h"
 #include "mongo/db/pipeline/resume_token.h"
 
@@ -86,9 +86,10 @@ public:
         void assertSupportsReadConcern(const repl::ReadConcernArgs& readConcern) const {
             // Only "majority" is allowed for change streams.
             uassert(ErrorCodes::InvalidOptions,
-                    str::stream() << "Read concern " << readConcern.toString()
-                                  << " is not supported for change streams. "
-                                     "Only read concern level \"majority\" is supported.",
+                    str::stream() << "$changeStream cannot run with a readConcern other than "
+                                  << "'majority', or in a multi-document transaction. Current "
+                                     "readConcern: "
+                                  << readConcern.toString(),
                     !readConcern.hasLevel() ||
                         readConcern.getLevel() == repl::ReadConcernLevel::kMajorityReadConcern);
         }

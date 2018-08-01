@@ -27,7 +27,6 @@ selector:
   - jstests/core/diagdata.js # Command not supported in mongos
   - jstests/core/do_txn*.js  # doTxn
   - jstests/core/dropdb_race.js  # syncdelay.
-  - jstests/core/evalb.js  # profiling.
   - jstests/core/fsync.js  # uses fsync.
   - jstests/core/geo_haystack*.js  # geoSearch.
   - jstests/core/geo_s2cursorlimitskip.js  # profiling.
@@ -132,7 +131,6 @@ executor:
       set_parameters:
         enableTestCommands: 1
     mongod_options:
-      nopreallocj: ''
       set_parameters:
         enableTestCommands: 1
         numInitialSyncAttempts: 1

@@ -160,18 +160,11 @@ public:
 
     Status processReplSetFreeze(int, BSONObjBuilder*) override;
 
-    Status processHeartbeat(const repl::ReplSetHeartbeatArgs&,
-                            repl::ReplSetHeartbeatResponse*) override;
-
     Status processReplSetReconfig(OperationContext*,
                                   const ReplSetReconfigArgs&,
                                   BSONObjBuilder*) override;
 
     Status processReplSetInitiate(OperationContext*, const BSONObj&, BSONObjBuilder*) override;
-
-    Status processReplSetFresh(const ReplSetFreshArgs&, BSONObjBuilder*) override;
-
-    Status processReplSetElect(const ReplSetElectArgs& args, BSONObjBuilder* response) override;
 
     Status processReplSetUpdatePosition(const repl::UpdatePositionArgs&, long long*) override;
 
@@ -202,8 +195,6 @@ public:
 
     Status processHeartbeatV1(const repl::ReplSetHeartbeatArgsV1&,
                               repl::ReplSetHeartbeatResponse*) override;
-
-    bool isV1ElectionProtocol() const override;
 
     bool getWriteConcernMajorityShouldJournal() override;
 

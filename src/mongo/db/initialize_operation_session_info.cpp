@@ -34,6 +34,7 @@
 #include "mongo/db/logical_session_cache.h"
 #include "mongo/db/logical_session_id_helpers.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/db/server_parameters.h"
 
 namespace mongo {
 
@@ -44,8 +45,21 @@ boost::optional<OperationSessionInfoFromClient> initializeOperationSessionInfo(
     bool isReplSetMemberOrMongos,
     bool supportsDocLocking,
     bool supportsRecoverToStableTimestamp) {
+    auto osi = OperationSessionInfoFromClient::parse("OperationSessionInfo"_sd, requestBody);
+
+    if (opCtx->getClient()->isInDirectClient()) {
+        uassert(50891,
+                "Invalid to set operation session info in a direct client",
+                !osi.getSessionId() && !osi.getTxnNumber() && !osi.getAutocommit() &&
+                    !osi.getStartTransaction());
+    }
 
     if (!requiresAuth) {
+        uassert(ErrorCodes::OperationNotSupportedInTransaction,
+                "This command is not supported in transactions",
+                !osi.getAutocommit());
+        uassert(
+            50889, "It is illegal to provide a txnNumber for this command", !osi.getTxnNumber());
         return boost::none;
     }
 
@@ -60,8 +74,6 @@ boost::optional<OperationSessionInfoFromClient> initializeOperationSessionInfo(
         }
     }
 
-    auto osi = OperationSessionInfoFromClient::parse("OperationSessionInfo"_sd, requestBody);
-
     if (osi.getSessionId()) {
         stdx::lock_guard<Client> lk(*opCtx->getClient());
 
@@ -73,7 +85,7 @@ boost::optional<OperationSessionInfoFromClient> initializeOperationSessionInfo(
         }
 
         opCtx->setLogicalSessionId(makeLogicalSessionId(osi.getSessionId().get(), opCtx));
-        lsc->vivify(opCtx, opCtx->getLogicalSessionId().get());
+        uassertStatusOK(lsc->vivify(opCtx, opCtx->getLogicalSessionId().get()));
     } else {
         uassert(ErrorCodes::InvalidOptions,
                 "Transaction number requires a session ID to also be specified",
@@ -107,6 +119,7 @@ boost::optional<OperationSessionInfoFromClient> initializeOperationSessionInfo(
         uassert(ErrorCodes::InvalidOptions,
                 "Specifying autocommit=true is not allowed.",
                 !osi.getAutocommit().value());
+
         uassert(ErrorCodes::IllegalOperation,
                 "Multi-document transactions are only allowed on storage engines that support "
                 "recover to stable timestamp.",

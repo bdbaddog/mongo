@@ -50,23 +50,14 @@
 
 namespace mongo {
 namespace {
-std::unique_ptr<DatabaseHolder> dbHolderStorage;
 
-GlobalInitializerRegisterer dbHolderImplInitializer("InitializeDbHolderimpl",
-                                                    [](InitializerContext* const) {
-                                                        dbHolderStorage =
-                                                            std::make_unique<DatabaseHolder>();
-                                                        return Status::OK();
-                                                    },
-                                                    [](DeinitializerContext* const) {
-                                                        dbHolderStorage = nullptr;
-                                                        return Status::OK();
-                                                    });
+const auto dbHolderStorage = ServiceContext::declareDecoration<DatabaseHolder>();
+
 }  // namespace
 
 MONGO_REGISTER_SHIM(DatabaseHolder::getDatabaseHolder)
 ()->DatabaseHolder& {
-    return *dbHolderStorage;
+    return dbHolderStorage(getGlobalServiceContext());
 }
 
 MONGO_REGISTER_SHIM(DatabaseHolder::makeImpl)
@@ -233,6 +224,7 @@ void DatabaseHolderImpl::closeAll(OperationContext* opCtx, const std::string& re
 
     set<string> dbs;
     for (DBs::const_iterator i = _dbs.begin(); i != _dbs.end(); ++i) {
+        BackgroundOperation::assertNoBgOpInProgForDb(i->first);
         dbs.insert(i->first);
     }
 
@@ -240,8 +232,6 @@ void DatabaseHolderImpl::closeAll(OperationContext* opCtx, const std::string& re
         string name = *i;
 
         LOG(2) << "DatabaseHolder::closeAll name:" << name;
-
-        BackgroundOperation::assertNoBgOpInProgForDb(name);
 
         Database* db = _dbs[name];
         repl::oplogCheckCloseDatabase(opCtx, db);

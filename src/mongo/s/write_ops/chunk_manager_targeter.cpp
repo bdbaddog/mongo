@@ -200,7 +200,7 @@ bool isExactIdQuery(OperationContext* opCtx,
 CompareResult compareShardVersions(const ChunkVersion& shardVersionA,
                                    const ChunkVersion& shardVersionB) {
     // Collection may have been dropped
-    if (!shardVersionA.hasEqualEpoch(shardVersionB)) {
+    if (shardVersionA.epoch() != shardVersionB.epoch()) {
         return CompareResult_Unknown;
     }
 
@@ -288,10 +288,9 @@ bool isMetadataDifferent(const std::shared_ptr<ChunkManager>& managerA,
         return true;
 
     if (managerA) {
-        return !managerA->getVersion().isStrictlyEqualTo(managerB->getVersion());
+        return managerA->getVersion() != managerB->getVersion();
     }
 
-    dassert(NULL != primaryA.get());
     return primaryA->getId() != primaryB->getId();
 }
 
@@ -689,17 +688,16 @@ void ChunkManagerTargeter::noteCouldNotTarget() {
 }
 
 void ChunkManagerTargeter::noteStaleResponse(const ShardEndpoint& endpoint,
-                                             const BSONObj& staleInfo) {
+                                             const StaleConfigInfo& staleInfo) {
     dassert(!_needsTargetingRefresh);
 
     ChunkVersion remoteShardVersion;
-    if (staleInfo["vWanted"].eoo()) {
-        // If we don't have a vWanted sent, assume the version is higher than our current
-        // version.
+    if (!staleInfo.getVersionWanted()) {
+        // If we don't have a vWanted sent, assume the version is higher than our current version.
         remoteShardVersion = getShardVersion(*_routingInfo, endpoint.shardName);
         remoteShardVersion.incMajor();
     } else {
-        remoteShardVersion = ChunkVersion::fromBSON(staleInfo, "vWanted");
+        remoteShardVersion = *staleInfo.getVersionWanted();
     }
 
     ShardVersionMap::iterator it = _remoteShardVersions.find(endpoint.shardName);
@@ -707,7 +705,7 @@ void ChunkManagerTargeter::noteStaleResponse(const ShardEndpoint& endpoint,
         _remoteShardVersions.insert(std::make_pair(endpoint.shardName, remoteShardVersion));
     } else {
         ChunkVersion& previouslyNotedVersion = it->second;
-        if (previouslyNotedVersion.hasEqualEpoch(remoteShardVersion)) {
+        if (previouslyNotedVersion.epoch() == remoteShardVersion.epoch()) {
             if (previouslyNotedVersion.isOlderThan(remoteShardVersion)) {
                 previouslyNotedVersion = remoteShardVersion;
             }

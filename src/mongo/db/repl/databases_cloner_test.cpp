@@ -38,6 +38,7 @@
 #include "mongo/db/repl/oplog_entry.h"
 #include "mongo/db/repl/storage_interface.h"
 #include "mongo/db/repl/storage_interface_mock.h"
+#include "mongo/db/service_context_test_fixture.h"
 #include "mongo/executor/network_interface_mock.h"
 #include "mongo/executor/thread_pool_task_executor_test_fixture.h"
 #include "mongo/stdx/mutex.h"
@@ -77,7 +78,8 @@ struct StorageInterfaceResults {
 };
 
 
-class DBsClonerTest : public executor::ThreadPoolExecutorTest {
+class DBsClonerTest : public executor::ThreadPoolExecutorTest,
+                      public ScopedGlobalServiceContextForTest {
 public:
     DBsClonerTest() : _storageInterface{}, _dbWorkThreadPool(ThreadPool::Options()) {}
 
@@ -102,7 +104,7 @@ public:
                                  const BSONObj& obj) {
         NetworkInterfaceMock* net = getNet();
         Milliseconds millis(0);
-        RemoteCommandResponse response(obj, BSONObj(), millis);
+        RemoteCommandResponse response(obj, millis);
         net->scheduleResponse(noi, net->now(), response);
     }
 
@@ -240,11 +242,10 @@ protected:
             log() << "Sending response for network request:";
             log() << "     req: " << noi->getRequest().dbname << "." << noi->getRequest().cmdObj;
             log() << "     resp:" << responses[processedRequests].second;
-            net->scheduleResponse(noi,
-                                  net->now(),
-                                  RemoteCommandResponse(responses[processedRequests].second,
-                                                        BSONObj(),
-                                                        Milliseconds(10)));
+            net->scheduleResponse(
+                noi,
+                net->now(),
+                RemoteCommandResponse(responses[processedRequests].second, Milliseconds(10)));
 
             if ((Date_t::now() - lastLog) > Seconds(1)) {
                 lastLog = Date_t();

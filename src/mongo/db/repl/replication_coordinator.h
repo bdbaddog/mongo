@@ -70,7 +70,6 @@ class OplogReader;
 class OpTime;
 class ReadConcernArgs;
 class ReplSetConfig;
-class ReplSetHeartbeatArgs;
 class ReplSetHeartbeatArgsV1;
 class ReplSetHeartbeatResponse;
 class ReplSetHtmlSummary;
@@ -586,8 +585,6 @@ public:
      * Handles an incoming heartbeat command with arguments 'args'. Populates 'response';
      * returns a Status with either OK or an error message.
      */
-    virtual Status processHeartbeat(const ReplSetHeartbeatArgs& args,
-                                    ReplSetHeartbeatResponse* response) = 0;
     virtual Status processHeartbeatV1(const ReplSetHeartbeatArgsV1& args,
                                       ReplSetHeartbeatResponse* response) = 0;
 
@@ -616,39 +613,6 @@ public:
     virtual Status processReplSetInitiate(OperationContext* opCtx,
                                           const BSONObj& configObj,
                                           BSONObjBuilder* resultObj) = 0;
-
-    /**
-     * Arguments to the replSetFresh command.
-     */
-    struct ReplSetFreshArgs {
-        std::string setName;  // Name of the replset
-        HostAndPort who;      // host and port of the member that sent the replSetFresh command
-        unsigned id;          // replSet id of the member that sent the replSetFresh command
-        int cfgver;  // replSet config version that the member who sent the command thinks it has
-        Timestamp opTime;  // last optime seen by the member who sent the replSetFresh command
-    };
-
-    /*
-     * Handles an incoming replSetFresh command.
-     * Adds BSON to 'resultObj'; returns a Status with either OK or an error message.
-     */
-    virtual Status processReplSetFresh(const ReplSetFreshArgs& args, BSONObjBuilder* resultObj) = 0;
-
-    /**
-     * Arguments to the replSetElect command.
-     */
-    struct ReplSetElectArgs {
-        std::string set;  // Name of the replset
-        int whoid;        // replSet id of the member that sent the replSetFresh command
-        int cfgver;  // replSet config version that the member who sent the command thinks it has
-        OID round;   // unique ID for this election
-    };
-
-    /*
-     * Handles an incoming replSetElect command.
-     * Adds BSON to 'resultObj'; returns a Status with either OK or an error message.
-     */
-    virtual Status processReplSetElect(const ReplSetElectArgs& args, BSONObjBuilder* resultObj) = 0;
 
     /**
      * Handles an incoming replSetUpdatePosition command, updating each node's oplog progress.
@@ -731,11 +695,6 @@ public:
     virtual void prepareReplMetadata(const BSONObj& metadataRequestObj,
                                      const OpTime& lastOpTimeFromClient,
                                      BSONObjBuilder* builder) const = 0;
-
-    /**
-     * Returns true if the V1 election protocol is being used and false otherwise.
-     */
-    virtual bool isV1ElectionProtocol() const = 0;
 
     /**
      * Returns whether or not majority write concerns should implicitly journal, if j has not been

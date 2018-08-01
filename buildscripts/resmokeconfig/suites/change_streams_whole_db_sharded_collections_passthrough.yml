@@ -8,13 +8,6 @@ selector:
   - jstests/change_streams/report_latest_observed_oplog_timestamp.js
   # Only relevant for single-collection change streams.
   - jstests/change_streams/metadata_notifications.js
-  # TODO SERVER-35280: Update change stream tests to handle drops of sharded collections and databases.
-  - jstests/change_streams/whole_cluster.js
-  - jstests/change_streams/whole_cluster_metadata_notifications.js
-  - jstests/change_streams/whole_cluster_resumability.js
-  - jstests/change_streams/whole_db.js
-  - jstests/change_streams/whole_db_metadata_notifications.js
-  - jstests/change_streams/whole_db_resumability.js
   exclude_with_any_tags:
   ##
   # The next three tags correspond to the special errors thrown by the
@@ -26,9 +19,6 @@ selector:
   - assumes_read_concern_unchanged
   # "Cowardly refusing to override write concern of command: ..."
   - assumes_write_concern_unchanged
-  # "Cowardly refusing to run test with overridden write concern when it uses a command that can
-  #  only perform w=1 writes: ..."
-  - requires_eval_command
   # Transactions not supported on sharded clusters.
   - uses_transactions
 
@@ -62,7 +52,6 @@ executor:
         enableTestCommands: 1
     mongod_options:
       bind_ip_all: ''
-      nopreallocj: ''
       set_parameters:
         enableTestCommands: 1
         writePeriodicNoops: 1

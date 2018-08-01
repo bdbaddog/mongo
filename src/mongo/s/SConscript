@@ -64,6 +64,7 @@ env.Library(
         '$BUILD_DIR/mongo/db/storage/key_string',
         '$BUILD_DIR/mongo/db/update/update_common',
         '$BUILD_DIR/mongo/util/concurrency/ticketholder',
+        'chunk_writes_tracker',
         'common_s',
     ],
 )
@@ -101,7 +102,6 @@ env.Library(
         "$BUILD_DIR/mongo/s/client/sharding_client",
         "$BUILD_DIR/mongo/s/coreshard",
         '$BUILD_DIR/mongo/s/client/shard_interface',
-        'transaction/router_session',
     ],
 )
 
@@ -147,6 +147,7 @@ env.Library(
         env.Idlc('request_types/get_database_version.idl')[0],
         env.Idlc('request_types/move_primary.idl')[0],
         env.Idlc('request_types/shard_collection.idl')[0],
+        env.Idlc('request_types/clone_collection_options_from_primary_shard.idl')[0],
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/client/connection_string',
@@ -179,7 +180,7 @@ env.Library(
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/db/query/collation/collator_factory_mock',
-        '$BUILD_DIR/mongo/db/service_context_noop_init',
+        '$BUILD_DIR/mongo/db/service_context_test_fixture',
         '$BUILD_DIR/mongo/executor/task_executor_pool',
         '$BUILD_DIR/mongo/s/catalog/dist_lock_manager_mock',
         '$BUILD_DIR/mongo/s/catalog/sharding_catalog_client_impl',
@@ -294,6 +295,7 @@ env.Library(
         '$BUILD_DIR/mongo/executor/thread_pool_task_executor',
         '$BUILD_DIR/mongo/s/client/sharding_client',
         'cluster_last_error_info',
+        'transaction/router_session',
     ],
 )
 
@@ -351,7 +353,7 @@ env.CppUnitTest(
         'catalog_cache_refresh_test.cpp',
         'chunk_manager_index_bounds_test.cpp',
         'chunk_manager_query_test.cpp',
-        'metadata_filtering_test.cpp',
+        'routing_table_history_test.cpp',
         'shard_key_pattern_test.cpp',
     ],
     LIBDEPS=[
@@ -359,6 +361,26 @@ env.CppUnitTest(
         '$BUILD_DIR/mongo/db/s/sharding',
         '$BUILD_DIR/mongo/db/serveronly',
         'catalog_cache_test_fixture',
+    ]
+)
+
+env.Library(
+    target='chunk_writes_tracker',
+    source=[
+        'chunk_writes_tracker.cpp',
+    ],
+    LIBDEPS=[
+        '$BUILD_DIR/mongo/base',
+    ],
+)
+
+env.CppUnitTest(
+    target='chunk_writes_tracker_test',
+    source=[
+        'chunk_writes_tracker_test.cpp',
+    ],
+    LIBDEPS=[
+        'chunk_writes_tracker',
     ]
 )
 
@@ -444,9 +466,8 @@ env.CppUnitTest(
         'client/shard_connection_test.cpp',
     ],
     LIBDEPS=[
-        '$BUILD_DIR/mongo/db/service_context_noop_init',
+        '$BUILD_DIR/mongo/db/service_context_test_fixture',
         '$BUILD_DIR/mongo/dbtests/mocklib',
-        '$BUILD_DIR/mongo/transport/transport_layer_egress_init',
         '$BUILD_DIR/mongo/util/net/network',
         'client/sharding_connection_hook',
         'sharding_legacy_api',

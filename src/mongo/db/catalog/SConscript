@@ -77,6 +77,7 @@ env.Library(
         '$BUILD_DIR/mongo/base',
         '$BUILD_DIR/mongo/db/common',
         '$BUILD_DIR/mongo/db/index/index_descriptor',
+        '$BUILD_DIR/mongo/db/index/key_generator',
         '$BUILD_DIR/mongo/db/index_names',
         '$BUILD_DIR/mongo/db/matcher/expressions',
         '$BUILD_DIR/mongo/db/query/collation/collator_factory_interface',
@@ -91,8 +92,9 @@ env.CppUnitTest(
         'index_spec_validate_test.cpp',
     ],
     LIBDEPS=[
-        '$BUILD_DIR/mongo/db/query/query_test_service_context',
+        '$BUILD_DIR/mongo/db/commands/test_commands_enabled',
         '$BUILD_DIR/mongo/db/matcher/expressions',
+        '$BUILD_DIR/mongo/db/query/query_test_service_context',
         'index_key_validate',
     ],
 )
@@ -286,6 +288,7 @@ env.Library(
         '$BUILD_DIR/mongo/db/repl/drop_pending_collection_reaper',
         '$BUILD_DIR/mongo/db/repl/oplog',
         '$BUILD_DIR/mongo/db/s/balancer',
+        '$BUILD_DIR/mongo/db/server_options_core',
         '$BUILD_DIR/mongo/db/service_context',
         '$BUILD_DIR/mongo/db/storage/key_string',
         '$BUILD_DIR/mongo/db/system_index',
@@ -293,9 +296,9 @@ env.Library(
         '$BUILD_DIR/mongo/db/views/views_mongod',
     ],
     LIBDEPS_PRIVATE=[
+        "$BUILD_DIR/mongo/db/commands/server_status_core",
         '$BUILD_DIR/mongo/db/logical_clock',
         '$BUILD_DIR/mongo/db/repl/repl_settings',
-        '$BUILD_DIR/mongo/db/storage/mmap_v1/mmap_v1_options',
         '$BUILD_DIR/mongo/db/storage/storage_engine_common',
     ],
 )
@@ -321,6 +324,7 @@ env.Library(
         '$BUILD_DIR/mongo/db/background',
         '$BUILD_DIR/mongo/db/db_raii',
         '$BUILD_DIR/mongo/db/query_exec',
+        '$BUILD_DIR/mongo/db/server_options_core',
         '$BUILD_DIR/mongo/db/views/views',
         '$BUILD_DIR/mongo/db/write_ops',
     ],

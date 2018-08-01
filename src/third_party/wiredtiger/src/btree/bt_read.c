@@ -221,7 +221,7 @@ __las_page_instantiate(WT_SESSION_IMPL *session, WT_REF *ref)
 			WT_ERR(__wt_buf_set(session,
 			    current_key, las_key.data, las_key.size));
 			break;
-		WT_ILLEGAL_VALUE_ERR(session);
+		WT_ILLEGAL_VALUE_ERR(session, page->type);
 		}
 
 		/* Append the latest update to the list. */
@@ -251,7 +251,7 @@ __las_page_instantiate(WT_SESSION_IMPL *session, WT_REF *ref)
 			    current_key, ref, &cbt, first_upd));
 			first_upd = NULL;
 			break;
-		WT_ILLEGAL_VALUE_ERR(session);
+		WT_ILLEGAL_VALUE_ERR(session, page->type);
 		}
 
 	/* Discard the cursor. */
@@ -276,13 +276,15 @@ __las_page_instantiate(WT_SESSION_IMPL *session, WT_REF *ref)
 		 */
 		page->modify->first_dirty_txn = WT_TXN_FIRST;
 
-		if (ref->page_las->las_skew_newest &&
+		FLD_SET(page->modify->restore_state, WT_PAGE_RS_LOOKASIDE);
+
+		if (ref->page_las->skew_newest &&
 		    !S2C(session)->txn_global.has_stable_timestamp &&
-		    __wt_txn_visible_all(session, ref->page_las->las_max_txn,
-		    WT_TIMESTAMP_NULL(&ref->page_las->onpage_timestamp))) {
-			page->modify->rec_max_txn = ref->page_las->las_max_txn;
+		    __wt_txn_visible_all(session, ref->page_las->unstable_txn,
+		    WT_TIMESTAMP_NULL(&ref->page_las->unstable_timestamp))) {
+			page->modify->rec_max_txn = ref->page_las->max_txn;
 			__wt_timestamp_set(&page->modify->rec_max_timestamp,
-			    &ref->page_las->onpage_timestamp);
+			    &ref->page_las->max_timestamp);
 			__wt_page_modify_clear(session, page);
 		}
 	}
@@ -786,7 +788,7 @@ skip_evict:		/*
 			return (LF_ISSET(WT_READ_IGNORE_CACHE_SIZE) &&
 			    !F_ISSET(session, WT_SESSION_IGNORE_CACHE_SIZE) ?
 			    0 : __wt_txn_autocommit_check(session));
-		WT_ILLEGAL_VALUE(session);
+		WT_ILLEGAL_VALUE(session, current_state);
 		}
 
 		/*

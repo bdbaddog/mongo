@@ -143,11 +143,12 @@ public:
 
     virtual Status insertRecords(OperationContext* opCtx,
                                  std::vector<Record>* records,
-                                 std::vector<Timestamp>* timestamps,
-                                 bool enforceQuota);
+                                 std::vector<Timestamp>* timestamps);
 
-    virtual StatusWith<RecordId> insertRecord(
-        OperationContext* opCtx, const char* data, int len, Timestamp timestamp, bool enforceQuota);
+    virtual StatusWith<RecordId> insertRecord(OperationContext* opCtx,
+                                              const char* data,
+                                              int len,
+                                              Timestamp timestamp);
 
     virtual Status insertRecordsWithDocWriter(OperationContext* opCtx,
                                               const DocWriter* const* docs,
@@ -159,7 +160,6 @@ public:
                                 const RecordId& oldLocation,
                                 const char* data,
                                 int len,
-                                bool enforceQuota,
                                 UpdateNotifier* notifier);
 
     virtual bool updateWithDamagesSupported() const;
@@ -178,8 +178,6 @@ public:
     virtual std::unique_ptr<RecordCursor> getRandomCursorWithOptions(
         OperationContext* opCtx, StringData extraConfig) const = 0;
 
-    std::vector<std::unique_ptr<RecordCursor>> getManyCursors(OperationContext* opCtx) const final;
-
     virtual Status truncate(OperationContext* opCtx);
 
     virtual bool compactSupported() const {
@@ -188,6 +186,10 @@ public:
     virtual bool compactsInPlace() const {
         return true;
     }
+
+    virtual boost::optional<Timestamp> getLastStableRecoveryTimestamp() const final;
+
+    virtual bool supportsRecoverToStableTimestamp() const final;
 
     virtual Status compact(OperationContext* opCtx,
                            RecordStoreCompactAdaptor* adaptor,
@@ -259,14 +261,11 @@ public:
     void reclaimOplog(OperationContext* opCtx);
 
     /**
-     * The `persistedTimestamp` is when replication recovery would need to replay from on a
-     * restart. `reclaimOplog` will not truncate oplog entries in front of this time.
+     * The `recoveryTimestamp` is when replication recovery would need to replay from for
+     * recoverable rollback, or restart for durable engines. `reclaimOplog` will not
+     * truncate oplog entries in front of this time.
      */
-    void reclaimOplog(OperationContext* opCtx, Timestamp persistedTimestamp);
-
-    int64_t cappedDeleteAsNeeded(OperationContext* opCtx, const RecordId& justInserted);
-
-    int64_t cappedDeleteAsNeeded_inlock(OperationContext* opCtx, const RecordId& justInserted);
+    void reclaimOplog(OperationContext* opCtx, Timestamp recoveryTimestamp);
 
     // Returns false if the oplog was dropped while waiting for a deletion request.
     bool yieldAndAwaitOplogDeletionRequest(OperationContext* opCtx);
@@ -335,6 +334,14 @@ private:
     void _changeNumRecords(OperationContext* opCtx, int64_t diff);
     void _increaseDataSize(OperationContext* opCtx, int64_t amount);
 
+    /**
+     * Delete records from this record store as needed while _cappedMaxSize or _cappedMaxDocs is
+     * exceeded.
+     *
+     * _inlock version to be called once a lock has been acquired.
+     */
+    int64_t _cappedDeleteAsNeeded(OperationContext* opCtx, const RecordId& justInserted);
+    int64_t _cappedDeleteAsNeeded_inlock(OperationContext* opCtx, const RecordId& justInserted);
 
     const std::string _uri;
     const uint64_t _tableId;  // not persisted

@@ -1,0 +1,55 @@
+# -*- mode: python; -*-
+
+Import("env")
+
+env = env.Clone()
+
+env.Library(
+    target='storage_biggie_core',
+    source=[
+        'biggie_kv_engine.cpp',
+        'biggie_record_store.cpp',
+        'biggie_recovery_unit.cpp',
+        'biggie_sorted_impl.cpp',
+    ],
+    LIBDEPS=[
+        '$BUILD_DIR/mongo/db/concurrency/write_conflict_exception',
+        '$BUILD_DIR/mongo/db/storage/ephemeral_for_test/ephemeral_for_test_record_store',
+        '$BUILD_DIR/mongo/db/storage/kv/kv_prefix',
+    ],
+    LIBDEPS_PRIVATE=[
+        '$BUILD_DIR/mongo/db/storage/key_string',
+        '$BUILD_DIR/mongo/db/snapshot_window_options',
+    ],
+)
+
+env.Library(
+    target='storage_biggie',
+    source=[
+        'biggie_init.cpp',
+    ],
+    LIBDEPS=[
+        '$BUILD_DIR/mongo/db/storage/kv/kv_engine'
+        'storage_biggie_core',
+    ],
+    LIBDEPS_PRIVATE=[
+        '$BUILD_DIR/mongo/db/storage/storage_engine_common',
+    ],
+)
+
+env.CppUnitTest(
+    target='storage_biggie_store_test',
+    source=[
+        'store_test.cpp',
+    ],
+)
+# Testing
+env.CppUnitTest(
+    target='biggie_record_store_test',
+    source=['biggie_record_store_test.cpp'
+            ],
+    LIBDEPS=[
+        'storage_biggie_core',
+        '$BUILD_DIR/mongo/db/storage/record_store_test_harness'
+    ]
+)

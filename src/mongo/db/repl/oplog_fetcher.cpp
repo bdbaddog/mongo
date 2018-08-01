@@ -72,11 +72,7 @@ Milliseconds calculateAwaitDataTimeout(const ReplSetConfig& config) {
     // Under protocol version 1, make the awaitData timeout (maxTimeMS) dependent on the election
     // timeout. This enables the sync source to communicate liveness of the primary to secondaries.
     // We never wait longer than 30 seconds.
-    // Under protocol version 0, use a default timeout of 2 seconds for awaitData.
-    if (config.getProtocolVersion() == 1LL) {
-        return std::min((config.getElectionTimeoutPeriod() / 2), maximumAwaitDataTimeoutMS);
-    }
-    return OplogFetcher::kDefaultProtocolZeroAwaitDataTimeout;
+    return std::min((config.getElectionTimeoutPeriod() / 2), maximumAwaitDataTimeoutMS);
 }
 
 /**
@@ -102,10 +98,7 @@ BSONObj makeGetMoreCommandObject(const NamespaceString& nss,
 /**
  * Returns command metadata object suitable for tailing remote oplog.
  */
-BSONObj makeMetadataObject(bool isV1ElectionProtocol) {
-    if (!isV1ElectionProtocol)
-        return ReadPreferenceSetting::secondaryPreferredMetadata();
-
+BSONObj makeMetadataObject() {
     BSONObjBuilder metaBuilder;
     metaBuilder << rpc::kReplSetMetadataFieldName << 1;
     metaBuilder << rpc::kOplogQueryMetadataFieldName << 1;
@@ -332,7 +325,7 @@ OplogFetcher::OplogFetcher(executor::TaskExecutor* executor,
                            maxFetcherRestarts,
                            onShutdownCallbackFn,
                            "oplog fetcher"),
-      _metadataObject(makeMetadataObject(config.getProtocolVersion() == 1LL)),
+      _metadataObject(makeMetadataObject()),
       _requiredRBID(requiredRBID),
       _requireFresherSyncSource(requireFresherSyncSource),
       _dataReplicatorExternalState(dataReplicatorExternalState),
@@ -350,7 +343,8 @@ OplogFetcher::~OplogFetcher() {
 }
 
 BSONObj OplogFetcher::_makeFindCommandObject(const NamespaceString& nss,
-                                             OpTime lastOpTimeFetched) const {
+                                             OpTime lastOpTimeFetched,
+                                             Milliseconds findMaxTime) const {
     auto lastCommittedWithCurrentTerm =
         _dataReplicatorExternalState->getCurrentTermAndLastCommittedOpTime();
     auto term = lastCommittedWithCurrentTerm.value;
@@ -360,7 +354,7 @@ BSONObj OplogFetcher::_makeFindCommandObject(const NamespaceString& nss,
     cmdBob.append("tailable", true);
     cmdBob.append("oplogReplay", true);
     cmdBob.append("awaitData", true);
-    cmdBob.append("maxTimeMS", durationCount<Milliseconds>(_getFindMaxTime()));
+    cmdBob.append("maxTimeMS", durationCount<Milliseconds>(findMaxTime));
     cmdBob.append("batchSize", _batchSize);
 
     if (term != OpTime::kUninitializedTerm) {

@@ -32,7 +32,7 @@
 
 #include "boost/optional.hpp"
 
-#include "mongo/db/service_context_noop.h"
+#include "mongo/db/service_context.h"
 #include "mongo/transport/service_executor_adaptive.h"
 #include "mongo/transport/service_executor_synchronous.h"
 #include "mongo/transport/service_executor_task_names.h"
@@ -104,6 +104,14 @@ public:
         _ioContext.stop();
     }
 
+    void drain() override final {
+        _ioContext.restart();
+        while (_ioContext.poll()) {
+            LOG(1) << "Draining remaining work in reactor.";
+        }
+        _ioContext.stop();
+    }
+
     std::unique_ptr<ReactorTimer> makeTimer() final {
         MONGO_UNREACHABLE;
     }
@@ -135,7 +143,7 @@ private:
 class ServiceExecutorAdaptiveFixture : public unittest::Test {
 protected:
     void setUp() override {
-        auto scOwned = stdx::make_unique<ServiceContextNoop>();
+        auto scOwned = ServiceContext::make();
         setGlobalServiceContext(std::move(scOwned));
 
         auto configOwned = stdx::make_unique<TestOptions>();
@@ -152,7 +160,7 @@ protected:
 class ServiceExecutorSynchronousFixture : public unittest::Test {
 protected:
     void setUp() override {
-        auto scOwned = stdx::make_unique<ServiceContextNoop>();
+        auto scOwned = ServiceContext::make();
         setGlobalServiceContext(std::move(scOwned));
 
         executor = stdx::make_unique<ServiceExecutorSynchronous>(getGlobalServiceContext());

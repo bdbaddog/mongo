@@ -32,9 +32,9 @@ load("jstests/replsets/rslib.js");  // For reconfig and startSetIfSupportsReadMa
         return;
     }
 
-    // Cannot wait for a stable checkpoint due to the no-snapshot secondary.
+    // Cannot wait for a stable recovery timestamp due to the no-snapshot secondary.
     replTest.initiateWithAnyNodeAsPrimary(
-        null, "replSetInitiate", {doNotWaitForStableCheckpoint: true});
+        null, "replSetInitiate", {doNotWaitForStableRecoveryTimestamp: true});
 
     // Get connections and collection.
     var primary = replTest.getPrimary();
@@ -55,7 +55,7 @@ load("jstests/replsets/rslib.js");  // For reconfig and startSetIfSupportsReadMa
 
     // We need to propagate the lastOpVisible from the primary as afterOpTime in the secondaries to
     // ensure we wait for the write to be in the majority committed view.
-    var lastOp = res.metadata["$replData"].lastOpVisible;
+    var lastOp = res.commandReply["$replData"].lastOpVisible;
 
     // Timeout is based on heartbeat timeout.
     assert.commandWorked(healthySecondary.getDB(name).foo.runCommand(
@@ -66,7 +66,7 @@ load("jstests/replsets/rslib.js");  // For reconfig and startSetIfSupportsReadMa
     assert.commandFailedWithCode(
         noSnapshotSecondary.getDB(name).foo.runCommand(
             'find', {"readConcern": {"level": "majority"}, "maxTimeMS": 1000}),
-        ErrorCodes.ExceededTimeLimit);
+        ErrorCodes.MaxTimeMSExpired);
 
     // Reconfig to make the no-snapshot secondary the primary
     var config = primary.getDB("local").system.replset.findOne();
@@ -79,6 +79,6 @@ load("jstests/replsets/rslib.js");  // For reconfig and startSetIfSupportsReadMa
     assert.commandFailedWithCode(
         primary.getSiblingDB(name).foo.runCommand(
             'find', {"readConcern": {"level": "majority"}, "maxTimeMS": 1000}),
-        ErrorCodes.ExceededTimeLimit);
+        ErrorCodes.MaxTimeMSExpired);
     replTest.stopSet();
 })();

@@ -42,6 +42,7 @@ namespace mongo {
 
 struct InsertStatement;
 class OperationContext;
+struct OplogSlot;
 
 namespace repl {
 class OpTime;
@@ -148,7 +149,8 @@ public:
                                     Collection* coll,
                                     const NamespaceString& collectionName,
                                     const CollectionOptions& options,
-                                    const BSONObj& idIndex) = 0;
+                                    const BSONObj& idIndex,
+                                    const OplogSlot& createOpTime) = 0;
     /**
      * This function logs an oplog entry when a 'collMod' command on a collection is executed.
      * Since 'collMod' commands can take a variety of different formats, the 'o' field of the
@@ -259,8 +261,10 @@ public:
     /**
      * The onTransactionCommit method is called on the commit of an atomic transaction, before the
      * RecoveryUnit onCommit() is called.  It must not be called when no transaction is active.
+     * It accepts a 'wasPrepared' argument specifying if the transaction was prepared before commit
+     * was called.
      */
-    virtual void onTransactionCommit(OperationContext* opCtx) = 0;
+    virtual void onTransactionCommit(OperationContext* opCtx, bool wasPrepared) = 0;
 
     /**
      * The onTransactionPrepare method is called when an atomic transaction is prepared. It must be

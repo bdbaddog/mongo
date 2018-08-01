@@ -356,14 +356,11 @@ PlanStage* buildStages(OperationContext* opCtx,
         case STAGE_CACHED_PLAN:
         case STAGE_COUNT:
         case STAGE_DELETE:
-        case STAGE_NOTIFY_DELETE:
         case STAGE_EOF:
         case STAGE_GROUP:
         case STAGE_IDHACK:
-        case STAGE_INDEX_ITERATOR:
         case STAGE_MULTI_ITERATOR:
         case STAGE_MULTI_PLAN:
-        case STAGE_OPLOG_START:
         case STAGE_PIPELINE_PROXY:
         case STAGE_QUEUED_DATA:
         case STAGE_SUBPLAN:

@@ -271,7 +271,7 @@ selector:
   - jstests/sharding/key_string.js
   - jstests/sharding/fts_score_sort_sharded.js
   - jstests/sharding/uuid_propagated_to_config_server_on_shardCollection.js
-  - jstests/sharding/hash_skey_split.js
+  - jstests/sharding/initial_split_validate_shard_collections.js
   - jstests/sharding/exact_shard_key_target.js
   - jstests/sharding/trace_missing_docs_test.js
   - jstests/sharding/cursor_cleanup.js
@@ -320,7 +320,6 @@ selector:
   - jstests/sharding/replication_with_undefined_shard_key.js
   - jstests/sharding/hash_single_shard.js
   - jstests/sharding/version2.js
-  - jstests/sharding/crash_mongos_against_upgraded_cluster.js
   - jstests/sharding/advance_logical_time_with_valid_signature.js
   - jstests/sharding/cleanup_orphaned_auth.js
   - jstests/sharding/mrShardedOutputAuth.js
@@ -365,7 +364,6 @@ selector:
   - jstests/sharding/config_rs_change.js
   - jstests/sharding/current_op_no_shards.js
   - jstests/sharding/movechunk_include.js
-  - jstests/sharding/user_flags_sharded.js
   - jstests/sharding/move_chunk_with_session_helper.js
 
 executor:

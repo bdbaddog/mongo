@@ -17,11 +17,6 @@
             adminDB.runCommand({createUser: "admin", pwd: "admin", roles: ["root"]}));
         assert.eq(1, adminDB.auth("admin", "admin"));
 
-        let ismmap = false;
-        if (!isMongos) {
-            ismmap = assert.commandWorked(adminDB.serverStatus()).storageEngine.name == "mmapv1";
-        }
-
         // Set up the test database.
         const testDBName = "auth_getMore";
         let testDB = adminDB.getSiblingDB(testDBName);
@@ -101,34 +96,6 @@
             ErrorCodes.Unauthorized,
             "read from another user's listIndexes cursor");
         testDB.logout();
-
-        // Test that "Mallory" cannot use a parallelCollectionScan cursor created by "Alice".
-        if (!isMongos) {
-            assert.eq(1, testDB.auth("Alice", "pwd"));
-            res = assert.commandWorked(
-                testDB.runCommand({parallelCollectionScan: "foo", numCursors: 1}));
-            assert.eq(res.cursors.length, 1, tojson(res));
-            cursorId = res.cursors[0].cursor.id;
-            testDB.logout();
-            assert.eq(1, testDB.auth("Mallory", "pwd"));
-            assert.commandFailedWithCode(testDB.runCommand({getMore: cursorId, collection: "foo"}),
-                                         ErrorCodes.Unauthorized,
-                                         "read from another user's parallelCollectionScan cursor");
-            testDB.logout();
-        }
-
-        // Test that "Mallory" cannot use a repairCursor cursor created by "Alice".
-        if (!isMongos && ismmap) {
-            assert.eq(1, testDB.auth("Alice", "pwd"));
-            res = assert.commandWorked(testDB.runCommand({repairCursor: "foo"}));
-            cursorId = res.cursor.id;
-            testDB.logout();
-            assert.eq(1, testDB.auth("Mallory", "pwd"));
-            assert.commandFailedWithCode(testDB.runCommand({getMore: cursorId, collection: "foo"}),
-                                         ErrorCodes.Unauthorized,
-                                         "read from another user's repairCursor cursor");
-            testDB.logout();
-        }
 
         //
         // Test that a user can call getMore on an indexStats cursor they created, even if the

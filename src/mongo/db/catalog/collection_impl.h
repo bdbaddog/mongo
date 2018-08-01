@@ -123,12 +123,6 @@ public:
                                                     bool forward = true) const final;
 
     /**
-     * Returns many cursors that partition the Collection into many disjoint sets. Iterating
-     * all returned cursors is equivalent to iterating the full collection.
-     */
-    std::vector<std::unique_ptr<RecordCursor>> getManyCursors(OperationContext* opCtx) const final;
-
-    /**
      * Deletes the document with the given RecordId from the collection.
      *
      * 'stmtId' the statement id for this delete operation. Pass in kUninitializedStmtId if not
@@ -163,7 +157,6 @@ public:
                            std::vector<InsertStatement>::const_iterator begin,
                            std::vector<InsertStatement>::const_iterator end,
                            OpDebug* opDebug,
-                           bool enforceQuota,
                            bool fromMigrate = false) final;
 
     /**
@@ -171,12 +164,10 @@ public:
      * i.e. will not add an _id field for documents that are missing it
      *
      * 'opDebug' Optional argument. When not null, will be used to record operation statistics.
-     * 'enforceQuota' If false, quotas will be ignored.
      */
     Status insertDocument(OperationContext* opCtx,
                           const InsertStatement& doc,
                           OpDebug* opDebug,
-                          bool enforceQuota,
                           bool fromMigrate = false) final;
 
     /**
@@ -195,8 +186,7 @@ public:
      */
     Status insertDocument(OperationContext* opCtx,
                           const BSONObj& doc,
-                          const std::vector<MultiIndexBlock*>& indexBlocks,
-                          bool enforceQuota) final;
+                          const std::vector<MultiIndexBlock*>& indexBlocks) final;
 
     /**
      * Updates the document @ oldLocation with newDoc.
@@ -211,7 +201,6 @@ public:
                             const RecordId& oldLocation,
                             const Snapshotted<BSONObj>& oldDoc,
                             const BSONObj& newDoc,
-                            bool enforceQuota,
                             bool indexesAffected,
                             OpDebug* opDebug,
                             OplogUpdateEntryArgs* args) final;
@@ -392,28 +381,12 @@ private:
      *  - some user error checks
      *  - adjust padding
      */
-    Status _insertDocument(OperationContext* opCtx, const BSONObj& doc, bool enforceQuota);
+    Status _insertDocument(OperationContext* opCtx, const BSONObj& doc);
 
     Status _insertDocuments(OperationContext* opCtx,
                             std::vector<InsertStatement>::const_iterator begin,
                             std::vector<InsertStatement>::const_iterator end,
-                            bool enforceQuota,
                             OpDebug* opDebug);
-
-
-    /**
-     * Perform update when document move will be required.
-     */
-    StatusWith<RecordId> _updateDocumentWithMove(OperationContext* opCtx,
-                                                 const RecordId& oldLocation,
-                                                 const Snapshotted<BSONObj>& oldDoc,
-                                                 const BSONObj& newDoc,
-                                                 bool enforceQuota,
-                                                 OpDebug* opDebug,
-                                                 OplogUpdateEntryArgs* args,
-                                                 const SnapshotId& sid);
-
-    bool _enforceQuota(bool userEnforeQuota) const;
 
     int _magic;
 

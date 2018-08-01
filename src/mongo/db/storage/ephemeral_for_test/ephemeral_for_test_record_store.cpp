@@ -397,8 +397,10 @@ StatusWith<RecordId> EphemeralForTestRecordStore::extractAndCheckLocForOplog(con
     return status;
 }
 
-StatusWith<RecordId> EphemeralForTestRecordStore::insertRecord(
-    OperationContext* opCtx, const char* data, int len, Timestamp, bool enforceQuota) {
+StatusWith<RecordId> EphemeralForTestRecordStore::insertRecord(OperationContext* opCtx,
+                                                               const char* data,
+                                                               int len,
+                                                               Timestamp) {
     if (_isCapped && len > _cappedMaxSize) {
         // We use dataSize for capped rollover and we don't want to delete everything if we know
         // this won't fit.
@@ -473,7 +475,6 @@ Status EphemeralForTestRecordStore::updateRecord(OperationContext* opCtx,
                                                  const RecordId& loc,
                                                  const char* data,
                                                  int len,
-                                                 bool enforceQuota,
                                                  UpdateNotifier* notifier) {
     stdx::lock_guard<stdx::recursive_mutex> lock(_data->recordsMutex);
     EphemeralForTestRecord* oldRecord = recordFor(loc);
@@ -618,13 +619,6 @@ Status EphemeralForTestRecordStore::touch(OperationContext* opCtx, BSONObjBuilde
         output->append("millis", 0);
     }
     return Status::OK();
-}
-
-void EphemeralForTestRecordStore::increaseStorageSize(OperationContext* opCtx,
-                                                      int size,
-                                                      bool enforceQuota) {
-    // unclear what this would mean for this class. For now, just error if called.
-    invariant(!"increaseStorageSize not yet implemented");
 }
 
 int64_t EphemeralForTestRecordStore::storageSize(OperationContext* opCtx,

@@ -63,7 +63,7 @@ TEST(RecordStoreTestHarness, UpdateRecord) {
         {
             WriteUnitOfWork uow(opCtx.get());
             StatusWith<RecordId> res =
-                rs->insertRecord(opCtx.get(), data.c_str(), data.size() + 1, Timestamp(), false);
+                rs->insertRecord(opCtx.get(), data.c_str(), data.size() + 1, Timestamp());
             ASSERT_OK(res.getStatus());
             loc = res.getValue();
             uow.commit();
@@ -80,18 +80,8 @@ TEST(RecordStoreTestHarness, UpdateRecord) {
         ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
         {
             WriteUnitOfWork uow(opCtx.get());
-            Status res =
-                rs->updateRecord(opCtx.get(), loc, data.c_str(), data.size() + 1, false, NULL);
-
-            if (ErrorCodes::NeedsDocumentMove == res) {
-                StatusWith<RecordId> newLocation = rs->insertRecord(
-                    opCtx.get(), data.c_str(), data.size() + 1, Timestamp(), false);
-                ASSERT_OK(newLocation.getStatus());
-                rs->deleteRecord(opCtx.get(), loc);
-                loc = newLocation.getValue();
-            } else {
-                ASSERT_OK(res);
-            }
+            Status res = rs->updateRecord(opCtx.get(), loc, data.c_str(), data.size() + 1, NULL);
+            ASSERT_OK(res);
 
             uow.commit();
         }
@@ -128,7 +118,7 @@ TEST(RecordStoreTestHarness, UpdateMultipleRecords) {
 
             WriteUnitOfWork uow(opCtx.get());
             StatusWith<RecordId> res =
-                rs->insertRecord(opCtx.get(), data.c_str(), data.size() + 1, Timestamp(), false);
+                rs->insertRecord(opCtx.get(), data.c_str(), data.size() + 1, Timestamp());
             ASSERT_OK(res.getStatus());
             locs[i] = res.getValue();
             uow.commit();
@@ -149,17 +139,8 @@ TEST(RecordStoreTestHarness, UpdateMultipleRecords) {
 
             WriteUnitOfWork uow(opCtx.get());
             Status res =
-                rs->updateRecord(opCtx.get(), locs[i], data.c_str(), data.size() + 1, false, NULL);
-
-            if (ErrorCodes::NeedsDocumentMove == res) {
-                StatusWith<RecordId> newLocation = rs->insertRecord(
-                    opCtx.get(), data.c_str(), data.size() + 1, Timestamp(), false);
-                ASSERT_OK(newLocation.getStatus());
-                rs->deleteRecord(opCtx.get(), locs[i]);
-                locs[i] = newLocation.getValue();
-            } else {
-                ASSERT_OK(res);
-            }
+                rs->updateRecord(opCtx.get(), locs[i], data.c_str(), data.size() + 1, NULL);
+            ASSERT_OK(res);
 
             uow.commit();
         }
@@ -195,8 +176,8 @@ TEST(RecordStoreTestHarness, UpdateRecordWithMoveNotifier) {
         ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
         {
             WriteUnitOfWork uow(opCtx.get());
-            StatusWith<RecordId> res = rs->insertRecord(
-                opCtx.get(), oldData.c_str(), oldData.size() + 1, Timestamp(), false);
+            StatusWith<RecordId> res =
+                rs->insertRecord(opCtx.get(), oldData.c_str(), oldData.size() + 1, Timestamp());
             ASSERT_OK(res.getStatus());
             loc = res.getValue();
             uow.commit();
@@ -215,20 +196,10 @@ TEST(RecordStoreTestHarness, UpdateRecordWithMoveNotifier) {
             UpdateNotifierSpy umn(opCtx.get(), loc, oldData.c_str(), oldData.size());
 
             WriteUnitOfWork uow(opCtx.get());
-            Status res = rs->updateRecord(
-                opCtx.get(), loc, newData.c_str(), newData.size() + 1, false, &umn);
-
-            if (ErrorCodes::NeedsDocumentMove == res) {
-                StatusWith<RecordId> newLocation = rs->insertRecord(
-                    opCtx.get(), newData.c_str(), newData.size() + 1, Timestamp(), false);
-                ASSERT_OK(newLocation.getStatus());
-                rs->deleteRecord(opCtx.get(), loc);
-                loc = newLocation.getValue();
-                ASSERT_EQUALS(0, umn.numInPlaceCallbacks());
-            } else {
-                ASSERT_OK(res);
-                ASSERT_GTE(1, umn.numInPlaceCallbacks());
-            }
+            Status res =
+                rs->updateRecord(opCtx.get(), loc, newData.c_str(), newData.size() + 1, &umn);
+            ASSERT_OK(res);
+            ASSERT_GTE(1, umn.numInPlaceCallbacks());
 
             uow.commit();
         }

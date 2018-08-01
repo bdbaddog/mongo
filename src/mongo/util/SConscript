@@ -88,6 +88,16 @@ env.CppUnitTest(
     ],
 )
 
+env.CppUnitTest(
+    target='invalidating_lru_cache_test',
+    source=[
+        'invalidating_lru_cache_test.cpp',
+    ],
+    LIBDEPS=[
+        '$BUILD_DIR/mongo/base',
+    ],
+)
+
 env.Library(
     target='summation',
     source=[
@@ -274,7 +284,7 @@ env.CppUnitTest(
         "periodic_runner_impl_test.cpp",
     ],
     LIBDEPS=[
-        '$BUILD_DIR/mongo/db/service_context_noop_init',
+        "$BUILD_DIR/mongo/db/service_context_test_fixture",
         "clock_source_mock",
         "periodic_runner_impl",
     ],
@@ -492,7 +502,15 @@ env.CppUnitTest(
     LIBDEPS=[
         'dns_query',
         "$BUILD_DIR/mongo/base",
-    ]
+    ],
+)
+
+env.CppUnitTest(
+    target='dns_name_test',
+    source=['dns_name_test.cpp'],
+    LIBDEPS=[
+        "$BUILD_DIR/mongo/base",
+    ],
 )
 
 env.Library(

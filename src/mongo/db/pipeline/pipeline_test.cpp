@@ -1536,7 +1536,7 @@ TEST(PipelineOptimizationTest, ChangeStreamLookupSwapsWithIndependentMatch) {
     auto spec = BSON("$changeStream" << BSON("fullDocument"
                                              << "updateLookup"));
     auto stages = DocumentSourceChangeStream::createFromBson(spec.firstElement(), expCtx);
-    ASSERT_EQ(stages.size(), 4UL);
+    ASSERT_EQ(stages.size(), 5UL);
     // Make sure the change lookup is at the end.
     ASSERT(dynamic_cast<DocumentSourceLookupChangePostImage*>(stages.back().get()));
 
@@ -1561,7 +1561,7 @@ TEST(PipelineOptimizationTest, ChangeStreamLookupDoesNotSwapWithMatchOnPostImage
     auto spec = BSON("$changeStream" << BSON("fullDocument"
                                              << "updateLookup"));
     auto stages = DocumentSourceChangeStream::createFromBson(spec.firstElement(), expCtx);
-    ASSERT_EQ(stages.size(), 4UL);
+    ASSERT_EQ(stages.size(), 5UL);
     // Make sure the change lookup is at the end.
     ASSERT(dynamic_cast<DocumentSourceLookupChangePostImage*>(stages.back().get()));
 
@@ -2119,7 +2119,8 @@ class Out : public needsPrimaryShardMergerBase {
         return "[]";
     }
     string mergePipeJson() {
-        return "[{$out: 'outColl'}]";
+        return "[{$out: {to: 'outColl', db: 'a', mode: '" +
+            WriteMode_serializer(WriteModeEnum::kModeReplaceCollection) + "'}}]";
     }
 };
 
@@ -2457,7 +2458,7 @@ TEST_F(PipelineValidateTest, TopLevelPipelineValidatedForStagesIllegalInTransact
     auto illegalStage = DocumentSourceDisallowedInTransactions::create();
     auto pipeline = Pipeline::create({matchStage, illegalStage}, ctx);
     ASSERT_NOT_OK(pipeline.getStatus());
-    ASSERT_EQ(pipeline.getStatus(), ErrorCodes::duplicateCodeForTest(50742));
+    ASSERT_EQ(pipeline.getStatus(), ErrorCodes::OperationNotSupportedInTransaction);
 }
 
 TEST_F(PipelineValidateTest, FacetPipelineValidatedForStagesIllegalInTransactions) {
@@ -2472,7 +2473,7 @@ TEST_F(PipelineValidateTest, FacetPipelineValidatedForStagesIllegalInTransaction
     auto illegalStage = DocumentSourceDisallowedInTransactions::create();
     auto pipeline = Pipeline::createFacetPipeline({matchStage, illegalStage}, ctx);
     ASSERT_NOT_OK(pipeline.getStatus());
-    ASSERT_EQ(pipeline.getStatus(), ErrorCodes::duplicateCodeForTest(50742));
+    ASSERT_EQ(pipeline.getStatus(), ErrorCodes::OperationNotSupportedInTransaction);
 }
 
 }  // namespace pipeline_validate
@@ -2515,8 +2516,8 @@ public:
 
 class DocumentSourceDependenciesNotSupported : public DocumentSourceDependencyDummy {
 public:
-    GetDepsReturn getDependencies(DepsTracker* deps) const final {
-        return GetDepsReturn::NOT_SUPPORTED;
+    DepsTracker::State getDependencies(DepsTracker* deps) const final {
+        return DepsTracker::State::NOT_SUPPORTED;
     }
 
     static boost::intrusive_ptr<DocumentSourceDependenciesNotSupported> create() {
@@ -2526,9 +2527,9 @@ public:
 
 class DocumentSourceNeedsASeeNext : public DocumentSourceDependencyDummy {
 public:
-    GetDepsReturn getDependencies(DepsTracker* deps) const final {
+    DepsTracker::State getDependencies(DepsTracker* deps) const final {
         deps->fields.insert("a");
-        return GetDepsReturn::SEE_NEXT;
+        return DepsTracker::State::SEE_NEXT;
     }
 
     static boost::intrusive_ptr<DocumentSourceNeedsASeeNext> create() {
@@ -2538,9 +2539,9 @@ public:
 
 class DocumentSourceNeedsOnlyB : public DocumentSourceDependencyDummy {
 public:
-    GetDepsReturn getDependencies(DepsTracker* deps) const final {
+    DepsTracker::State getDependencies(DepsTracker* deps) const final {
         deps->fields.insert("b");
-        return GetDepsReturn::EXHAUSTIVE_FIELDS;
+        return DepsTracker::State::EXHAUSTIVE_FIELDS;
     }
 
     static boost::intrusive_ptr<DocumentSourceNeedsOnlyB> create() {
@@ -2550,9 +2551,9 @@ public:
 
 class DocumentSourceNeedsOnlyTextScore : public DocumentSourceDependencyDummy {
 public:
-    GetDepsReturn getDependencies(DepsTracker* deps) const final {
+    DepsTracker::State getDependencies(DepsTracker* deps) const final {
         deps->setNeedsMetadata(DepsTracker::MetadataType::TEXT_SCORE, true);
-        return GetDepsReturn::EXHAUSTIVE_META;
+        return DepsTracker::State::EXHAUSTIVE_META;
     }
 
     static boost::intrusive_ptr<DocumentSourceNeedsOnlyTextScore> create() {
@@ -2562,8 +2563,8 @@ public:
 
 class DocumentSourceStripsTextScore : public DocumentSourceDependencyDummy {
 public:
-    GetDepsReturn getDependencies(DepsTracker* deps) const final {
-        return GetDepsReturn::EXHAUSTIVE_META;
+    DepsTracker::State getDependencies(DepsTracker* deps) const final {
+        return DepsTracker::State::EXHAUSTIVE_META;
     }
 
     static boost::intrusive_ptr<DocumentSourceStripsTextScore> create() {

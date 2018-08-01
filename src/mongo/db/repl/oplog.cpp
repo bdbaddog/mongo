@@ -152,8 +152,7 @@ void _getNextOpTimes(OperationContext* opCtx,
     long long term = OpTime::kUninitializedTerm;
 
     // Fetch term out of the newOpMutex.
-    if (replCoord->getReplicationMode() == ReplicationCoordinator::modeReplSet &&
-        replCoord->isV1ElectionProtocol()) {
+    if (replCoord->getReplicationMode() == ReplicationCoordinator::modeReplSet) {
         // Current term. If we're not a replset of pv=1, it remains kOldProtocolVersionTerm.
         term = replCoord->getTerm();
     }
@@ -434,7 +433,8 @@ OpTime logOp(OperationContext* opCtx,
              const OperationSessionInfo& sessionInfo,
              StmtId statementId,
              const OplogLink& oplogLink,
-             bool prepare) {
+             bool prepare,
+             const OplogSlot& oplogSlot) {
     auto replCoord = ReplicationCoordinator::get(opCtx);
     // For commands, the test below is on the command ns and therefore does not check for
     // specific namespaces such as system.profile. This is the caller's responsibility.
@@ -453,7 +453,11 @@ OpTime logOp(OperationContext* opCtx,
 
     OplogSlot slot;
     WriteUnitOfWork wuow(opCtx);
-    _getNextOpTimes(opCtx, oplog, 1, &slot);
+    if (oplogSlot.opTime.isNull()) {
+        _getNextOpTimes(opCtx, oplog, 1, &slot);
+    } else {
+        slot = oplogSlot;
+    }
 
     auto writer = _logOpWriter(opCtx,
                                opstr,
@@ -946,8 +950,9 @@ std::map<std::string, ApplyOpMetadata> opsMap = {
          BSONObj& cmd,
          const OpTime& opTime,
          OplogApplication::Mode mode) -> Status {
-         return convertToCapped(opCtx, parseUUIDorNs(opCtx, ns, ui, cmd), cmd["size"].number());
-     }}},
+          return convertToCapped(opCtx, parseUUIDorNs(opCtx, ns, ui, cmd), cmd["size"].number());
+      },
+      {ErrorCodes::NamespaceNotFound}}},
     {"emptycapped",
      {[](OperationContext* opCtx,
          const char* ns,
@@ -955,8 +960,9 @@ std::map<std::string, ApplyOpMetadata> opsMap = {
          BSONObj& cmd,
          const OpTime& opTime,
          OplogApplication::Mode mode) -> Status {
-         return emptyCapped(opCtx, parseUUIDorNs(opCtx, ns, ui, cmd));
-     }}},
+          return emptyCapped(opCtx, parseUUIDorNs(opCtx, ns, ui, cmd));
+      },
+      {ErrorCodes::NamespaceNotFound}}},
 };
 
 }  // namespace

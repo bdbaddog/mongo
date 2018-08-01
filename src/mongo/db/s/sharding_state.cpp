@@ -32,11 +32,9 @@
 
 #include "mongo/db/s/sharding_state.h"
 
-#include "mongo/base/init.h"
 #include "mongo/bson/util/bson_extract.h"
 #include "mongo/client/connection_string.h"
 #include "mongo/client/replica_set_monitor.h"
-#include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/catalog_raii.h"
 #include "mongo/db/client.h"
 #include "mongo/db/dbhelpers.h"
@@ -47,22 +45,19 @@
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/s/chunk_splitter.h"
 #include "mongo/db/s/operation_sharding_state.h"
+#include "mongo/db/s/periodic_balancer_config_refresher.h"
 #include "mongo/db/s/sharded_connection_info.h"
 #include "mongo/db/s/sharding_initialization_mongod.h"
 #include "mongo/db/s/type_shard_identity.h"
 #include "mongo/executor/task_executor_pool.h"
-#include "mongo/rpc/metadata/config_server_metadata.h"
 #include "mongo/rpc/metadata/metadata_hook.h"
 #include "mongo/s/catalog/sharding_catalog_client.h"
-#include "mongo/s/catalog/type_chunk.h"
-#include "mongo/s/catalog_cache.h"
-#include "mongo/s/chunk_version.h"
+#include "mongo/s/catalog_cache_loader.h"
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/client/sharding_network_connection_hook.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/sharding_initialization.h"
 #include "mongo/util/log.h"
-#include "mongo/util/mongoutils/str.h"
 
 namespace mongo {
 namespace {
@@ -79,7 +74,8 @@ const auto getShardingState = ServiceContext::declareDecoration<ShardingState>()
  */
 void updateShardIdentityConfigStringCB(const std::string& setName,
                                        const std::string& newConnectionString) {
-    auto configsvrConnStr = grid.shardRegistry()->getConfigServerConnectionString();
+    auto configsvrConnStr =
+        Grid::get(getGlobalServiceContext())->shardRegistry()->getConfigServerConnectionString();
     if (configsvrConnStr.getSetName() != setName) {
         // Ignore all change notification for other sets that are not the config server.
         return;
@@ -99,9 +95,9 @@ void updateShardIdentityConfigStringCB(const std::string& setName,
 }  // namespace
 
 ShardingState::ShardingState()
-    : _initializationState(static_cast<uint32_t>(InitializationState::kNew)),
-      _initializationStatus(Status(ErrorCodes::InternalError, "Uninitialized value")),
-      _globalInit(&initializeGlobalShardingStateForMongod) {}
+    : _globalInit(&initializeGlobalShardingStateForMongod),
+      _initializationState(static_cast<uint32_t>(InitializationState::kNew)),
+      _initializationStatus(Status(ErrorCodes::InternalError, "Uninitialized value")) {}
 
 ShardingState::~ShardingState() = default;
 
@@ -118,8 +114,8 @@ bool ShardingState::enabled() const {
 }
 
 void ShardingState::setEnabledForTest(const std::string& shardName) {
+    _shardId = shardName;
     _setInitializationState(InitializationState::kInitialized);
-    _shardName = shardName;
 }
 
 Status ShardingState::canAcceptShardedCommands() const {
@@ -135,10 +131,28 @@ Status ShardingState::canAcceptShardedCommands() const {
     }
 }
 
-std::string ShardingState::getShardName() {
+ShardId ShardingState::shardId() {
     invariant(enabled());
     stdx::lock_guard<stdx::mutex> lk(_mutex);
-    return _shardName;
+    return _shardId;
+}
+
+OID ShardingState::clusterId() {
+    invariant(enabled());
+    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    return _clusterId;
+}
+
+bool ShardingState::needCollectionMetadata(OperationContext* opCtx, const std::string& ns) {
+    if (!enabled())
+        return false;
+
+    Client* client = opCtx->getClient();
+
+    // Shard version information received from mongos may either by attached to the Client or
+    // directly to the OperationContext.
+    return ShardedConnectionInfo::get(client, false) ||
+        OperationShardingState::get(opCtx).hasShardVersion();
 }
 
 void ShardingState::shutDown(OperationContext* opCtx) {
@@ -149,32 +163,10 @@ void ShardingState::shutDown(OperationContext* opCtx) {
     }
 }
 
-Status ShardingState::updateConfigServerOpTimeFromMetadata(OperationContext* opCtx) {
-    if (!enabled()) {
-        // Nothing to do if sharding state has not been initialized.
-        return Status::OK();
-    }
-
-    boost::optional<repl::OpTime> opTime = rpc::ConfigServerMetadata::get(opCtx).getOpTime();
-    if (opTime) {
-        if (!AuthorizationSession::get(opCtx->getClient())
-                 ->isAuthorizedForActionsOnResource(ResourcePattern::forClusterResource(),
-                                                    ActionType::internal)) {
-            return Status(ErrorCodes::Unauthorized, "Unauthorized to update config opTime");
-        }
-
-        Grid::get(opCtx)->advanceConfigOpTime(*opTime);
-    }
-
-    return Status::OK();
-}
-
 void ShardingState::setGlobalInitMethodForTest(GlobalInitFunc func) {
     _globalInit = func;
 }
 
-// NOTE: This method will be called inside a database lock so it should never take any database
-// locks, perform I/O, or any long running operations.
 Status ShardingState::initializeFromShardIdentity(OperationContext* opCtx,
                                                   const ShardIdentityType& shardIdentity) {
     invariant(serverGlobalParams.clusterRole == ClusterRole::ShardServer);
@@ -193,8 +185,8 @@ Status ShardingState::initializeFromShardIdentity(OperationContext* opCtx,
     const auto& configSvrConnStr = shardIdentity.getConfigsvrConnectionString();
 
     if (enabled()) {
-        invariant(!_shardName.empty());
-        fassert(40372, _shardName == shardIdentity.getShardName());
+        invariant(_shardId.isValid());
+        fassert(40372, _shardId == shardIdentity.getShardName());
 
         auto prevConfigsvrConnStr =
             Grid::get(opCtx)->shardRegistry()->getConfigServerConnectionString();
@@ -231,7 +223,9 @@ Status ShardingState::initializeFromShardIdentity(OperationContext* opCtx,
                                repl::MemberState::RS_PRIMARY);
 
             CatalogCacheLoader::get(opCtx).initializeReplicaSetRole(isStandaloneOrPrimary);
-            ChunkSplitter::get(opCtx).setReplicaSetMode(isStandaloneOrPrimary);
+            ChunkSplitter::get(opCtx).onShardingInitialization(isStandaloneOrPrimary);
+            PeriodicBalancerConfigRefresher::get(opCtx).onShardingInitialization(
+                opCtx->getServiceContext(), isStandaloneOrPrimary);
 
             log() << "initialized sharding components for "
                   << (isStandaloneOrPrimary ? "primary" : "secondary") << " node.";
@@ -241,7 +235,7 @@ Status ShardingState::initializeFromShardIdentity(OperationContext* opCtx,
             _initializationStatus = status;
             _setInitializationState(InitializationState::kError);
         }
-        _shardName = shardIdentity.getShardName().toString();
+        _shardId = shardIdentity.getShardName().toString();
         _clusterId = shardIdentity.getClusterId();
 
         return status;
@@ -369,32 +363,6 @@ StatusWith<bool> ShardingState::initializeShardingAwarenessIfNeeded(OperationCon
             return false;
         }
     }
-}
-
-void ShardingState::appendInfo(OperationContext* opCtx, BSONObjBuilder& builder) {
-    const bool isEnabled = enabled();
-    builder.appendBool("enabled", isEnabled);
-    if (!isEnabled)
-        return;
-
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
-
-    builder.append("configServer",
-                   Grid::get(opCtx)->shardRegistry()->getConfigServerConnectionString().toString());
-    builder.append("shardName", _shardName);
-    builder.append("clusterId", _clusterId);
-}
-
-bool ShardingState::needCollectionMetadata(OperationContext* opCtx, const std::string& ns) {
-    if (!enabled())
-        return false;
-
-    Client* client = opCtx->getClient();
-
-    // Shard version information received from mongos may either by attached to the Client or
-    // directly to the OperationContext.
-    return ShardedConnectionInfo::get(client, false) ||
-        OperationShardingState::get(opCtx).hasShardVersion();
 }
 
 Status ShardingState::updateShardIdentityConfigString(OperationContext* opCtx,

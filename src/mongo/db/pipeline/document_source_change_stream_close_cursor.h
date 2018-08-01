@@ -88,7 +88,7 @@ public:
             DocumentSourceSort::create(pExpCtx,
                                        change_stream_constants::kSortSpec,
                                        noLimit,
-                                       DocumentSourceSort::kMaxMemoryUsageBytes,
+                                       internalDocumentSourceSortMaxBlockingSortBytes.load(),
                                        mergingPresorted);
         return {sortMergingPresorted, this};
     }
@@ -101,7 +101,6 @@ private:
         : DocumentSource(expCtx) {}
 
     bool _shouldCloseCursor = false;
-    boost::optional<Document> _queuedInvalidate;
 };
 
 }  // namespace mongo

@@ -33,7 +33,6 @@
 #include "mongo/db/pipeline/pipeline_d.h"
 
 #include "mongo/bson/simple_bsonobj_comparator.h"
-#include "mongo/client/dbclientinterface.h"
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/database.h"
@@ -47,7 +46,6 @@
 #include "mongo/db/db_raii.h"
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/exec/fetch.h"
-#include "mongo/db/exec/index_iterator.h"
 #include "mongo/db/exec/multi_iterator.h"
 #include "mongo/db/exec/shard_filter.h"
 #include "mongo/db/exec/working_set.h"
@@ -60,6 +58,7 @@
 #include "mongo/db/pipeline/document_source_cursor.h"
 #include "mongo/db/pipeline/document_source_geo_near.h"
 #include "mongo/db/pipeline/document_source_geo_near_cursor.h"
+#include "mongo/db/pipeline/document_source_group.h"
 #include "mongo/db/pipeline/document_source_match.h"
 #include "mongo/db/pipeline/document_source_merge_cursors.h"
 #include "mongo/db/pipeline/document_source_sample.h"
@@ -71,9 +70,7 @@
 #include "mongo/db/query/get_executor.h"
 #include "mongo/db/query/plan_summary_stats.h"
 #include "mongo/db/query/query_planner.h"
-#include "mongo/db/s/collection_metadata.h"
 #include "mongo/db/s/collection_sharding_state.h"
-#include "mongo/db/s/metadata_manager.h"
 #include "mongo/db/s/sharding_state.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/session_catalog.h"
@@ -112,44 +109,16 @@ StatusWith<unique_ptr<PlanExecutor, PlanExecutor::Deleter>> createRandomCursorEx
         return {nullptr};
     }
 
-    // Attempt to get a random cursor from the RecordStore. If the RecordStore does not support
-    // random cursors, attempt to get one from the _id index.
-    std::unique_ptr<RecordCursor> rsRandCursor =
-        collection->getRecordStore()->getRandomCursor(opCtx);
+    // Attempt to get a random cursor from the RecordStore.
+    auto rsRandCursor = collection->getRecordStore()->getRandomCursor(opCtx);
+    if (!rsRandCursor) {
+        // The storage engine has no random cursor support.
+        return {nullptr};
+    }
 
     auto ws = stdx::make_unique<WorkingSet>();
-    std::unique_ptr<PlanStage> stage;
-
-    if (rsRandCursor) {
-        stage = stdx::make_unique<MultiIteratorStage>(opCtx, ws.get(), collection);
-        static_cast<MultiIteratorStage*>(stage.get())->addIterator(std::move(rsRandCursor));
-
-    } else {
-        auto indexCatalog = collection->getIndexCatalog();
-        auto indexDescriptor = indexCatalog->findIdIndex(opCtx);
-
-        if (!indexDescriptor) {
-            // There was no _id index.
-            return {nullptr};
-        }
-
-        IndexAccessMethod* idIam = indexCatalog->getIndex(indexDescriptor);
-        auto idxRandCursor = idIam->newRandomCursor(opCtx);
-
-        if (!idxRandCursor) {
-            // Storage engine does not support any type of random cursor.
-            return {nullptr};
-        }
-
-        auto idxIterator = stdx::make_unique<IndexIteratorStage>(opCtx,
-                                                                 ws.get(),
-                                                                 collection,
-                                                                 idIam,
-                                                                 indexDescriptor->keyPattern(),
-                                                                 std::move(idxRandCursor));
-        stage = stdx::make_unique<FetchStage>(
-            opCtx, ws.get(), idxIterator.release(), nullptr, collection);
-    }
+    auto stage = stdx::make_unique<MultiIteratorStage>(opCtx, ws.get(), collection);
+    stage->addIterator(std::move(rsRandCursor));
 
     {
         AutoGetCollectionForRead autoColl(opCtx, collection->ns());
@@ -671,32 +640,35 @@ Timestamp PipelineD::getLatestOplogTimestamp(const Pipeline* pipeline) {
     return Timestamp();
 }
 
-std::string PipelineD::getPlanSummaryStr(const Pipeline* pPipeline) {
+std::string PipelineD::getPlanSummaryStr(const Pipeline* pipeline) {
     if (auto docSourceCursor =
-            dynamic_cast<DocumentSourceCursor*>(pPipeline->_sources.front().get())) {
+            dynamic_cast<DocumentSourceCursor*>(pipeline->_sources.front().get())) {
         return docSourceCursor->getPlanSummaryStr();
     }
 
     return "";
 }
 
-void PipelineD::getPlanSummaryStats(const Pipeline* pPipeline, PlanSummaryStats* statsOut) {
+void PipelineD::getPlanSummaryStats(const Pipeline* pipeline, PlanSummaryStats* statsOut) {
     invariant(statsOut);
 
     if (auto docSourceCursor =
-            dynamic_cast<DocumentSourceCursor*>(pPipeline->_sources.front().get())) {
+            dynamic_cast<DocumentSourceCursor*>(pipeline->_sources.front().get())) {
         *statsOut = docSourceCursor->getPlanSummaryStats();
     }
 
     bool hasSortStage{false};
-    for (auto&& source : pPipeline->_sources) {
-        if (dynamic_cast<DocumentSourceSort*>(source.get())) {
+    bool usedDisk{false};
+    for (auto&& source : pipeline->_sources) {
+        if (dynamic_cast<DocumentSourceSort*>(source.get()))
             hasSortStage = true;
-            break;
-        }
-    }
 
+        usedDisk = usedDisk || source->usedDisk();
+        if (usedDisk && hasSortStage)
+            break;
+    }
     statsOut->hasSortStage = hasSortStage;
+    statsOut->usedDisk = usedDisk;
 }
 
 PipelineD::MongoDInterface::MongoDInterface(OperationContext* opCtx) : _client(opCtx) {}
@@ -711,10 +683,8 @@ DBClientBase* PipelineD::MongoDInterface::directClient() {
 
 bool PipelineD::MongoDInterface::isSharded(OperationContext* opCtx, const NamespaceString& nss) {
     AutoGetCollectionForReadCommand autoColl(opCtx, nss);
-    // TODO SERVER-24960: Use CollectionShardingState::collectionIsSharded() to confirm sharding
-    // state.
-    auto css = CollectionShardingState::get(opCtx, nss);
-    return bool(css->getMetadata(opCtx));
+    auto const css = CollectionShardingState::get(opCtx, nss);
+    return css->getMetadata(opCtx)->isSharded();
 }
 
 BSONObj PipelineD::MongoDInterface::insert(const boost::intrusive_ptr<ExpressionContext>& expCtx,
@@ -766,7 +736,7 @@ BSONObj PipelineD::MongoDInterface::getCollectionOptions(const NamespaceString& 
     return infos.empty() ? BSONObj() : infos.front().getObjectField("options").getOwned();
 }
 
-Status PipelineD::MongoDInterface::renameIfOptionsAndIndexesHaveNotChanged(
+void PipelineD::MongoDInterface::renameIfOptionsAndIndexesHaveNotChanged(
     OperationContext* opCtx,
     const BSONObj& renameCommandObj,
     const NamespaceString& targetNs,
@@ -774,31 +744,29 @@ Status PipelineD::MongoDInterface::renameIfOptionsAndIndexesHaveNotChanged(
     const std::list<BSONObj>& originalIndexes) {
     Lock::GlobalWrite globalLock(opCtx);
 
-    if (SimpleBSONObjComparator::kInstance.evaluate(originalCollectionOptions !=
-                                                    getCollectionOptions(targetNs))) {
-        return {ErrorCodes::CommandFailed,
-                str::stream() << "collection options of target collection " << targetNs.ns()
-                              << " changed during processing. Original options: "
-                              << originalCollectionOptions
-                              << ", new options: "
-                              << getCollectionOptions(targetNs)};
-    }
+    uassert(ErrorCodes::CommandFailed,
+            str::stream() << "collection options of target collection " << targetNs.ns()
+                          << " changed during processing. Original options: "
+                          << originalCollectionOptions
+                          << ", new options: "
+                          << getCollectionOptions(targetNs),
+            SimpleBSONObjComparator::kInstance.evaluate(originalCollectionOptions ==
+                                                        getCollectionOptions(targetNs)));
 
     auto currentIndexes = _client.getIndexSpecs(targetNs.ns());
-    if (originalIndexes.size() != currentIndexes.size() ||
-        !std::equal(originalIndexes.begin(),
-                    originalIndexes.end(),
-                    currentIndexes.begin(),
-                    SimpleBSONObjComparator::kInstance.makeEqualTo())) {
-        return {ErrorCodes::CommandFailed,
-                str::stream() << "indexes of target collection " << targetNs.ns()
-                              << " changed during processing."};
-    }
+    uassert(ErrorCodes::CommandFailed,
+            str::stream() << "indexes of target collection " << targetNs.ns()
+                          << " changed during processing.",
+            originalIndexes.size() == currentIndexes.size() &&
+                std::equal(originalIndexes.begin(),
+                           originalIndexes.end(),
+                           currentIndexes.begin(),
+                           SimpleBSONObjComparator::kInstance.makeEqualTo()));
 
     BSONObj info;
-    bool ok = _client.runCommand("admin", renameCommandObj, info);
-    return ok ? Status::OK() : Status{ErrorCodes::CommandFailed,
-                                      str::stream() << "renameCollection failed: " << info};
+    uassert(ErrorCodes::CommandFailed,
+            str::stream() << "renameCollection failed: " << info,
+            _client.runCommand("admin", renameCommandObj, info));
 }
 
 StatusWith<std::unique_ptr<Pipeline, PipelineDeleter>> PipelineD::MongoDInterface::makePipeline(
@@ -845,13 +813,11 @@ Status PipelineD::MongoDInterface::attachCursorSourceToPipeline(
     // collection representing the document source to be not-sharded. We confirm sharding state
     // here to avoid taking a collection lock elsewhere for this purpose alone.
     // TODO SERVER-27616: This check is incorrect in that we don't acquire a collection cursor
-    // until after we release the lock, leaving room for a collection to be sharded inbetween.
-    // TODO SERVER-24960: Use CollectionShardingState::collectionIsSharded() to confirm sharding
-    // state.
+    // until after we release the lock, leaving room for a collection to be sharded in-between.
     auto css = CollectionShardingState::get(expCtx->opCtx, expCtx->ns);
     uassert(4567,
             str::stream() << "from collection (" << expCtx->ns.ns() << ") cannot be sharded",
-            !bool(css->getMetadata(expCtx->opCtx)));
+            !css->getMetadata(expCtx->opCtx)->isSharded());
 
     PipelineD::prepareCursorSource(autoColl->getCollection(), expCtx->ns, nullptr, pipeline);
 
@@ -860,7 +826,7 @@ Status PipelineD::MongoDInterface::attachCursorSourceToPipeline(
 
 std::string PipelineD::MongoDInterface::getShardName(OperationContext* opCtx) const {
     if (ShardingState::get(opCtx)->enabled()) {
-        return ShardingState::get(opCtx)->getShardName();
+        return ShardingState::get(opCtx)->shardId().toString();
     }
 
     return std::string();
@@ -900,7 +866,7 @@ std::pair<std::vector<FieldPath>, bool> PipelineD::MongoDInterface::collectDocum
 
     // Collection is not sharded or UUID mismatch implies collection has been dropped and recreated
     // as sharded.
-    if (!scm || !scm->uuidMatches(uuid)) {
+    if (!scm->isSharded() || !scm->uuidMatches(uuid)) {
         return {{"_id"}, false};
     }
 
@@ -965,8 +931,14 @@ BSONObj PipelineD::MongoDInterface::_reportCurrentOpForClient(
     CurOp::reportCurrentOpForClient(
         opCtx, client, (truncateOps == CurrentOpTruncateMode::kTruncateOps), &builder);
 
-    // Append lock stats before returning.
-    if (auto clientOpCtx = client->getOperationContext()) {
+    OperationContext* clientOpCtx = client->getOperationContext();
+
+    if (clientOpCtx) {
+        if (auto opCtxSession = OperationContextSession::get(clientOpCtx)) {
+            opCtxSession->reportUnstashedState(repl::ReadConcernArgs::get(clientOpCtx), &builder);
+        }
+
+        // Append lock stats before returning.
         if (auto lockerInfo = clientOpCtx->lockState()->getLockerInfo()) {
             fillLockerInfo(*lockerInfo, builder);
         }

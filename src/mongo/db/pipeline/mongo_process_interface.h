@@ -35,7 +35,7 @@
 #include <string>
 #include <vector>
 
-#include "mongo/client/dbclientinterface.h"
+#include "mongo/client/dbclient_base.h"
 #include "mongo/db/collection_index_usage_tracker.h"
 #include "mongo/db/generic_cursor.h"
 #include "mongo/db/namespace_string.h"
@@ -135,8 +135,10 @@ public:
     /**
      * Performs the given rename command if the collection given by 'targetNs' has the same options
      * as specified in 'originalCollectionOptions', and has the same indexes as 'originalIndexes'.
+     *
+     * Throws an exception if the collection options and/or indexes are different.
      */
-    virtual Status renameIfOptionsAndIndexesHaveNotChanged(
+    virtual void renameIfOptionsAndIndexesHaveNotChanged(
         OperationContext* opCtx,
         const BSONObj& renameCommandObj,
         const NamespaceString& targetNs,

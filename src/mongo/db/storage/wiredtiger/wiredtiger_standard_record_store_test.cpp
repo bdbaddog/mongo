@@ -69,14 +69,7 @@ using std::stringstream;
 
 class WiredTigerHarnessHelper final : public RecordStoreHarnessHelper {
 public:
-    WiredTigerHarnessHelper()
-        : _dbpath("wt_test"),
-          _engine(kWiredTigerEngineName, _dbpath.path(), &_cs, "", 1, false, false, false, false) {
-        repl::ReplicationCoordinator::set(
-            getGlobalServiceContext(),
-            std::unique_ptr<repl::ReplicationCoordinator>(new repl::ReplicationCoordinatorMock(
-                getGlobalServiceContext(), repl::ReplSettings())));
-    }
+    WiredTigerHarnessHelper() : WiredTigerHarnessHelper(""_sd) {}
 
     WiredTigerHarnessHelper(StringData extraStrings)
         : _dbpath("wt_test"),
@@ -88,8 +81,11 @@ public:
                   false,
                   false,
                   false,
-                  false) {}
-
+                  false) {
+        repl::ReplicationCoordinator::set(serviceContext(),
+                                          std::make_unique<repl::ReplicationCoordinatorMock>(
+                                              serviceContext(), repl::ReplSettings()));
+    }
 
     ~WiredTigerHarnessHelper() {}
 
@@ -231,8 +227,7 @@ TEST(WiredTigerRecordStoreTest, SizeStorer1) {
         {
             WriteUnitOfWork uow(opCtx.get());
             for (int i = 0; i < N; i++) {
-                StatusWith<RecordId> res =
-                    rs->insertRecord(opCtx.get(), "a", 2, Timestamp(), false);
+                StatusWith<RecordId> res = rs->insertRecord(opCtx.get(), "a", 2, Timestamp());
                 ASSERT_OK(res.getStatus());
             }
             uow.commit();
@@ -333,7 +328,7 @@ private:
             ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
             WriteUnitOfWork uow(opCtx.get());
             for (int i = 0; i < expectedNumRecords; i++) {
-                ASSERT_OK(rs->insertRecord(opCtx.get(), "a", 2, Timestamp(), false).getStatus());
+                ASSERT_OK(rs->insertRecord(opCtx.get(), "a", 2, Timestamp()).getStatus());
             }
             uow.commit();
         }

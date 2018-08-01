@@ -1244,8 +1244,43 @@ SSLPeerInfo SSLManagerApple::parseAndValidatePeerCertificateDeprecated(
     return swPeerSubjectName.getValue().get_value_or(SSLPeerInfo());
 }
 
+void recordTLSVersion(::SSLContextRef ssl) {
+    ::SSLProtocol protocol;
+
+    uassertOSStatusOK(::SSLGetNegotiatedProtocolVersion(ssl, &protocol));
+
+    auto& counts = mongo::TLSVersionCounts::get(getGlobalServiceContext());
+    switch (protocol) {
+        case kTLSProtocol1:
+            counts.tls10.addAndFetch(1);
+            break;
+        case kTLSProtocol11:
+            counts.tls11.addAndFetch(1);
+            break;
+        case kTLSProtocol12:
+            counts.tls12.addAndFetch(1);
+            break;
+        // case kTLSProtocol13:
+        //     counts.tls13.addAndFetch(1);
+        //     break;
+        case kSSLProtocolUnknown:
+        case kSSLProtocol2:
+        case kSSLProtocol3:
+        case kSSLProtocol3Only:
+        case kTLSProtocol1Only:
+        case kSSLProtocolAll:
+        case kDTLSProtocol1:
+            // Do nothing
+            break;
+    }
+}
+
+
 StatusWith<boost::optional<SSLPeerInfo>> SSLManagerApple::parseAndValidatePeerCertificate(
     ::SSLContextRef ssl, const std::string& remoteHost) {
+
+    // Record TLS version stats
+    recordTLSVersion(ssl);
 
     /* While we always have a system CA via the Keychain,
      * we'll pretend not to in terms of validation if the server
@@ -1258,14 +1293,11 @@ StatusWith<boost::optional<SSLPeerInfo>> SSLManagerApple::parseAndValidatePeerCe
         return {boost::none};
     }
 
-    const auto badCert = [this](StringData msg,
-                                bool warn = false) -> StatusWith<boost::optional<SSLPeerInfo>> {
+    const auto badCert = [](StringData msg,
+                            bool warn = false) -> StatusWith<boost::optional<SSLPeerInfo>> {
         constexpr StringData prefix = "SSL peer certificate validation failed: "_sd;
         if (warn) {
-            // do not output warning if "no certificate" warnings are suppressed
-            if (!_suppressNoCertificateWarning) {
-                warning() << prefix << msg;
-            }
+            warning() << prefix << msg;
             return {boost::none};
         } else {
             std::string m = str::stream() << prefix << msg << "; connection rejected";
@@ -1278,9 +1310,19 @@ StatusWith<boost::optional<SSLPeerInfo>> SSLManagerApple::parseAndValidatePeerCe
     const auto status = ::SSLCopyPeerTrust(ssl, &trust);
     CFUniquePtr<::SecTrustRef> cftrust(trust);
     if ((status != ::errSecSuccess) || (!cftrust)) {
-        return badCert(str::stream() << "Unable to retreive SSL trust from peer: "
-                                     << stringFromOSStatus(status),
-                       _weakValidation);
+        if (_weakValidation && _suppressNoCertificateWarning) {
+            return {boost::none};
+        } else {
+            if (status == ::errSecSuccess) {
+                return badCert(str::stream() << "no SSL certificate provided by peer: "
+                                             << stringFromOSStatus(status),
+                               _weakValidation);
+            } else {
+                return badCert(str::stream() << "Unable to retreive SSL trust from peer: "
+                                             << stringFromOSStatus(status),
+                               _weakValidation);
+            }
+        }
     }
 
     if (_ca) {
@@ -1305,7 +1347,7 @@ StatusWith<boost::optional<SSLPeerInfo>> SSLManagerApple::parseAndValidatePeerCe
 
     auto cert = ::SecTrustGetCertificateAtIndex(cftrust.get(), 0);
     if (!cert) {
-        return badCert("no SSL certificate provided by peer", _weakValidation);
+        return badCert("no SSL certificate found in trust container", _weakValidation);
     }
 
     CFUniquePtr<::CFMutableArrayRef> oids(

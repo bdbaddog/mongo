@@ -50,6 +50,9 @@
 #include "mongo/db/jsobj.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/server_parameters.h"
+#include "mongo/rpc/factory.h"
+#include "mongo/rpc/op_msg_rpc_impls.h"
+#include "mongo/rpc/protocol.h"
 #include "mongo/rpc/write_concern_error_detail.h"
 #include "mongo/s/stale_exception.h"
 #include "mongo/util/invariant.h"
@@ -109,22 +112,25 @@ bool checkAuthorizationImplPreParse(OperationContext* opCtx,
 BSONObj CommandHelpers::runCommandDirectly(OperationContext* opCtx, const OpMsgRequest& request) {
     auto command = globalCommandRegistry()->findCommand(request.getCommandName());
     invariant(command);
-    BufBuilder bb;
-    CommandReplyBuilder crb(BSONObjBuilder{bb});
+    rpc::OpMsgReplyBuilder replyBuilder;
+    std::unique_ptr<CommandInvocation> invocation;
     try {
-        auto invocation = command->parse(opCtx, request);
-        invocation->run(opCtx, &crb);
-        auto body = crb.getBodyBuilder();
+        invocation = command->parse(opCtx, request);
+        invocation->run(opCtx, &replyBuilder);
+        auto body = replyBuilder.getBodyBuilder();
         CommandHelpers::extractOrAppendOk(body);
     } catch (const StaleConfigException&) {
         // These exceptions are intended to be handled at a higher level.
         throw;
     } catch (const DBException& ex) {
-        auto body = crb.getBodyBuilder();
+        if (ex.code() == ErrorCodes::Unauthorized) {
+            CommandHelpers::auditLogAuthEvent(opCtx, invocation.get(), request, ex.code());
+        }
+        auto body = replyBuilder.getBodyBuilder();
         body.resetToEmpty();
         appendCommandStatusNoThrow(body, ex.toStatus());
     }
-    return BSONObj(bb.release());
+    return replyBuilder.releaseBody();
 }
 
 void CommandHelpers::auditLogAuthEvent(OperationContext* opCtx,
@@ -380,24 +386,6 @@ bool CommandHelpers::uassertShouldAttemptParse(OperationContext* opCtx,
 constexpr StringData CommandHelpers::kHelpFieldName;
 
 //////////////////////////////////////////////////////////////
-// CommandReplyBuilder
-
-CommandReplyBuilder::CommandReplyBuilder(BSONObjBuilder bodyObj)
-    : _bodyBuf(&bodyObj.bb()), _bodyOffset(bodyObj.offset()) {
-    // CommandReplyBuilder requires that bodyObj build into an externally-owned buffer.
-    invariant(!bodyObj.owned());
-    bodyObj.doneFast();
-}
-
-BSONObjBuilder CommandReplyBuilder::getBodyBuilder() const {
-    return BSONObjBuilder(BSONObjBuilder::ResumeBuildingTag{}, *_bodyBuf, _bodyOffset);
-}
-
-void CommandReplyBuilder::reset() {
-    getBodyBuilder().resetToEmpty();
-}
-
-//////////////////////////////////////////////////////////////
 // CommandInvocation
 
 CommandInvocation::~CommandInvocation() = default;
@@ -443,20 +431,16 @@ public:
           _dbName(_request->getDatabase().toString()) {}
 
 private:
-    void run(OperationContext* opCtx, CommandReplyBuilder* result) override {
-        try {
-            BSONObjBuilder bob = result->getBodyBuilder();
-            bool ok = _command->run(opCtx, _dbName, _request->body, bob);
+    void run(OperationContext* opCtx, rpc::ReplyBuilderInterface* result) override {
+        BSONObjBuilder bob = result->getBodyBuilder();
+        bool ok = _command->run(opCtx, _dbName, _request->body, bob);
+        if (!ok)
             CommandHelpers::appendSimpleCommandStatus(bob, ok);
-        } catch (const ExceptionFor<ErrorCodes::Unauthorized>& e) {
-            CommandHelpers::auditLogAuthEvent(opCtx, this, *_request, e.code());
-            throw;
-        }
     }
 
     void explain(OperationContext* opCtx,
                  ExplainOptions::Verbosity verbosity,
-                 BSONObjBuilder* result) override {
+                 rpc::ReplyBuilderInterface* result) override {
         uassertStatusOK(_command->explain(opCtx, *_request, verbosity, result));
     }
 
@@ -508,7 +492,7 @@ Command::Command(StringData name, StringData oldName)
 Status BasicCommand::explain(OperationContext* opCtx,
                              const OpMsgRequest& request,
                              ExplainOptions::Verbosity verbosity,
-                             BSONObjBuilder* out) const {
+                             rpc::ReplyBuilderInterface* result) const {
     return {ErrorCodes::IllegalOperation, str::stream() << "Cannot explain cmd: " << getName()};
 }
 
@@ -535,7 +519,6 @@ void Command::generateHelpResponse(OperationContext* opCtx,
     helpBuilder.append("help",
                        str::stream() << "help for: " << command.getName() << " " << command.help());
     replyBuilder->setCommandReply(helpBuilder.obj());
-    replyBuilder->setMetadata(rpc::makeEmptyMetadata());
 }
 
 bool ErrmsgCommandDeprecated::run(OperationContext* opCtx,

@@ -34,7 +34,6 @@
 #include "mongo/db/jsobj.h"
 #include "mongo/db/operation_context_noop.h"
 #include "mongo/db/repl/repl_set_config.h"
-#include "mongo/db/repl/repl_set_heartbeat_args.h"
 #include "mongo/db/repl/repl_set_heartbeat_args_v1.h"
 #include "mongo/db/repl/replication_coordinator_external_state_mock.h"
 #include "mongo/db/repl/replication_coordinator_impl.h"
@@ -124,9 +123,13 @@ TEST_F(ReplCoordHBV1Test,
     hbResp.setState(MemberState::RS_PRIMARY);
     hbResp.setConfigVersion(rsConfig.getConfigVersion());
     hbResp.setConfig(rsConfig);
+    // The smallest valid optime in PV1.
+    OpTime opTime(Timestamp(), 0);
+    hbResp.setAppliedOpTime(opTime);
+    hbResp.setDurableOpTime(opTime);
     BSONObjBuilder responseBuilder;
     responseBuilder << "ok" << 1;
-    hbResp.addToBSON(&responseBuilder, true);
+    hbResp.addToBSON(&responseBuilder);
     net->scheduleResponse(
         noi, startDate + Milliseconds(200), makeResponseStatus(responseBuilder.obj()));
     assertRunUntil(startDate + Milliseconds(200));
@@ -194,9 +197,13 @@ TEST_F(ReplCoordHBV1Test,
     hbResp.setState(MemberState::RS_PRIMARY);
     hbResp.setConfigVersion(rsConfig.getConfigVersion());
     hbResp.setConfig(rsConfig);
+    // The smallest valid optime in PV1.
+    OpTime opTime(Timestamp(), 0);
+    hbResp.setAppliedOpTime(opTime);
+    hbResp.setDurableOpTime(opTime);
     BSONObjBuilder responseBuilder;
     responseBuilder << "ok" << 1;
-    hbResp.addToBSON(&responseBuilder, true);
+    hbResp.addToBSON(&responseBuilder);
     net->scheduleResponse(
         noi, startDate + Milliseconds(200), makeResponseStatus(responseBuilder.obj()));
     assertRunUntil(startDate + Milliseconds(200));
@@ -264,12 +271,16 @@ TEST_F(ReplCoordHBV1Test,
     hbResp.setState(MemberState::RS_PRIMARY);
     hbResp.setConfigVersion(rsConfig.getConfigVersion());
     hbResp.setConfig(rsConfig);
+    // The smallest valid optime in PV1.
+    OpTime opTime(Timestamp(), 0);
+    hbResp.setAppliedOpTime(opTime);
+    hbResp.setDurableOpTime(opTime);
     BSONObjBuilder responseBuilder;
     responseBuilder << "ok" << 1;
-    hbResp.addToBSON(&responseBuilder, true);
+    hbResp.addToBSON(&responseBuilder);
     net->scheduleResponse(
-        noi, startDate + Milliseconds(200), makeResponseStatus(responseBuilder.obj()));
-    assertRunUntil(startDate + Milliseconds(2200));
+        noi, startDate + Milliseconds(50), makeResponseStatus(responseBuilder.obj()));
+    assertRunUntil(startDate + Milliseconds(550));
 
     // Because the new config is stored using an out-of-band thread, we need to perform some
     // extra synchronization to let the executor finish the heartbeat reconfig.  We know that
@@ -374,17 +385,18 @@ TEST_F(ReplCoordHBV1Test, IgnoreTheContentsOfMetadataWhenItsReplicaSetIdDoesNotM
         hbResp.setSetName(rsConfig.getReplSetName());
         hbResp.setState(MemberState::RS_PRIMARY);
         hbResp.setConfigVersion(rsConfig.getConfigVersion());
+        hbResp.setAppliedOpTime(opTime);
+        hbResp.setDurableOpTime(opTime);
 
         BSONObjBuilder responseBuilder;
         responseBuilder << "ok" << 1;
-        hbResp.addToBSON(&responseBuilder, true);
+        hbResp.addToBSON(&responseBuilder);
 
         rpc::ReplSetMetadata metadata(
             opTime.getTerm(), opTime, opTime, rsConfig.getConfigVersion(), unexpectedId, 1, -1);
-        BSONObjBuilder metadataBuilder;
-        metadata.writeToMetadata(&metadataBuilder).transitional_ignore();
+        uassertStatusOK(metadata.writeToMetadata(&responseBuilder));
 
-        heartbeatResponse = makeResponseStatus(responseBuilder.obj(), metadataBuilder.obj());
+        heartbeatResponse = makeResponseStatus(responseBuilder.obj());
     }
 
     // process heartbeat

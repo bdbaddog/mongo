@@ -105,7 +105,7 @@ public:
     /**
      * Takes a union of all sub-pipelines, and adds them to 'deps'.
      */
-    GetDepsReturn getDependencies(DepsTracker* deps) const final;
+    DepsTracker::State getDependencies(DepsTracker* deps) const final;
 
     const char* getSourceName() const final {
         return "$facet";
@@ -138,6 +138,7 @@ public:
     void detachFromOperationContext() final;
     void reattachToOperationContext(OperationContext* opCtx) final;
     StageConstraints constraints(Pipeline::SplitState pipeState) const final;
+    bool usedDisk() final;
 
 protected:
     void doDispose() final;

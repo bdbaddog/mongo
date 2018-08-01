@@ -1,0 +1,107 @@
+# This test suite exercises core, generic transactions behavior. The tests in this suite, pulled
+# from 'jstests/core/txns', should be "topology agnostic". They ideally generalize to single replica
+# sets and sharded clusters.
+
+test_kind: js_test
+selector:
+  roots:
+  - jstests/core/txns/**/*.js
+  exclude_files:
+  # Profile can only be run against the admin database on mongos.
+  - jstests/core/txns/transactions_profiling.js
+  - jstests/core/txns/transactions_profiling_with_drops.js
+
+  # No featureCompatibilityVersion parameter on mongos.
+  - jstests/core/txns/abort_transactions_on_FCV_downgrade.js
+
+  # Prepare is not a command on mongos.
+  - jstests/core/txns/empty_prepare.js
+  - jstests/core/txns/prepare_conflict.js
+  - jstests/core/txns/abort_prepared_transaction.js
+  - jstests/core/txns/commit_prepared_transaction.js
+  - jstests/core/txns/commit_prepared_transaction_errors.js
+
+  # Implicitly creates a database through a collection rename, which does not work in a sharded
+  # cluster.
+  - jstests/core/txns/transactions_block_ddl.js
+
+  # TODO SERVER-36124: maxTimeMS doesn't work for insert on mongos.
+  - jstests/core/txns/write_conflicts_with_non_txns.js
+
+  # TODO SERVER-36120: No doTxn command on mongos.
+  - jstests/core/txns/do_txn_atomicity.js
+  - jstests/core/txns/do_txn_basic.js
+
+  # TODO SERVER-36121: Set the transactionLifetimeLimitSeconds parameter, which is not on mongos.
+  - jstests/core/txns/abort_expired_transaction.js
+  - jstests/core/txns/abort_transaction_thread_does_not_block_on_locks.js
+
+  # Writes to the local database are not allowed through mongos.
+  # TODO SERVER-28756: Mongos CSRS write retry logic drops txnNumbers.
+  - jstests/core/txns/banned_txn_dbs.js
+
+  # TODO SERVER-36260: Mongos should reject commands with txnNumbers that aren't allowed in a
+  # transaction.
+  # TODO SERVER-33709: Support readConcern snapshot in cluster count command.
+  - jstests/core/txns/commands_not_allowed_in_txn.js
+
+  # TODO SERVER-35708 Mongos does not attach errorLabels on command response.
+  - jstests/core/txns/multi_statement_transaction_abort.js
+
+  # TODO SERVER-36057: Mongos doesn't validate autocommit / startTransaction fields.
+  - jstests/core/txns/upconvert_read_concern.js
+
+  # TODO SERVER-35825: Mongos should only allow readConcern on writes that start transactions.
+  - jstests/core/txns/no_read_concern_snapshot_outside_txn.js
+
+  # TODO SERVER-35707: Figure out transaction abort state on re-targeting exceptions.
+  - jstests/core/txns/view_reads_in_transaction.js
+  - jstests/core/txns/list_collections_not_blocked_by_txn.js
+  - jstests/core/txns/statement_ids_accepted.js
+
+  # TODO SERVER-36240: Rely on readConcern being upconverted to snapshot.
+  - jstests/core/txns/ban_tailable_cursor.js
+  - jstests/core/txns/concurrent_drops_and_creates.js
+  - jstests/core/txns/find_and_modify_in_transaction.js
+  - jstests/core/txns/kill_cursors_in_transaction.js
+  - jstests/core/txns/kill_sessions_kills_transaction.js
+  - jstests/core/txns/kill_transaction_cursors_after_commit.js
+  - jstests/core/txns/kill_txn_cursor.js
+  - jstests/core/txns/multi_delete_in_transaction.js
+  - jstests/core/txns/multi_statement_transaction.js
+  - jstests/core/txns/multi_update_in_transaction.js
+  - jstests/core/txns/no_implicit_collection_creation_in_txn.js
+  - jstests/core/txns/prepare_committed_transaction.js
+  - jstests/core/txns/read_own_multikey_writes.js
+  - jstests/core/txns/repeatable_reads_in_transaction.js
+  - jstests/core/txns/shell_prompt_in_transaction.js
+  - jstests/core/txns/start_transaction_with_read.js
+  - jstests/core/txns/transaction_error_handling.js
+  - jstests/core/txns/transactions_write_conflicts.js
+  - jstests/core/txns/transactions_write_conflicts_unique_indexes.js
+executor:
+  archive:
+    hooks:
+      - ValidateCollections
+  config:
+    shell_options:
+      eval: "testingReplication = true;"
+      readMode: commands
+  hooks:
+  # We don't execute dbHash or oplog consistency checks since there is only a single replica set
+  # node.
+  - class: ValidateCollections
+  - class: CleanEveryN
+    n: 20
+  fixture:
+    class: ShardedClusterFixture
+    mongos_options:
+      set_parameters:
+        enableTestCommands: 1
+    mongod_options:
+      enableMajorityReadConcern: ''
+      set_parameters:
+        enableTestCommands: 1
+        numInitialSyncAttempts: 1
+    num_rs_nodes_per_shard: 1
+

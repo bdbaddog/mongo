@@ -31,7 +31,7 @@
 #include <jsapi.h>
 #include <vm/PosixNSPR.h>
 
-#include "mongo/client/dbclientcursor.h"
+#include "mongo/client/dbclient_cursor.h"
 #include "mongo/scripting/mozjs/bindata.h"
 #include "mongo/scripting/mozjs/bson.h"
 #include "mongo/scripting/mozjs/code.h"
@@ -102,8 +102,6 @@ public:
     void registerOperation(OperationContext* opCtx) override;
 
     void unregisterOperation() override;
-
-    void localConnectForDbEval(OperationContext* opCtx, const char* dbName) override;
 
     void externalSetup() override;
 
@@ -242,11 +240,6 @@ public:
     typename std::enable_if<std::is_same<T, MongoHelpersInfo>::value, WrapType<T>&>::type
     getProto() {
         return _mongoHelpersProto;
-    }
-
-    template <typename T>
-    typename std::enable_if<std::is_same<T, MongoLocalInfo>::value, WrapType<T>&>::type getProto() {
-        return _mongoLocalProto;
     }
 
     template <typename T>
@@ -389,12 +382,9 @@ private:
 
     /**
      * The connection state of the scope.
-     *
-     * This is for dbeval and the shell
      */
     enum class ConnectState : char {
         Not,
-        Local,
         External,
     };
 
@@ -453,7 +443,6 @@ private:
     WrapType<MinKeyInfo> _minKeyProto;
     WrapType<MongoExternalInfo> _mongoExternalProto;
     WrapType<MongoHelpersInfo> _mongoHelpersProto;
-    WrapType<MongoLocalInfo> _mongoLocalProto;
     WrapType<NativeFunctionInfo> _nativeFunctionProto;
     WrapType<NumberDecimalInfo> _numberDecimalProto;
     WrapType<NumberIntInfo> _numberIntProto;

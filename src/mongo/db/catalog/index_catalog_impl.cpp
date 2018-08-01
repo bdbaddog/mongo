@@ -571,14 +571,6 @@ Status IndexCatalogImpl::_isSpecOk(OperationContext* opCtx, const BSONObj& spec)
         }
     }
 
-    // SERVER-16893 Forbid use of v0 indexes with non-mmapv1 engines
-    if (indexVersion == IndexVersion::kV0 &&
-        !opCtx->getServiceContext()->getStorageEngine()->isMmapV1()) {
-        return Status(ErrorCodes::CannotCreateIndex,
-                      str::stream() << "use of v0 indexes is only allowed with the "
-                                    << "mmapv1 storage engine");
-    }
-
     if (!IndexDescriptor::isIndexVersionSupported(indexVersion)) {
         return Status(ErrorCodes::CannotCreateIndex,
                       str::stream() << "this version of mongod cannot build new indexes "
@@ -626,7 +618,13 @@ Status IndexCatalogImpl::_isSpecOk(OperationContext* opCtx, const BSONObj& spec)
     // Drop pending collections are internal to the server and will not be exported to another
     // storage engine. The indexes contained in these collections are not subject to the same
     // namespace length constraints as the ones in created by users.
-    if (!nss.isDropPendingNamespace()) {
+    // Index names do not limit the maximum allowable length of the target namespace under FCV 4.2
+    // and above.
+    const auto checkIndexNamespace =
+        serverGlobalParams.featureCompatibility.isVersionInitialized() &&
+        serverGlobalParams.featureCompatibility.getVersion() !=
+            ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo42;
+    if (checkIndexNamespace && !nss.isDropPendingNamespace()) {
         auto indexNamespace = IndexDescriptor::makeIndexNamespace(nss.ns(), name);
         if (indexNamespace.length() > NamespaceString::MaxNsLen)
             return Status(ErrorCodes::CannotCreateIndex,
@@ -643,6 +641,7 @@ Status IndexCatalogImpl::_isSpecOk(OperationContext* opCtx, const BSONObj& spec)
                                     << keyStatus.reason());
     }
 
+    const string pluginName = IndexNames::findPluginName(key);
     std::unique_ptr<CollatorInterface> collator;
     BSONElement collationElement = spec.getField("collation");
     if (collationElement) {
@@ -674,9 +673,8 @@ Status IndexCatalogImpl::_isSpecOk(OperationContext* opCtx, const BSONObj& spec)
                                   << "' option"};
         }
 
-        string pluginName = IndexNames::findPluginName(key);
         if ((pluginName != IndexNames::BTREE) && (pluginName != IndexNames::GEO_2DSPHERE) &&
-            (pluginName != IndexNames::HASHED)) {
+            (pluginName != IndexNames::HASHED) && (pluginName != IndexNames::ALLPATHS)) {
             return Status(ErrorCodes::CannotCreateIndex,
                           str::stream() << "Index type '" << pluginName
                                         << "' does not support collation: "
@@ -685,6 +683,26 @@ Status IndexCatalogImpl::_isSpecOk(OperationContext* opCtx, const BSONObj& spec)
     }
 
     const bool isSparse = spec["sparse"].trueValue();
+
+    if (pluginName == IndexNames::ALLPATHS) {
+        if (isSparse) {
+            return Status(ErrorCodes::CannotCreateIndex,
+                          str::stream() << "Index type '" << pluginName
+                                        << "' does not support the sparse option");
+        }
+
+        if (spec["unique"].trueValue()) {
+            return Status(ErrorCodes::CannotCreateIndex,
+                          str::stream() << "Index type '" << pluginName
+                                        << "' does not support the unique option");
+        }
+
+        if (spec.getField("expireAfterSeconds")) {
+            return Status(ErrorCodes::CannotCreateIndex,
+                          str::stream() << "Index type '" << pluginName
+                                        << "' cannot be a TTL index");
+        }
+    }
 
     // Ensure if there is a filter, its valid.
     BSONElement filterElement = spec.getField("partialFilterExpression");

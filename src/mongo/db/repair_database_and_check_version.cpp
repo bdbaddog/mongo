@@ -50,7 +50,6 @@
 #include "mongo/db/repl/drop_pending_collection_reaper.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/server_options.h"
-#include "mongo/db/storage/mmap_v1/mmap_v1_options.h"
 #include "mongo/util/exit.h"
 #include "mongo/util/log.h"
 #include "mongo/util/quick_exit.h"
@@ -68,8 +67,8 @@ using std::endl;
 namespace {
 
 const std::string mustDowngradeErrorMsg = str::stream()
-    << "UPGRADE PROBLEM: The data files need to be fully upgraded to version 3.6 before attempting "
-       "an upgrade to 4.0; see "
+    << "UPGRADE PROBLEM: The data files need to be fully upgraded to version 4.0 before attempting "
+       "an upgrade to 4.2; see "
     << feature_compatibility_version_documentation::kUpgradeLink << " for more details.";
 
 Status restoreMissingFeatureCompatibilityVersionDocument(OperationContext* opCtx,
@@ -104,11 +103,11 @@ Status restoreMissingFeatureCompatibilityVersionDocument(OperationContext* opCtx
                           BSON("_id" << FeatureCompatibilityVersionParser::kParameterName),
                           featureCompatibilityVersion)) {
         log() << "Re-creating featureCompatibilityVersion document that was deleted with version "
-              << FeatureCompatibilityVersionParser::kVersion36 << ".";
+              << FeatureCompatibilityVersionParser::kVersion40 << ".";
 
         BSONObj fcvObj = BSON("_id" << FeatureCompatibilityVersionParser::kParameterName
                                     << FeatureCompatibilityVersionParser::kVersionField
-                                    << FeatureCompatibilityVersionParser::kVersion36);
+                                    << FeatureCompatibilityVersionParser::kVersion40);
 
         writeConflictRetry(opCtx, "insertFCVDocument", fcvNss.ns(), [&] {
             WriteUnitOfWork wunit(opCtx);
@@ -135,7 +134,6 @@ Status restoreMissingFeatureCompatibilityVersionDocument(OperationContext* opCtx
  */
 Status ensureAllCollectionsHaveUUIDs(OperationContext* opCtx,
                                      const std::vector<std::string>& dbNames) {
-    bool isMmapV1 = opCtx->getServiceContext()->getStorageEngine()->isMmapV1();
     for (const auto& dbName : dbNames) {
         Database* db = DatabaseHolder::getDatabaseHolder().openDb(opCtx, dbName);
         invariant(db);
@@ -146,11 +144,6 @@ Status ensureAllCollectionsHaveUUIDs(OperationContext* opCtx,
             // drop these collections on wiredTiger because users are not permitted to
             // store data in them.
             if (coll->ns().coll() == "system.indexes" || coll->ns().coll() == "system.namespaces") {
-                if (isMmapV1) {
-                    // system.indexes and system.namespaces don't currently have UUIDs in MMAP.
-                    // SERVER-29926 and SERVER-30095 will address this problem.
-                    continue;
-                }
                 const auto nssToDrop = coll->ns();
                 LOG(1) << "Attempting to drop invalid system collection " << nssToDrop;
                 if (coll->numRecords(opCtx)) {
@@ -426,14 +419,14 @@ StatusWith<bool> repairDatabasesAndCheckVersion(OperationContext* opCtx) {
                     if (!swVersion.isOK()) {
                         severe() << swVersion.getStatus();
                         // Note this error path captures all cases of an FCV document existing,
-                        // but with any value other than "3.6" or "4.0". This includes unexpected
+                        // but with any value other than "4.0" or "4.2". This includes unexpected
                         // cases with no path forward such as the FCV value not being a string.
                         return {ErrorCodes::MustDowngrade,
                                 str::stream()
                                     << "UPGRADE PROBLEM: Unable to parse the "
                                        "featureCompatibilityVersion document. The data files need "
-                                       "to be fully upgraded to version 3.6 before attempting an "
-                                       "upgrade to 4.0. If you are upgrading to 4.0, see "
+                                       "to be fully upgraded to version 4.0 before attempting an "
+                                       "upgrade to 4.2. If you are upgrading to 4.2, see "
                                     << feature_compatibility_version_documentation::kUpgradeLink
                                     << "."};
                     }
@@ -445,23 +438,23 @@ StatusWith<bool> repairDatabasesAndCheckVersion(OperationContext* opCtx) {
                     // On startup, if the version is in an upgrading or downrading state, print a
                     // warning.
                     if (version ==
-                        ServerGlobalParams::FeatureCompatibility::Version::kUpgradingTo40) {
+                        ServerGlobalParams::FeatureCompatibility::Version::kUpgradingTo42) {
                         log() << "** WARNING: A featureCompatibilityVersion upgrade did not "
                               << "complete. " << startupWarningsLog;
                         log() << "**          The current featureCompatibilityVersion is "
                               << FeatureCompatibilityVersionParser::toString(version) << "."
                               << startupWarningsLog;
                         log() << "**          To fix this, use the setFeatureCompatibilityVersion "
-                              << "command to resume upgrade to 4.0." << startupWarningsLog;
+                              << "command to resume upgrade to 4.2." << startupWarningsLog;
                     } else if (version == ServerGlobalParams::FeatureCompatibility::Version::
-                                              kDowngradingTo36) {
+                                              kDowngradingTo40) {
                         log() << "** WARNING: A featureCompatibilityVersion downgrade did not "
                               << "complete. " << startupWarningsLog;
                         log() << "**          The current featureCompatibilityVersion is "
                               << FeatureCompatibilityVersionParser::toString(version) << "."
                               << startupWarningsLog;
                         log() << "**          To fix this, use the setFeatureCompatibilityVersion "
-                              << "command to resume downgrade to 3.6." << startupWarningsLog;
+                              << "command to resume downgrade to 4.0." << startupWarningsLog;
                     }
                 }
             }
@@ -507,7 +500,7 @@ StatusWith<bool> repairDatabasesAndCheckVersion(OperationContext* opCtx) {
         if (replSettings.usingReplSets()) {
             // We only care about _id indexes and drop-pending collections if we are in a replset.
             checkForIdIndexesAndDropPendingCollections(opCtx, db);
-            // Ensure oplog is capped (mmap does not guarantee order of inserts on noncapped
+            // Ensure oplog is capped (mongodb does not guarantee order of inserts on noncapped
             // collections)
             if (db->name() == "local") {
                 checkForCappedOplog(opCtx, db);
@@ -525,13 +518,7 @@ StatusWith<bool> repairDatabasesAndCheckVersion(OperationContext* opCtx) {
     if (!fcvDocumentExists && nonLocalDatabases) {
         severe()
             << "Unable to start up mongod due to missing featureCompatibilityVersion document.";
-        if (opCtx->getServiceContext()->getStorageEngine()->isMmapV1()) {
-            severe() << "Please run with --journalOptions "
-                     << static_cast<int>(MMAPV1Options::JournalRecoverOnly)
-                     << " to recover the journal. Then run with --repair to restore the document.";
-        } else {
-            severe() << "Please run with --repair to restore the document.";
-        }
+        severe() << "Please run with --repair to restore the document.";
         fassertFailedNoTrace(40652);
     }
 

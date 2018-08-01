@@ -109,10 +109,11 @@ env.Library(
         '$BUILD_DIR/mongo/db/mongohasher',
         '$BUILD_DIR/mongo/db/server_options_core',
         '$BUILD_DIR/mongo/logger/parse_log_component_settings',
+        '$BUILD_DIR/mongo/rpc/protocol',
     ],
 )
 
-# Commands available in all mongodb server processes (mongod, mongos, etc.) 
+# Commands available in all mongodb server processes (mongod, mongos, etc.)
 env.Library(
     target="servers",
     source=[
@@ -166,10 +167,11 @@ env.Library(
         "fsync.cpp",
     ],
     LIBDEPS_PRIVATE=[
+	'$BUILD_DIR/mongo/db/auth/authprivilege',
         '$BUILD_DIR/mongo/db/commands',
         '$BUILD_DIR/mongo/db/concurrency/write_conflict_exception',
         '$BUILD_DIR/mongo/db/curop',
-        '$BUILD_DIR/mongo/db/storage/mmap_v1/storage_mmapv1',
+        '$BUILD_DIR/mongo/db/storage/backup_cursor_service',
         'fsync_locked',
     ]
 )
@@ -286,12 +288,11 @@ env.Library(
         "dbhash.cpp",
         "do_txn_cmd.cpp",
         "driverHelpers.cpp",
-        "eval.cpp",
         "haystack.cpp",
+        "invalidate_view_catalog_command.cpp",
         "mr.cpp",
         "oplog_application_checks.cpp",
         "oplog_note.cpp",
-        "parallel_collection_scan.cpp",
         "resize_oplog.cpp",
         "restart_catalog_command.cpp",
         "set_feature_compatibility_version_command.cpp",
@@ -301,6 +302,7 @@ env.Library(
         "touch.cpp",
         "txn_cmds.cpp",
         "user_management_commands.cpp",
+        env.Idlc("txn_cmds.idl")[0],
     ],
     LIBDEPS_PRIVATE=[
         '$BUILD_DIR/mongo/base',
@@ -325,6 +327,7 @@ env.Library(
         '$BUILD_DIR/mongo/db/repl/repl_coordinator_interface',
         '$BUILD_DIR/mongo/db/rw_concern_d',
         '$BUILD_DIR/mongo/db/s/sharding_catalog_manager',
+        '$BUILD_DIR/mongo/idl/idl_parser',
         '$BUILD_DIR/mongo/s/sharding_legacy_api',
         '$BUILD_DIR/mongo/util/net/ssl_manager',
         'core',

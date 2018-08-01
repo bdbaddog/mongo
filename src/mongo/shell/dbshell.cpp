@@ -41,13 +41,11 @@
 #include "mongo/base/init.h"
 #include "mongo/base/initializer.h"
 #include "mongo/base/status.h"
-#include "mongo/client/dbclientinterface.h"
 #include "mongo/client/mongo_uri.h"
 #include "mongo/db/auth/sasl_command_constants.h"
 #include "mongo/db/client.h"
 #include "mongo/db/log_process_details.h"
 #include "mongo/db/server_options.h"
-#include "mongo/db/service_context_registrar.h"
 #include "mongo/logger/console_appender.h"
 #include "mongo/logger/logger.h"
 #include "mongo/logger/message_event_utf8_encoder.h"
@@ -99,10 +97,10 @@ const auto kDefaultMongoURL = "mongodb://127.0.0.1:27017"_sd;
 // to the latest version because there is no feature gating that currently occurs at the mongo shell
 // level. The server is responsible for rejecting usages of new features if its
 // featureCompatibilityVersion is lower.
-MONGO_INITIALIZER_WITH_PREREQUISITES(SetFeatureCompatibilityVersion40, ("EndStartupOptionSetup"))
+MONGO_INITIALIZER_WITH_PREREQUISITES(SetFeatureCompatibilityVersion42, ("EndStartupOptionSetup"))
 (InitializerContext* context) {
     mongo::serverGlobalParams.featureCompatibility.setVersion(
-        ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo40);
+        ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo42);
     return Status::OK();
 }
 const auto kAuthParam = "authSource"s;
@@ -221,6 +219,9 @@ char* shellReadline(const char* prompt, int handlesigint = 0) {
 }
 
 void setupSignals() {
+#ifndef _WIN32
+    signal(SIGHUP, quitNicely);
+#endif
     signal(SIGINT, quitNicely);
 }
 
@@ -557,7 +558,7 @@ string finishCode(string code) {
 }
 
 bool execPrompt(mongo::Scope& scope, const char* promptFunction, string& prompt) {
-    string execStatement = string("__prompt__ = ") + promptFunction + "();";
+    string execStatement = string("__promptWrapper__(") + promptFunction + ");";
     scope.exec("delete __prompt__;", "", false, false, false, 0);
     scope.exec(execStatement, "", false, false, false, 0);
     if (scope.type("__prompt__") == String) {
@@ -742,7 +743,7 @@ int _main(int argc, char* argv[], char** envp) {
     mongo::shell_utils::RecordMyLocation(argv[0]);
 
     mongo::runGlobalInitializersOrDie(argc, argv, envp);
-
+    setGlobalServiceContext(ServiceContext::make());
     // TODO This should use a TransportLayerManager or TransportLayerFactory
     auto serviceContext = getGlobalServiceContext();
     transport::TransportLayerASIO::Options opts;
@@ -757,11 +758,16 @@ int _main(int argc, char* argv[], char** envp) {
 
     // hide password from ps output
     for (int i = 0; i < (argc - 1); ++i) {
-        if (!strcmp(argv[i], "-p") || !strcmp(argv[i], "--password")) {
+        StringData arg(argv[i]);
+        if (arg == "-p"_sd || arg == "--password"_sd) {
             char* arg = argv[i + 1];
             while (*arg) {
                 *arg++ = 'x';
             }
+        } else if (MongoURI::isMongoURI(arg)) {
+            auto reformedURI = MongoURI::redact(arg);
+            auto length = arg.size();
+            ::strncpy(argv[i], reformedURI.data(), length);
         }
     }
 

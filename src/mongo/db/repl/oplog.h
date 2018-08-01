@@ -91,7 +91,6 @@ void createOplog(OperationContext* opCtx, const std::string& oplogCollectionName
 
 /*
  * Shortcut for above function using oplogCollectionName = _oplogCollectionName,
- * and replEnabled = replCoord::isReplSet();
  */
 void createOplog(OperationContext* opCtx);
 
@@ -127,6 +126,7 @@ std::vector<OpTime> logInsertOps(OperationContext* opCtx,
  *   linked via prevTs, and the timestamps of the oplog entry that contains the document
  *   before/after update was applied. The timestamps are ignored if isNull() is true.
  * prepare this specifies if the oplog entry should be put into a 'prepare' state.
+ * oplogSlot If non-null, use this reserved oplog slot instead of a new one.
  *
  * Returns the optime of the oplog entry written to the oplog.
  * Returns a null optime if oplog was not modified.
@@ -142,7 +142,8 @@ OpTime logOp(OperationContext* opCtx,
              const OperationSessionInfo& sessionInfo,
              StmtId stmtId,
              const OplogLink& oplogLink,
-             bool prepare);
+             bool prepare,
+             const OplogSlot& oplogSlot);
 
 // Flush out the cached pointer to the oplog.
 // Used by the closeDatabase command to ensure we don't cache closed things.

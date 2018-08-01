@@ -40,7 +40,6 @@
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/service_context.h"
-#include "mongo/db/service_context_d.h"
 #include "mongo/db/storage/storage_engine_init.h"
 #include "mongo/dbtests/dbtests.h"
 
@@ -284,11 +283,11 @@ public:
             coll = db->createCollection(&_opCtx, _ns);
             // Drop all indexes including id index.
             coll->getIndexCatalog()->dropAllIndexes(&_opCtx, true);
-            // Insert some documents with enforceQuota=true.
+            // Insert some documents.
             int32_t nDocs = 1000;
             OpDebug* const nullOpDebug = nullptr;
             for (int32_t i = 0; i < nDocs; ++i) {
-                coll->insertDocument(&_opCtx, InsertStatement(BSON("a" << i)), nullOpDebug, true)
+                coll->insertDocument(&_opCtx, InsertStatement(BSON("a" << i)), nullOpDebug)
                     .transitional_ignore();
             }
             wunit.commit();

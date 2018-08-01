@@ -1,9 +1,5 @@
 /**
  * Tests that the cluster is balanced in parallel in one balancer round (replica sets).
- *
- * This test is labeled resource intensive because its total io_write is 900MB compared to a median
- * of 135MB across all sharding tests in mmapv1.
- * @tags: [resource_intensive]
  */
 (function() {
     'use strict';
@@ -41,7 +37,7 @@
 
     // Do enable the balancer and wait for a single balancer round
     st.startBalancer();
-    st.awaitBalancerRound();
+    st.waitForBalancer(true, 60000);
     st.stopBalancer();
 
     assert.eq(1,

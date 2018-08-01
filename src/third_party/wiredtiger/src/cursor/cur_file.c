@@ -710,7 +710,7 @@ __curfile_create(WT_SESSION_IMPL *session,
 	 * WiredTiger.wt should not be cached, doing so interferes
 	 * with named checkpoints.
 	 */
-	if (cacheable && !WT_STREQ(WT_METAFILE_URI, cursor->internal_uri))
+	if (cacheable && strcmp(WT_METAFILE_URI, cursor->internal_uri) != 0)
 		F_SET(cursor, WT_CURSTD_CACHEABLE);
 
 	WT_ERR(__wt_cursor_init(
@@ -724,8 +724,7 @@ err:		/*
 		 * Our caller expects to release the data handle if we fail.
 		 * Disconnect it from the cursor before closing.
 		 */
-		if (session->dhandle != NULL)
-			__wt_cursor_dhandle_decr_use(session);
+		__wt_cursor_dhandle_decr_use(session);
 		cbt->btree = NULL;
 		WT_TRET(__curfile_close(cursor));
 		*cursorp = NULL;

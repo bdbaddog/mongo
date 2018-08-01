@@ -43,14 +43,37 @@
 
 namespace mongo {
 namespace catalog {
-void closeCatalog(OperationContext* opCtx) {
+MinVisibleTimestampMap closeCatalog(OperationContext* opCtx) {
     invariant(opCtx->lockState()->isW());
 
+    MinVisibleTimestampMap minVisibleTimestampMap;
+    std::vector<std::string> allDbs;
+    opCtx->getServiceContext()->getStorageEngine()->listDatabases(&allDbs);
+
+    const auto& databaseHolder = DatabaseHolder::getDatabaseHolder();
+    for (auto&& dbName : allDbs) {
+        const auto db = databaseHolder.get(opCtx, dbName);
+        for (Collection* coll : *db) {
+            OptionalCollectionUUID uuid = coll->uuid();
+            boost::optional<Timestamp> minVisible = coll->getMinimumVisibleSnapshot();
+
+            // If there's a minimum visible, invariant there's also a UUID.
+            invariant(!minVisible || uuid);
+            if (uuid && minVisible) {
+                LOG(1) << "closeCatalog: preserving min visible timestamp. Collection: "
+                       << coll->ns() << " UUID: " << uuid << " TS: " << minVisible;
+                minVisibleTimestampMap[*uuid] = *minVisible;
+            }
+        }
+    }
+
+    // Need to mark the UUIDCatalog as open if we our closeAll fails, dismissed if successful.
+    auto reopenOnFailure = MakeGuard([opCtx] { UUIDCatalog::get(opCtx).onOpenCatalog(opCtx); });
     // Closing UUID Catalog: only lookupNSSByUUID will fall back to using pre-closing state to
     // allow authorization for currently unknown UUIDs. This is needed because authorization needs
     // to work before acquiring locks, and might otherwise spuriously regard a UUID as unknown
     // while reloading the catalog.
-    UUIDCatalog::get(opCtx).onCloseCatalog();
+    UUIDCatalog::get(opCtx).onCloseCatalog(opCtx);
     LOG(1) << "closeCatalog: closing UUID catalog";
 
     // Close all databases.
@@ -61,9 +84,12 @@ void closeCatalog(OperationContext* opCtx) {
     // Close the storage engine's catalog.
     log() << "closeCatalog: closing storage engine catalog";
     opCtx->getServiceContext()->getStorageEngine()->closeCatalog(opCtx);
+
+    reopenOnFailure.Dismiss();
+    return minVisibleTimestampMap;
 }
 
-void openCatalog(OperationContext* opCtx) {
+void openCatalog(OperationContext* opCtx, const MinVisibleTimestampMap& minVisibleTimestampMap) {
     invariant(opCtx->lockState()->isW());
 
     // Load the catalog in the storage engine.
@@ -165,6 +191,10 @@ void openCatalog(OperationContext* opCtx) {
                    << collName;
             uuidCatalog.registerUUIDCatalogEntry(*uuid, collection);
 
+            if (minVisibleTimestampMap.count(*uuid) > 0) {
+                collection->setMinimumVisibleSnapshot(minVisibleTimestampMap.find(*uuid)->second);
+            }
+
             // If this is the oplog collection, re-establish the replication system's cached pointer
             // to the oplog.
             if (collNss.isOplog()) {
@@ -175,7 +205,7 @@ void openCatalog(OperationContext* opCtx) {
     }
     // Opening UUID Catalog: The UUID catalog is now in sync with the storage engine catalog. Clear
     // the pre-closing state.
-    UUIDCatalog::get(opCtx).onOpenCatalog();
+    UUIDCatalog::get(opCtx).onOpenCatalog(opCtx);
     LOG(1) << "openCatalog: finished reloading UUID catalog";
 }
 }  // namespace catalog

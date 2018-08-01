@@ -39,9 +39,6 @@ class OpMsgReply final : public rpc::ReplyInterface {
 public:
     explicit OpMsgReply(const Message* message) : _msg(OpMsg::parseOwned(*message)) {}
     explicit OpMsgReply(OpMsg msg) : _msg(std::move(msg)) {}
-    const BSONObj& getMetadata() const override {
-        return _msg.body;
-    }
     const BSONObj& getCommandReply() const override {
         return _msg.body;
     }
@@ -59,17 +56,14 @@ public:
         _builder.beginBody().appendElements(reply);
         return *this;
     }
-    BSONObjBuilder getInPlaceReplyBuilder(std::size_t reserveBytes) override {
-        BSONObjBuilder bob = _builder.beginBody();
-        // Eagerly reserve space and claim our reservation immediately so we can actually write data
-        // to it.
-        bob.bb().reserveBytes(reserveBytes);
-        bob.bb().claimReservedBytes(reserveBytes);
-        return bob;
+    BSONObjBuilder getBodyBuilder() override {
+        if (!_builder.isBuildingBody()) {
+            return _builder.beginBody();
+        }
+        return _builder.resumeBody();
     }
-    ReplyBuilderInterface& setMetadata(const BSONObj& metadata) override {
-        _builder.resumeBody().appendElements(metadata);
-        return *this;
+    OpMsgBuilder::DocSequenceBuilder getDocSequenceBuilder(StringData name) override {
+        return _builder.beginDocSequence(name);
     }
     rpc::Protocol getProtocol() const override {
         return rpc::Protocol::kOpMsg;
@@ -79,6 +73,12 @@ public:
     }
     Message done() override {
         return _builder.finish();
+    }
+    void reserveBytes(const std::size_t bytes) override {
+        _builder.reserveBytes(bytes);
+    }
+    BSONObj releaseBody() {
+        return _builder.releaseBody();
     }
 
 private:

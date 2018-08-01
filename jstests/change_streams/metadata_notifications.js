@@ -8,6 +8,7 @@
     load("jstests/libs/change_stream_util.js");
     load('jstests/replsets/libs/two_phase_drops.js');  // For 'TwoPhaseDropCollectionTest'.
     load("jstests/libs/collection_drop_recreate.js");  // For assert[Drop|Create]Collection.
+    load("jstests/libs/fixture_helpers.js");           // For isSharded.
 
     db = db.getSiblingDB(jsTestName());
     let cst = new ChangeStreamTest(db);
@@ -70,7 +71,7 @@
         {operationType: "drop"},
         {operationType: "invalidate"},
     ];
-    const changes = cst.assertNextChangesEqual(
+    let changes = cst.assertNextChangesEqual(
         {cursor: cursor, expectedChanges: expectedChanges, expectInvalidate: true});
     const resumeToken = changes[0]._id;
     const resumeTokenDrop = changes[3]._id;
@@ -89,37 +90,52 @@
     coll = assertCreateCollection(db, collName);
     assert.writeOK(coll.insert({_id: "after recreate"}));
 
-    // TODO SERVER-34789: The code below should throw an error. We exercise this behavior here to
-    // be sure that it doesn't crash the server, but the ability to resume a change stream using
-    // 'resumeAfter' with a resume token from an invalidate is a bug, not a feature.
-
     // Test resuming the change stream from the collection drop using 'resumeAfter'.
-    expectedChanges = [{
-        operationType: "insert",
-        ns: {db: db.getName(), coll: coll.getName()},
-        fullDocument: {_id: "after recreate"},
-        documentKey: {_id: "after recreate"}
-    }];
-    assertResumeExpected(
-        {coll: coll.getName(), spec: {resumeAfter: resumeTokenDrop}, expected: expectedChanges});
-
-    // Test resuming the change stream from the invalidate after the drop using 'resumeAfter'.
-    assertResumeExpected({
-        coll: coll.getName(),
-        spec: {resumeAfter: resumeTokenInvalidate},
-        expected: expectedChanges
+    // If running in a sharded passthrough suite, resuming from the drop will first return the drop
+    // from the other shard before returning an invalidate.
+    cursor = cst.startWatchingChanges({
+        collection: coll,
+        pipeline: [{$changeStream: {resumeAfter: resumeTokenDrop}}],
+        aggregateOptions: {collation: {locale: "simple"}, cursor: {batchSize: 0}}
+    });
+    cst.consumeDropUpTo({
+        cursor: cursor,
+        dropType: "drop",
+        expectedNext: {operationType: "invalidate"},
+        expectInvalidate: true
     });
 
-    // Test resuming the change stream from the collection drop using 'startAfter'.
-    assertResumeExpected(
-        {coll: coll.getName(), spec: {startAfter: resumeTokenDrop}, expected: expectedChanges});
+    // Test resuming the change stream from the invalidate after the drop using 'resumeAfter'.
+    assert.commandFailedWithCode(db.runCommand({
+        aggregate: coll.getName(),
+        pipeline: [{$changeStream: {resumeAfter: resumeTokenInvalidate}}],
+        cursor: {},
+        collation: {locale: "simple"},
+    }),
+                                 ErrorCodes.InvalidResumeToken);
 
-    // Test resuming the change stream from the 'invalidate' notification using 'startAfter'. This
-    // is expected to behave identical to resuming from the drop.
+    // Test resuming the change stream from the collection drop using 'startAfter'.
     assertResumeExpected({
         coll: coll.getName(),
-        spec: {startAfter: resumeTokenInvalidate},
-        expected: expectedChanges
+        spec: {startAfter: resumeTokenDrop},
+        expected: [{operationType: "invalidate"}]
+    });
+
+    // Test resuming the change stream from the 'invalidate' notification using 'startAfter'.
+    cursor = cst.startWatchingChanges({
+        collection: coll,
+        pipeline: [{$changeStream: {startAfter: resumeTokenInvalidate}}],
+        aggregateOptions: {collation: {locale: "simple"}, cursor: {batchSize: 0}}
+    });
+    cst.consumeDropUpTo({
+        cursor: cursor,
+        dropType: "drop",
+        expectedNext: {
+            operationType: "insert",
+            ns: {db: db.getName(), coll: coll.getName()},
+            fullDocument: {_id: "after recreate"},
+            documentKey: {_id: "after recreate"}
+        },
     });
 
     // Test that renaming a collection being watched generates a "rename" entry followed by an
@@ -161,36 +177,35 @@
         coll = db[collName];
         assert.writeOK(coll.insert({_id: "after rename"}));
 
-        // TODO SERVER-34789: The code below should throw an error. We exercise this behavior here
-        // to be sure that it doesn't crash the server, but the ability to resume a change stream
-        // after an invalidate using 'resumeAfter' is a bug, not a feature.
-
         // Test resuming the change stream from the collection rename using 'resumeAfter'.
+        assertResumeExpected({
+            coll: coll.getName(),
+            spec: {resumeAfter: resumeTokenRename},
+            expected: [{operationType: "invalidate"}]
+        });
+        // Test resuming the change stream from the invalidate after the rename using 'resumeAfter'.
+        assert.commandFailedWithCode(db.runCommand({
+            aggregate: coll.getName(),
+            pipeline: [{$changeStream: {resumeAfter: resumeTokenInvalidate}}],
+            cursor: {},
+            collation: {locale: "simple"},
+        }),
+                                     ErrorCodes.InvalidResumeToken);
+
+        // Test resuming the change stream from the rename using 'startAfter'.
+        assertResumeExpected({
+            coll: coll.getName(),
+            spec: {startAfter: resumeTokenRename},
+            expected: [{operationType: "invalidate"}]
+        });
+
+        // Test resuming the change stream from the invalidate after the rename using 'startAfter'.
         expectedChanges = [{
             operationType: "insert",
             ns: {db: db.getName(), coll: coll.getName()},
             fullDocument: {_id: "after rename"},
             documentKey: {_id: "after rename"}
         }];
-        assertResumeExpected({
-            coll: coll.getName(),
-            spec: {resumeAfter: resumeTokenRename},
-            expected: expectedChanges
-        });
-        // Test resuming the change stream from the invalidate after the rename using 'resumeAfter'.
-        assertResumeExpected({
-            coll: coll.getName(),
-            spec: {resumeAfter: resumeTokenInvalidate},
-            expected: expectedChanges
-        });
-
-        // Test resuming the change stream from the rename using 'startAfter'.
-        assertResumeExpected({
-            coll: coll.getName(),
-            spec: {startAfter: resumeTokenRename},
-            expected: expectedChanges
-        });
-        // Test resuming the change stream from the invalidate after the rename using 'startAfter'.
         assertResumeExpected({
             coll: coll.getName(),
             spec: {startAfter: resumeTokenInvalidate},

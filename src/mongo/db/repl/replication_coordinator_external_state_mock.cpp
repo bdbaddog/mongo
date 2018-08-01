@@ -72,10 +72,6 @@ void ReplicationCoordinatorExternalStateMock::startSteadyStateReplication(Operat
 
 void ReplicationCoordinatorExternalStateMock::stopDataReplication(OperationContext*) {}
 
-Status ReplicationCoordinatorExternalStateMock::runRepairOnLocalDB(OperationContext* opCtx) {
-    return Status::OK();
-}
-
 Status ReplicationCoordinatorExternalStateMock::initializeReplSetStorage(OperationContext* opCtx,
                                                                          const BSONObj& config) {
     return storeLocalConfigDocument(opCtx, config);
@@ -250,7 +246,13 @@ bool ReplicationCoordinatorExternalStateMock::isReadConcernSnapshotSupportedBySt
     return true;
 }
 
-std::size_t ReplicationCoordinatorExternalStateMock::getOplogFetcherMaxFetcherRestarts() const {
+std::size_t ReplicationCoordinatorExternalStateMock::getOplogFetcherSteadyStateMaxFetcherRestarts()
+    const {
+    return 0;
+}
+
+std::size_t ReplicationCoordinatorExternalStateMock::getOplogFetcherInitialSyncMaxFetcherRestarts()
+    const {
     return 0;
 }
 
@@ -260,8 +262,7 @@ void ReplicationCoordinatorExternalStateMock::setIsReadCommittedEnabled(bool val
 
 void ReplicationCoordinatorExternalStateMock::onDrainComplete(OperationContext* opCtx) {}
 
-OpTime ReplicationCoordinatorExternalStateMock::onTransitionToPrimary(OperationContext* opCtx,
-                                                                      bool isV1ElectionProtocol) {
+OpTime ReplicationCoordinatorExternalStateMock::onTransitionToPrimary(OperationContext* opCtx) {
     _lastOpTime = _firstOpTimeOfMyTerm;
     _firstOpTimeOfMyTerm = OpTime();
     return fassert(40297, _lastOpTime);

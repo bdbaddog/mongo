@@ -236,17 +236,14 @@ void WiredTigerRecoveryUnit::preallocateSnapshot() {
     getSession();
 }
 
-void* WiredTigerRecoveryUnit::writingPtr(void* data, size_t len) {
-    // This API should not be used for anything other than the MMAP V1 storage engine
-    MONGO_UNREACHABLE;
-}
-
 void WiredTigerRecoveryUnit::_txnClose(bool commit) {
     invariant(_active);
     WT_SESSION* s = _session->getSession();
     if (_timer) {
         const int transactionTime = _timer->millis();
-        if (transactionTime >= serverGlobalParams.slowMS) {
+        // `serverGlobalParams.slowMs` can be set to values <= 0. In those cases, give logging a
+        // break.
+        if (transactionTime >= std::max(1, serverGlobalParams.slowMS)) {
             LOG(kSlowTransactionSeverity) << "Slow WT transaction. Lifetime of SnapshotId "
                                           << _mySnapshotId << " was " << transactionTime << "ms";
         }
@@ -428,7 +425,11 @@ Status WiredTigerRecoveryUnit::setTimestamp(Timestamp timestamp) {
 }
 
 void WiredTigerRecoveryUnit::setCommitTimestamp(Timestamp timestamp) {
-    invariant(!_inUnitOfWork);
+    // This can be called either outside of a WriteUnitOfWork or in a prepared transaction after
+    // setPrepareTimestamp() is called. Prepared transactions ensure the correct timestamping
+    // semantics and the set-once commitTimestamp behavior is exactly what prepared transactions
+    // want.
+    invariant(!_inUnitOfWork || !_prepareTimestamp.isNull());
     invariant(_commitTimestamp.isNull(),
               str::stream() << "Commit timestamp set to " << _commitTimestamp.toString()
                             << " and trying to set it to "
@@ -442,7 +443,7 @@ void WiredTigerRecoveryUnit::setCommitTimestamp(Timestamp timestamp) {
     _commitTimestamp = timestamp;
 }
 
-Timestamp WiredTigerRecoveryUnit::getCommitTimestamp() {
+Timestamp WiredTigerRecoveryUnit::getCommitTimestamp() const {
     return _commitTimestamp;
 }
 
@@ -459,10 +460,35 @@ void WiredTigerRecoveryUnit::clearCommitTimestamp() {
 
 void WiredTigerRecoveryUnit::setPrepareTimestamp(Timestamp timestamp) {
     invariant(_inUnitOfWork);
-    invariant(_prepareTimestamp.isNull());
-    invariant(_commitTimestamp.isNull());
+    invariant(_prepareTimestamp.isNull(),
+              str::stream() << "Trying to set prepare timestamp to " << timestamp.toString()
+                            << ". It's already set to "
+                            << _prepareTimestamp.toString());
+    invariant(_commitTimestamp.isNull(),
+              str::stream() << "Commit timestamp is " << _commitTimestamp.toString()
+                            << " and trying to set prepare timestamp to "
+                            << timestamp.toString());
+    invariant(!_lastTimestampSet,
+              str::stream() << "Last timestamp set is " << _lastTimestampSet->toString()
+                            << " and trying to set prepare timestamp to "
+                            << timestamp.toString());
 
     _prepareTimestamp = timestamp;
+}
+
+Timestamp WiredTigerRecoveryUnit::getPrepareTimestamp() const {
+    invariant(_inUnitOfWork);
+    invariant(!_prepareTimestamp.isNull());
+    invariant(_commitTimestamp.isNull(),
+              str::stream() << "Commit timestamp is " << _commitTimestamp.toString()
+                            << " and trying to get prepare timestamp of "
+                            << _prepareTimestamp.toString());
+    invariant(!_lastTimestampSet,
+              str::stream() << "Last timestamp set is " << _lastTimestampSet->toString()
+                            << " and trying to get prepare timestamp of "
+                            << _prepareTimestamp.toString());
+
+    return _prepareTimestamp;
 }
 
 void WiredTigerRecoveryUnit::setIgnorePrepared(bool value) {
@@ -506,7 +532,10 @@ WiredTigerCursor::WiredTigerCursor(const std::string& uri,
     _session = _ru->getSession();
     _cursor = _session->getCursor(uri, tableId, forRecordStore);
     if (!_cursor) {
-        error() << "no cursor for uri: " << uri;
+        // It could be an index file or a data file here.
+        error() << "Failed to get the cursor for uri: " << uri;
+        error() << "This may be due to missing data files. " << kWTRepairMsg;
+        fassertFailedNoTrace(50883);
     }
 }
 

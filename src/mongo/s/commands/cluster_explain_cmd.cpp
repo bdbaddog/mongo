@@ -28,7 +28,6 @@
 
 #include "mongo/platform/basic.h"
 
-#include "mongo/client/dbclientinterface.h"
 #include "mongo/db/command_generic_argument.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/query/explain.h"
@@ -96,20 +95,13 @@ public:
           _innerInvocation{std::move(innerInvocation)} {}
 
 private:
-    void run(OperationContext* opCtx, CommandReplyBuilder* result) override {
-        try {
-            auto bob = result->getBodyBuilder();
-            _innerInvocation->explain(opCtx, _verbosity, &bob);
-        } catch (const ExceptionFor<ErrorCodes::Unauthorized>&) {
-            CommandHelpers::auditLogAuthEvent(
-                opCtx, this, *_outerRequest, ErrorCodes::Unauthorized);
-            throw;
-        }
+    void run(OperationContext* opCtx, rpc::ReplyBuilderInterface* result) override {
+        _innerInvocation->explain(opCtx, _verbosity, result);
     }
 
     void explain(OperationContext* opCtx,
                  ExplainOptions::Verbosity verbosity,
-                 BSONObjBuilder* result) override {
+                 rpc::ReplyBuilderInterface* result) override {
         uasserted(ErrorCodes::IllegalOperation, "Explain cannot explain itself.");
     }
 

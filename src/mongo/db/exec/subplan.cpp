@@ -35,7 +35,6 @@
 #include <memory>
 #include <vector>
 
-#include "mongo/client/dbclientinterface.h"
 #include "mongo/db/exec/multi_plan.h"
 #include "mongo/db/exec/scoped_timer.h"
 #include "mongo/db/matcher/extensions_callback_real.h"
@@ -134,13 +133,20 @@ Status SubplanStage::planSubqueries() {
         // Plan the i-th child. We might be able to find a plan for the i-th child in the plan
         // cache. If there's no cached plan, then we generate and rank plans using the MPS.
         const auto* planCache = _collection->infoCache()->getPlanCache();
-        if (auto cachedSol = planCache->getCacheEntryIfCacheable(*branchResult->canonicalQuery)) {
-            // We have a CachedSolution. Store it for later.
-            LOG(5) << "Subplanner: cached plan found for child " << i << " of "
-                   << _orExpression->numChildren();
 
-            branchResult->cachedSolution = std::move(cachedSol);
-        } else {
+        // Populate branchResult->cachedSolution if an active cachedSolution entry exists.
+        if (planCache->shouldCacheQuery(*branchResult->canonicalQuery)) {
+            auto planCacheKey = planCache->computeKey(*branchResult->canonicalQuery);
+            if (auto cachedSol = planCache->getCacheEntryIfActive(planCacheKey)) {
+                // We have a CachedSolution. Store it for later.
+                LOG(5) << "Subplanner: cached plan found for child " << i << " of "
+                       << _orExpression->numChildren();
+
+                branchResult->cachedSolution = std::move(cachedSol);
+            }
+        }
+
+        if (!branchResult->cachedSolution) {
             // No CachedSolution found. We'll have to plan from scratch.
             LOG(5) << "Subplanner: planning child " << i << " of " << _orExpression->numChildren();
 
@@ -429,13 +435,6 @@ Status SubplanStage::pickBestPlan(PlanYieldPolicy* yieldPolicy) {
     // Plan each branch of the $or.
     Status subplanningStatus = planSubqueries();
     if (!subplanningStatus.isOK()) {
-        if (subplanningStatus == ErrorCodes::QueryPlanKilled ||
-            subplanningStatus == ErrorCodes::ExceededTimeLimit) {
-            // Query planning cannot continue if the plan for one of the subqueries was killed
-            // because the collection or a candidate index may have been dropped, or if we've
-            // exceeded the operation's time limit.
-            return subplanningStatus;
-        }
         return choosePlanWholeQuery(yieldPolicy);
     }
 
@@ -444,7 +443,7 @@ Status SubplanStage::pickBestPlan(PlanYieldPolicy* yieldPolicy) {
     Status subplanSelectStat = choosePlanForSubqueries(yieldPolicy);
     if (!subplanSelectStat.isOK()) {
         if (subplanSelectStat == ErrorCodes::QueryPlanKilled ||
-            subplanSelectStat == ErrorCodes::ExceededTimeLimit) {
+            subplanSelectStat == ErrorCodes::MaxTimeMSExpired) {
             // Query planning cannot continue if the plan for one of the subqueries was killed
             // because the collection or a candidate index may have been dropped, or if we've
             // exceeded the operation's time limit.

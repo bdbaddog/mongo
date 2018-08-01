@@ -72,6 +72,7 @@
 #include "mongo/db/s/balancer/balancer.h"
 #include "mongo/db/s/chunk_splitter.h"
 #include "mongo/db/s/config/sharding_catalog_manager.h"
+#include "mongo/db/s/periodic_balancer_config_refresher.h"
 #include "mongo/db/s/sharding_state.h"
 #include "mongo/db/s/sharding_state_recovery.h"
 #include "mongo/db/server_options.h"
@@ -79,6 +80,7 @@
 #include "mongo/db/service_context.h"
 #include "mongo/db/session_catalog.h"
 #include "mongo/db/storage/storage_engine.h"
+#include "mongo/db/system_index.h"
 #include "mongo/executor/network_connection_hook.h"
 #include "mongo/executor/network_interface.h"
 #include "mongo/executor/network_interface_factory.h"
@@ -122,13 +124,25 @@ const char tsFieldName[] = "ts";
 
 MONGO_FAIL_POINT_DEFINE(dropPendingCollectionReaperHang);
 
-// Set this to specify maximum number of times the oplog fetcher will consecutively restart the
-// oplog tailing query on non-cancellation errors.
-MONGO_EXPORT_SERVER_PARAMETER(oplogFetcherMaxFetcherRestarts, int, 3)
+// Set this to specify the maximum number of times the oplog fetcher will consecutively restart the
+// oplog tailing query on non-cancellation errors during steady state replication.
+MONGO_EXPORT_SERVER_PARAMETER(oplogFetcherSteadyStateMaxFetcherRestarts, int, 1)
     ->withValidator([](const int& potentialNewValue) {
         if (potentialNewValue < 0) {
             return Status(ErrorCodes::BadValue,
-                          "oplogFetcherMaxFetcherRestarts must be nonnegative");
+                          "oplogFetcherSteadyStateMaxFetcherRestarts must be nonnegative");
+        }
+        return Status::OK();
+    });
+
+// Set this to specify the maximum number of times the oplog fetcher will consecutively restart the
+// oplog tailing query on non-cancellation errors during initial sync. By default we provide a
+// generous amount of restarts to avoid potentially restarting an entire initial sync from scratch.
+MONGO_EXPORT_SERVER_PARAMETER(oplogFetcherInitialSyncMaxFetcherRestarts, int, 10)
+    ->withValidator([](const int& potentialNewValue) {
+        if (potentialNewValue < 0) {
+            return Status(ErrorCodes::BadValue,
+                          "oplogFetcherInitialSyncMaxFetcherRestarts must be nonnegative");
         }
         return Status::OK();
     });
@@ -394,26 +408,6 @@ ThreadPool* ReplicationCoordinatorExternalStateImpl::getDbWorkThreadPool() const
     return _writerPool.get();
 }
 
-Status ReplicationCoordinatorExternalStateImpl::runRepairOnLocalDB(OperationContext* opCtx) {
-    try {
-        Lock::GlobalWrite globalWrite(opCtx);
-        StorageEngine* engine = getGlobalServiceContext()->getStorageEngine();
-
-        if (!engine->isMmapV1()) {
-            return Status::OK();
-        }
-
-        UnreplicatedWritesBlock uwb(opCtx);
-        Status status = repairDatabase(opCtx, engine, localDbName, false, false);
-
-        // Open database before returning
-        DatabaseHolder::getDatabaseHolder().openDb(opCtx, localDbName);
-    } catch (const DBException& ex) {
-        return ex.toStatus();
-    }
-    return Status::OK();
-}
-
 Status ReplicationCoordinatorExternalStateImpl::initializeReplSetStorage(OperationContext* opCtx,
                                                                          const BSONObj& config) {
     try {
@@ -436,8 +430,6 @@ Status ReplicationCoordinatorExternalStateImpl::initializeReplSetStorage(Operati
                                // retries and they will succeed.  Unfortunately, initial sync will
                                // fail if it finds its sync source has an empty oplog.  Thus, we
                                // need to wait here until the seed document is visible in our oplog.
-                               AutoGetCollection oplog(
-                                   opCtx, NamespaceString::kRsOplogNamespace, MODE_IS);
                                waitForAllEarlierOplogWritesToBeVisible(opCtx);
                            });
 
@@ -474,8 +466,17 @@ Status ReplicationCoordinatorExternalStateImpl::initializeReplSetStorage(Operati
 
 void ReplicationCoordinatorExternalStateImpl::waitForAllEarlierOplogWritesToBeVisible(
     OperationContext* opCtx) {
-    AutoGetCollection oplog(opCtx, NamespaceString::kRsOplogNamespace, MODE_IS);
-    oplog.getCollection()->getRecordStore()->waitForAllEarlierOplogWritesToBeVisible(opCtx);
+    Collection* oplog;
+    {
+        // We don't want to be holding the collection lock while blocking, to avoid deadlocks.
+        // It is safe to store and access the oplog's Collection object after dropping the lock
+        // because the oplog is special and cannot be deleted on a running process.
+        // TODO(spencer): It should be possible to get the pointer to the oplog Collection object
+        // without ever having to take the collection lock.
+        AutoGetCollection oplogLock(opCtx, NamespaceString::kRsOplogNamespace, MODE_IS);
+        oplog = oplogLock.getCollection();
+    }
+    oplog->getRecordStore()->waitForAllEarlierOplogWritesToBeVisible(opCtx);
 }
 
 void ReplicationCoordinatorExternalStateImpl::onDrainComplete(OperationContext* opCtx) {
@@ -489,8 +490,7 @@ void ReplicationCoordinatorExternalStateImpl::onDrainComplete(OperationContext* 
     }
 }
 
-OpTime ReplicationCoordinatorExternalStateImpl::onTransitionToPrimary(OperationContext* opCtx,
-                                                                      bool isV1ElectionProtocol) {
+OpTime ReplicationCoordinatorExternalStateImpl::onTransitionToPrimary(OperationContext* opCtx) {
     invariant(opCtx->lockState()->isW());
 
     // Clear the appliedThrough marker so on startup we'll use the top of the oplog. This must be
@@ -504,20 +504,28 @@ OpTime ReplicationCoordinatorExternalStateImpl::onTransitionToPrimary(OperationC
     _replicationProcess->getConsistencyMarkers()->clearAppliedThrough(
         opCtx, lastAppliedOpTime.getTimestamp());
 
-    if (isV1ElectionProtocol) {
-        writeConflictRetry(opCtx, "logging transition to primary to oplog", "local.oplog.rs", [&] {
-            WriteUnitOfWork wuow(opCtx);
-            opCtx->getClient()->getServiceContext()->getOpObserver()->onOpMessage(
-                opCtx,
-                BSON("msg"
-                     << "new primary"));
-            wuow.commit();
-        });
-    }
+    writeConflictRetry(opCtx, "logging transition to primary to oplog", "local.oplog.rs", [&] {
+        WriteUnitOfWork wuow(opCtx);
+        opCtx->getClient()->getServiceContext()->getOpObserver()->onOpMessage(
+            opCtx,
+            BSON("msg"
+                 << "new primary"));
+        wuow.commit();
+    });
     const auto opTimeToReturn = fassert(28665, loadLastOpTime(opCtx));
 
     _shardingOnTransitionToPrimaryHook(opCtx);
     _dropAllTempCollections(opCtx);
+
+    // It is only necessary to check the system indexes on the first transition to master.
+    // On subsequent transitions to master the indexes will have already been created.
+    static std::once_flag verifySystemIndexesOnce;
+    std::call_once(verifySystemIndexesOnce, [opCtx] {
+        const auto globalAuthzManager = AuthorizationManager::get(opCtx->getServiceContext());
+        if (globalAuthzManager->shouldValidateAuthSchemaOnStartup()) {
+            fassert(50877, verifySystemIndexes(opCtx));
+        }
+    });
 
     serverGlobalParams.validateFeaturesAsMaster.store(true);
 
@@ -702,6 +710,7 @@ void ReplicationCoordinatorExternalStateImpl::shardingOnStepDownHook() {
         invariant(serverGlobalParams.clusterRole == ClusterRole::ShardServer);
         ChunkSplitter::get(_service).onStepDown();
         CatalogCacheLoader::get(_service).onStepDown();
+        PeriodicBalancerConfigRefresher::get(_service).onStepDown();
     }
 
     if (auto validator = LogicalTimeValidator::get(_service)) {
@@ -785,6 +794,7 @@ void ReplicationCoordinatorExternalStateImpl::_shardingOnTransitionToPrimaryHook
 
         CatalogCacheLoader::get(_service).onStepUp();
         ChunkSplitter::get(_service).onStepUp();
+        PeriodicBalancerConfigRefresher::get(_service).onStepUp(_service);
     } else {  // unsharded
         if (auto validator = LogicalTimeValidator::get(_service)) {
             validator->enableKeyGenerator(opCtx, true);
@@ -915,8 +925,14 @@ bool ReplicationCoordinatorExternalStateImpl::isReadConcernSnapshotSupportedBySt
     return storageEngine->supportsReadConcernSnapshot();
 }
 
-std::size_t ReplicationCoordinatorExternalStateImpl::getOplogFetcherMaxFetcherRestarts() const {
-    return oplogFetcherMaxFetcherRestarts.load();
+std::size_t ReplicationCoordinatorExternalStateImpl::getOplogFetcherSteadyStateMaxFetcherRestarts()
+    const {
+    return oplogFetcherSteadyStateMaxFetcherRestarts.load();
+}
+
+std::size_t ReplicationCoordinatorExternalStateImpl::getOplogFetcherInitialSyncMaxFetcherRestarts()
+    const {
+    return oplogFetcherInitialSyncMaxFetcherRestarts.load();
 }
 
 JournalListener::Token ReplicationCoordinatorExternalStateImpl::getToken() {

@@ -240,19 +240,28 @@ public:
         log() << "repairDatabase " << dbname;
         BackgroundOperation::assertNoBgOpInProgForDb(dbname);
 
-        e = cmdObj.getField("preserveClonedFilesOnFailure");
-        bool preserveClonedFilesOnFailure = e.isBoolean() && e.boolean();
-        e = cmdObj.getField("backupOriginalFiles");
-        bool backupOriginalFiles = e.isBoolean() && e.boolean();
+        uassert(ErrorCodes::BadValue,
+                "preserveClonedFilesOnFailure not supported",
+                !cmdObj.getField("preserveClonedFilesOnFailure").trueValue());
+        uassert(ErrorCodes::BadValue,
+                "backupOriginalFiles not supported",
+                !cmdObj.getField("backupOriginalFiles").trueValue());
 
-        StorageEngine* engine = getGlobalServiceContext()->getStorageEngine();
-        repl::UnreplicatedWritesBlock uwb(opCtx);
-        Status status = repairDatabase(
-            opCtx, engine, dbname, preserveClonedFilesOnFailure, backupOriginalFiles);
+        {
+            // Conceal UUIDCatalog changes for the duration of repairDatabase so that calls to
+            // UUIDCatalog::lookupNSSByUUID do not cause spurious NamespaceNotFound errors while
+            // repairDatabase makes updates.
+            ConcealUUIDCatalogChangesBlock cucc(opCtx);
 
-        // Open database before returning
-        DatabaseHolder::getDatabaseHolder().openDb(opCtx, dbname);
-        uassertStatusOK(status);
+            StorageEngine* engine = getGlobalServiceContext()->getStorageEngine();
+            repl::UnreplicatedWritesBlock uwb(opCtx);
+            Status status = repairDatabase(opCtx, engine, dbname);
+
+            // Open database before returning
+            DatabaseHolder::getDatabaseHolder().openDb(opCtx, dbname);
+            uassertStatusOK(status);
+        }
+
         return true;
     }
 } cmdRepairDatabase;
@@ -608,7 +617,7 @@ public:
 
         result.append("ns", nss.ns());
         Status status = appendCollectionStorageStats(opCtx, nss, jsobj, &result);
-        if (!status.isOK()) {
+        if (!status.isOK() && status.code() != ErrorCodes::NamespaceNotFound) {
             errmsg = status.reason();
             return false;
         }

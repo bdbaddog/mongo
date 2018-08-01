@@ -60,7 +60,7 @@ class UpdateRequest;
  * refresh' (in which case refreshFromStorageIfNeeded needs to be called in order to make it
  * up-to-date).
  */
-class Session {
+class Session : public Decorable<Session> {
     MONGO_DISALLOW_COPYING(Session);
 
 public:
@@ -92,6 +92,13 @@ public:
          * Releases stashed transaction state onto 'opCtx'. Must only be called once.
          */
         void release(OperationContext* opCtx);
+
+        /**
+         * Returns the read concern arguments.
+         */
+        repl::ReadConcernArgs getReadConcernArgs() const {
+            return _readConcernArgs;
+        }
 
     private:
         bool _released = false;
@@ -171,6 +178,8 @@ public:
     /**
      * Similar to beginOrContinueTxn except it is used specifically for shard migrations and does
      * not check or modify the autocommit parameter.
+     *
+     * Not called with session checked out.
      */
     void beginOrContinueTxnOnMigration(OperationContext* opCtx, TxnNumber txnNumber);
 
@@ -199,6 +208,8 @@ public:
      * Helper function to begin a migration on a primary node.
      *
      * Returns whether the specified statement should be migrated at all or skipped.
+     *
+     * Not called with session checked out.
      */
     bool onMigrateBeginOnPrimary(OperationContext* opCtx, TxnNumber txnNumber, StmtId stmtId);
 
@@ -270,22 +281,36 @@ public:
     /**
      * Commits the transaction, including committing the write unit of work and updating
      * transaction state.
+     *
+     * Throws an exception if the transaction is prepared.
      */
-    void commitTransaction(OperationContext* opCtx);
+    void commitUnpreparedTransaction(OperationContext* opCtx);
 
     /**
-     * Puts a transaction into a prepared state.
+     * Commits the transaction, including committing the write unit of work and updating
+     * transaction state.
+     *
+     * Throws an exception if the transaction is not prepared or if the 'commitTimestamp' is null.
      */
-    void prepareTransaction(OperationContext* opCtx);
+    void commitPreparedTransaction(OperationContext* opCtx, Timestamp commitTimestamp);
+
+    /**
+     * Puts a transaction into a prepared state and returns the prepareTimestamp.
+     */
+    Timestamp prepareTransaction(OperationContext* opCtx);
 
     /**
      * Aborts the transaction outside the transaction, releasing transaction resources.
+     *
+     * Not called with session checked out.
      */
     void abortArbitraryTransaction();
 
     /**
      * Same as abortArbitraryTransaction, except only executes if _transactionExpireDate indicates
      * that the transaction has expired.
+     *
+     * Not called with session checked out.
      */
     void abortArbitraryTransactionIfExpired();
 
@@ -307,17 +332,17 @@ public:
      */
     bool inMultiDocumentTransaction() const {
         stdx::lock_guard<stdx::mutex> lk(_mutex);
-        return _txnState == MultiDocumentTransactionState::kInProgress;
+        return _txnState.inMultiDocumentTransaction(lk);
     };
 
     bool transactionIsCommitted() const {
         stdx::lock_guard<stdx::mutex> lk(_mutex);
-        return _txnState == MultiDocumentTransactionState::kCommitted;
+        return _txnState.isCommitted(lk);
     }
 
     bool transactionIsAborted() const {
         stdx::lock_guard<stdx::mutex> lk(_mutex);
-        return _txnState == MultiDocumentTransactionState::kAborted;
+        return _txnState.isAborted(lk);
     }
 
     /**
@@ -347,6 +372,11 @@ public:
         return _singleTransactionStats;
     }
 
+    repl::OpTime getSpeculativeTransactionReadOpTimeForTest() const {
+        stdx::lock_guard<stdx::mutex> lk(_mutex);
+        return _speculativeTransactionReadOpTime;
+    }
+
     /**
      * If this session is holding stashed locks in _txnResourceStash, reports the current state of
      * the session using the provided builder. Locks the session object's mutex while running.
@@ -354,10 +384,25 @@ public:
     void reportStashedState(BSONObjBuilder* builder) const;
 
     /**
+     * If this session is not holding stashed locks in _txnResourceStash (transaction is active),
+     * reports the current state of the session using the provided builder. Locks the session
+     * object's mutex while running.
+     */
+    void reportUnstashedState(repl::ReadConcernArgs readConcernArgs, BSONObjBuilder* builder) const;
+
+    /**
      * Convenience method which creates and populates a BSONObj containing the stashed state.
      * Returns an empty BSONObj if this session has no stashed resources.
      */
     BSONObj reportStashedState() const;
+
+    /**
+     * This method returns a string with information about a slow transaction. The format of the
+     * logging string produced should match the format used for slow operation logging. A
+     * transaction must be completed (committed or aborted) and a valid LockStats reference must be
+     * passed in order for this method to be called.
+     */
+    std::string transactionInfoForLog(const SingleThreadedLockStats* lockStats);
 
     void addMultikeyPathInfo(MultikeyPathInfo info) {
         _multikeyPathInfo.push_back(std::move(info));
@@ -376,6 +421,16 @@ public:
      */
     static boost::optional<repl::OplogEntry> createMatchingTransactionTableUpdate(
         const repl::OplogEntry& entry);
+
+    void transitionToPreparedforTest() {
+        stdx::lock_guard<stdx::mutex> lk(_mutex);
+        _txnState.transitionTo(lk, TransactionState::kPrepared);
+    }
+
+    void transitionToCommittingforTest() {
+        stdx::lock_guard<stdx::mutex> lk(_mutex);
+        _txnState.transitionTo(lk, TransactionState::kCommittingWithoutPrepare);
+    }
 
 private:
     // Holds function which determines whether the CursorManager has client cursor references for a
@@ -420,16 +475,110 @@ private:
                                       std::vector<StmtId> stmtIdsWritten,
                                       const repl::OpTime& lastStmtIdWriteTs);
 
+    /**
+     * Indicates the state of the current multi-document transaction, if any.  If the transaction is
+     * in any state but kInProgress, no more operations can be collected. Once the transaction is in
+     * kPrepared, the transaction is not allowed to abort outside of an 'abortTransaction' command.
+     * At this point, aborting the transaction must log an 'abortTransaction' oplog entry.
+     */
+    class TransactionState {
+    public:
+        enum StateFlag {
+            kNone = 1 << 0,
+            kInProgress = 1 << 1,
+            kPrepared = 1 << 2,
+            kCommittingWithoutPrepare = 1 << 3,
+            kCommittingWithPrepare = 1 << 4,
+            kCommitted = 1 << 5,
+            kAborted = 1 << 6
+        };
+
+        using StateSet = int;
+
+        bool isInSet(WithLock, StateSet stateSet) const {
+            return _state & stateSet;
+        }
+
+        /**
+         * Transitions the session from the current state to the new state. If transition validation
+         * is not relaxed, invariants if the transition is illegal.
+         */
+        enum class TransitionValidation { kValidateTransition, kRelaxTransitionValidation };
+        void transitionTo(
+            WithLock,
+            StateFlag newState,
+            TransitionValidation shouldValidate = TransitionValidation::kValidateTransition);
+
+        bool inMultiDocumentTransaction(WithLock) const {
+            return _state == kInProgress || _state == kPrepared;
+        }
+
+        bool isNone(WithLock) const {
+            return _state == kNone;
+        }
+
+        bool isInProgress(WithLock) const {
+            return _state == kInProgress;
+        }
+
+        bool isPrepared(WithLock) const {
+            return _state == kPrepared;
+        }
+
+        bool isCommittingWithoutPrepare(WithLock) const {
+            return _state == kCommittingWithoutPrepare;
+        }
+
+        bool isCommittingWithPrepare(WithLock) const {
+            return _state == kCommittingWithPrepare;
+        }
+
+        bool isCommitted(WithLock) const {
+            return _state == kCommitted;
+        }
+
+        bool isAborted(WithLock) const {
+            return _state == kAborted;
+        }
+
+        std::string toString() const {
+            return toString(_state);
+        }
+
+        static std::string toString(StateFlag state);
+
+    private:
+        static bool _isLegalTransition(StateFlag oldState, StateFlag newState);
+
+        StateFlag _state = kNone;
+    };
+
+    friend std::ostream& operator<<(std::ostream& s, TransactionState txnState) {
+        return (s << txnState.toString());
+    }
+
+    friend StringBuilder& operator<<(StringBuilder& s, TransactionState txnState) {
+        return (s << txnState.toString());
+    }
+
+    // Abort the transaction if it's in one of the expected states and clean up the transaction
+    // states associated with the opCtx.
+    void _abortActiveTransaction(OperationContext* opCtx,
+                                 TransactionState::StateSet expectedStates);
+
     void _abortArbitraryTransaction(WithLock);
 
-    // Releases stashed transaction resources to abort the transaction.
-    void _abortTransaction(WithLock);
+    // Releases stashed transaction resources to abort the transaction on the session.
+    void _abortTransactionOnSession(WithLock);
 
-    // Committing a transaction first changes its state to "Committing" and writes to the oplog,
+    // Clean up the transaction resources unstashed on operation context.
+    void _cleanUpTxnResourceOnOpCtx(OperationContext* opCtx);
+
+    // Committing a transaction first changes its state to "Committing*" and writes to the oplog,
     // then it changes the state to "Committed".
     //
-    // When a transaction is in "Committing" state, it's not allowed for other threads to change its
-    // state (i.e. abort the transaction), otherwise the on-disk state will diverge from the
+    // When a transaction is in "Committing*" state, it's not allowed for other threads to change
+    // its state (i.e. abort the transaction), otherwise the on-disk state will diverge from the
     // in-memory state.
     // There are 3 cases where the transaction will be aborted.
     // 1) abortTransaction command. Session check-out mechanism only allows one client to access a
@@ -455,6 +604,12 @@ private:
     // truncated because it was too old.
     bool _hasIncompleteHistory{false};
 
+    // Reports transaction stats for both active and inactive transactions using the provided
+    // builder.
+    void _reportTransactionStats(WithLock wl,
+                                 BSONObjBuilder* builder,
+                                 repl::ReadConcernArgs readConcernArgs) const;
+
     // Caches what is known to be the last written transaction record for the session
     boost::optional<SessionTxnRecord> _lastWrittenSessionRecord;
 
@@ -466,15 +621,8 @@ private:
     // Holds transaction resources between network operations.
     boost::optional<TxnResources> _txnResourceStash;
 
-    // Indicates the state of the current multi-document transaction or snapshot read, if any.  If
-    // the transaction is in any state but kInProgress, no more operations can be collected.
-    enum class MultiDocumentTransactionState {
-        kNone,
-        kInProgress,
-        kCommitting,
-        kCommitted,
-        kAborted
-    } _txnState = MultiDocumentTransactionState::kNone;
+    // Maintains the transaction state and the transition table for legal state transitions.
+    TransactionState _txnState;
 
     // Holds oplog data for operations which have been applied in the current multi-document
     // transaction.  Not used for retryable writes.

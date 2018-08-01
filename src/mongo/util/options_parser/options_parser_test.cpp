@@ -2785,9 +2785,6 @@ TEST(ChainingInterface, PositionalHoleInRange) {
     argv.push_back("binaryname");
     std::map<std::string, std::string> env_map;
 
-    moe::Value value;
-    std::vector<std::string>::iterator positionalit;
-
     ASSERT_NOT_OK(parser.run(testOpts, argv, env_map, &environment));
 }
 
@@ -2805,9 +2802,6 @@ TEST(ChainingInterface, PositionalOverlappingRange) {
     std::vector<std::string> argv;
     argv.push_back("binaryname");
     std::map<std::string, std::string> env_map;
-
-    moe::Value value;
-    std::vector<std::string>::iterator positionalit;
 
     ASSERT_NOT_OK(parser.run(testOpts, argv, env_map, &environment));
 }
@@ -2827,9 +2821,6 @@ TEST(ChainingInterface, PositionalOverlappingRangeInfinite) {
     argv.push_back("binaryname");
     std::map<std::string, std::string> env_map;
 
-    moe::Value value;
-    std::vector<std::string>::iterator positionalit;
-
     ASSERT_NOT_OK(parser.run(testOpts, argv, env_map, &environment));
 }
 
@@ -2847,9 +2838,6 @@ TEST(ChainingInterface, PositionalMultipleInfinite) {
     std::vector<std::string> argv;
     argv.push_back("binaryname");
     std::map<std::string, std::string> env_map;
-
-    moe::Value value;
-    std::vector<std::string>::iterator positionalit;
 
     ASSERT_NOT_OK(parser.run(testOpts, argv, env_map, &environment));
 }
@@ -3801,7 +3789,7 @@ TEST(YAMLConfigFile, DeprecatedDottedNameDeprecatedOnly) {
 
     moe::OptionSection testOpts;
     testOpts.addOptionChaining("config", "config", moe::String, "Config file to parse");
-    testOpts.addOptionChaining("dotted.canonical", "var1", moe::Int, "Var1", "dotted.deprecated");
+    testOpts.addOptionChaining("dotted.canonical", "var1", moe::Int, "Var1", {"dotted.deprecated"});
 
     std::vector<std::string> argv;
     argv.push_back("binaryname");
@@ -3824,14 +3812,14 @@ TEST(YAMLConfigFile, DeprecatedDottedNameDeprecatedOnly) {
 TEST(YAMLConfigFile, DeprecatedDottedNameSameAsCanonicalDottedName) {
     moe::OptionSection testOpts;
     ASSERT_THROWS(testOpts.addOptionChaining(
-                      "dotted.canonical", "var1", moe::Int, "Var1", "dotted.canonical"),
+                      "dotted.canonical", "var1", moe::Int, "Var1", {"dotted.canonical"}),
                   ::mongo::DBException);
 }
 
 // Deprecated dotted name cannot be the empty string.
 TEST(YAMLConfigFile, DeprecatedDottedNameEmptyString) {
     moe::OptionSection testOpts;
-    ASSERT_THROWS(testOpts.addOptionChaining("dotted.canonical", "var1", moe::Int, "Var1", ""),
+    ASSERT_THROWS(testOpts.addOptionChaining("dotted.canonical", "var1", moe::Int, "Var1", {""}),
                   ::mongo::DBException);
 }
 
@@ -3840,16 +3828,17 @@ TEST(YAMLConfigFile, DeprecatedDottedNameSameAsOtherOptionsDottedName) {
     moe::OptionSection testOpts;
     testOpts.addOptionChaining("dotted.canonical1", "var1", moe::Int, "Var1");
     ASSERT_THROWS(testOpts.addOptionChaining(
-                      "dotted.canonical2", "var2", moe::Int, "Var2", "dotted.canonical1"),
+                      "dotted.canonical2", "var2", moe::Int, "Var2", {"dotted.canonical1"}),
                   ::mongo::DBException);
 }
 
 // Deprecated dotted name cannot be the same as another option's deprecated dotted name.
 TEST(YAMLConfigFile, DeprecatedDottedNameSameAsOtherOptionsDeprecatedDottedName) {
     moe::OptionSection testOpts;
-    testOpts.addOptionChaining("dotted.canonical1", "var1", moe::Int, "Var1", "dotted.deprecated1");
+    testOpts.addOptionChaining(
+        "dotted.canonical1", "var1", moe::Int, "Var1", {"dotted.deprecated"});
     ASSERT_THROWS(testOpts.addOptionChaining(
-                      "dotted.canonical2", "var2", moe::Int, "Var2", "dotted.deprecated1"),
+                      "dotted.canonical2", "var2", moe::Int, "Var2", {"dotted.deprecated"}),
                   ::mongo::DBException);
 }
 
@@ -3861,7 +3850,7 @@ TEST(YAMLConfigFile, DeprecatedDottedNameCanonicalAndDeprecated) {
 
     moe::OptionSection testOpts;
     testOpts.addOptionChaining("config", "config", moe::String, "Config file to parse");
-    testOpts.addOptionChaining("dotted.canonical", "var1", moe::Int, "Var1", "dotted.deprecated");
+    testOpts.addOptionChaining("dotted.canonical", "var1", moe::Int, "Var1", {"dotted.deprecated"});
 
     std::vector<std::string> argv;
     argv.push_back("binaryname");

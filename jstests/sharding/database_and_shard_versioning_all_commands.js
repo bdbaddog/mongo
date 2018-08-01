@@ -12,6 +12,14 @@
 
     const SHARD_VERSION_UNSHARDED = [Timestamp(0, 0), ObjectId("000000000000000000000000")];
 
+    // These commands exist in the 4.0 mongo shell, so we must define a test case in mixed version
+    // suites. However, a check exists in this test that asserts that every command tested exists
+    // on mongos. In an all-4.2 environment, these commands won't exist. To increase test coverage,
+    // and allow us to run on same- and mixed-version suites, we will allow these commands to have
+    // a test defined without always existing on the mongos being used.
+    const fcv40OnlyCommands =
+        ['abortTransaction', 'commitTransaction', 'eval', 'geoNear', 'group', 'reIndex'];
+
     function validateTestCase(testCase) {
         assert(testCase.skip || testCase.command,
                "must specify exactly one of 'skip' or 'command' for test case " + tojson(testCase));
@@ -50,6 +58,7 @@
         _hashBSONElement: {skip: "executes locally on mongos (not sent to any remote node)"},
         _isSelf: {skip: "executes locally on mongos (not sent to any remote node)"},
         _mergeAuthzCollections: {skip: "always targets the config server"},
+        abortTransaction: {skip: "unversioned and uses special targetting rules"},
         addShard: {skip: "not on a user database"},
         addShardToZone: {skip: "not on a user database"},
         aggregate: {
@@ -88,6 +97,7 @@
                 assert(mongosConn.getDB(dbName).getCollection(collName).drop());
             }
         },
+        commitTransaction: {skip: "unversioned and uses special targetting rules"},
         compact: {skip: "not allowed through mongos"},
         configureFailPoint: {skip: "executes locally on mongos (not sent to any remote node)"},
         connPoolStats: {skip: "executes locally on mongos (not sent to any remote node)"},
@@ -197,17 +207,7 @@
         echo: {skip: "does not forward command to primary shard"},
         enableSharding: {skip: "does not forward command to primary shard"},
         endSessions: {skip: "goes through the cluster write path"},
-        eval: {
-            sendsDbVersion: false,
-            // It is a known bug that eval does not send shardVersion (SERVER-33357).
-            sendsShardVersion: false,
-            command: {
-                eval: function(collName) {
-                    const doc = db[collName].findOne();
-                },
-                args: [collName]
-            }
-        },
+        eval: {skip: "must define test coverage for 4.0 backwards compatibility"},
         explain: {skip: "TODO SERVER-31226"},
         features: {skip: "executes locally on mongos (not sent to any remote node)"},
         filemd5: {
@@ -227,6 +227,7 @@
         },
         flushRouterConfig: {skip: "executes locally on mongos (not sent to any remote node)"},
         fsync: {skip: "broadcast to all shards"},
+        geoNear: {skip: "must define test coverage for 4.0 backwards compatibility"},
         getCmdLineOpts: {skip: "executes locally on mongos (not sent to any remote node)"},
         getDiagnosticData: {skip: "executes locally on mongos (not sent to any remote node)"},
         getLastError: {skip: "does not forward command to primary shard"},
@@ -240,6 +241,7 @@
         grantPrivilegesToRole: {skip: "always targets the config server"},
         grantRolesToRole: {skip: "always targets the config server"},
         grantRolesToUser: {skip: "always targets the config server"},
+        group: {skip: "must define test coverage for 4.0 backwards compatibility"},
         hostInfo: {skip: "executes locally on mongos (not sent to any remote node)"},
         insert: {
             sendsDbVersion: false,
@@ -355,22 +357,11 @@
             }
         },
         profile: {skip: "not supported in mongos"},
-        reIndex: {
-            sendsDbVersion: true,
-            sendsShardVersion: true,
-            setUp: function(mongosConn) {
-                // Expects the collection to exist, and doesn't implicitly create it.
-                assert.commandWorked(mongosConn.getDB(dbName).runCommand({create: collName}));
-            },
-            command: {reIndex: collName},
-            cleanUp: function(mongosConn) {
-                assert(mongosConn.getDB(dbName).getCollection(collName).drop());
-            }
-        },
         reapLogicalSessionCacheNow: {skip: "is a no-op on mongos"},
         refreshLogicalSessionCacheNow: {skip: "goes through the cluster write path"},
         refreshSessions: {skip: "executes locally on mongos (not sent to any remote node)"},
         refreshSessionsInternal: {skip: "executes locally on mongos (not sent to any remote node)"},
+        reIndex: {skip: "must define test coverage for 4.0 backwards compatibility"},
         removeShard: {skip: "not on a user database"},
         removeShardFromZone: {skip: "not on a user database"},
         renameCollection: {
@@ -557,6 +548,9 @@
             // After iterating through all the existing commands, ensure there were no additional
             // test cases that did not correspond to any mongos command.
             for (let key of Object.keys(testCases)) {
+                if (fcv40OnlyCommands.includes(key)) {
+                    continue;
+                }
                 assert(testCases[key].validated || testCases[key].conditional,
                        "you defined a test case for a command '" + key +
                            "' that does not exist on mongos: " + tojson(testCases[key]));

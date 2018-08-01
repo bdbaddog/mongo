@@ -37,11 +37,11 @@
 #include "mongo/db/catalog/index_catalog.h"
 #include "mongo/db/catalog_raii.h"
 #include "mongo/db/dbhelpers.h"
-#include "mongo/db/exec/plan_stage.h"
 #include "mongo/db/exec/working_set_common.h"
 #include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/query/internal_plans.h"
 #include "mongo/db/repl/optime.h"
+#include "mongo/db/repl/replication_process.h"
 #include "mongo/db/s/start_chunk_clone_request.h"
 #include "mongo/db/service_context.h"
 #include "mongo/executor/remote_command_request.h"
@@ -86,45 +86,6 @@ BSONObj createRequestWithSessionId(StringData commandName,
 }
 
 }  // namespace
-
-/**
- * Used to receive invalidation notifications from operations, which delete documents.
- */
-class DeleteNotificationStage final : public PlanStage {
-public:
-    DeleteNotificationStage(MigrationChunkClonerSourceLegacy* cloner, OperationContext* opCtx)
-        : PlanStage("SHARDING_NOTIFY_DELETE", opCtx), _cloner(cloner) {}
-
-    void doInvalidate(OperationContext* opCtx, const RecordId& dl, InvalidationType type) override {
-        if (type == INVALIDATION_DELETION) {
-            stdx::lock_guard<stdx::mutex> sl(_cloner->_mutex);
-            _cloner->_cloneLocs.erase(dl);
-        }
-    }
-
-    StageState doWork(WorkingSetID* out) override {
-        MONGO_UNREACHABLE;
-    }
-
-    bool isEOF() override {
-        MONGO_UNREACHABLE;
-    }
-
-    std::unique_ptr<PlanStageStats> getStats() override {
-        MONGO_UNREACHABLE;
-    }
-
-    SpecificStats* getSpecificStats() const override {
-        MONGO_UNREACHABLE;
-    }
-
-    StageType stageType() const override {
-        return STAGE_NOTIFY_DELETE;
-    }
-
-private:
-    MigrationChunkClonerSourceLegacy* const _cloner;
-};
 
 /**
  * Used to commit work for LogOpForSharding. Used to keep track of changes in documents that are
@@ -199,7 +160,6 @@ MigrationChunkClonerSourceLegacy::MigrationChunkClonerSourceLegacy(MoveChunkRequ
 
 MigrationChunkClonerSourceLegacy::~MigrationChunkClonerSourceLegacy() {
     invariant(_state == kDone);
-    invariant(!_deleteNotifyExec);
 }
 
 Status MigrationChunkClonerSourceLegacy::startClone(OperationContext* opCtx) {
@@ -497,15 +457,6 @@ Status MigrationChunkClonerSourceLegacy::nextCloneBatch(OperationContext* opCtx,
 
     _cloneLocs.erase(_cloneLocs.begin(), it);
 
-    // If we have drained all the cloned data, there is no need to keep the delete notify executor
-    // around
-    if (_cloneLocs.empty() && _deleteNotifyExec) {
-        // We have a different OperationContext than when we created the PlanExecutor, so need to
-        // manually destroy it ourselves.
-        _deleteNotifyExec->dispose(opCtx, collection->getCursorManager());
-        _deleteNotifyExec.reset();
-    }
-
     return Status::OK();
 }
 
@@ -530,34 +481,17 @@ Status MigrationChunkClonerSourceLegacy::nextModsBatch(OperationContext* opCtx,
 }
 
 void MigrationChunkClonerSourceLegacy::_cleanup(OperationContext* opCtx) {
-    {
-        stdx::lock_guard<stdx::mutex> sl(_mutex);
-        _state = kDone;
-        _reload.clear();
-        _deleted.clear();
-    }
-    // Implicitly resets _deleteNotifyExec to avoid possible invariant failure
-    // in on destruction of MigrationChunkClonerSourceLegacy, and will always
-    // call deleteNotifyExec destructor on scope exit even if something in the
-    // below if statement fails
-    auto deleteNotifyExec = std::move(_deleteNotifyExec);
-
-    if (deleteNotifyExec) {
-        // Don't allow an Interrupt exception to prevent _deleteNotifyExec from getting cleaned up.
-        UninterruptibleLockGuard noInterrupt(opCtx->lockState());
-
-        AutoGetCollection autoColl(opCtx, _args.getNss(), MODE_IS);
-        const auto cursorManager =
-            autoColl.getCollection() ? autoColl.getCollection()->getCursorManager() : nullptr;
-        deleteNotifyExec->dispose(opCtx, cursorManager);
-    }
+    stdx::lock_guard<stdx::mutex> sl(_mutex);
+    _state = kDone;
+    _reload.clear();
+    _deleted.clear();
 }
 
 StatusWith<BSONObj> MigrationChunkClonerSourceLegacy::_callRecipient(const BSONObj& cmdObj) {
     executor::RemoteCommandResponse responseStatus(
         Status{ErrorCodes::InternalError, "Uninitialized value"});
 
-    auto executor = grid.getExecutorPool()->getFixedExecutor();
+    auto executor = Grid::get(getGlobalServiceContext())->getExecutorPool()->getFixedExecutor();
     auto scheduleStatus = executor->scheduleRemoteCommand(
         executor::RemoteCommandRequest(_recipientHost, "admin", cmdObj, nullptr),
         [&responseStatus](const executor::TaskExecutor::RemoteCommandCallbackArgs& args) {
@@ -604,19 +538,6 @@ Status MigrationChunkClonerSourceLegacy::_storeCurrentLocs(OperationContext* opC
                               << " in storeCurrentLocs for "
                               << _args.getNss().ns()};
     }
-
-    // Install the stage, which will listen for notifications on the collection
-    auto statusWithDeleteNotificationPlanExecutor =
-        PlanExecutor::make(opCtx,
-                           stdx::make_unique<WorkingSet>(),
-                           stdx::make_unique<DeleteNotificationStage>(this, opCtx),
-                           collection,
-                           PlanExecutor::YIELD_MANUAL);
-    if (!statusWithDeleteNotificationPlanExecutor.isOK()) {
-        return statusWithDeleteNotificationPlanExecutor.getStatus();
-    }
-
-    _deleteNotifyExec = std::move(statusWithDeleteNotificationPlanExecutor.getValue());
 
     // Assume both min and max non-empty, append MinKey's to make them fit chosen index
     const KeyPattern kp(idx->keyPattern());
@@ -746,13 +667,12 @@ void MigrationChunkClonerSourceLegacy::_xfer(OperationContext* opCtx,
     arr.done();
 }
 
-repl::OpTime MigrationChunkClonerSourceLegacy::nextSessionMigrationBatch(
+boost::optional<repl::OpTime> MigrationChunkClonerSourceLegacy::nextSessionMigrationBatch(
     OperationContext* opCtx, BSONArrayBuilder* arrBuilder) {
     repl::OpTime opTimeToWait;
-    auto seenOpTimeTerm = repl::OpTime::kUninitializedTerm;
 
     if (!_sessionCatalogSource) {
-        return {};
+        return boost::none;
     }
 
     while (_sessionCatalogSource->hasMoreOplog()) {
@@ -765,15 +685,6 @@ repl::OpTime MigrationChunkClonerSourceLegacy::nextSessionMigrationBatch(
         }
 
         auto newOpTime = result.oplog->getOpTime();
-        if (seenOpTimeTerm == repl::OpTime::kUninitializedTerm) {
-            seenOpTimeTerm = newOpTime.getTerm();
-        } else {
-            uassert(40650,
-                    str::stream() << "detected change of term from " << seenOpTimeTerm << " to "
-                                  << newOpTime.getTerm(),
-                    seenOpTimeTerm == newOpTime.getTerm());
-        }
-
         auto oplogDoc = result.oplog->toBSON();
 
         // Use the builder size instead of accumulating the document sizes directly so that we
@@ -793,7 +704,7 @@ repl::OpTime MigrationChunkClonerSourceLegacy::nextSessionMigrationBatch(
         }
     }
 
-    return opTimeToWait;
+    return boost::make_optional(opTimeToWait);
 }
 
 }  // namespace mongo

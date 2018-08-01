@@ -57,8 +57,13 @@ public:
     // ---------
 
     /**
-     * Having multiple out for the same ns is a rules violation; Calling on a non-created ident is
-     * invalid and may crash.
+     * Requesting multiple copies for the same ns/ident is a rules violation; Calling on a
+     * non-created ident is invalid and may crash.
+     *
+     * Trying to access this record store in the future will retreive the pointer from the
+     * collection object, and therefore this function can only be called once per namespace.
+     *
+     * @param ident Will be created if it does not already exist.
      */
     virtual std::unique_ptr<RecordStore> getRecordStore(OperationContext* opCtx,
                                                         StringData ns,
@@ -187,6 +192,15 @@ public:
         MONGO_UNREACHABLE;
     }
 
+    virtual StatusWith<std::vector<std::string>> beginNonBlockingBackup(OperationContext* opCtx) {
+        return Status(ErrorCodes::CommandNotSupported,
+                      "The current storage engine doesn't support backup mode");
+    }
+
+    virtual void endNonBlockingBackup(OperationContext* opCtx) {
+        MONGO_UNREACHABLE;
+    }
+
     virtual bool isDurable() const = 0;
 
     /**
@@ -311,9 +325,9 @@ public:
     }
 
     /**
-     * See `StorageEngine::getLastStableCheckpointTimestamp`
+     * See `StorageEngine::getLastStableRecoveryTimestamp`
      */
-    virtual boost::optional<Timestamp> getLastStableCheckpointTimestamp() const {
+    virtual boost::optional<Timestamp> getLastStableRecoveryTimestamp() const {
         MONGO_UNREACHABLE;
     }
 

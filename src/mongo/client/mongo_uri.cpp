@@ -41,10 +41,10 @@
 
 #include "mongo/base/status_with.h"
 #include "mongo/bson/bsonobjbuilder.h"
-#include "mongo/client/dbclientinterface.h"
 #include "mongo/client/sasl_client_authenticate.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/stdx/utility.h"
+#include "mongo/util/dns_name.h"
 #include "mongo/util/dns_query.h"
 #include "mongo/util/hex.h"
 #include "mongo/util/mongoutils/str.h"
@@ -235,65 +235,103 @@ MongoURI::OptionsMap addTXTOptions(std::map<std::string, std::string> options,
     return {std::make_move_iterator(begin(options)), std::make_move_iterator(end(options))};
 }
 
-std::string stripHost(const std::string& hostname) {
-    return hostname.substr(hostname.find('.') + 1);
-}
+// Contains the parts of a MongoURI as unowned StringData's. Any code that needs to break up
+// URIs into their basic components without fully parsing them can use this struct.
+// Internally, MongoURI uses this to do basic parsing of the input URI string.
+struct URIParts {
+    explicit URIParts(StringData uri);
+    StringData scheme;
+    StringData username;
+    StringData password;
+    StringData hostIdentifiers;
+    StringData database;
+    StringData options;
+};
 
-bool isWithinDomain(std::string hostname, std::string domain) {
-    auto removeFQDNRoot = [](std::string name) -> std::string {
-        if (name.back() == '.') {
-            name.pop_back();
-        }
-        return name;
-    };
-    hostname = stripHost(removeFQDNRoot(std::move(hostname)));
-    domain = removeFQDNRoot(std::move(domain));
-    return hostname == domain;
-}
-}  // namespace
-
-MongoURI MongoURI::parseImpl(const std::string& url) {
-    const StringData urlSD(url);
-
-    // 1. Validate and remove the scheme prefix mongodb://
-    const bool isSeedlist = urlSD.startsWith(kURISRVPrefix);
-    if (!(urlSD.startsWith(kURIPrefix) || isSeedlist)) {
-        return MongoURI(uassertStatusOK(ConnectionString::parse(url)));
+URIParts::URIParts(StringData uri) {
+    // 1. Strip off the scheme ("mongo://")
+    auto schemeEnd = uri.find("://");
+    if (schemeEnd == std::string::npos) {
+        uasserted(ErrorCodes::FailedToParse,
+                  str::stream() << "URI must begin with " << kURIPrefix << " or " << kURISRVPrefix
+                                << ": "
+                                << uri);
     }
-    const auto uriWithoutPrefix = urlSD.substr(urlSD.find("://") + 3);
+    const auto uriWithoutPrefix = uri.substr(schemeEnd + 3);
+    scheme = uri.substr(0, schemeEnd);
 
     // 2. Split the string by the first, unescaped / (if any), yielding:
     // split[0]: User information and host identifers
     // split[1]: Auth database and connection options
     const auto userAndDb = partitionForward(uriWithoutPrefix, '/');
     const auto userAndHostInfo = userAndDb.first;
-    const auto databaseAndOptions = userAndDb.second;
 
     // 2.b Make sure that there are no question marks in the left side of the /
     //     as any options after the ? must still have the / delimeter
-    if (databaseAndOptions.empty() && userAndHostInfo.find('?') != std::string::npos) {
+    if (userAndDb.second.empty() && userAndHostInfo.find('?') != std::string::npos) {
         uasserted(
             ErrorCodes::FailedToParse,
             str::stream()
                 << "URI must contain slash delimeter between hosts and options for mongodb:// URL: "
-                << url);
+                << uri);
     }
 
     // 3. Split the user information and host identifiers string by the last, unescaped @,
-    // yielding:
-    // split[0]: User information
-    // split[1]: Host identifiers;
     const auto userAndHost = partitionBackward(userAndHostInfo, '@');
     const auto userInfo = userAndHost.first;
-    const auto hostIdentifiers = userAndHost.second;
+    hostIdentifiers = userAndHost.second;
 
-    // 4. Validate, split (if applicable), and URL decode the user information, yielding:
-    // split[0] = username
-    // split[1] = password
+    // 4. Split up the username and password
     const auto userAndPass = partitionForward(userInfo, ':');
-    const auto usernameSD = userAndPass.first;
-    const auto passwordSD = userAndPass.second;
+    username = userAndPass.first;
+    password = userAndPass.second;
 
+    // 5. Split the database name from the list of options
+    const auto databaseAndOptions = partitionForward(userAndDb.second, '?');
+    database = databaseAndOptions.first;
+    options = databaseAndOptions.second;
+}
+}  // namespace
+
+bool MongoURI::isMongoURI(StringData uri) {
+    return (uri.startsWith(kURIPrefix) || uri.startsWith(kURISRVPrefix));
+}
+
+std::string MongoURI::redact(StringData url) {
+    uassert(50892, "String passed to MongoURI::redact wasn't a MongoURI", isMongoURI(url));
+    URIParts parts(url);
+    std::ostringstream out;
+
+    out << parts.scheme << "://";
+    if (!parts.username.empty()) {
+        out << parts.username << "@";
+    }
+    out << parts.hostIdentifiers;
+    if (!parts.database.empty()) {
+        out << "/" << parts.database;
+    }
+
+    return out.str();
+}
+
+MongoURI MongoURI::parseImpl(const std::string& url) {
+    const StringData urlSD(url);
+
+    // 1. Validate and remove the scheme prefix `mongodb://` or `mongodb+srv://`
+    const bool isSeedlist = urlSD.startsWith(kURISRVPrefix);
+    if (!(urlSD.startsWith(kURIPrefix) || isSeedlist)) {
+        return MongoURI(uassertStatusOK(ConnectionString::parse(url)));
+    }
+
+    // 2. Split up the URI into its components for further parsing and validation
+    URIParts parts(url);
+    const auto hostIdentifiers = parts.hostIdentifiers;
+    const auto usernameSD = parts.username;
+    const auto passwordSD = parts.password;
+    const auto databaseSD = parts.database;
+    const auto connectionOptions = parts.options;
+
+    // 3. URI decode and validate the username/password
     const auto containsColonOrAt = [](StringData str) {
         return (str.find(':') != std::string::npos) || (str.find('@') != std::string::npos);
     };
@@ -325,7 +363,7 @@ MongoURI MongoURI::parseImpl(const std::string& url) {
                                 << url);
     const auto password = passwordWithStatus.getValue();
 
-    // 5. Validate, split, and URL decode the host identifiers.
+    // 4. Validate, split, and URL decode the host identifiers.
     const auto hostIdentifiersStr = hostIdentifiers.toString();
     std::vector<HostAndPort> servers;
     for (auto i = boost::make_split_iterator(hostIdentifiersStr,
@@ -365,36 +403,43 @@ MongoURI MongoURI::parseImpl(const std::string& url) {
             uasserted(ErrorCodes::FailedToParse,
                       "Only a single server may be specified with a mongo+srv:// url.");
         }
-        const int dots = std::count(begin(canonicalHost), end(canonicalHost), '.');
-        const int requiredDots = (canonicalHost.back() == '.') + 2;
-        if (dots < requiredDots) {
+
+        const mongo::dns::HostName host(canonicalHost);
+
+        if (host.nameComponents().size() < 3) {
             uasserted(ErrorCodes::FailedToParse,
                       "A server specified with a mongo+srv:// url must have at least 3 hostname "
                       "components separated by dots ('.')");
         }
-        const auto domain = stripHost(canonicalHost);
-        auto srvEntries = dns::lookupSRVRecords("_mongodb._tcp." + canonicalHost);
+
+        const mongo::dns::HostName srvSubdomain("_mongodb._tcp");
+
+        const auto srvEntries =
+            dns::lookupSRVRecords(srvSubdomain.resolvedIn(host).canonicalName());
+
+        auto makeFQDN = [](dns::HostName hostName) {
+            hostName.forceQualification();
+            return hostName;
+        };
+
+        const mongo::dns::HostName domain = makeFQDN(host.parentDomain());
         servers.clear();
-        std::transform(std::make_move_iterator(begin(srvEntries)),
-                       std::make_move_iterator(end(srvEntries)),
-                       back_inserter(servers),
-                       [&domain](auto&& srv) {
-                           if (!isWithinDomain(srv.host, domain)) {
-                               uasserted(ErrorCodes::FailedToParse,
-                                         "Hostname "s + srv.host + " is not within the domain "s +
-                                             domain);
-                           }
-                           return HostAndPort(std::move(srv.host), srv.port);
-                       });
+        using std::begin;
+        using std::end;
+        std::transform(
+            begin(srvEntries), end(srvEntries), back_inserter(servers), [&domain](auto&& srv) {
+                const dns::HostName target(srv.host);  // FQDN
+
+                if (!domain.contains(target)) {
+                    uasserted(ErrorCodes::FailedToParse,
+                              str::stream() << "Hostname " << target << " is not within the domain "
+                                            << domain);
+                }
+                return HostAndPort(srv.host, srv.port);
+            });
     }
 
-    // 6. Split the auth database and connection options string by the first, unescaped ?,
-    // yielding:
-    // split[0] = auth database
-    // split[1] = connection options
-    const auto dbAndOpts = partitionForward(databaseAndOptions, '?');
-    const auto databaseSD = dbAndOpts.first;
-    const auto connectionOptions = dbAndOpts.second;
+    // 5. Decode the database name
     const auto databaseWithStatus = uriDecode(databaseSD);
     if (!databaseWithStatus.isOK()) {
         uasserted(ErrorCodes::FailedToParse,
@@ -404,7 +449,7 @@ MongoURI MongoURI::parseImpl(const std::string& url) {
     }
     const auto database = databaseWithStatus.getValue();
 
-    // 7. Validate the database contains no prohibited characters
+    // 6. Validate the database contains no prohibited characters
     // Prohibited characters:
     // slash ("/"), backslash ("\"), space (" "), double-quote ("""), or dollar sign ("$")
     // period (".") is also prohibited, but drivers MAY allow periods
@@ -417,7 +462,7 @@ MongoURI MongoURI::parseImpl(const std::string& url) {
                                 << url);
     }
 
-    // 8. Validate, split, and URL decode the connection options
+    // 7. Validate, split, and URL decode the connection options
     auto options =
         addTXTOptions(parseOptions(connectionOptions, url), canonicalHost, url, isSeedlist);
 

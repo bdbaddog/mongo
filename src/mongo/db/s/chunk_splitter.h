@@ -29,12 +29,14 @@
 #pragma once
 
 #include "mongo/util/concurrency/thread_pool.h"
+#include "mongo/util/periodic_runner.h"
 
 namespace mongo {
 
 class NamespaceString;
 class OperationContext;
 class ServiceContext;
+class ChunkSplitStateDriver;
 
 /**
  * Handles asynchronous auto-splitting of chunks.
@@ -56,7 +58,7 @@ public:
      * Sets the mode of the ChunkSplitter to either primary or secondary.
      * The ChunkSplitter is only active when primary.
      */
-    void setReplicaSetMode(bool isPrimary);
+    void onShardingInitialization(bool isPrimary);
 
     /**
      * Invoked when the shard server primary enters the 'PRIMARY' state to set up the ChunkSplitter
@@ -75,7 +77,8 @@ public:
     /**
      * Schedules an autosplit task. This function throws on scheduling failure.
      */
-    void trySplitting(const NamespaceString& nss,
+    void trySplitting(ChunkSplitStateDriver chunkSplitStateDriver,
+                      const NamespaceString& nss,
                       const BSONObj& min,
                       const BSONObj& max,
                       long dataWritten);
@@ -89,7 +92,8 @@ private:
      * original owner. This optimization presumes that the user is doing writes with increasing or
      * decreasing shard key values.
      */
-    void _runAutosplit(const NamespaceString& nss,
+    void _runAutosplit(ChunkSplitStateDriver chunkSplitStateDriver,
+                       const NamespaceString& nss,
                        const BSONObj& min,
                        const BSONObj& max,
                        long dataWritten);

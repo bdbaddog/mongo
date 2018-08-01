@@ -45,6 +45,7 @@
 #include "mongo/db/operation_context.h"
 #include "mongo/db/query/query_request.h"
 #include "mongo/db/repl/read_concern_args.h"
+#include "mongo/db/server_parameters.h"
 #include "mongo/executor/task_executor_pool.h"
 #include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/rpc/metadata/repl_set_metadata.h"
@@ -68,6 +69,11 @@ namespace {
 // Include kReplSetMetadataFieldName in a request to get the shard's ReplSetMetadata in the
 // response.
 const BSONObj kReplMetadata(BSON(rpc::kReplSetMetadataFieldName << 1));
+
+constexpr bool internalProhibitShardOperationRetryByDefault = false;
+MONGO_EXPORT_SERVER_PARAMETER(internalProhibitShardOperationRetry,
+                              bool,
+                              internalProhibitShardOperationRetryByDefault);
 
 /**
  * Returns a new BSONObj describing the same command and arguments as 'cmdObj', but with maxTimeMS
@@ -101,6 +107,10 @@ ShardRemote::ShardRemote(const ShardId& id,
 ShardRemote::~ShardRemote() = default;
 
 bool ShardRemote::isRetriableError(ErrorCodes::Error code, RetryPolicy options) {
+    if (internalProhibitShardOperationRetry.loadRelaxed()) {
+        return false;
+    }
+
     if (options == RetryPolicy::kNoRetry) {
         return false;
     }
@@ -234,26 +244,17 @@ StatusWith<Shard::CommandResponse> ShardRemote::_runCommand(OperationContext* op
 
     return Shard::CommandResponse(std::move(host),
                                   std::move(result),
-                                  response.metadata.getOwned(),
                                   std::move(commandStatus),
                                   std::move(writeConcernStatus));
 }
 
-StatusWith<Shard::QueryResponse> ShardRemote::_exhaustiveFindOnConfig(
+StatusWith<Shard::QueryResponse> ShardRemote::_runExhaustiveCursorCommand(
     OperationContext* opCtx,
     const ReadPreferenceSetting& readPref,
-    const repl::ReadConcernLevel& readConcernLevel,
-    const NamespaceString& nss,
-    const BSONObj& query,
-    const BSONObj& sort,
-    boost::optional<long long> limit) {
-    invariant(isConfig());
-    auto const grid = Grid::get(opCtx);
-
-    ReadPreferenceSetting readPrefWithMinOpTime(readPref);
-    readPrefWithMinOpTime.minOpTime = grid->configOpTime();
-
-    const auto host = _targeter->findHost(opCtx, readPrefWithMinOpTime);
+    const string& dbName,
+    Milliseconds maxTimeMSOverride,
+    const BSONObj& cmdObj) {
+    const auto host = _targeter->findHost(opCtx, readPref);
     if (!host.isOK()) {
         return host.getStatus();
     }
@@ -261,7 +262,8 @@ StatusWith<Shard::QueryResponse> ShardRemote::_exhaustiveFindOnConfig(
     QueryResponse response;
 
     // If for some reason the callback never gets invoked, we will return this status in response.
-    Status status = Status(ErrorCodes::InternalError, "Internal error running find command");
+    Status status =
+        Status(ErrorCodes::InternalError, "Internal error running cursor callback in command");
 
     auto fetcherCallback = [&status, &response](const Fetcher::QueryResponseStatus& dataStatus,
                                                 Fetcher::NextAction* nextAction,
@@ -302,6 +304,52 @@ StatusWith<Shard::QueryResponse> ShardRemote::_exhaustiveFindOnConfig(
         getMoreBob->append("collection", data.nss.coll());
     };
 
+    const Milliseconds requestTimeout =
+        std::min(opCtx->getRemainingMaxTimeMillis(), maxTimeMSOverride);
+
+    Fetcher fetcher(Grid::get(opCtx)->getExecutorPool()->getFixedExecutor(),
+                    host.getValue(),
+                    dbName,
+                    cmdObj,
+                    fetcherCallback,
+                    _appendMetadataForCommand(opCtx, readPref),
+                    requestTimeout, /* command network timeout */
+                    requestTimeout /* getMore network timeout */);
+
+    Status scheduleStatus = fetcher.schedule();
+    if (!scheduleStatus.isOK()) {
+        return scheduleStatus;
+    }
+
+    fetcher.join();
+
+    updateReplSetMonitor(host.getValue(), status);
+
+    if (!status.isOK()) {
+        if (ErrorCodes::isExceededTimeLimitError(status.code())) {
+            LOG(0) << "Operation timed out " << causedBy(status);
+        }
+        return status;
+    }
+
+    return response;
+}
+
+
+StatusWith<Shard::QueryResponse> ShardRemote::_exhaustiveFindOnConfig(
+    OperationContext* opCtx,
+    const ReadPreferenceSetting& readPref,
+    const repl::ReadConcernLevel& readConcernLevel,
+    const NamespaceString& nss,
+    const BSONObj& query,
+    const BSONObj& sort,
+    boost::optional<long long> limit) {
+    invariant(isConfig());
+    auto const grid = Grid::get(opCtx);
+
+    ReadPreferenceSetting readPrefWithMinOpTime(readPref);
+    readPrefWithMinOpTime.minOpTime = grid->configOpTime();
+
     BSONObj readConcernObj;
     {
         invariant(readConcernLevel == repl::ReadConcernLevel::kMajorityReadConcern);
@@ -331,31 +379,8 @@ StatusWith<Shard::QueryResponse> ShardRemote::_exhaustiveFindOnConfig(
         qr.asFindCommand(&findCmdBuilder);
     }
 
-    Fetcher fetcher(Grid::get(opCtx)->getExecutorPool()->getFixedExecutor(),
-                    host.getValue(),
-                    nss.db().toString(),
-                    findCmdBuilder.done(),
-                    fetcherCallback,
-                    _appendMetadataForCommand(opCtx, readPrefWithMinOpTime),
-                    maxTimeMS /* find network timeout */,
-                    maxTimeMS /* getMore network timeout */);
-    Status scheduleStatus = fetcher.schedule();
-    if (!scheduleStatus.isOK()) {
-        return scheduleStatus;
-    }
-
-    fetcher.join();
-
-    updateReplSetMonitor(host.getValue(), status);
-
-    if (!status.isOK()) {
-        if (ErrorCodes::isExceededTimeLimitError(status.code())) {
-            LOG(0) << "Operation timed out " << causedBy(status);
-        }
-        return status;
-    }
-
-    return response;
+    return _runExhaustiveCursorCommand(
+        opCtx, readPrefWithMinOpTime, nss.db().toString(), maxTimeMS, findCmdBuilder.done());
 }
 
 Status ShardRemote::createIndexOnConfig(OperationContext* opCtx,

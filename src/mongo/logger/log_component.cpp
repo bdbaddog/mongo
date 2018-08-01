@@ -75,8 +75,10 @@ LogComponent LogComponent::parent() const {
             DECLARE_LOG_COMPONENT_PARENT(kJournal, kStorage);
             DECLARE_LOG_COMPONENT_PARENT(kASIO, kNetwork);
             DECLARE_LOG_COMPONENT_PARENT(kBridge, kNetwork);
+            DECLARE_LOG_COMPONENT_PARENT(kReplicationElection, kReplication);
             DECLARE_LOG_COMPONENT_PARENT(kReplicationHeartbeats, kReplication);
             DECLARE_LOG_COMPONENT_PARENT(kReplicationRollback, kReplication);
+            DECLARE_LOG_COMPONENT_PARENT(kShardingCatalogRefresh, kSharding);
             DECLARE_LOG_COMPONENT_PARENT(kStorageRecovery, kStorage);
         case kNumLogComponents:
             return kNumLogComponents;
@@ -108,12 +110,16 @@ StringData LogComponent::toStringData() const {
             return "query"_sd;
         case kReplication:
             return "replication"_sd;
+        case kReplicationElection:
+            return "election"_sd;
         case kReplicationHeartbeats:
             return "heartbeats"_sd;
         case kReplicationRollback:
             return "rollback"_sd;
         case kSharding:
             return "sharding"_sd;
+        case kShardingCatalogRefresh:
+            return "shardingCatalogRefresh"_sd;
         case kStorage:
             return "storage"_sd;
         case kStorageRecovery:
@@ -186,12 +192,16 @@ StringData LogComponent::getNameForLog() const {
             return "QUERY   "_sd;
         case kReplication:
             return "REPL    "_sd;
+        case kReplicationElection:
+            return "ELECTION"_sd;
         case kReplicationHeartbeats:
             return "REPL_HB "_sd;
         case kReplicationRollback:
             return "ROLLBACK"_sd;
         case kSharding:
             return "SHARDING"_sd;
+        case kShardingCatalogRefresh:
+            return "SH_REFR "_sd;
         case kStorage:
             return "STORAGE "_sd;
         case kStorageRecovery:

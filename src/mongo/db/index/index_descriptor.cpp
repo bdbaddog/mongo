@@ -90,6 +90,7 @@ constexpr StringData IndexDescriptor::kKeyPatternFieldName;
 constexpr StringData IndexDescriptor::kLanguageOverrideFieldName;
 constexpr StringData IndexDescriptor::kNamespaceFieldName;
 constexpr StringData IndexDescriptor::kPartialFilterExprFieldName;
+constexpr StringData IndexDescriptor::kPathProjectionFieldName;
 constexpr StringData IndexDescriptor::kSparseFieldName;
 constexpr StringData IndexDescriptor::kStorageEngineFieldName;
 constexpr StringData IndexDescriptor::kTextVersionFieldName;
@@ -99,6 +100,7 @@ constexpr StringData IndexDescriptor::kWeightsFieldName;
 bool IndexDescriptor::isIndexVersionSupported(IndexVersion indexVersion) {
     switch (indexVersion) {
         case IndexVersion::kV0:
+            return false;
         case IndexVersion::kV1:
         case IndexVersion::kV2:
             return true;
@@ -107,7 +109,7 @@ bool IndexDescriptor::isIndexVersionSupported(IndexVersion indexVersion) {
 }
 
 std::set<IndexVersion> IndexDescriptor::getSupportedIndexVersions() {
-    return {IndexVersion::kV0, IndexVersion::kV1, IndexVersion::kV2};
+    return {IndexVersion::kV1, IndexVersion::kV2};
 }
 
 Status IndexDescriptor::isIndexVersionAllowedForCreation(

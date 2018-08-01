@@ -64,13 +64,13 @@ mongo::Status mongo::emptyCapped(OperationContext* opCtx, const NamespaceString&
     }
 
     Database* db = autoDb.getDb();
-    massert(13429, "no such database", db);
+    uassert(ErrorCodes::NamespaceNotFound, "no such database", db);
 
     Collection* collection = db->getCollection(opCtx, collectionName);
     uassert(ErrorCodes::CommandNotSupportedOnView,
             str::stream() << "emptycapped not supported on view: " << collectionName.ns(),
             collection || !db->getViewCatalog()->lookup(opCtx, collectionName.ns()));
-    massert(28584, "no such collection", collection);
+    uassert(ErrorCodes::NamespaceNotFound, "no such collection", collection);
 
     if (collectionName.isSystem() && !collectionName.isSystemDotProfile()) {
         return Status(ErrorCodes::IllegalOperation,
@@ -231,7 +231,7 @@ mongo::Status mongo::cloneCollectionAsCapped(OperationContext* opCtx,
             // Go to the next document
             retries = 0;
         } catch (const WriteConflictException&) {
-            CurOp::get(opCtx)->debug().writeConflicts++;
+            CurOp::get(opCtx)->debug().additiveMetrics.incrementWriteConflicts(1);
             retries++;  // logAndBackoff expects this to be 1 on first call.
             WriteConflictException::logAndBackoff(retries, "cloneCollectionAsCapped", fromNss.ns());
 

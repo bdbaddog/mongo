@@ -92,18 +92,14 @@ public:
         const IndexCatalogEntry* ice = indexCatalog->getEntry(desc);
 
         auto actualMultikeyPaths = ice->getMultikeyPaths(_opCtx.get());
-        if (storageEngineSupportsPathLevelMultikeyTracking()) {
-            ASSERT_FALSE(actualMultikeyPaths.empty());
-            const bool match = (expectedMultikeyPaths == actualMultikeyPaths);
-            if (!match) {
-                FAIL(str::stream() << "Expected: " << dumpMultikeyPaths(expectedMultikeyPaths)
-                                   << ", Actual: "
-                                   << dumpMultikeyPaths(actualMultikeyPaths));
-            }
-            ASSERT_TRUE(match);
-        } else {
-            ASSERT_TRUE(actualMultikeyPaths.empty());
+        ASSERT_FALSE(actualMultikeyPaths.empty());
+        const bool match = (expectedMultikeyPaths == actualMultikeyPaths);
+        if (!match) {
+            FAIL(str::stream() << "Expected: " << dumpMultikeyPaths(expectedMultikeyPaths)
+                               << ", Actual: "
+                               << dumpMultikeyPaths(actualMultikeyPaths));
         }
+        ASSERT_TRUE(match);
     }
 
 protected:
@@ -111,14 +107,6 @@ protected:
     const NamespaceString _nss;
 
 private:
-    bool storageEngineSupportsPathLevelMultikeyTracking() {
-        // Path-level multikey tracking is supported for all storage engines that use the KVCatalog.
-        // MMAPv1 is the only storage engine that does not.
-        //
-        // TODO SERVER-22727: Store path-level multikey information in MMAPv1 index catalog.
-        return !getGlobalServiceContext()->getStorageEngine()->isMmapV1();
-    }
-
     std::string dumpMultikeyPaths(const MultikeyPaths& multikeyPaths) {
         std::stringstream ss;
 
@@ -144,12 +132,10 @@ TEST_F(MultikeyPathsTest, PathsUpdatedOnIndexCreation) {
     {
         WriteUnitOfWork wuow(_opCtx.get());
         OpDebug* const nullOpDebug = nullptr;
-        const bool enforceQuota = true;
         ASSERT_OK(collection->insertDocument(
             _opCtx.get(),
             InsertStatement(BSON("_id" << 0 << "a" << 5 << "b" << BSON_ARRAY(1 << 2 << 3))),
-            nullOpDebug,
-            enforceQuota));
+            nullOpDebug));
         wuow.commit();
     }
 
@@ -176,17 +162,14 @@ TEST_F(MultikeyPathsTest, PathsUpdatedOnIndexCreationWithMultipleDocuments) {
     {
         WriteUnitOfWork wuow(_opCtx.get());
         OpDebug* const nullOpDebug = nullptr;
-        const bool enforceQuota = true;
         ASSERT_OK(collection->insertDocument(
             _opCtx.get(),
             InsertStatement(BSON("_id" << 0 << "a" << 5 << "b" << BSON_ARRAY(1 << 2 << 3))),
-            nullOpDebug,
-            enforceQuota));
+            nullOpDebug));
         ASSERT_OK(collection->insertDocument(
             _opCtx.get(),
             InsertStatement(BSON("_id" << 1 << "a" << BSON_ARRAY(1 << 2 << 3) << "b" << 5)),
-            nullOpDebug,
-            enforceQuota));
+            nullOpDebug));
         wuow.commit();
     }
 
@@ -225,12 +208,10 @@ TEST_F(MultikeyPathsTest, PathsUpdatedOnDocumentInsert) {
     {
         WriteUnitOfWork wuow(_opCtx.get());
         OpDebug* const nullOpDebug = nullptr;
-        const bool enforceQuota = true;
         ASSERT_OK(collection->insertDocument(
             _opCtx.get(),
             InsertStatement(BSON("_id" << 0 << "a" << 5 << "b" << BSON_ARRAY(1 << 2 << 3))),
-            nullOpDebug,
-            enforceQuota));
+            nullOpDebug));
         wuow.commit();
     }
 
@@ -239,12 +220,10 @@ TEST_F(MultikeyPathsTest, PathsUpdatedOnDocumentInsert) {
     {
         WriteUnitOfWork wuow(_opCtx.get());
         OpDebug* const nullOpDebug = nullptr;
-        const bool enforceQuota = true;
         ASSERT_OK(collection->insertDocument(
             _opCtx.get(),
             InsertStatement(BSON("_id" << 1 << "a" << BSON_ARRAY(1 << 2 << 3) << "b" << 5)),
-            nullOpDebug,
-            enforceQuota));
+            nullOpDebug));
         wuow.commit();
     }
 
@@ -271,11 +250,8 @@ TEST_F(MultikeyPathsTest, PathsUpdatedOnDocumentUpdate) {
     {
         WriteUnitOfWork wuow(_opCtx.get());
         OpDebug* const nullOpDebug = nullptr;
-        const bool enforceQuota = true;
-        ASSERT_OK(collection->insertDocument(_opCtx.get(),
-                                             InsertStatement(BSON("_id" << 0 << "a" << 5)),
-                                             nullOpDebug,
-                                             enforceQuota));
+        ASSERT_OK(collection->insertDocument(
+            _opCtx.get(), InsertStatement(BSON("_id" << 0 << "a" << 5)), nullOpDebug));
         wuow.commit();
     }
 
@@ -289,7 +265,6 @@ TEST_F(MultikeyPathsTest, PathsUpdatedOnDocumentUpdate) {
         auto oldDoc = collection->docFor(_opCtx.get(), record->id);
         {
             WriteUnitOfWork wuow(_opCtx.get());
-            const bool enforceQuota = true;
             const bool indexesAffected = true;
             OpDebug* opDebug = nullptr;
             OplogUpdateEntryArgs args;
@@ -298,7 +273,6 @@ TEST_F(MultikeyPathsTest, PathsUpdatedOnDocumentUpdate) {
                 record->id,
                 oldDoc,
                 BSON("_id" << 0 << "a" << 5 << "b" << BSON_ARRAY(1 << 2 << 3)),
-                enforceQuota,
                 indexesAffected,
                 opDebug,
                 &args);
@@ -329,12 +303,10 @@ TEST_F(MultikeyPathsTest, PathsNotUpdatedOnDocumentDelete) {
     {
         WriteUnitOfWork wuow(_opCtx.get());
         OpDebug* const nullOpDebug = nullptr;
-        const bool enforceQuota = true;
         ASSERT_OK(collection->insertDocument(
             _opCtx.get(),
             InsertStatement(BSON("_id" << 0 << "a" << 5 << "b" << BSON_ARRAY(1 << 2 << 3))),
-            nullOpDebug,
-            enforceQuota));
+            nullOpDebug));
         wuow.commit();
     }
 
@@ -387,13 +359,11 @@ TEST_F(MultikeyPathsTest, PathsUpdatedForMultipleIndexesOnDocumentInsert) {
     {
         WriteUnitOfWork wuow(_opCtx.get());
         OpDebug* const nullOpDebug = nullptr;
-        const bool enforceQuota = true;
         ASSERT_OK(collection->insertDocument(
             _opCtx.get(),
             InsertStatement(
                 BSON("_id" << 0 << "a" << BSON_ARRAY(1 << 2 << 3) << "b" << 5 << "c" << 8)),
-            nullOpDebug,
-            enforceQuota));
+            nullOpDebug));
         wuow.commit();
     }
 

@@ -89,9 +89,11 @@ public:
 
     void clearCommitTimestamp() override;
 
-    Timestamp getCommitTimestamp() override;
+    Timestamp getCommitTimestamp() const override;
 
     void setPrepareTimestamp(Timestamp timestamp) override;
+
+    Timestamp getPrepareTimestamp() const override;
 
     void setIgnorePrepared(bool ignore) override;
 
@@ -99,10 +101,6 @@ public:
                                 boost::optional<Timestamp> provided = boost::none) override;
 
     ReadSource getTimestampReadSource() const override;
-
-    void* writingPtr(void* data, size_t len) override;
-
-    void setRollbackWritesDisabled() override {}
 
     virtual void setOrderedCommit(bool orderedCommit) override {
         _orderedCommit = orderedCommit;

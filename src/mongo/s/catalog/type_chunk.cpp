@@ -121,6 +121,27 @@ void ChunkRange::append(BSONObjBuilder* builder) const {
     builder->append(kMaxKey, _maxKey);
 }
 
+const Status ChunkRange::extractKeyPattern(KeyPattern* shardKeyPatternOut) const {
+    BSONObjIterator min(getMin());
+    BSONObjIterator max(getMax());
+    BSONObjBuilder b;
+    while (min.more() && max.more()) {
+        BSONElement x = min.next();
+        BSONElement y = max.next();
+        if (!str::equals(x.fieldName(), y.fieldName()) || (min.more() && !max.more()) ||
+            (!min.more() && max.more())) {
+            return {ErrorCodes::ShardKeyNotFound,
+                    str::stream() << "the shard key of min " << _minKey << " doesn't match with "
+                                  << "the shard key of max "
+                                  << _maxKey};
+        }
+        b.append(x.fieldName(), 1);
+    }
+    const auto& shardKeyPattern = KeyPattern(b.obj());
+    *shardKeyPatternOut = shardKeyPattern;
+    return Status::OK();
+}
+
 std::string ChunkRange::toString() const {
     return str::stream() << "[" << _minKey << ", " << _maxKey << ")";
 }
@@ -223,7 +244,7 @@ StatusWith<ChunkType> ChunkType::fromConfigBSON(const BSONObj& source) {
     }
 
     {
-        auto versionStatus = ChunkVersion::parseFromBSONForChunk(source);
+        auto versionStatus = ChunkVersion::parseLegacyWithField(source, ChunkType::lastmod());
         if (!versionStatus.isOK()) {
             return versionStatus.getStatus();
         }
@@ -262,7 +283,7 @@ BSONObj ChunkType::toConfigBSON() const {
     if (_shard)
         builder.append(shard.name(), getShard().toString());
     if (_version)
-        _version->appendForChunk(&builder);
+        _version->appendLegacyWithField(&builder, ChunkType::lastmod());
     if (_jumbo)
         builder.append(jumbo.name(), getJumbo());
     addHistoryToBSON(builder);
@@ -305,11 +326,12 @@ StatusWith<ChunkType> ChunkType::fromShardBSON(const BSONObj& source, const OID&
 
     {
         auto statusWithChunkVersion =
-            ChunkVersion::parseFromBSONWithFieldAndSetEpoch(source, lastmod.name(), epoch);
+            ChunkVersion::parseLegacyWithField(source, ChunkType::lastmod());
         if (!statusWithChunkVersion.isOK()) {
             return statusWithChunkVersion.getStatus();
         }
-        chunk._version = std::move(statusWithChunkVersion.getValue());
+        auto version = std::move(statusWithChunkVersion.getValue());
+        chunk._version = ChunkVersion(version.majorVersion(), version.minorVersion(), epoch);
     }
 
     {

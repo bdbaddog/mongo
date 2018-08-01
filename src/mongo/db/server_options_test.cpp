@@ -56,11 +56,11 @@
 #include "mongo/util/options_parser/options_parser.h"
 #include "mongo/util/scopeguard.h"
 
+
 namespace {
 
 using mongo::ErrorCodes;
 using mongo::Status;
-
 namespace moe = mongo::optionenvironment;
 
 class OptionsParserTester : public moe::OptionsParser {
@@ -761,6 +761,7 @@ TEST(SetupOptions, NonNumericSampleRateYAMLConfigOptionFailsToParse) {
     OptionsParserTester parser;
     moe::Environment environment;
     moe::OptionSection options;
+
 
     ASSERT_OK(::mongo::addGeneralServerOptions(&options));
 

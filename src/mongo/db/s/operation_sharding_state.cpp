@@ -51,6 +51,10 @@ constexpr auto kDbVersionField = "databaseVersion"_sd;
 
 OperationShardingState::OperationShardingState() = default;
 
+OperationShardingState::~OperationShardingState() {
+    invariant(!_shardingOperationFailedStatus);
+}
+
 OperationShardingState& OperationShardingState::get(OperationContext* opCtx) {
     return shardingMetadataDecoration(opCtx);
 }
@@ -75,17 +79,7 @@ void OperationShardingState::initializeClientRoutingVersions(NamespaceString nss
 
     const auto shardVersionElem = cmdObj.getField(ChunkVersion::kShardVersionField);
     if (!shardVersionElem.eoo()) {
-        uassert(ErrorCodes::BadValue,
-                str::stream() << "expected shardVersion element to be an array, got "
-                              << shardVersionElem,
-                shardVersionElem.type() == BSONType::Array);
-        const BSONArray versionArr(shardVersionElem.Obj());
-
-        bool canParse;
-        ChunkVersion shardVersion = ChunkVersion::fromBSON(versionArr, &canParse);
-        uassert(ErrorCodes::BadValue,
-                str::stream() << "could not parse shardVersion from field " << versionArr,
-                canParse);
+        auto shardVersion = uassertStatusOK(ChunkVersion::parseFromCommand(cmdObj));
 
         if (nss.isSystemDotIndexes()) {
             _shardVersions[nss.ns()] = ChunkVersion::IGNORED();
@@ -188,6 +182,20 @@ void OperationShardingState::setMovePrimaryCriticalSectionSignal(
     std::shared_ptr<Notification<void>> critSecSignal) {
     invariant(critSecSignal);
     _movePrimaryCriticalSectionSignal = std::move(critSecSignal);
+}
+
+void OperationShardingState::setShardingOperationFailedStatus(const Status& status) {
+    invariant(!_shardingOperationFailedStatus);
+    _shardingOperationFailedStatus = std::move(status);
+}
+
+boost::optional<Status> OperationShardingState::resetShardingOperationFailedStatus() {
+    if (!_shardingOperationFailedStatus) {
+        return boost::none;
+    }
+    Status failedStatus = Status(*_shardingOperationFailedStatus);
+    _shardingOperationFailedStatus = boost::none;
+    return failedStatus;
 }
 
 }  // namespace mongo

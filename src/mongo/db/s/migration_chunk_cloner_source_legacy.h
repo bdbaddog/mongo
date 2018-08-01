@@ -34,7 +34,6 @@
 #include "mongo/bson/bsonobj.h"
 #include "mongo/client/connection_string.h"
 #include "mongo/db/namespace_string.h"
-#include "mongo/db/query/plan_executor.h"
 #include "mongo/db/repl/optime.h"
 #include "mongo/db/s/migration_chunk_cloner_source.h"
 #include "mongo/db/s/migration_session_id.h"
@@ -99,6 +98,18 @@ public:
     }
 
     /**
+     * Returns the rollback ID recorded at the beginning of session migration. If the underlying
+     * SessionCatalogMigrationSource does not exist, that means this node is running as a standalone
+     * and doesn't support retryable writes, so we return boost::none.
+     */
+    boost::optional<int> getRollbackIdAtInit() const {
+        if (_sessionCatalogSource) {
+            return _sessionCatalogSource->getRollbackIdAtInit();
+        }
+        return boost::none;
+    }
+
+    /**
      * Called by the recipient shard. Used to estimate how many more bytes of clone data are
      * remaining in the chunk cloner.
      */
@@ -135,9 +146,18 @@ public:
      * Appends to the buffer oplogs that contain session information for this migration.
      * If this function returns a valid OpTime, this means that the oplog appended are
      * not guaranteed to be majority committed and the caller has to use wait for the
-     * returned opTime to be majority committed.
+     * returned opTime to be majority committed. If the underlying SessionCatalogMigrationSource
+     * does not exist, that means this node is running as a standalone and doesn't support retryable
+     * writes, so we return boost::none.
+     *
+     * This waiting is necessary because session migration is only allowed to send out committed
+     * entries, as opposed to chunk migration, which can send out uncommitted documents. With chunk
+     * migration, the uncommitted documents will not be visibile until the end of the migration
+     * commits, which means that if it fails, they won't be visible, whereas session oplog entries
+     * take effect immediately since they are appended to the chain.
      */
-    repl::OpTime nextSessionMigrationBatch(OperationContext* opCtx, BSONArrayBuilder* arrBuilder);
+    boost::optional<repl::OpTime> nextSessionMigrationBatch(OperationContext* opCtx,
+                                                            BSONArrayBuilder* arrBuilder);
 
 private:
     friend class DeleteNotificationStage;
@@ -196,10 +216,6 @@ private:
 
     // The resolved primary of the recipient shard
     const HostAndPort _recipientHost;
-
-    // Registered deletion notifications plan executor, which will listen for document deletions
-    // during the cloning stage
-    std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> _deleteNotifyExec;
 
     std::unique_ptr<SessionCatalogMigrationSource> _sessionCatalogSource;
 

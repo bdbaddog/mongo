@@ -32,7 +32,7 @@
 #include <memory>
 
 #include "mongo/base/disallow_copying.h"
-#include "mongo/client/dbclientcursor.h"
+#include "mongo/client/dbclient_cursor.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/repl/optime.h"
 #include "mongo/db/session_txn_record_gen.h"
@@ -108,6 +108,13 @@ public:
      * Remembers the oplog timestamp of a new write that just occurred.
      */
     void notifyNewWriteOpTime(repl::OpTime opTimestamp);
+
+    /**
+     * Returns the rollback ID recorded at the beginning of session migration.
+     */
+    int getRollbackIdAtInit() const {
+        return _rollbackIdAtInit;
+    }
 
 private:
     /**

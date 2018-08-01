@@ -37,6 +37,7 @@
 #include <vector>
 
 #include "mongo/bson/util/bson_extract.h"
+#include "mongo/db/concurrency/lock_state.h"
 #include "mongo/db/operation_context_noop.h"
 #include "mongo/db/repl/bson_extract_optime.h"
 #include "mongo/db/repl/is_master_response.h"
@@ -44,7 +45,6 @@
 #include "mongo/db/repl/read_concern_args.h"
 #include "mongo/db/repl/repl_client_info.h"
 #include "mongo/db/repl/repl_set_config.h"
-#include "mongo/db/repl/repl_set_heartbeat_args.h"
 #include "mongo/db/repl/repl_set_heartbeat_args_v1.h"
 #include "mongo/db/repl/repl_set_request_votes_args.h"
 #include "mongo/db/repl/repl_settings.h"
@@ -56,7 +56,7 @@
 #include "mongo/db/repl/topology_coordinator.h"
 #include "mongo/db/repl/update_position_args.h"
 #include "mongo/db/server_options.h"
-#include "mongo/db/service_context_noop.h"
+#include "mongo/db/service_context.h"
 #include "mongo/db/write_concern_options.h"
 #include "mongo/executor/network_interface_mock.h"
 #include "mongo/rpc/metadata/oplog_query_metadata.h"
@@ -382,10 +382,10 @@ TEST_F(ReplCoordTest, InitiateSucceedsWhenQuorumCheckPasses) {
     ASSERT_BSONOBJ_EQ(hbArgs.toBSON(), noi->getRequest().cmdObj);
     ReplSetHeartbeatResponse hbResp;
     hbResp.setConfigVersion(0);
+    hbResp.setAppliedOpTime(OpTime(Timestamp(100, 1), 0));
+    hbResp.setDurableOpTime(OpTime(Timestamp(100, 1), 0));
     getNet()->scheduleResponse(
-        noi,
-        startDate + Milliseconds(10),
-        RemoteCommandResponse(hbResp.toBSON(false), BSONObj(), Milliseconds(8)));
+        noi, startDate + Milliseconds(10), RemoteCommandResponse(hbResp.toBSON(), Milliseconds(8)));
     getNet()->runUntil(startDate + Milliseconds(10));
     getNet()->exitNetwork();
     ASSERT_EQUALS(startDate + Milliseconds(10), getNet()->now());
@@ -828,10 +828,6 @@ TEST_F(ReplCoordTest, NodeReturnsWriteConcernFailedUntilASufficientNumberOfNodes
 
 TEST_F(ReplCoordTest,
        NodeReturnsUnknownReplWriteConcernWhenAwaitReplicationReceivesAnInvalidWriteConcernMode) {
-    auto service = stdx::make_unique<ServiceContextNoop>();
-    auto client = service->makeClient("test");
-    auto opCtx = client->makeOperationContext();
-
     assertStartSuccess(BSON("_id"
                             << "mySet"
                             << "version"
@@ -861,6 +857,7 @@ TEST_F(ReplCoordTest,
     invalidWriteConcern.wTimeout = WriteConcernOptions::kNoWaiting;
     invalidWriteConcern.wMode = "fakemode";
 
+    auto opCtx = makeOperationContext();
     ReplicationCoordinator::StatusAndDuration statusAndDur =
         getReplCoord()->awaitReplication(opCtx.get(), time1, invalidWriteConcern);
     ASSERT_EQUALS(ErrorCodes::UnknownReplWriteConcern, statusAndDur.status);
@@ -869,10 +866,6 @@ TEST_F(ReplCoordTest,
 TEST_F(
     ReplCoordTest,
     NodeReturnsWriteConcernFailedUntilASufficientSetOfNodesHaveTheWriteAndTheWriteIsInACommittedSnapshot) {
-    auto service = stdx::make_unique<ServiceContextNoop>();
-    auto client = service->makeClient("test");
-    auto opCtx = client->makeOperationContext();
-
     assertStartSuccess(
         BSON("_id"
              << "mySet"
@@ -940,7 +933,7 @@ TEST_F(
     multiRackWriteConcern.wTimeout = WriteConcernOptions::kNoWaiting;
     multiRackWriteConcern.wMode = "multiDCAndRack";
 
-
+    auto opCtx = makeOperationContext();
     // Nothing satisfied
     getReplCoord()->setMyLastAppliedOpTime(time1);
     getReplCoord()->setMyLastDurableOpTime(time1);
@@ -1361,7 +1354,7 @@ protected:
             hbResp.setDurableOpTime(desiredOpTime);
             BSONObjBuilder respObj;
             respObj << "ok" << 1;
-            hbResp.addToBSON(&respObj, false);
+            hbResp.addToBSON(&respObj);
             getNet()->scheduleResponse(noi, getNet()->now(), makeResponseStatus(respObj.obj()));
         }
         while (getNet()->hasReadyRequests()) {
@@ -1621,6 +1614,172 @@ TEST_F(ReplCoordTest, DrainCompletionMidStepDown) {
     // ASSERT_EQUALS(2, getReplCoord()->getTerm()); // SERVER-28290
 }
 
+TEST_F(StepDownTest, StepDownCanCompleteBasedOnReplSetUpdatePositionAlone) {
+    const auto repl = getReplCoord();
+
+    OpTimeWithTermOne opTime1(100, 1);
+    OpTimeWithTermOne opTime2(200, 1);
+
+    repl->setMyLastAppliedOpTime(opTime2);
+    repl->setMyLastDurableOpTime(opTime2);
+
+    // Secondaries not caught up yet.
+    ASSERT_OK(repl->setLastAppliedOptime_forTest(1, 1, opTime1));
+    ASSERT_OK(repl->setLastAppliedOptime_forTest(1, 2, opTime1));
+
+    simulateSuccessfulV1Election();
+    ASSERT_TRUE(repl->getMemberState().primary());
+
+    // Step down where the secondary actually has to catch up before the stepDown can succeed.
+    auto result = stepDown_nonBlocking(false, Seconds(10), Seconds(60));
+
+    // The node has not been able to step down yet.
+    ASSERT_TRUE(repl->getMemberState().primary());
+
+    // Catch up one of the secondaries using only replSetUpdatePosition.
+    long long configVersion = repl->getConfig().getConfigVersion();
+    UpdatePositionArgs updatePositionArgs;
+
+    ASSERT_OK(updatePositionArgs.initialize(
+        BSON(UpdatePositionArgs::kCommandFieldName
+             << 1
+             << UpdatePositionArgs::kUpdateArrayFieldName
+             << BSON_ARRAY(BSON(UpdatePositionArgs::kConfigVersionFieldName
+                                << configVersion
+                                << UpdatePositionArgs::kMemberIdFieldName
+                                << 1
+                                << UpdatePositionArgs::kAppliedOpTimeFieldName
+                                << opTime2.asOpTime().toBSON()
+                                << UpdatePositionArgs::kDurableOpTimeFieldName
+                                << opTime2.asOpTime().toBSON())
+                           << BSON(UpdatePositionArgs::kConfigVersionFieldName
+                                   << configVersion
+                                   << UpdatePositionArgs::kMemberIdFieldName
+                                   << 2
+                                   << UpdatePositionArgs::kAppliedOpTimeFieldName
+                                   << opTime1.asOpTime().toBSON()
+                                   << UpdatePositionArgs::kDurableOpTimeFieldName
+                                   << opTime1.asOpTime().toBSON())))));
+
+    ASSERT_OK(repl->processReplSetUpdatePosition(updatePositionArgs, &configVersion));
+
+    // Verify that stepDown completes successfully.
+    ASSERT_OK(*result.second.get());
+    ASSERT_TRUE(repl->getMemberState().secondary());
+}
+
+class StepDownTestWithUnelectableNode : public StepDownTest {
+private:
+    void setUp() override {
+        ReplCoordTest::setUp();
+        init("mySet/test1:1234,test2:1234,test3:1234");
+        assertStartSuccess(BSON("_id"
+                                << "mySet"
+                                << "version"
+                                << 1
+                                << "protocolVersion"
+                                << 1
+                                << "members"
+                                << BSON_ARRAY(BSON("_id" << 0 << "host"
+                                                         << "test1:1234")
+                                              << BSON("_id" << 1 << "host"
+                                                            << "test2:1234"
+                                                            << "priority"
+                                                            << 0)
+                                              << BSON("_id" << 2 << "host"
+                                                            << "test3:1234"))),
+                           HostAndPort("test1", 1234));
+        ASSERT_OK(getReplCoord()->setFollowerMode(MemberState::RS_SECONDARY));
+    }
+};
+
+TEST_F(StepDownTestWithUnelectableNode,
+       UpdatePositionDuringStepDownWakesUpStepDownWaiterMoreThanOnce) {
+    const auto repl = getReplCoord();
+
+    OpTimeWithTermOne opTime1(100, 1);
+    OpTimeWithTermOne opTime2(200, 1);
+
+    repl->setMyLastAppliedOpTime(opTime2);
+    repl->setMyLastDurableOpTime(opTime2);
+
+    // No secondaries are caught up yet.
+    ASSERT_OK(repl->setLastAppliedOptime_forTest(1, 1, opTime1));
+    ASSERT_OK(repl->setLastAppliedOptime_forTest(1, 2, opTime1));
+
+    simulateSuccessfulV1Election();
+    ASSERT_TRUE(repl->getMemberState().primary());
+
+    // Step down where the secondary actually has to catch up before the stepDown can succeed.
+    auto result = stepDown_nonBlocking(false, Seconds(10), Seconds(60));
+
+    // The node has not been able to step down yet.
+    ASSERT_TRUE(repl->getMemberState().primary());
+
+    // Use replSetUpdatePosition to catch up the first secondary, which is not electable.
+    // This will yield a majority at the primary's opTime, so the waiter will be woken up,
+    // but stepDown will not be able to complete.
+    long long configVersion = repl->getConfig().getConfigVersion();
+    UpdatePositionArgs catchupFirstSecondary;
+
+    ASSERT_OK(catchupFirstSecondary.initialize(
+        BSON(UpdatePositionArgs::kCommandFieldName
+             << 1
+             << UpdatePositionArgs::kUpdateArrayFieldName
+             << BSON_ARRAY(BSON(UpdatePositionArgs::kConfigVersionFieldName
+                                << configVersion
+                                << UpdatePositionArgs::kMemberIdFieldName
+                                << 1
+                                << UpdatePositionArgs::kAppliedOpTimeFieldName
+                                << opTime2.asOpTime().toBSON()
+                                << UpdatePositionArgs::kDurableOpTimeFieldName
+                                << opTime2.asOpTime().toBSON())
+                           << BSON(UpdatePositionArgs::kConfigVersionFieldName
+                                   << configVersion
+                                   << UpdatePositionArgs::kMemberIdFieldName
+                                   << 2
+                                   << UpdatePositionArgs::kAppliedOpTimeFieldName
+                                   << opTime1.asOpTime().toBSON()
+                                   << UpdatePositionArgs::kDurableOpTimeFieldName
+                                   << opTime1.asOpTime().toBSON())))));
+
+    ASSERT_OK(repl->processReplSetUpdatePosition(catchupFirstSecondary, &configVersion));
+
+    // The primary has still not been able to finish stepping down.
+    ASSERT_TRUE(repl->getMemberState().primary());
+
+    // Now catch up the other secondary. This will wake up the waiter again, but this time
+    // there is an electable node, so stepDown will complete.
+    UpdatePositionArgs catchupOtherSecondary;
+
+    ASSERT_OK(catchupOtherSecondary.initialize(
+        BSON(UpdatePositionArgs::kCommandFieldName
+             << 1
+             << UpdatePositionArgs::kUpdateArrayFieldName
+             << BSON_ARRAY(BSON(UpdatePositionArgs::kConfigVersionFieldName
+                                << configVersion
+                                << UpdatePositionArgs::kMemberIdFieldName
+                                << 1
+                                << UpdatePositionArgs::kAppliedOpTimeFieldName
+                                << opTime2.asOpTime().toBSON()
+                                << UpdatePositionArgs::kDurableOpTimeFieldName
+                                << opTime2.asOpTime().toBSON())
+                           << BSON(UpdatePositionArgs::kConfigVersionFieldName
+                                   << configVersion
+                                   << UpdatePositionArgs::kMemberIdFieldName
+                                   << 2
+                                   << UpdatePositionArgs::kAppliedOpTimeFieldName
+                                   << opTime2.asOpTime().toBSON()
+                                   << UpdatePositionArgs::kDurableOpTimeFieldName
+                                   << opTime2.asOpTime().toBSON())))));
+
+    ASSERT_OK(repl->processReplSetUpdatePosition(catchupOtherSecondary, &configVersion));
+
+    // Verify that stepDown completes successfully.
+    ASSERT_OK(*result.second.get());
+    ASSERT_TRUE(repl->getMemberState().secondary());
+}
+
 TEST_F(StepDownTest, NodeReturnsNotMasterWhenAskedToStepDownAsANonPrimaryNode) {
     const auto opCtx = makeOperationContext();
 
@@ -1639,23 +1798,32 @@ TEST_F(StepDownTest, NodeReturnsNotMasterWhenAskedToStepDownAsANonPrimaryNode) {
 TEST_F(StepDownTest,
        NodeReturnsExceededTimeLimitWhenStepDownFailsToObtainTheGlobalLockWithinTheAllottedTime) {
     OpTimeWithTermOne optime1(100, 1);
-    // All nodes are caught up
+
+    // Set up this test so that all nodes are caught up. This is necessary to exclude the false
+    // positive case where stepDown returns "ExceededTimeLimit", but not because it could not
+    // acquire the lock, but because it could not satisfy all stepdown conditions on time.
     getReplCoord()->setMyLastAppliedOpTime(optime1);
     getReplCoord()->setMyLastDurableOpTime(optime1);
     ASSERT_OK(getReplCoord()->setLastAppliedOptime_forTest(1, 1, optime1));
     ASSERT_OK(getReplCoord()->setLastAppliedOptime_forTest(1, 2, optime1));
 
     simulateSuccessfulV1Election();
+    ASSERT_TRUE(getReplCoord()->getMemberState().primary());
 
     const auto opCtx = makeOperationContext();
 
-    // Make sure stepDown cannot grab the global shared lock
+    // Make sure stepDown cannot grab the global exclusive lock. We need to use a different
+    // locker to test this, or otherwise stepDown will be granted the lock automatically.
     Lock::GlobalWrite lk(opCtx.get());
+    ASSERT_TRUE(opCtx->lockState()->isW());
+    auto locker = opCtx.get()->swapLockState(stdx::make_unique<LockerImpl>());
 
     Status status =
         getReplCoord()->stepDown(opCtx.get(), false, Milliseconds(0), Milliseconds(1000));
     ASSERT_EQUALS(ErrorCodes::ExceededTimeLimit, status);
     ASSERT_TRUE(getReplCoord()->getMemberState().primary());
+
+    opCtx.get()->swapLockState(std::move(locker));
 }
 
 /* Step Down Test for a 5-node replica set */
@@ -1669,8 +1837,7 @@ protected:
      */
     void simulateHeartbeatResponses(OpTime optimePrimary,
                                     OpTime optimeLagged,
-                                    int numNodesCaughtUp,
-                                    bool caughtUpAreElectable) {
+                                    int numNodesCaughtUp) {
         int hbNum = 1;
         while (getNet()->hasReadyRequests()) {
             NetworkInterfaceMock::NetworkOperationIterator noi = getNet()->getNextReadyRequest();
@@ -1687,7 +1854,6 @@ protected:
 
             // Catch up 'numNodesCaughtUp' nodes out of 5.
             OpTime optimeResponse = (hbNum <= numNodesCaughtUp) ? optimePrimary : optimeLagged;
-            bool isElectable = (hbNum <= numNodesCaughtUp) ? caughtUpAreElectable : true;
 
             ReplSetHeartbeatResponse hbResp;
             hbResp.setSetName(hbArgs.getSetName());
@@ -1695,10 +1861,9 @@ protected:
             hbResp.setConfigVersion(hbArgs.getConfigVersion());
             hbResp.setDurableOpTime(optimeResponse);
             hbResp.setAppliedOpTime(optimeResponse);
-            hbResp.setElectable(isElectable);
             BSONObjBuilder respObj;
             respObj << "ok" << 1;
-            hbResp.addToBSON(&respObj, false);
+            hbResp.addToBSON(&respObj);
             getNet()->scheduleResponse(noi, getNet()->now(), makeResponseStatus(respObj.obj()));
             hbNum += 1;
         }
@@ -1729,41 +1894,6 @@ private:
     }
 };
 
-TEST_F(
-    StepDownTestFiveNode,
-    NodeReturnsExceededTimeLimitWhenStepDownIsRunAndCaughtUpMajorityExistsButWithoutElectableNode) {
-    OpTime optimeLagged(Timestamp(100, 1), 1);
-    OpTime optimePrimary(Timestamp(100, 2), 1);
-
-    // All nodes are caught up
-    getReplCoord()->setMyLastAppliedOpTime(optimePrimary);
-    getReplCoord()->setMyLastDurableOpTime(optimePrimary);
-    ASSERT_OK(getReplCoord()->setLastAppliedOptime_forTest(1, 1, optimeLagged));
-    ASSERT_OK(getReplCoord()->setLastAppliedOptime_forTest(1, 2, optimeLagged));
-    ASSERT_OK(getReplCoord()->setLastAppliedOptime_forTest(1, 3, optimeLagged));
-    ASSERT_OK(getReplCoord()->setLastAppliedOptime_forTest(1, 4, optimeLagged));
-
-    simulateSuccessfulV1Election();
-
-    enterNetwork();
-    getNet()->runUntil(getNet()->now() + Seconds(2));
-    ASSERT(getNet()->hasReadyRequests());
-
-    // Make sure a majority are caught up (i.e. 3 out of 5). We catch up two secondaries since
-    // the primary counts as one towards majority
-    int numNodesCaughtUp = 2;
-    simulateHeartbeatResponses(optimePrimary, optimeLagged, numNodesCaughtUp, false);
-    getNet()->runReadyNetworkOperations();
-    exitNetwork();
-
-    const auto opCtx = makeOperationContext();
-
-    ASSERT_TRUE(getReplCoord()->getMemberState().primary());
-    auto status = getReplCoord()->stepDown(opCtx.get(), false, Milliseconds(0), Milliseconds(1000));
-    ASSERT_EQUALS(ErrorCodes::ExceededTimeLimit, status);
-    ASSERT_TRUE(getReplCoord()->getMemberState().primary());
-}
-
 TEST_F(StepDownTestFiveNode,
        NodeReturnsExceededTimeLimitWhenStepDownIsRunAndNoCaughtUpMajorityExists) {
     OpTime optimeLagged(Timestamp(100, 1), 1);
@@ -1786,7 +1916,7 @@ TEST_F(StepDownTestFiveNode,
     // Make sure less than a majority are caught up (i.e. 2 out of 5) We catch up one secondary
     // since the primary counts as one towards majority
     int numNodesCaughtUp = 1;
-    simulateHeartbeatResponses(optimePrimary, optimeLagged, numNodesCaughtUp, true);
+    simulateHeartbeatResponses(optimePrimary, optimeLagged, numNodesCaughtUp);
     getNet()->runReadyNetworkOperations();
     exitNetwork();
 
@@ -1821,7 +1951,7 @@ TEST_F(
     // Make sure a majority are caught up (i.e. 3 out of 5). We catch up two secondaries since
     // the primary counts as one towards majority
     int numNodesCaughtUp = 2;
-    simulateHeartbeatResponses(optimePrimary, optimeLagged, numNodesCaughtUp, true);
+    simulateHeartbeatResponses(optimePrimary, optimeLagged, numNodesCaughtUp);
     getNet()->runReadyNetworkOperations();
     exitNetwork();
 
@@ -1869,6 +1999,55 @@ TEST_F(ReplCoordTest, SingleNodeReplSetStepDownTimeoutAndElectionTimeoutExpiresA
     Date_t stepdownUntil = getNet()->now() + Seconds(1);
     getNet()->runUntil(stepdownUntil);
     ASSERT_EQUALS(stepdownUntil, getNet()->now());
+    ASSERT_TRUE(getTopoCoord().getMemberState().primary());
+    getNet()->exitNetwork();
+    ASSERT_TRUE(getReplCoord()->getMemberState().primary());
+}
+
+TEST_F(ReplCoordTest, SingleNodeReplSetUnfreeze) {
+    init();
+
+    assertStartSuccess(BSON("_id"
+                            << "mySet"
+                            << "version"
+                            << 1
+                            << "members"
+                            << BSON_ARRAY(BSON("_id" << 0 << "host"
+                                                     << "test1:1234"))
+                            << "protocolVersion"
+                            << 1
+                            << "settings"
+                            << BSON("electionTimeoutMillis" << 10000)),
+                       HostAndPort("test1", 1234));
+    auto opCtx = makeOperationContext();
+    getExternalState()->setElectionTimeoutOffsetLimitFraction(0);
+
+    // Become Secondary.
+    ASSERT_OK(getReplCoord()->setFollowerMode(MemberState::RS_SECONDARY));
+    getReplCoord()->setMyLastAppliedOpTime(OpTimeWithTermOne(100, 1));
+    getReplCoord()->setMyLastDurableOpTime(OpTimeWithTermOne(100, 1));
+    ASSERT_TRUE(getTopoCoord().getMemberState().secondary());
+    ASSERT_TRUE(getReplCoord()->getMemberState().secondary());
+
+    // Freeze the node for 20 seconds.
+    BSONObjBuilder resultObj;
+    Date_t freezeUntil = getNet()->now() + Seconds(15);
+    ASSERT_OK(getReplCoord()->processReplSetFreeze(20, &resultObj));
+    getNet()->enterNetwork();
+
+    // Now run time forward and unfreeze the node after 15 seconds.
+    getNet()->runUntil(freezeUntil);
+    ASSERT_EQUALS(freezeUntil, getNet()->now());
+    ASSERT_TRUE(getTopoCoord().getMemberState().secondary());
+    getNet()->exitNetwork();
+    ASSERT_TRUE(getReplCoord()->getMemberState().secondary());
+    ASSERT_OK(getReplCoord()->processReplSetFreeze(0, &resultObj));
+    getNet()->enterNetwork();
+
+    // Wait for single node election to happen.
+    Date_t waitUntil = freezeUntil + Seconds(1);
+    getNet()->runUntil(waitUntil);
+    ASSERT_EQUALS(waitUntil, getNet()->now());
     ASSERT_TRUE(getTopoCoord().getMemberState().primary());
     getNet()->exitNetwork();
     ASSERT_TRUE(getReplCoord()->getMemberState().primary());
@@ -1996,10 +2175,6 @@ TEST_F(StepDownTest,
     ASSERT_TRUE(getReplCoord()->getMemberState().primary());
 
     // Step down where the secondary actually has to catch up before the stepDown can succeed.
-    // On entering the network, _stepDownContinue should cancel the heartbeats scheduled for
-    // T + 2 seconds and send out a new round of heartbeats immediately.
-    // This makes it unnecessary to advance the clock after entering the network to process
-    // the heartbeat requests.
     auto result = stepDown_nonBlocking(false, Seconds(10), Seconds(60));
 
     catchUpSecondaries(optime2);
@@ -2023,15 +2198,12 @@ TEST_F(StepDownTest,
     simulateSuccessfulV1Election();
 
     // Step down where the secondary actually has to catch up before the stepDown can succeed.
-    // On entering the network, _stepDownContinue should cancel the heartbeats scheduled for
-    // T + 2 seconds and send out a new round of heartbeats immediately.
-    // This makes it unnecessary to advance the clock after entering the network to process
-    // the heartbeat requests.
     auto result = stepDown_nonBlocking(false, Seconds(10), Seconds(60));
 
-    // Secondary has not caught up on first round of heartbeats.
+    // Advance the clock by two seconds to allow for a round of heartbeats to be sent. The
+    // secondary will not appear to be caught up.
     enterNetwork();
-    getNet()->runUntil(getNet()->now() + Milliseconds(1000));
+    getNet()->runUntil(getNet()->now() + Milliseconds(2000));
     NetworkInterfaceMock::NetworkOperationIterator noi = getNet()->getNextReadyRequest();
     RemoteCommandRequest request = noi->getRequest();
     log() << "HB1: " << request.target.toString() << " processing " << request.cmdObj;
@@ -2043,7 +2215,7 @@ TEST_F(StepDownTest,
         hbResp.setConfigVersion(hbArgs.getConfigVersion());
         BSONObjBuilder respObj;
         respObj << "ok" << 1;
-        hbResp.addToBSON(&respObj, false);
+        hbResp.addToBSON(&respObj);
         getNet()->scheduleResponse(noi, getNet()->now(), makeResponseStatus(respObj.obj()));
     }
     while (getNet()->hasReadyRequests()) {
@@ -2095,10 +2267,6 @@ TEST_F(StepDownTest, OnlyOneStepDownCmdIsAllowedAtATime) {
     ASSERT_TRUE(getReplCoord()->getMemberState().primary());
 
     // Step down where the secondary actually has to catch up before the stepDown can succeed.
-    // On entering the network, _stepDownContinue should cancel the heartbeats scheduled for
-    // T + 2 seconds and send out a new round of heartbeats immediately.
-    // This makes it unnecessary to advance the clock after entering the network to process
-    // the heartbeat requests.
     auto result = stepDown_nonBlocking(false, Seconds(10), Seconds(60));
 
     // We should still be primary at this point
@@ -2134,12 +2302,6 @@ TEST_F(StepDownTest, UnconditionalStepDownFailsStepDownCommand) {
 
     ASSERT_TRUE(getReplCoord()->getMemberState().primary());
 
-    // Step down where the secondary actually has to catch up before the stepDown can succeed.
-    // On entering the network, _stepDownContinue should cancel the heartbeats scheduled for
-    // T + 2 seconds and send out a new round of heartbeats immediately.
-    // This makes it unnecessary to advance the clock after entering the network to process
-    // the heartbeat requests.
-
     // Start a stepdown command that needs to wait for secondaries to catch up.
     auto result = stepDown_nonBlocking(false, Seconds(10), Seconds(60));
 
@@ -2173,12 +2335,6 @@ TEST_F(StepDownTest, InterruptingStepDownCommandRestoresWriteAvailability) {
     simulateSuccessfulV1Election();
 
     ASSERT_TRUE(getReplCoord()->getMemberState().primary());
-
-    // Step down where the secondary actually has to catch up before the stepDown can succeed.
-    // On entering the network, _stepDownContinue should cancel the heartbeats scheduled for
-    // T + 2 seconds and send out a new round of heartbeats immediately.
-    // This makes it unnecessary to advance the clock after entering the network to process
-    // the heartbeat requests.
 
     // Start a stepdown command that needs to wait for secondaries to catch up.
     auto result = stepDown_nonBlocking(false, Seconds(10), Seconds(60));
@@ -2220,12 +2376,6 @@ TEST_F(StepDownTest, InterruptingAfterUnconditionalStepdownDoesNotRestoreWriteAv
     simulateSuccessfulV1Election();
 
     ASSERT_TRUE(getReplCoord()->getMemberState().primary());
-
-    // Step down where the secondary actually has to catch up before the stepDown can succeed.
-    // On entering the network, _stepDownContinue should cancel the heartbeats scheduled for
-    // T + 2 seconds and send out a new round of heartbeats immediately.
-    // This makes it unnecessary to advance the clock after entering the network to process
-    // the heartbeat requests.
 
     // Start a stepdown command that needs to wait for secondaries to catch up.
     auto result = stepDown_nonBlocking(false, Seconds(10), Seconds(60));
@@ -4370,9 +4520,8 @@ TEST_F(ReplCoordTest,
                                   << 3
                                   << "syncSourceIndex"
                                   << 1)));
-    BSONObjBuilder metadataBuilder;
-    ASSERT_OK(metadata.getValue().writeToMetadata(&metadataBuilder));
-    auto metadataObj = metadataBuilder.obj();
+    BSONObjBuilder responseBuilder;
+    ASSERT_OK(metadata.getValue().writeToMetadata(&responseBuilder));
 
     auto net = getNet();
     net->enterNetwork();
@@ -4387,7 +4536,8 @@ TEST_F(ReplCoordTest,
     hbResp.setConfigVersion(config.getConfigVersion());
     hbResp.setSetName(config.getReplSetName());
     hbResp.setState(MemberState::RS_SECONDARY);
-    net->scheduleResponse(noi, net->now(), makeResponseStatus(hbResp.toBSON(true), metadataObj));
+    responseBuilder.appendElements(hbResp.toBSON());
+    net->scheduleResponse(noi, net->now(), makeResponseStatus(responseBuilder.obj()));
     net->runReadyNetworkOperations();
     net->exitNetwork();
 
@@ -4496,9 +4646,8 @@ TEST_F(ReplCoordTest, TermAndLastCommittedOpTimeUpdatedFromHeartbeatWhenArbiter)
                                   << 3
                                   << "syncSourceIndex"
                                   << 1)));
-    BSONObjBuilder metadataBuilder;
-    ASSERT_OK(metadata.getValue().writeToMetadata(&metadataBuilder));
-    auto metadataObj = metadataBuilder.obj();
+    BSONObjBuilder responseBuilder;
+    ASSERT_OK(metadata.getValue().writeToMetadata(&responseBuilder));
 
     auto net = getNet();
     net->enterNetwork();
@@ -4513,7 +4662,8 @@ TEST_F(ReplCoordTest, TermAndLastCommittedOpTimeUpdatedFromHeartbeatWhenArbiter)
     hbResp.setConfigVersion(config.getConfigVersion());
     hbResp.setSetName(config.getReplSetName());
     hbResp.setState(MemberState::RS_SECONDARY);
-    net->scheduleResponse(noi, net->now(), makeResponseStatus(hbResp.toBSON(true), metadataObj));
+    responseBuilder.appendElements(hbResp.toBSON());
+    net->scheduleResponse(noi, net->now(), makeResponseStatus(responseBuilder.obj()));
     net->runReadyNetworkOperations();
     net->exitNetwork();
 
@@ -4687,7 +4837,9 @@ TEST_F(ReplCoordTest,
     hbResp.setConfigVersion(3);
     hbResp.setSetName("mySet");
     hbResp.setState(MemberState::RS_SECONDARY);
-    net->scheduleResponse(noi, net->now(), makeResponseStatus(hbResp.toBSON(true)));
+    hbResp.setAppliedOpTime(OpTime(Timestamp(100, 1), 0));
+    hbResp.setDurableOpTime(OpTime(Timestamp(100, 1), 0));
+    net->scheduleResponse(noi, net->now(), makeResponseStatus(hbResp.toBSON()));
     net->runReadyNetworkOperations();
     net->exitNetwork();
 
@@ -4739,11 +4891,14 @@ TEST_F(ReplCoordTest,
     hbResp.setSetName("mySet");
     hbResp.setState(MemberState::RS_PRIMARY);
     hbResp.setTerm(replCoord->getTerm());
+    hbResp.setAppliedOpTime(OpTime(Timestamp(100, 1), 0));
+    hbResp.setDurableOpTime(OpTime(Timestamp(100, 1), 0));
+    hbResp.setConfigVersion(1);
 
     // Heartbeat response is scheduled with a delay so that we can be sure that
     // the election was rescheduled due to the heartbeat response.
     auto heartbeatWhen = net->now() + Seconds(1);
-    net->scheduleResponse(noi, heartbeatWhen, makeResponseStatus(hbResp.toBSON(true)));
+    net->scheduleResponse(noi, heartbeatWhen, makeResponseStatus(hbResp.toBSON()));
     net->runUntil(heartbeatWhen);
     ASSERT_EQUALS(heartbeatWhen, net->now());
     net->runReadyNetworkOperations();
@@ -4797,7 +4952,7 @@ TEST_F(ReplCoordTest,
     // Heartbeat response is scheduled with a delay so that we can be sure that
     // the election was rescheduled due to the heartbeat response.
     auto heartbeatWhen = net->now() + Seconds(1);
-    net->scheduleResponse(noi, heartbeatWhen, makeResponseStatus(hbResp.toBSON(true)));
+    net->scheduleResponse(noi, heartbeatWhen, makeResponseStatus(hbResp.toBSON()));
     net->runUntil(heartbeatWhen);
     ASSERT_EQUALS(heartbeatWhen, net->now());
     net->runReadyNetworkOperations();
@@ -4848,7 +5003,7 @@ TEST_F(ReplCoordTest,
     // Heartbeat response is scheduled with a delay so that we can be sure that
     // the election was rescheduled due to the heartbeat response.
     auto heartbeatWhen = net->now() + Seconds(1);
-    net->scheduleResponse(noi, heartbeatWhen, makeResponseStatus(hbResp.toBSON(true)));
+    net->scheduleResponse(noi, heartbeatWhen, makeResponseStatus(hbResp.toBSON()));
     net->runUntil(heartbeatWhen);
     ASSERT_EQUALS(heartbeatWhen, net->now());
     net->runReadyNetworkOperations();

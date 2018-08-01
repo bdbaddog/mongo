@@ -101,8 +101,10 @@ public:
 
     virtual void deleteRecord(OperationContext* opCtx, const RecordId& dl) {}
 
-    virtual StatusWith<RecordId> insertRecord(
-        OperationContext* opCtx, const char* data, int len, Timestamp, bool enforceQuota) {
+    virtual StatusWith<RecordId> insertRecord(OperationContext* opCtx,
+                                              const char* data,
+                                              int len,
+                                              Timestamp) {
         _numInserts++;
         return StatusWith<RecordId>(RecordId(6, 4));
     }
@@ -125,7 +127,6 @@ public:
                                 const RecordId& oldLocation,
                                 const char* data,
                                 int len,
-                                bool enforceQuota,
                                 UpdateNotifier* notifier) {
         return Status::OK();
     }
@@ -271,6 +272,12 @@ bool DevNullKVEngine::isCacheUnderPressure(OperationContext* opCtx) const {
 void DevNullKVEngine::setCachePressureForTest(int pressure) {
     invariant(pressure >= 0 && pressure <= 100);
     _cachePressureForTest = pressure;
+}
+
+StatusWith<std::vector<std::string>> DevNullKVEngine::beginNonBlockingBackup(
+    OperationContext* opCtx) {
+    std::vector<std::string> filesToCopy = {"filename.wt"};
+    return filesToCopy;
 }
 
 }  // namespace mongo
