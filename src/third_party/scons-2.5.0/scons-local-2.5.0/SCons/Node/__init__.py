@@ -1475,9 +1475,9 @@ class Node(object):
                     if t: Trace(': %s changed' % child)
                     result = True
 
-        contents = self.get_executor().get_contents()
         if self.has_builder():
             import SCons.Util
+            contents = self.get_executor().get_contents()
             newsig = SCons.Util.MD5signature(contents)
             if bi.bactsig != newsig:
                 if t: Trace(': bactsig %s != newsig %s' % (bi.bactsig, newsig))
@@ -1643,8 +1643,14 @@ class Node(object):
         for k in new_bkids:
             if not k in old_bkids:
                 lines.append("`%s' is a new dependency\n" % stringify(k))
-            elif _decider_map[k.changed_since_last_build](k, self, osig[k]):
-                lines.append("`%s' changed\n" % stringify(k))
+            else:
+                try:
+                    changed = _decider_map[k.changed_since_last_build](k, self, osig[k])
+                except DeciderNeedsNode as e:
+                    changed = e.decider(self, osig[k], node=self)
+                if changed:
+                    lines.append("`%s' changed\n" % stringify(k))
+
 
         if len(lines) == 0 and old_bkids != new_bkids:
             lines.append("the dependency order changed:\n" +
