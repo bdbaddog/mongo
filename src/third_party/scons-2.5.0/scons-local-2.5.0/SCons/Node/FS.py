@@ -42,6 +42,7 @@ import stat
 import sys
 import time
 import codecs
+from itertools import izip, chain
 
 import SCons.Action
 import SCons.Debug
@@ -691,6 +692,7 @@ class Base(SCons.Node.Node):
         raise AttributeError("%r object has no attribute %r" %
                          (self.__class__, attr))
 
+    # @profile
     def __str__(self):
         """A Node.FS.Base object's string representation is its path
         name."""
@@ -2494,6 +2496,12 @@ class FileNodeInfo(SCons.Node.NodeInfoBase):
             if key not in ('__weakref__',):
                 setattr(self, key, value)
 
+    def __eq__(self, other):
+        return self.csig == other.csig and self.timestamp == other.timestamp and self.size == other.size
+
+    def __ne__(self, other):
+        return not self.__eq__(other)
+
 class FileBuildInfo(SCons.Node.BuildInfoBase):
     __slots__ = ('dependency_map')
     current_version_id = 2
@@ -3263,6 +3271,11 @@ class File(Base):
     def changed_state(self, target, prev_ni):
         return self.state != SCons.Node.up_to_date
 
+    # Caching node -> string mapping for the below method
+    __dmap_cache = {}
+    __dmap_sig_cache = {}
+
+    # @profile
     def _build_dependency_map(self, binfo):
         """
         Build mapping from file -> signature
@@ -3288,16 +3301,38 @@ class File(Base):
         ]
 
         m = {}
-        for children, signatures in pairs:
-            for child, signature in zip(children, signatures):
-                schild = str(child)
-                m[schild] = signature
+        # for children, signatures in pairs:
+        # for child, signature in izip(children, signatures):
+        for child, signature in izip(chain(binfo.bsources, binfo.bdepends, binfo.bimplicit),
+                                     chain(binfo.bsourcesigs, binfo.bdependsigs, binfo.bimplicitsigs)):
+
+            # Use/create mapping from child object -> string for child to avoid calling __str__ on Nodes
+            try:
+                schild = File.__dmap_cache[child]
+            except KeyError as e:
+                schild = sys.intern(str(child))
+                File.__dmap_cache[child] = schild
+
+            m[schild] = signature
+
+            # Use/create mapping from string for node to it's signature
+            try:
+                x = File.__dmap_sig_cache[schild]
+            except KeyError as e:
+                File.__dmap_sig_cache[schild] = signature
+                x = None
+
+            if x and x != signature:
+                print("NOMATCH [Target:%s] [File:%s]: %s -> %s"%(str(self), str(child), signature, x))
+                for i in ['csig','timestamp','size']:
+                    print("%s: %s == %s"%(i, getattr(x, i), getattr(signature,i)))
 
         # store this info so we can avoid regenerating it.
         binfo.dependency_map = m
 
         return m
 
+    # @profile
     def _get_previous_signatures(self, dmap):
         """
         Return a list of corresponding csigs from previous
@@ -3343,6 +3378,7 @@ class File(Base):
 
         return None
 
+    # @profile
     def changed_timestamp_then_content(self, target, prev_ni, node=None):
         """
         Used when decider for file is Timestamp-MD5
