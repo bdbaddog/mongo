@@ -2580,6 +2580,11 @@ class FileBuildInfo(SCons.Node.BuildInfoBase):
         result.append('%s [%s]' % (self.bactsig, self.bact))
         return '\n'.join(result)
 
+    def __setattr__(self, key, value):
+        if key != 'dependency_map' and hasattr(self,'dependency_map'):
+            del self.dependency_map
+        return super(FileBuildInfo, self).__setattr__(key, value)
+
 class File(Base):
     """A class for files in a file system.
     """
@@ -3275,6 +3280,30 @@ class File(Base):
     __dmap_cache = {}
     __dmap_sig_cache = {}
 
+
+    def _old_build_dependency_map(self, binfo):
+
+        m = {}
+
+        # For an "empty" binfo properties like bsources
+        # do not exist: check this to avoid exception.
+        if (len(binfo.bsourcesigs) + len(binfo.bdependsigs) + \
+            len(binfo.bimplicitsigs)) == 0:
+            return {}
+
+        pairs = [
+            (binfo.bsources, binfo.bsourcesigs),
+            (binfo.bdepends, binfo.bdependsigs),
+            (binfo.bimplicit, binfo.bimplicitsigs)
+        ]
+        for children, signatures in pairs:
+            for child, signature in zip(children, signatures):
+                schild = str(child)
+                m[schild] = signature
+                # print("old: %80s -> %s" % (schild, signature.csig))
+
+        return m
+
     # @profile
     def _build_dependency_map(self, binfo):
         """
@@ -3294,38 +3323,36 @@ class File(Base):
             len(binfo.bimplicitsigs)) == 0:
             return {}
 
-        pairs = [
-            (binfo.bsources, binfo.bsourcesigs),
-            (binfo.bdepends, binfo.bdependsigs),
-            (binfo.bimplicit, binfo.bimplicitsigs)
-        ]
-
         m = {}
         # for children, signatures in pairs:
         # for child, signature in izip(children, signatures):
         for child, signature in izip(chain(binfo.bsources, binfo.bdepends, binfo.bimplicit),
                                      chain(binfo.bsourcesigs, binfo.bdependsigs, binfo.bimplicitsigs)):
 
-            # Use/create mapping from child object -> string for child to avoid calling __str__ on Nodes
-            try:
-                schild = File.__dmap_cache[child]
-            except KeyError as e:
-                schild = sys.intern(str(child))
-                File.__dmap_cache[child] = schild
+            # # Use/create mapping from child object -> string for child to avoid calling __str__ on Nodes
+            # try:
+            #     schild = File.__dmap_cache[child]
+            # except KeyError as e:
+            #     schild = sys.intern(str(child))
+            #     File.__dmap_cache[child] = schild
+
+            # schild = sys.intern(str(child))
+            schild = str(child)
 
             m[schild] = signature
+            # print("new: %80s -> %s"%(schild, signature.csig))
 
-            # Use/create mapping from string for node to it's signature
-            try:
-                x = File.__dmap_sig_cache[schild]
-            except KeyError as e:
-                File.__dmap_sig_cache[schild] = signature
-                x = None
-
-            if x and x != signature:
-                print("NOMATCH [Target:%s] [File:%s]: %s -> %s"%(str(self), str(child), signature, x))
-                for i in ['csig','timestamp','size']:
-                    print("%s: %s == %s"%(i, getattr(x, i), getattr(signature,i)))
+            # # Use/create mapping from string for node to it's signature
+            # try:
+            #     x = File.__dmap_sig_cache[schild]
+            # except KeyError as e:
+            #     File.__dmap_sig_cache[schild] = signature
+            #     x = None
+            #
+            # if x and x != signature:
+            #     print("NOMATCH [Target:%s] [File:%s]: %s -> %s"%(str(self), str(child), signature, x))
+            #     for i in ['csig','timestamp','size']:
+            #         print("%s: %s == %s"%(i, getattr(x, i), getattr(signature,i)))
 
         # store this info so we can avoid regenerating it.
         binfo.dependency_map = m
@@ -3401,12 +3428,24 @@ class File(Base):
 
         # Now get sconsign name -> csig map and then get proper prev_ni if possible
         bi = node.get_stored_info().binfo
+        rebuilt = False
         try:
             dependency_map = bi.dependency_map
         except AttributeError as e:
+            # if str(node) == 'build/cached/mongo/base/error_codes.h':
+            #     print("YUpp")
             dependency_map = self._build_dependency_map(bi)
+            rebuilt = True
+
+
+        old_map = self._old_build_dependency_map(bi)
+        o_prev_ni = self._get_previous_signatures(old_map)
+
 
         prev_ni = self._get_previous_signatures(dependency_map)
+
+        if o_prev_ni != prev_ni:
+            print("ERROR: old != new ni [%s]"%str(self))
 
         if not self.changed_timestamp_match(target, prev_ni):
             try:
