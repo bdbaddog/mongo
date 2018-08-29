@@ -3438,14 +3438,14 @@ class File(Base):
             rebuilt = True
 
 
-        old_map = self._old_build_dependency_map(bi)
-        o_prev_ni = self._get_previous_signatures(old_map)
+        # old_map = self._old_build_dependency_map(bi)
+        # o_prev_ni = self._get_previous_signatures(old_map)
 
 
         prev_ni = self._get_previous_signatures(dependency_map)
 
-        if o_prev_ni != prev_ni:
-            print("ERROR: old != new ni [%s]"%str(self))
+        # if o_prev_ni != prev_ni:
+        #     print("ERROR: old != new ni [%s]"%str(self))
 
         if not self.changed_timestamp_match(target, prev_ni):
             try:
