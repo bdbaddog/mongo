@@ -56,8 +56,9 @@ public:
         Operation() = default;
         Operation(ServiceContext::UniqueClient client, RecoveryUnit* ru)
             : _client(std::move(client)), _opCtx(_client->makeOperationContext()) {
-            delete _opCtx->releaseRecoveryUnit();
-            _opCtx->setRecoveryUnit(ru, WriteUnitOfWork::RecoveryUnitState::kNotInUnitOfWork);
+            _opCtx->releaseRecoveryUnit();
+            _opCtx->setRecoveryUnit(std::unique_ptr<RecoveryUnit>(ru),
+                                    WriteUnitOfWork::RecoveryUnitState::kNotInUnitOfWork);
         }
 
 
@@ -118,7 +119,7 @@ public:
         auto op = makeOperation();
         WriteUnitOfWork wuow(op);
         ASSERT_OK(op->recoveryUnit()->setTimestamp(_counter));
-        ASSERT_OK(rs->updateRecord(op, id, contents.c_str(), contents.length() + 1, nullptr));
+        ASSERT_OK(rs->updateRecord(op, id, contents.c_str(), contents.length() + 1));
         wuow.commit();
     }
 

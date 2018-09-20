@@ -50,6 +50,7 @@
 #include "mongo/s/request_types/create_database_gen.h"
 #include "mongo/s/shard_id.h"
 #include "mongo/s/stale_exception.h"
+#include "mongo/s/transaction/transaction_router.h"
 #include "mongo/util/log.h"
 #include "mongo/util/scopeguard.h"
 
@@ -94,10 +95,22 @@ const auto kAllowImplicitCollectionCreation = "allowImplicitCollectionCreation"_
  * same cmdObj combined with the default sharding parameters.
  */
 std::vector<AsyncRequestsSender::Request> buildUnversionedRequestsForShards(
-    std::vector<ShardId> shardIds, const BSONObj& cmdObj) {
+    OperationContext* opCtx, std::vector<ShardId> shardIds, const BSONObj& cmdObj) {
     auto cmdToSend = cmdObj;
     if (!cmdToSend.hasField(kAllowImplicitCollectionCreation)) {
         cmdToSend = appendAllowImplicitCreate(cmdToSend, false);
+    }
+
+    if (shardIds.size() == 1u) {
+        // The commands that support snapshot read concern only send unversioned
+        // requests to unsharded collections, so they should only be targeting
+        // the primary shard.
+        if (auto txnRouter = TransactionRouter::get(opCtx)) {
+            txnRouter->computeAtClusterTimeForOneShard(opCtx, shardIds[0]);
+        }
+    } else {
+        invariant(repl::ReadConcernArgs::get(opCtx).getLevel() !=
+                  repl::ReadConcernLevel::kSnapshotReadConcern);
     }
 
     std::vector<AsyncRequestsSender::Request> requests;
@@ -111,11 +124,12 @@ std::vector<AsyncRequestsSender::Request> buildUnversionedRequestsForAllShards(
     OperationContext* opCtx, const BSONObj& cmdObj) {
     std::vector<ShardId> shardIds;
     Grid::get(opCtx)->shardRegistry()->getAllShardIdsNoReload(&shardIds);
-    return buildUnversionedRequestsForShards(std::move(shardIds), cmdObj);
+    return buildUnversionedRequestsForShards(opCtx, std::move(shardIds), cmdObj);
 }
 
 std::vector<AsyncRequestsSender::Request> buildVersionedRequestsForTargetedShards(
     OperationContext* opCtx,
+    const NamespaceString& nss,
     const CachedCollectionRoutingInfo& routingInfo,
     const BSONObj& cmdObj,
     const BSONObj& query,
@@ -129,6 +143,7 @@ std::vector<AsyncRequestsSender::Request> buildVersionedRequestsForTargetedShard
             : cmdObj;
 
         return buildUnversionedRequestsForShards(
+            opCtx,
             {routingInfo.db().primaryId()},
             appendDbVersionIfPresent(cmdObjWithShardVersion, routingInfo.db()));
     }
@@ -143,6 +158,11 @@ std::vector<AsyncRequestsSender::Request> buildVersionedRequestsForTargetedShard
     // The collection is sharded. Target all shards that own chunks that match the query.
     std::set<ShardId> shardIds;
     routingInfo.cm()->getShardIdsForQuery(opCtx, query, collation, &shardIds);
+
+    if (auto txnRouter = TransactionRouter::get(opCtx)) {
+        txnRouter->computeAtClusterTime(opCtx, false, shardIds, nss, query, collation);
+    }
+
     for (const ShardId& shardId : shardIds) {
         requests.emplace_back(shardId,
                               appendShardVersion(cmdToSend, routingInfo.cm()->getVersion(shardId)));
@@ -264,7 +284,7 @@ std::vector<AsyncRequestsSender::Response> scatterGatherVersionedTargetByRouting
     const BSONObj& query,
     const BSONObj& collation) {
     const auto requests =
-        buildVersionedRequestsForTargetedShards(opCtx, routingInfo, cmdObj, query, collation);
+        buildVersionedRequestsForTargetedShards(opCtx, nss, routingInfo, cmdObj, query, collation);
 
     return gatherResponses(opCtx, dbName, readPref, retryPolicy, requests);
 }
@@ -286,7 +306,7 @@ std::vector<AsyncRequestsSender::Response> scatterGatherOnlyVersionIfUnsharded(
         requests = buildUnversionedRequestsForAllShards(opCtx, cmdObj);
     } else {
         requests = buildVersionedRequestsForTargetedShards(
-            opCtx, routingInfo, cmdObj, BSONObj(), BSONObj());
+            opCtx, nss, routingInfo, cmdObj, BSONObj(), BSONObj());
     }
 
     return gatherResponses(opCtx, nss.db(), readPref, retryPolicy, requests);
@@ -305,7 +325,7 @@ AsyncRequestsSender::Response executeCommandAgainstDatabasePrimary(
                         readPref,
                         retryPolicy,
                         buildUnversionedRequestsForShards(
-                            {dbInfo.primaryId()}, appendDbVersionIfPresent(cmdObj, dbInfo)));
+                            opCtx, {dbInfo.primaryId()}, appendDbVersionIfPresent(cmdObj, dbInfo)));
     return std::move(responses.front());
 }
 
@@ -524,97 +544,6 @@ StatusWith<CachedDatabaseInfo> createShardDatabase(OperationContext* opCtx, Stri
     }
 
     return dbStatus.getStatus().withContext(str::stream() << "Database " << dbName << " not found");
-}
-
-BSONObj appendAtClusterTime(BSONObj cmdObj, LogicalTime atClusterTime) {
-    BSONObjBuilder cmdAtClusterTimeBob;
-    for (auto el : cmdObj) {
-        if (el.fieldNameStringData() == repl::ReadConcernArgs::kReadConcernFieldName) {
-            BSONObjBuilder readConcernBob =
-                cmdAtClusterTimeBob.subobjStart(repl::ReadConcernArgs::kReadConcernFieldName);
-            for (auto&& elem : el.Obj()) {
-                // afterClusterTime cannot be specified with atClusterTime.
-                if (elem.fieldNameStringData() !=
-                    repl::ReadConcernArgs::kAfterClusterTimeFieldName) {
-                    readConcernBob.append(elem);
-                }
-            }
-            readConcernBob.append(repl::ReadConcernArgs::kAtClusterTimeFieldName,
-                                  atClusterTime.asTimestamp());
-        } else {
-            cmdAtClusterTimeBob.append(el);
-        }
-    }
-
-    return cmdAtClusterTimeBob.obj();
-}
-
-BSONObj appendAtClusterTimeToReadConcern(BSONObj readConcernObj, LogicalTime atClusterTime) {
-    invariant(readConcernObj[repl::ReadConcernArgs::kAtClusterTimeFieldName].eoo());
-
-    BSONObjBuilder readConcernBob;
-    for (auto&& elem : readConcernObj) {
-        // afterClusterTime cannot be specified with atClusterTime.
-        if (elem.fieldNameStringData() != repl::ReadConcernArgs::kAfterClusterTimeFieldName) {
-            readConcernBob.append(elem);
-        }
-    }
-
-    readConcernBob.append(repl::ReadConcernArgs::kAtClusterTimeFieldName,
-                          atClusterTime.asTimestamp());
-
-    return readConcernBob.obj();
-}
-
-boost::optional<LogicalTime> computeAtClusterTimeForOneShard(OperationContext* opCtx,
-                                                             const ShardId& shardId) {
-
-    if (repl::ReadConcernArgs::get(opCtx).getLevel() !=
-        repl::ReadConcernLevel::kSnapshotReadConcern) {
-        return boost::none;
-    }
-
-    auto shardRegistry = Grid::get(opCtx)->shardRegistry();
-    invariant(shardRegistry);
-    return shardRegistry->getShardNoReload(shardId)->getLastCommittedOpTime();
-}
-
-namespace {
-
-LogicalTime _computeAtClusterTime(OperationContext* opCtx,
-                                  bool mustRunOnAll,
-                                  const std::set<ShardId>& shardIds,
-                                  const NamespaceString& nss,
-                                  const BSONObj query,
-                                  const BSONObj collation) {
-    // TODO: SERVER-31767
-    return LogicalClock::get(opCtx)->getClusterTime();
-}
-
-}  // namespace
-
-boost::optional<LogicalTime> computeAtClusterTime(OperationContext* opCtx,
-                                                  bool mustRunOnAll,
-                                                  const std::set<ShardId>& shardIds,
-                                                  const NamespaceString& nss,
-                                                  const BSONObj query,
-                                                  const BSONObj collation) {
-
-    if (repl::ReadConcernArgs::get(opCtx).getLevel() !=
-        repl::ReadConcernLevel::kSnapshotReadConcern) {
-        return boost::none;
-    }
-
-    auto atClusterTime =
-        _computeAtClusterTime(opCtx, mustRunOnAll, shardIds, nss, query, collation);
-
-    // If the user passed afterClusterTime, atClusterTime must be greater than or equal to it.
-    const auto afterClusterTime = repl::ReadConcernArgs::get(opCtx).getArgsAfterClusterTime();
-    if (afterClusterTime && *afterClusterTime > atClusterTime) {
-        return afterClusterTime;
-    }
-
-    return atClusterTime;
 }
 
 std::set<ShardId> getTargetedShardsForQuery(OperationContext* opCtx,

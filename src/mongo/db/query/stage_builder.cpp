@@ -45,7 +45,6 @@
 #include "mongo/db/exec/fetch.h"
 #include "mongo/db/exec/geo_near.h"
 #include "mongo/db/exec/index_scan.h"
-#include "mongo/db/exec/keep_mutations.h"
 #include "mongo/db/exec/limit.h"
 #include "mongo/db/exec/merge_sort.h"
 #include "mongo/db/exec/or.h"
@@ -92,16 +91,21 @@ PlanStage* buildStages(OperationContext* opCtx,
                 return nullptr;
             }
 
-            IndexScanParams params;
+            auto descriptor = collection->getIndexCatalog()->findIndexByName(
+                opCtx, ixn->index.identifier.catalogName);
+            invariant(descriptor);
 
-            params.descriptor =
-                collection->getIndexCatalog()->findIndexByName(opCtx, ixn->index.name);
-            invariant(params.descriptor);
-
+            // We use the node's internal name, keyPattern and multikey details here. For $**
+            // indexes, these may differ from the information recorded in the index's descriptor.
+            IndexScanParams params{*descriptor,
+                                   ixn->index.identifier.catalogName,
+                                   ixn->index.keyPattern,
+                                   ixn->index.multikeyPaths,
+                                   ixn->index.multikey};
             params.bounds = ixn->bounds;
             params.direction = ixn->direction;
             params.addKeyMetadata = ixn->addKeyMetadata;
-            return new IndexScan(opCtx, params, ws, ixn->filter.get());
+            return new IndexScan(opCtx, std::move(params), ws, ixn->filter.get());
         }
         case STAGE_FETCH: {
             const FetchNode* fn = static_cast<const FetchNode*>(root);
@@ -241,8 +245,8 @@ PlanStage* buildStages(OperationContext* opCtx,
             params.addPointMeta = node->addPointMeta;
             params.addDistMeta = node->addDistMeta;
 
-            IndexDescriptor* twoDIndex =
-                collection->getIndexCatalog()->findIndexByName(opCtx, node->index.name);
+            IndexDescriptor* twoDIndex = collection->getIndexCatalog()->findIndexByName(
+                opCtx, node->index.identifier.catalogName);
             invariant(twoDIndex);
 
             GeoNear2DStage* nearStage =
@@ -260,16 +264,16 @@ PlanStage* buildStages(OperationContext* opCtx,
             params.addPointMeta = node->addPointMeta;
             params.addDistMeta = node->addDistMeta;
 
-            IndexDescriptor* s2Index =
-                collection->getIndexCatalog()->findIndexByName(opCtx, node->index.name);
+            IndexDescriptor* s2Index = collection->getIndexCatalog()->findIndexByName(
+                opCtx, node->index.identifier.catalogName);
             invariant(s2Index);
 
             return new GeoNear2DSphereStage(params, opCtx, ws, collection, s2Index);
         }
         case STAGE_TEXT: {
             const TextNode* node = static_cast<const TextNode*>(root);
-            IndexDescriptor* desc =
-                collection->getIndexCatalog()->findIndexByName(opCtx, node->index.name);
+            IndexDescriptor* desc = collection->getIndexCatalog()->findIndexByName(
+                opCtx, node->index.identifier.catalogName);
             invariant(desc);
             const FTSAccessMethod* fam =
                 static_cast<FTSAccessMethod*>(collection->getIndexCatalog()->getIndex(desc));
@@ -299,14 +303,6 @@ PlanStage* buildStages(OperationContext* opCtx,
                 ws,
                 childStage);
         }
-        case STAGE_KEEP_MUTATIONS: {
-            const KeepMutationsNode* km = static_cast<const KeepMutationsNode*>(root);
-            PlanStage* childStage = buildStages(opCtx, collection, cq, qsol, km->children[0], ws);
-            if (nullptr == childStage) {
-                return nullptr;
-            }
-            return new KeepMutationsStage(opCtx, km->filter.get(), ws, childStage);
-        }
         case STAGE_DISTINCT_SCAN: {
             const DistinctNode* dn = static_cast<const DistinctNode*>(root);
 
@@ -317,8 +313,8 @@ PlanStage* buildStages(OperationContext* opCtx,
 
             DistinctParams params;
 
-            params.descriptor =
-                collection->getIndexCatalog()->findIndexByName(opCtx, dn->index.name);
+            params.descriptor = collection->getIndexCatalog()->findIndexByName(
+                opCtx, dn->index.identifier.catalogName);
             invariant(params.descriptor);
             params.direction = dn->direction;
             params.bounds = dn->bounds;
@@ -333,17 +329,24 @@ PlanStage* buildStages(OperationContext* opCtx,
                 return nullptr;
             }
 
-            CountScanParams params;
+            auto descriptor = collection->getIndexCatalog()->findIndexByName(
+                opCtx, csn->index.identifier.catalogName);
+            invariant(descriptor);
 
-            params.descriptor =
-                collection->getIndexCatalog()->findIndexByName(opCtx, csn->index.name);
-            invariant(params.descriptor);
+            // We use the node's internal name, keyPattern and multikey details here. For $**
+            // indexes, these may differ from the information recorded in the index's descriptor.
+            CountScanParams params{*descriptor,
+                                   csn->index.identifier.catalogName,
+                                   csn->index.keyPattern,
+                                   csn->index.multikeyPaths,
+                                   csn->index.multikey};
+
             params.startKey = csn->startKey;
             params.startKeyInclusive = csn->startKeyInclusive;
             params.endKey = csn->endKey;
             params.endKeyInclusive = csn->endKeyInclusive;
 
-            return new CountScan(opCtx, params, ws);
+            return new CountScan(opCtx, std::move(params), ws);
         }
         case STAGE_ENSURE_SORTED: {
             const EnsureSortedNode* esn = static_cast<const EnsureSortedNode*>(root);

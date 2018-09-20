@@ -18,7 +18,6 @@ selector:
   # Skip any tests that run with auth explicitly.
   - jstests/core/*[aA]uth*.js
   # Skip any tests that require privileges for non test databases.
-  - jstests/core/copydb.js
   - jstests/core/system_profile.js
   # Cannot specify afterClusterTime and afterOpTime.
   - jstests/core/read_after_optime.js
@@ -49,15 +48,10 @@ selector:
   - jstests/core/fsync.js  # uses fsync.
   - jstests/core/geo_haystack*.js  # geoSearch.
   - jstests/core/geo_update_btree2.js  # notablescan.
-  - jstests/core/index_bigkeys_nofail.js  # failIndexKeyTooLong.
-  - jstests/core/index_bigkeys_validation.js  # failIndexKeyTooLong.
   - jstests/core/index_id_options.js  # "local" database.
   - jstests/core/index9.js  # "local" database.
   - jstests/core/profile*.js  # profiling.
   - jstests/core/queryoptimizera.js  # "local" database. 
-  - jstests/core/repair_database.js # repairDatabase
-  - jstests/core/repair_database_input_validation.js # repairDatabase
-  - jstests/core/repair_server12955.js # repairDatabase
   - jstests/core/stages*.js  # stageDebug.
   # The following tests fail because mongos behaves differently from mongod when testing certain
   # functionality. The differences are in a comment next to the failing test.
@@ -121,18 +115,14 @@ selector:
   - jstests/core/explain_upsert.js
   # The `dbstats` command builds in-memory structures that are not causally consistent.
   - jstests/core/dbstats.js
-  # TODO SERVER-33248: Remove this test from the blacklist. The secondary can get stuck without a
-  # sync source if the RestartCatalog command kills its oplog fetching cursor, which blocks
-  # secondary majority reads.
-  - jstests/core/restart_catalog.js
 
   # These include operations the root user auth'd on the test database is not authorized to perform,
   # e.g. dropping or creating system collections.
-  - jstests/core/cannot_create_system_dot_indexes.js
   - jstests/core/list_collections_no_views.js
   - jstests/core/rename8.js
   - jstests/core/views/duplicate_ns.js
   - jstests/core/views/invalid_system_views.js
+  - jstests/core/views/view_with_invalid_dbname.js
   - jstests/core/views/views_creation.js
   - jstests/core/views/views_drop.js
   - jstests/core/views/views_rename.js

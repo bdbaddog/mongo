@@ -348,11 +348,13 @@ TEST(PlanCacheCommandsTest, planCacheClearOneKey) {
                 << cqB->getQueryRequest().getProj());
     ASSERT_TRUE(
         std::find_if(shapesBefore.begin(), shapesBefore.end(), [&shapeA](const BSONObj& obj) {
-            return SimpleBSONObjComparator::kInstance.evaluate(shapeA == obj);
+            auto filteredObj = obj.removeField("queryHash");
+            return SimpleBSONObjComparator::kInstance.evaluate(shapeA == filteredObj);
         }) != shapesBefore.end());
     ASSERT_TRUE(
         std::find_if(shapesBefore.begin(), shapesBefore.end(), [&shapeB](const BSONObj& obj) {
-            return SimpleBSONObjComparator::kInstance.evaluate(shapeB == obj);
+            auto filteredObj = obj.removeField("queryHash");
+            return SimpleBSONObjComparator::kInstance.evaluate(shapeB == filteredObj);
         }) != shapesBefore.end());
 
     // Drop {b: 1} from cache. Make sure {a: 1} is still in cache afterwards.
@@ -362,7 +364,8 @@ TEST(PlanCacheCommandsTest, planCacheClearOneKey) {
         opCtx.get(), &planCache, nss.ns(), BSON("query" << cqB->getQueryObj())));
     vector<BSONObj> shapesAfter = getShapes(planCache);
     ASSERT_EQUALS(shapesAfter.size(), 1U);
-    ASSERT_BSONOBJ_EQ(shapesAfter[0], shapeA);
+    auto filteredShape0 = shapesAfter[0].removeField("queryHash");
+    ASSERT_BSONOBJ_EQ(filteredShape0, shapeA);
 }
 
 TEST(PlanCacheCommandsTest, planCacheClearOneKeyCollation) {
@@ -385,8 +388,13 @@ TEST(PlanCacheCommandsTest, planCacheClearOneKeyCollation) {
     // Create plan cache with 2 entries. Add an index so that indexability is included in the plan
     // cache keys.
     PlanCache planCache;
-    planCache.notifyOfIndexEntries(
-        {IndexEntry(fromjson("{a: 1}"), false, false, false, "index_name", NULL, BSONObj())});
+    planCache.notifyOfIndexEntries({IndexEntry(fromjson("{a: 1}"),
+                                               false,
+                                               false,
+                                               false,
+                                               IndexEntry::Identifier{"index_name"},
+                                               NULL,
+                                               BSONObj())});
     QuerySolution qs;
     qs.cacheData.reset(createSolutionCacheData());
     std::vector<QuerySolution*> solns;
@@ -414,13 +422,16 @@ TEST(PlanCacheCommandsTest, planCacheClearOneKeyCollation) {
                                               << cqCollation->getCollator()->getSpec().toBSON());
     ASSERT_TRUE(
         std::find_if(shapesBefore.begin(), shapesBefore.end(), [&shape](const BSONObj& obj) {
-            return SimpleBSONObjComparator::kInstance.evaluate(shape == obj);
+            auto filteredObj = obj.removeField("queryHash");
+            return SimpleBSONObjComparator::kInstance.evaluate(shape == filteredObj);
         }) != shapesBefore.end());
-    ASSERT_TRUE(
-        std::find_if(
-            shapesBefore.begin(), shapesBefore.end(), [&shapeWithCollation](const BSONObj& obj) {
-                return SimpleBSONObjComparator::kInstance.evaluate(shapeWithCollation == obj);
-            }) != shapesBefore.end());
+    ASSERT_TRUE(std::find_if(shapesBefore.begin(),
+                             shapesBefore.end(),
+                             [&shapeWithCollation](const BSONObj& obj) {
+                                 auto filteredObj = obj.removeField("queryHash");
+                                 return SimpleBSONObjComparator::kInstance.evaluate(
+                                     shapeWithCollation == filteredObj);
+                             }) != shapesBefore.end());
 
     // Drop query with collation from cache. Make other query is still in cache afterwards.
     BSONObjBuilder bob;
@@ -428,7 +439,8 @@ TEST(PlanCacheCommandsTest, planCacheClearOneKeyCollation) {
     ASSERT_OK(PlanCacheClear::clear(opCtx.get(), &planCache, nss.ns(), shapeWithCollation));
     vector<BSONObj> shapesAfter = getShapes(planCache);
     ASSERT_EQUALS(shapesAfter.size(), 1U);
-    ASSERT_BSONOBJ_EQ(shapesAfter[0], shape);
+    auto filteredShape0 = shapesAfter[0].removeField("queryHash");
+    ASSERT_BSONOBJ_EQ(filteredShape0, shape);
 }
 
 /**
@@ -626,8 +638,13 @@ TEST(PlanCacheCommandsTest, planCacheListPlansCollation) {
     // Create plan cache with 2 entries. Add an index so that indexability is included in the plan
     // cache keys. Give query with collation two solutions.
     PlanCache planCache;
-    planCache.notifyOfIndexEntries(
-        {IndexEntry(fromjson("{a: 1}"), false, false, false, "index_name", NULL, BSONObj())});
+    planCache.notifyOfIndexEntries({IndexEntry(fromjson("{a: 1}"),
+                                               false,
+                                               false,
+                                               false,
+                                               IndexEntry::Identifier{"index_name"},
+                                               NULL,
+                                               BSONObj())});
     QuerySolution qs;
     qs.cacheData.reset(createSolutionCacheData());
     std::vector<QuerySolution*> solns;

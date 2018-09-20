@@ -97,9 +97,8 @@ public:
 };
 
 /**
- * Check that nIndexes is incremented correctly when an index builds (and that it is not
- * incremented when an index fails to build), system.indexes has an entry added (or not), and
- * system.namespaces has a doc added (or not).
+ * Check that nIndexes is incremented correctly when an index builds, and that it is not
+ * incremented when an index fails to build.
  */
 class BuildIndex : public Base {
 public:
@@ -150,7 +149,8 @@ public:
 
         ASSERT_OK(dbtests::createIndex(&opCtx, ns(), BSON("a" << 1 << "b" << 1)));
 
-        unique_ptr<DBClientCursor> c = db.query(ns(), Query().sort(BSON("a" << 1 << "b" << 1)));
+        unique_ptr<DBClientCursor> c =
+            db.query(NamespaceString(ns()), Query().sort(BSON("a" << 1 << "b" << 1)));
         ASSERT_EQUALS(1111, c->itcount());
     }
 };
@@ -167,7 +167,8 @@ public:
             db.insert(ns(), BSON("i" << i));
         }
 
-        unique_ptr<DBClientCursor> c = db.query(ns(), Query().sort(BSON("i" << 1)));
+        unique_ptr<DBClientCursor> c =
+            db.query(NamespaceString(ns()), Query().sort(BSON("i" << 1)));
 
         BSONObj o = c->next();
         ASSERT(c->more());

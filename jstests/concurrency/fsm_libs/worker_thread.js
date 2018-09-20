@@ -20,7 +20,6 @@ var workerThread = (function() {
     // args.globalAssertLevel = the global assertion level to use
     // args.errorLatch = CountDownLatch instance that threads count down when they error
     // args.sessionOptions = the options to start a session with
-    // args.testData = TestData object
     // run = callback that takes a map of workloads to their associated $config
     function main(workloads, args, run) {
         var myDB;
@@ -35,7 +34,7 @@ var workerThread = (function() {
         // The global 'TestData' object may still be undefined if the concurrency suite isn't being
         // run by resmoke.py (e.g. if it is being run via a parallel shell in the backup/restore
         // tests).
-        TestData = (args.testData !== undefined) ? args.testData : {};
+        TestData = (TestData !== undefined) ? TestData : {};
 
         try {
             if (typeof db !== 'undefined') {

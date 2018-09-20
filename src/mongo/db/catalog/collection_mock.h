@@ -35,9 +35,7 @@ namespace mongo {
 /**
  * This class comprises a mock Collection for use by UUIDCatalog unit tests.
  */
-class CollectionMock : virtual public Collection::Impl,
-                       virtual CappedCallback,
-                       virtual UpdateNotifier {
+class CollectionMock : virtual public Collection::Impl, virtual CappedCallback {
 public:
     CollectionMock(const NamespaceString& ns) : _ns(ns) {}
     ~CollectionMock() = default;
@@ -59,9 +57,6 @@ private:
         std::abort();
     }
 
-    Status recordStoreGoingToUpdateInPlace(OperationContext* opCtx, const RecordId& loc) {
-        std::abort();
-    }
     const NamespaceString _ns;
 
 public:
@@ -163,7 +158,7 @@ public:
                             const BSONObj& newDoc,
                             bool indexesAffected,
                             OpDebug* opDebug,
-                            OplogUpdateEntryArgs* args) {
+                            CollectionUpdateArgs* args) {
         std::abort();
     }
 
@@ -176,7 +171,7 @@ public:
                                                      const Snapshotted<RecordData>& oldRec,
                                                      const char* damageSource,
                                                      const mutablebson::DamageVector& damages,
-                                                     OplogUpdateEntryArgs* args) {
+                                                     CollectionUpdateArgs* args) {
         std::abort();
     }
 

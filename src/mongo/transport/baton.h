@@ -30,10 +30,11 @@
 
 #include <memory>
 
-#include "mongo/stdx/functional.h"
 #include "mongo/transport/transport_layer.h"
+#include "mongo/util/functional.h"
 #include "mongo/util/future.h"
 #include "mongo/util/time_support.h"
+#include "mongo/util/waitable.h"
 
 namespace mongo {
 
@@ -55,7 +56,7 @@ class ReactorTimer;
  * context switches, as well as improving the readability of stack traces by grounding async
  * execution on top of a regular client call stack.
  */
-class Baton {
+class Baton : public Waitable {
 public:
     virtual ~Baton() = default;
 
@@ -82,7 +83,7 @@ public:
     /**
      * Executes a callback on the baton.
      */
-    virtual void schedule(stdx::function<void()> func) = 0;
+    virtual void schedule(unique_function<void()> func) = 0;
 
     /**
      * Adds a session, returning a future which activates on read/write-ability of the session.
@@ -92,11 +93,6 @@ public:
         Out,
     };
     virtual Future<void> addSession(Session& session, Type type) = 0;
-
-    /**
-     * Adds a timer, returning a future which activates after a duration.
-     */
-    virtual Future<void> waitFor(const ReactorTimer& timer, Milliseconds timeout) = 0;
 
     /**
      * Adds a timer, returning a future which activates after a deadline.
@@ -116,14 +112,6 @@ public:
      * Returns true if the timer was in the baton to be cancelled.
      */
     virtual bool cancelTimer(const ReactorTimer& timer) = 0;
-
-    /**
-     * Runs the baton.  This blocks, waiting for networking events or timeouts, and fulfills
-     * promises and executes scheduled work.
-     *
-     * Returns false if the optional deadline has passed
-     */
-    virtual bool run(OperationContext* opCtx, boost::optional<Date_t> deadline) = 0;
 };
 
 using BatonHandle = std::shared_ptr<Baton>;

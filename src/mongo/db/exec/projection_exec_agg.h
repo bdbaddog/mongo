@@ -62,20 +62,29 @@ public:
 
     ~ProjectionExecAgg();
 
+    BSONObj applyProjection(BSONObj inputDoc) const;
+
+    stdx::unordered_set<std::string> applyProjectionToFields(
+        const stdx::unordered_set<std::string>& fields) const;
+
+    /**
+     * Apply the projection to a single field name. Returns whether or not the projection would
+     * allow that field to remain in a document.
+     **/
+    bool applyProjectionToOneField(StringData field) const;
+
+    /**
+     * Returns the exhaustive set of all paths that will be preserved by this projection, or an
+     * empty set if the exhaustive set cannot be determined. An inclusion will always produce an
+     * exhaustive set; an exclusion will always produce an empty set.
+     */
+    std::set<std::string> getExhaustivePaths() const;
+
     ProjectionType getType() const;
 
     BSONObj getProjectionSpec() const {
         return _projSpec;
     }
-
-    const BSONObj& getSpec() const {
-        return _projSpec;
-    }
-
-    BSONObj applyProjection(BSONObj inputDoc) const;
-
-    stdx::unordered_set<std::string> applyProjectionToFields(
-        const stdx::unordered_set<std::string>& fields) const;
 
 private:
     /**

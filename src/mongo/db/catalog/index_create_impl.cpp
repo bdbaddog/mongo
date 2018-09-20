@@ -74,6 +74,12 @@ MONGO_FAIL_POINT_DEFINE(hangAfterIndexBuildOf);
 
 AtomicInt32 maxIndexBuildMemoryUsageMegabytes(500);
 
+MONGO_REGISTER_SHIM(MultiIndexBlock::makeImpl)
+(OperationContext* const opCtx, Collection* const collection, PrivateTo<MultiIndexBlock>)
+    ->std::unique_ptr<MultiIndexBlock::Impl> {
+    return stdx::make_unique<MultiIndexBlockImpl>(opCtx, collection);
+}
+
 class ExportedMaxIndexBuildMemoryUsageParameter
     : public ExportedServerParameter<std::int32_t, ServerParameterType::kStartupAndRuntime> {
 public:
@@ -223,16 +229,8 @@ StatusWith<std::vector<BSONObj>> MultiIndexBlockImpl::init(const std::vector<BSO
     for (size_t i = 0; i < indexSpecs.size(); i++) {
         BSONObj info = indexSpecs[i];
 
-        string pluginName = IndexNames::findPluginName(info["key"].Obj());
-        if (pluginName.size()) {
-            Status s = _collection->getIndexCatalog()->_upgradeDatabaseMinorVersionIfNeeded(
-                _opCtx, pluginName);
-            if (!s.isOK())
-                return s;
-        }
-
         // Any foreground indexes make all indexes be built in the foreground.
-        _buildInBackground = (_buildInBackground && initBackgroundIndexFromSpec(info));
+        _buildInBackground = (_buildInBackground && info["background"].trueValue());
     }
 
     std::vector<BSONObj> indexInfoObjs;
@@ -311,7 +309,7 @@ StatusWith<std::vector<BSONObj>> MultiIndexBlockImpl::init(const std::vector<BSO
         log() << "Index build interrupted due to 'crashAfterStartingIndexBuild' failpoint. Exiting "
                  "after waiting for changes to become durable.";
         Locker::LockSnapshot lockInfo;
-        _opCtx->lockState()->saveLockStateAndUnlock(&lockInfo);
+        invariant(_opCtx->lockState()->saveLockStateAndUnlock(&lockInfo));
         if (_opCtx->recoveryUnit()->waitUntilDurable()) {
             quickExit(EXIT_TEST);
         }
@@ -330,7 +328,7 @@ void failPointHangDuringBuild(FailPoint* fp, StringData where, const BSONObj& do
     }
 }
 
-Status MultiIndexBlockImpl::insertAllDocumentsInCollection(std::set<RecordId>* dupsOut) {
+Status MultiIndexBlockImpl::insertAllDocumentsInCollection() {
     invariant(!_opCtx->lockState()->inAWriteUnitOfWork());
 
     // Refrain from persisting any multikey updates as a result from building the index. Instead,
@@ -400,16 +398,11 @@ Status MultiIndexBlockImpl::insertAllDocumentsInCollection(std::set<RecordId>* d
             Status ret = insert(objToIndex.value(), loc);
             if (_buildInBackground)
                 exec->saveState();
-            if (ret.isOK()) {
-                wunit.commit();
-            } else if (dupsOut && ret.code() == ErrorCodes::DuplicateKey) {
-                // If dupsOut is non-null, we should only fail the specific insert that
-                // led to a DuplicateKey rather than the whole index build.
-                dupsOut->insert(loc);
-            } else {
+            if (!ret.isOK()) {
                 // Fail the index build hard.
                 return ret;
             }
+            wunit.commit();
             if (_buildInBackground) {
                 auto restoreStatus = exec->restoreState();  // Handles any WCEs internally.
                 if (!restoreStatus.isOK()) {
@@ -447,7 +440,7 @@ Status MultiIndexBlockImpl::insertAllDocumentsInCollection(std::set<RecordId>* d
     if (MONGO_FAIL_POINT(hangAfterStartingIndexBuildUnlocked)) {
         // Unlock before hanging so replication recognizes we've completed.
         Locker::LockSnapshot lockInfo;
-        _opCtx->lockState()->saveLockStateAndUnlock(&lockInfo);
+        invariant(_opCtx->lockState()->saveLockStateAndUnlock(&lockInfo));
         while (MONGO_FAIL_POINT(hangAfterStartingIndexBuildUnlocked)) {
             log() << "Hanging index build with no locks due to "
                      "'hangAfterStartingIndexBuildUnlocked' failpoint";
@@ -467,7 +460,7 @@ Status MultiIndexBlockImpl::insertAllDocumentsInCollection(std::set<RecordId>* d
 
     progress->finished();
 
-    Status ret = doneInserting(dupsOut);
+    Status ret = doneInserting();
     if (!ret.isOK())
         return ret;
 
@@ -485,7 +478,7 @@ Status MultiIndexBlockImpl::insert(const BSONObj& doc, const RecordId& loc) {
         int64_t unused;
         Status idxStatus(ErrorCodes::InternalError, "");
         if (_indexes[i].bulk) {
-            idxStatus = _indexes[i].bulk->insert(_opCtx, doc, loc, _indexes[i].options, &unused);
+            idxStatus = _indexes[i].bulk->insert(_opCtx, doc, loc, _indexes[i].options);
         } else {
             idxStatus = _indexes[i].real->insert(_opCtx, doc, loc, _indexes[i].options, &unused);
         }

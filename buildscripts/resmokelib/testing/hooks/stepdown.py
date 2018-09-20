@@ -25,7 +25,7 @@ class ContinuousStepdown(interface.Hook):  # pylint: disable=too-many-instance-a
 
     def __init__(  # pylint: disable=too-many-arguments
             self, hook_logger, fixture, config_stepdown=True, shard_stepdown=True,
-            stepdown_duration_secs=10, stepdown_interval_ms=8000, terminate=False, kill=False,
+            stepdown_interval_ms=8000, terminate=False, kill=False,
             use_stepdown_permitted_file=False, use_stepping_down_file=False,
             wait_for_mongos_retarget=False):
         """Initialize the ContinuousStepdown.
@@ -35,7 +35,6 @@ class ContinuousStepdown(interface.Hook):  # pylint: disable=too-many-instance-a
             fixture: the target fixture (a replica set or sharded cluster).
             config_stepdown: whether to stepdown the CSRS.
             shard_stepdown: whether to stepdown the shard replica sets in a sharded cluster.
-            stepdown_duration_secs: the number of seconds to step down the primary.
             stepdown_interval_ms: the number of milliseconds between stepdowns.
             terminate: shut down the node cleanly as a means of stepping it down.
             kill: With a 50% probability, kill the node instead of shutting it down cleanly.
@@ -53,7 +52,6 @@ class ContinuousStepdown(interface.Hook):  # pylint: disable=too-many-instance-a
         self._fixture = fixture
         self._config_stepdown = config_stepdown
         self._shard_stepdown = shard_stepdown
-        self._stepdown_duration_secs = stepdown_duration_secs
         self._stepdown_interval_secs = float(stepdown_interval_ms) / 1000
         self._wait_for_mongos_retarget = wait_for_mongos_retarget
 
@@ -88,8 +86,8 @@ class ContinuousStepdown(interface.Hook):  # pylint: disable=too-many-instance-a
         utils.remove_if_exists(self._stepping_down_file)
         self._stepdown_thread = _StepdownThread(
             self.logger, self._mongos_fixtures, self._rs_fixtures, self._stepdown_interval_secs,
-            self._stepdown_duration_secs, self._terminate, self._kill,
-            self._stepdown_permitted_file, self._stepping_down_file, self._wait_for_mongos_retarget)
+            self._terminate, self._kill, self._stepdown_permitted_file, self._stepping_down_file,
+            self._wait_for_mongos_retarget)
         self.logger.info("Starting the stepdown thread.")
         self._stepdown_thread.start()
 
@@ -142,9 +140,8 @@ class ContinuousStepdown(interface.Hook):  # pylint: disable=too-many-instance-a
 
 class _StepdownThread(threading.Thread):  # pylint: disable=too-many-instance-attributes
     def __init__(  # pylint: disable=too-many-arguments
-            self, logger, mongos_fixtures, rs_fixtures, stepdown_interval_secs,
-            stepdown_duration_secs, terminate, kill, stepdown_permitted_file, stepping_down_file,
-            wait_for_mongos_retarget):
+            self, logger, mongos_fixtures, rs_fixtures, stepdown_interval_secs, terminate, kill,
+            stepdown_permitted_file, stepping_down_file, wait_for_mongos_retarget):
         """Initialize _StepdownThread."""
         threading.Thread.__init__(self, name="StepdownThread")
         self.daemon = True
@@ -152,7 +149,10 @@ class _StepdownThread(threading.Thread):  # pylint: disable=too-many-instance-at
         self._mongos_fixtures = mongos_fixtures
         self._rs_fixtures = rs_fixtures
         self._stepdown_interval_secs = stepdown_interval_secs
-        self._stepdown_duration_secs = stepdown_duration_secs
+        # We set the self._stepdown_duration_secs to a very long time, to ensure that the former
+        # primary will not step back up on its own and the stepdown thread will cause it step up via
+        # replSetStepUp.
+        self._stepdown_duration_secs = 24 * 60 * 60  # 24 hours
         self._terminate = terminate
         self._kill = kill
         self._stepdown_permitted_file = stepdown_permitted_file
@@ -177,25 +177,31 @@ class _StepdownThread(threading.Thread):  # pylint: disable=too-many-instance-at
             self.logger.warning("No replica set on which to run stepdowns.")
             return
 
-        while True:
-            if self._is_stopped():
-                break
-            self._wait_for_permission_or_resume()
-            now = time.time()
-            if now - self._last_exec > self._stepdown_interval_secs:
-                self.logger.info("Starting stepdown of all primaries")
-                self._step_down_all()
-                # Wait until each replica set has a primary, so the test can make progress.
-                self._await_primaries()
-                self._last_exec = time.time()
-                self.logger.info("Completed stepdown of all primaries in %0d ms",
-                                 (self._last_exec - now) * 1000)
-            now = time.time()
-            if self._is_permitted():
-                # The 'wait_secs' is used to wait 'self._stepdown_interval_secs' from the moment
-                # the last stepdown command was sent.
-                wait_secs = max(0, self._stepdown_interval_secs - (now - self._last_exec))
-                self._wait(wait_secs)
+        try:
+            while True:
+                if self._is_stopped():
+                    break
+                self._wait_for_permission_or_resume()
+                now = time.time()
+                if now - self._last_exec > self._stepdown_interval_secs:
+                    self.logger.info("Starting stepdown of all primaries")
+                    self._step_down_all()
+                    # Wait until each replica set has a primary, so the test can make progress.
+                    self._await_primaries()
+                    self._last_exec = time.time()
+                    self.logger.info("Completed stepdown of all primaries in %0d ms",
+                                     (self._last_exec - now) * 1000)
+                now = time.time()
+                if self._is_permitted():
+                    # The 'wait_secs' is used to wait 'self._stepdown_interval_secs' from the moment
+                    # the last stepdown command was sent.
+                    wait_secs = max(0, self._stepdown_interval_secs - (now - self._last_exec))
+                    self._wait(wait_secs)
+
+        except Exception:  # pylint: disable=W0703
+            # Proactively log the exception when it happens so it will be
+            # flushed immediately.
+            self.logger.exception("Stepdown Thread threw exception")
 
     def stop(self):
         """Stop the thread."""
@@ -293,14 +299,6 @@ class _StepdownThread(threading.Thread):  # pylint: disable=too-many-instance-at
             except pymongo.errors.AutoReconnect:
                 # AutoReconnect exceptions are expected as connections are closed during stepdown.
                 pass
-            except pymongo.errors.ExecutionTimeout as err:
-                # ExecutionTimeout exceptions are expected when the election attempt fails due to
-                # not being able to acquire the global X lock within self._stepdown_duration_secs
-                # seconds. We'll try again after self._stepdown_interval_secs seconds.
-                self.logger.info(
-                    "Failed to step down the primary on port %d of replica set '%s': %s",
-                    primary.port, rs_fixture.replset_name, err)
-                return
             except pymongo.errors.PyMongoError:
                 self.logger.exception(
                     "Error while stepping down the primary on port %d of replica set '%s'.",
@@ -359,17 +357,22 @@ class _StepdownThread(threading.Thread):  # pylint: disable=too-many-instance-at
             # If we failed to step up one of the secondaries, then we run the replSetStepUp to try
             # and elect the former primary again. This way we don't need to wait
             # self._stepdown_duration_secs seconds to restore write availability to the cluster.
-            try:
-                client = primary.mongo_client()
-                client.admin.command("replSetStepUp")
-            except pymongo.errors.OperationFailure as err:
-                # It is possible that by the time we've run the replSetStepUp command that
-                # self._stepdown_duration_secs seconds have already passed and the former primary is
-                # running for election on its own. We just ignore the error response from the former
-                # primary.
-                self.logger.info(
-                    "Failed to step up the old primary on port %d of replica set '%s': %s",
-                    primary.port, rs_fixture.replset_name, err)
+            # Since the former primary may have been killed, we need to wait until it has been
+            # restarted by retrying replSetStepUp.
+            retry_time_secs = rs_fixture.AWAIT_REPL_TIMEOUT_MINS * 60
+            retry_start_time = time.time()
+            while True:
+                try:
+                    client = primary.mongo_client()
+                    client.admin.command("replSetStepUp")
+                    break
+                except pymongo.errors.OperationFailure:
+                    self._wait(0.2)
+                if time.time() - retry_start_time > retry_time_secs:
+                    raise errors.ServerFailure(
+                        "The old primary on port {} of replica set {} did not step up in"
+                        " {} seconds.".format(client.port, rs_fixture.replset_name,
+                                              retry_time_secs))
 
         # Bump the counter for the chosen secondary to indicate that the replSetStepUp command
         # executed successfully.
@@ -403,10 +406,9 @@ class _StepdownThread(threading.Thread):  # pylint: disable=too-many-instance-at
                         pass
                     retarget_time = time.time() - start_time
                     if retarget_time >= 60:
-                        self.logger.exception(
-                            "Timeout waiting for mongos: %s to retarget to db: %s", mongos_conn_str,
-                            db)
-                        raise  # pylint: disable=misplaced-bare-raise
+                        raise RuntimeError(
+                            "Timeout waiting for mongos: {} to retarget to db: {}".format(
+                                mongos_conn_str, db))
                     time.sleep(0.2)
                 for coll in coll_names:
                     while True:
@@ -417,10 +419,9 @@ class _StepdownThread(threading.Thread):  # pylint: disable=too-many-instance-at
                             pass
                         retarget_time = time.time() - start_time
                         if retarget_time >= 60:
-                            self.logger.exception(
-                                "Timeout waiting for mongos: %s to retarget to db: %s",
-                                mongos_conn_str, db)
-                            raise  # pylint: disable=misplaced-bare-raise
+                            raise RuntimeError(
+                                "Timeout waiting for mongos: {} to retarget to db: {}".format(
+                                    mongos_conn_str, db))
                         time.sleep(0.2)
                 retarget_time = time.time() - start_time
                 self.logger.info("Finished waiting for mongos: %s to retarget db: %s, in %d ms",
@@ -439,7 +440,8 @@ class _StepdownThread(threading.Thread):  # pylint: disable=too-many-instance-at
         """Create self._stepping_down_file, if specified."""
         if self._stepping_down_file:
             if os.path.isfile(self._stepping_down_file):
-                raise  # pylint: disable=misplaced-bare-raise
+                raise RuntimeError("Stepping down file {} already exists".format(
+                    self._stepping_down_file))
             with open(self._stepping_down_file, "w") as fh:
                 fh.write("")
 

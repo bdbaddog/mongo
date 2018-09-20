@@ -207,12 +207,10 @@ PlanStage::StageState AndHashStage::doWork(WorkingSetID* out) {
     // We know that we've ADVANCED.  See if the WSM is in our table.
     WorkingSetMember* member = _ws->get(*out);
 
-    // Maybe the child had an invalidation.  We intersect RecordId(s) so we can't do anything
-    // with this WSM.
-    if (!member->hasRecordId()) {
-        _ws->flagForReview(*out);
-        return PlanStage::NEED_TIME;
-    }
+    // The child must give us a WorkingSetMember with a record id, since we intersect index keys
+    // based on the record id. The planner ensures that the child stage can never produce an WSM
+    // with no record id.
+    invariant(member->hasRecordId());
 
     DataMap::iterator it = _dataMap.find(member->recordId);
     if (_dataMap.end() == it) {
@@ -252,12 +250,10 @@ PlanStage::StageState AndHashStage::readFirstChild(WorkingSetID* out) {
     if (PlanStage::ADVANCED == childStatus) {
         WorkingSetMember* member = _ws->get(id);
 
-        // Maybe the child had an invalidation.  We intersect RecordId(s) so we can't do anything
-        // with this WSM.
-        if (!member->hasRecordId()) {
-            _ws->flagForReview(id);
-            return PlanStage::NEED_TIME;
-        }
+        // The child must give us a WorkingSetMember with a record id, since we intersect index keys
+        // based on the record id. The planner ensures that the child stage can never produce an WSM
+        // with no record id.
+        invariant(member->hasRecordId());
 
         if (!_dataMap.insert(std::make_pair(member->recordId, id)).second) {
             // Didn't insert because we already had this RecordId inside the map. This should only
@@ -311,14 +307,11 @@ PlanStage::StageState AndHashStage::hashOtherChildren(WorkingSetID* out) {
     if (PlanStage::ADVANCED == childStatus) {
         WorkingSetMember* member = _ws->get(id);
 
-        // Maybe the child had an invalidation.  We intersect RecordId(s) so we can't do anything
-        // with this WSM.
-        if (!member->hasRecordId()) {
-            _ws->flagForReview(id);
-            return PlanStage::NEED_TIME;
-        }
+        // The child must give us a WorkingSetMember with a record id, since we intersect index keys
+        // based on the record id. The planner ensures that the child stage can never produce an
+        // WSM with no record id.
+        invariant(member->hasRecordId());
 
-        verify(member->hasRecordId());
         if (_dataMap.end() == _dataMap.find(member->recordId)) {
             // Ignore.  It's not in any previous child.
         } else {
@@ -387,59 +380,6 @@ PlanStage::StageState AndHashStage::hashOtherChildren(WorkingSetID* out) {
         }
 
         return childStatus;
-    }
-}
-
-void AndHashStage::doInvalidate(OperationContext* opCtx,
-                                const RecordId& dl,
-                                InvalidationType type) {
-    // TODO remove this since calling isEOF is illegal inside of doInvalidate().
-    if (isEOF()) {
-        return;
-    }
-
-    // Invalidation can happen to our warmup results.  If that occurs just
-    // flag it and forget about it.
-    for (size_t i = 0; i < _lookAheadResults.size(); ++i) {
-        if (WorkingSet::INVALID_ID != _lookAheadResults[i]) {
-            WorkingSetMember* member = _ws->get(_lookAheadResults[i]);
-            if (member->hasRecordId() && member->recordId == dl) {
-                WorkingSetCommon::fetchAndInvalidateRecordId(opCtx, member, _collection);
-                _ws->flagForReview(_lookAheadResults[i]);
-                _lookAheadResults[i] = WorkingSet::INVALID_ID;
-            }
-        }
-    }
-
-    // If it's a deletion, we have to forget about the RecordId, and since the AND-ing is by
-    // RecordId we can't continue processing it even with the object.
-    //
-    // If it's a mutation the predicates implied by the AND-ing may no longer be true.
-    //
-    // So, we flag and try to pick it up later.
-    DataMap::iterator it = _dataMap.find(dl);
-    if (_dataMap.end() != it) {
-        WorkingSetID id = it->second;
-        WorkingSetMember* member = _ws->get(id);
-        verify(member->recordId == dl);
-
-        if (_hashingChildren) {
-            ++_specificStats.flaggedInProgress;
-        } else {
-            ++_specificStats.flaggedButPassed;
-        }
-
-        // Update memory stats.
-        _memUsage -= member->getMemUsage();
-
-        // The RecordId is about to be invalidated.  Fetch it and clear the RecordId.
-        WorkingSetCommon::fetchAndInvalidateRecordId(opCtx, member, _collection);
-
-        // Add the WSID to the to-be-reviewed list in the WS.
-        _ws->flagForReview(id);
-
-        // And don't return it from this stage.
-        _dataMap.erase(it);
     }
 }
 

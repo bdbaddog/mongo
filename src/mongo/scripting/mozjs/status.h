@@ -51,6 +51,7 @@ struct MongoStatusInfo : public BaseInfo {
     struct Functions {
         MONGO_DECLARE_JS_FUNCTION(code);
         MONGO_DECLARE_JS_FUNCTION(reason);
+        MONGO_DECLARE_JS_FUNCTION(stack);
     };
 
     static void postInstall(JSContext* cx, JS::HandleObject global, JS::HandleObject proto);

@@ -36,6 +36,7 @@
 #include "mongo/config.h"
 #include "mongo/db/catalog/database_holder.h"
 #include "mongo/db/catalog/health_log.h"
+#include "mongo/db/catalog/index_key_validate.h"
 #include "mongo/db/catalog/uuid_catalog.h"
 #include "mongo/db/client.h"
 #include "mongo/db/commands/feature_compatibility_version.h"
@@ -55,6 +56,8 @@
 #include "mongo/db/storage/encryption_hooks.h"
 #include "mongo/db/storage/storage_engine_init.h"
 #include "mongo/db/ttl.h"
+#include "mongo/embedded/logical_session_cache_factory_embedded.h"
+#include "mongo/embedded/periodic_runner_embedded.h"
 #include "mongo/embedded/replication_coordinator_embedded.h"
 #include "mongo/embedded/service_entry_point_embedded.h"
 #include "mongo/logger/log_component.h"
@@ -114,6 +117,19 @@ MONGO_INITIALIZER(fsyncLockedForWriting)(InitializerContext* context) {
     setLockedForWritingImpl([]() { return false; });
     return Status::OK();
 }
+
+GlobalInitializerRegisterer filterAllowedIndexFieldNamesEmbeddedInitializer(
+    "FilterAllowedIndexFieldNamesEmbedded",
+    {},
+    {"FilterAllowedIndexFieldNames"},
+    [](InitializerContext* service) {
+        index_key_validate::filterAllowedIndexFieldNames =
+            [](std::set<StringData>& allowedIndexFieldNames) {
+                allowedIndexFieldNames.erase(IndexDescriptor::kBackgroundFieldName);
+                allowedIndexFieldNames.erase(IndexDescriptor::kExpireAfterSecondsFieldName);
+            };
+        return Status::OK();
+    });
 }  // namespace
 
 using logger::LogComponent;
@@ -135,6 +151,8 @@ void shutdown(ServiceContext* srvContext) {
         UninterruptibleLockGuard noInterrupt(shutdownOpCtx->lockState());
         Lock::GlobalLock lk(shutdownOpCtx.get(), MODE_X);
         DatabaseHolder::getDatabaseHolder().closeAll(shutdownOpCtx.get(), "shutdown");
+
+        LogicalSessionCache::set(serviceContext, nullptr);
 
         // Shut down the background periodic task runner
         if (auto runner = serviceContext->getPeriodicRunner()) {
@@ -285,6 +303,15 @@ ServiceContext* initialize(const char* yaml_config) {
     if (!storageGlobalParams.readOnly) {
         restartInProgressIndexesFromLastShutdown(startupOpCtx.get());
     }
+
+    auto periodicRunner = std::make_unique<PeriodicRunnerEmbedded>(
+        serviceContext, serviceContext->getPreciseClockSource());
+    periodicRunner->startup();
+    serviceContext->setPeriodicRunner(std::move(periodicRunner));
+
+    // Set up the logical session cache
+    auto sessionCache = makeLogicalSessionCacheEmbedded();
+    LogicalSessionCache::set(serviceContext, std::move(sessionCache));
 
     // MessageServer::run will return when exit code closes its socket and we don't need the
     // operation context anymore

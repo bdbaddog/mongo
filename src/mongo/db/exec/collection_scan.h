@@ -58,7 +58,6 @@ public:
     StageState doWork(WorkingSetID* out) final;
     bool isEOF() final;
 
-    void doInvalidate(OperationContext* opCtx, const RecordId& dl, InvalidationType type) final;
     void doSaveState() final;
     void doRestoreState() final;
     void doDetachFromOperationContext() final;
@@ -110,11 +109,6 @@ private:
     bool _isDead;
 
     RecordId _lastSeenId;  // Null if nothing has been returned from _cursor yet.
-
-    // We allocate a working set member with this id on construction of the stage. It gets used for
-    // all fetch requests. This should only be used for passing up the Fetcher for a NEED_YIELD, and
-    // should remain in the INVALID state.
-    const WorkingSetID _wsidForFetch;
 
     // If _params.shouldTrackLatestOplogTimestamp is set and the collection is the oplog, the latest
     // timestamp seen in the collection.  Otherwise, this is a null timestamp.

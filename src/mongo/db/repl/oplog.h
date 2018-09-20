@@ -31,6 +31,7 @@
 #include <string>
 #include <vector>
 
+#include "mongo/base/shim.h"
 #include "mongo/base/status.h"
 #include "mongo/bson/bsonobj.h"
 #include "mongo/bson/timestamp.h"
@@ -163,15 +164,6 @@ void acquireOplogCollectionForLogging(OperationContext* opCtx);
 void establishOplogCollectionForLogging(OperationContext* opCtx, Collection* oplog);
 
 using IncrementOpsAppliedStatsFn = stdx::function<void()>;
-/**
- * Take the object field of a BSONObj, the BSONObj, and the namespace of
- * the operation and perform necessary validation to ensure the BSONObj is a
- * properly-formed command to insert into system.indexes. This is only to
- * be used for insert operations into system.indexes. It is called via applyOps.
- */
-std::pair<BSONObj, NamespaceString> prepForApplyOpsIndexInsert(const BSONElement& fieldO,
-                                                               const BSONObj& op,
-                                                               const NamespaceString& requestNss);
 
 /**
  * This class represents the different modes of oplog application that are used within the
@@ -264,11 +256,20 @@ void createIndexForApplyOps(OperationContext* opCtx,
                             IncrementOpsAppliedStatsFn incrementOpsAppliedStats,
                             OplogApplication::Mode mode);
 
-/**
- * Allocates optimes for new entries in the oplog.  Returns an OplogSlot or a vector of OplogSlots,
- * which contain the new optimes along with their terms and newly calculated hash fields.
- */
-OplogSlot getNextOpTime(OperationContext* opCtx);
+// Shims currently do not support free functions so we wrap getNextOpTime in a class as a
+// workaround.
+struct GetNextOpTimeClass {
+    /**
+     * Allocates optimes for new entries in the oplog.  Returns an OplogSlot or a vector of
+     * OplogSlots, which contain the new optimes along with their terms and newly calculated hash
+     * fields.
+     */
+    static MONGO_DECLARE_SHIM((OperationContext * opCtx)->OplogSlot) getNextOpTime;
+};
+
+inline OplogSlot getNextOpTime(OperationContext* opCtx) {
+    return GetNextOpTimeClass::getNextOpTime(opCtx);
+}
 
 /**
  * Allocates an OpTime, but does not update the storage engine with the timestamp. This is used to

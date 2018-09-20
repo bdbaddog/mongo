@@ -131,7 +131,6 @@
             skip: "Tested in views/views_sharded.js",
         },
         clearLog: {skip: isUnrelated},
-        clone: {skip: "Tested in replsets/cloneDb.js"},
         cloneCollection: {skip: "Tested in noPassthroughWithMongod/clonecollection.js"},
         cloneCollectionAsCapped: {
             command: {cloneCollectionAsCapped: "view", toCollection: "testcapped", size: 10240},
@@ -147,8 +146,6 @@
         connectionStatus: {skip: isUnrelated},
         convertToCapped: {command: {convertToCapped: "view", size: 12345}, expectFailure: true},
         coordinateCommitTransaction: {skip: isUnrelated},
-        copydb: {skip: "Tested in replsets/copydb.js"},
-        copydbsaslstart: {skip: isUnrelated},
         count: {command: {count: "view"}},
         cpuload: {skip: isAnInternalCommand},
         create: {skip: "tested in views/views_creation.js"},
@@ -430,7 +427,7 @@
             }
         ],
         repairCursor: {command: {repairCursor: "view"}, expectFailure: true},
-        repairDatabase: {command: {repairDatabase: 1}},
+        repairDatabase: {skip: isUnrelated},
         replSetAbortPrimaryCatchUp: {skip: isUnrelated},
         replSetFreeze: {skip: isUnrelated},
         replSetGetConfig: {skip: isUnrelated},
@@ -541,6 +538,9 @@
         updateZoneKeyRange: {skip: isUnrelated},
         usersInfo: {skip: isUnrelated},
         validate: {command: {validate: "view"}, expectFailure: true},
+        waitForOngoingChunkSplits: {skip: isUnrelated},
+        voteCommitTransaction: {skip: isUnrelated},
+        voteAbortTransaction: {skip: isUnrelated},
         whatsmyuri: {skip: isUnrelated}
     };
 

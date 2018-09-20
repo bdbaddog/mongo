@@ -46,6 +46,7 @@
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/query/explain.h"
 #include "mongo/db/query/plan_ranker.h"
+#include "mongo/util/hex.h"
 #include "mongo/util/log.h"
 
 namespace {
@@ -246,11 +247,10 @@ Status PlanCacheListQueryShapes::list(const PlanCache& planCache, BSONObjBuilder
     invariant(bob);
 
     // Fetch all cached solutions from plan cache.
-    vector<PlanCacheEntry*> solutions = planCache.getAllEntries();
+    auto entries = planCache.getAllEntries();
 
     BSONArrayBuilder arrayBuilder(bob->subarrayStart("shapes"));
-    for (vector<PlanCacheEntry*>::const_iterator i = solutions.begin(); i != solutions.end(); i++) {
-        PlanCacheEntry* entry = *i;
+    for (auto&& entry : entries) {
         invariant(entry);
 
         BSONObjBuilder shapeBuilder(arrayBuilder.subobjStart());
@@ -260,10 +260,8 @@ Status PlanCacheListQueryShapes::list(const PlanCache& planCache, BSONObjBuilder
         if (!entry->collation.isEmpty()) {
             shapeBuilder.append("collation", entry->collation);
         }
+        shapeBuilder.append("queryHash", unsignedIntToFixedLengthHex(entry->queryHash));
         shapeBuilder.doneFast();
-
-        // Release resources for cached solution after extracting query shape.
-        delete entry;
     }
     arrayBuilder.doneFast();
 
@@ -310,18 +308,14 @@ Status PlanCacheClear::clear(OperationContext* opCtx,
 
         unique_ptr<CanonicalQuery> cq = std::move(statusWithCQ.getValue());
 
-        if (planCache->get(*cq).state == PlanCache::CacheEntryState::kNotPresent) {
-            // Log if asked to clear non-existent query shape.
+        Status result = planCache->remove(*cq);
+        if (!result.isOK()) {
+            invariant(result.code() == ErrorCodes::NoSuchKey);
             LOG(1) << ns << ": query shape doesn't exist in PlanCache - "
                    << redact(cq->getQueryObj()) << "(sort: " << cq->getQueryRequest().getSort()
                    << "; projection: " << cq->getQueryRequest().getProj()
                    << "; collation: " << cq->getQueryRequest().getCollation() << ")";
             return Status::OK();
-        }
-
-        Status result = planCache->remove(*cq);
-        if (!result.isOK()) {
-            return result;
         }
 
         LOG(1) << ns << ": removed plan cache entry - " << redact(cq->getQueryObj())
@@ -359,30 +353,15 @@ Status PlanCacheListPlans::runPlanCacheCommand(OperationContext* opCtx,
     AutoGetCollectionForReadCommand ctx(opCtx, NamespaceString(ns));
 
     PlanCache* planCache;
-    Status status = getPlanCache(opCtx, ctx.getCollection(), ns, &planCache);
-    if (!status.isOK()) {
-        // No collection - return empty plans array.
-        BSONArrayBuilder plansBuilder(bob->subarrayStart("plans"));
-        plansBuilder.doneFast();
-        return Status::OK();
-    }
+    uassertStatusOK(getPlanCache(opCtx, ctx.getCollection(), ns, &planCache));
     return list(opCtx, *planCache, ns, cmdObj, bob);
 }
 
-// static
-Status PlanCacheListPlans::list(OperationContext* opCtx,
-                                const PlanCache& planCache,
-                                const std::string& ns,
-                                const BSONObj& cmdObj,
-                                BSONObjBuilder* bob) {
-    auto statusWithCQ = canonicalize(opCtx, ns, cmdObj);
-    if (!statusWithCQ.isOK()) {
-        return statusWithCQ.getStatus();
-    }
-    unique_ptr<CanonicalQuery> cq = std::move(statusWithCQ.getValue());
-
+namespace {
+Status listPlansOriginalFormat(std::unique_ptr<CanonicalQuery> cq,
+                               const PlanCache& planCache,
+                               BSONObjBuilder* bob) {
     auto lookupResult = planCache.getEntry(*cq);
-
     if (lookupResult == ErrorCodes::NoSuchKey) {
         // Return empty plans in results if query shape does not
         // exist in plan cache.
@@ -392,9 +371,11 @@ Status PlanCacheListPlans::list(OperationContext* opCtx,
     } else if (!lookupResult.isOK()) {
         return lookupResult.getStatus();
     }
-    std::unique_ptr<PlanCacheEntry> entry = std::move(lookupResult.getValue());
+
+    auto entry = std::move(lookupResult.getValue());
 
     BSONArrayBuilder plansBuilder(bob->subarrayStart("plans"));
+
     size_t numPlans = entry->plannerData.size();
     invariant(numPlans == entry->decision->stats.size());
     invariant(numPlans == entry->decision->scores.size());
@@ -427,7 +408,7 @@ Status PlanCacheListPlans::list(OperationContext* opCtx,
             BSONArrayBuilder scoresBob(feedbackBob.subarrayStart("scores"));
             for (size_t i = 0; i < entry->feedback.size(); ++i) {
                 BSONObjBuilder scoreBob(scoresBob.subobjStart());
-                scoreBob.append("score", entry->feedback[i]->score);
+                scoreBob.append("score", entry->feedback[i]);
             }
             scoresBob.doneFast();
         }
@@ -440,11 +421,33 @@ Status PlanCacheListPlans::list(OperationContext* opCtx,
 
     // Append the time the entry was inserted into the plan cache.
     bob->append("timeOfCreation", entry->timeOfCreation);
-
+    bob->append("queryHash", unsignedIntToFixedLengthHex(entry->queryHash));
     // Append whether or not the entry is active.
     bob->append("isActive", entry->isActive);
     bob->append("works", static_cast<long long>(entry->works));
+    return Status::OK();
+}
+}  // namespace
 
+// static
+Status PlanCacheListPlans::list(OperationContext* opCtx,
+                                const PlanCache& planCache,
+                                const std::string& ns,
+                                const BSONObj& cmdObj,
+                                BSONObjBuilder* bob) {
+    auto statusWithCQ = canonicalize(opCtx, ns, cmdObj);
+    if (!statusWithCQ.isOK()) {
+        return statusWithCQ.getStatus();
+    }
+
+    if (!internalQueryCacheListPlansNewOutput.load())
+        return listPlansOriginalFormat(std::move(statusWithCQ.getValue()), planCache, bob);
+
+    unique_ptr<CanonicalQuery> cq = std::move(statusWithCQ.getValue());
+    auto entry = uassertStatusOK(planCache.getEntry(*cq));
+
+    // internalQueryCacheDisableInactiveEntries is True and we should use the new output format.
+    Explain::planCacheEntryToBSON(*entry, bob);
     return Status::OK();
 }
 

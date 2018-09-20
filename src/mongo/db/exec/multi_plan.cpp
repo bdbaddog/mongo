@@ -45,7 +45,6 @@
 #include "mongo/db/query/explain.h"
 #include "mongo/db/query/plan_cache.h"
 #include "mongo/db/query/plan_ranker.h"
-#include "mongo/db/storage/record_fetcher.h"
 #include "mongo/stdx/memory.h"
 #include "mongo/util/log.h"
 #include "mongo/util/mongoutils/str.h"
@@ -111,7 +110,7 @@ PlanStage::StageState MultiPlanStage::doWork(WorkingSetID* out) {
     // Look for an already produced result that provides the data the caller wants.
     if (!bestPlan.results.empty()) {
         *out = bestPlan.results.front();
-        bestPlan.results.pop_front();
+        bestPlan.results.pop();
         return PlanStage::ADVANCED;
     }
 
@@ -148,11 +147,11 @@ PlanStage::StageState MultiPlanStage::doWork(WorkingSetID* out) {
 Status MultiPlanStage::tryYield(PlanYieldPolicy* yieldPolicy) {
     // These are the conditions which can cause us to yield:
     //   1) The yield policy's timer elapsed, or
-    //   2) some stage requested a yield due to a document fetch, or
+    //   2) some stage requested a yield, or
     //   3) we need to yield and retry due to a WriteConflictException.
     // In all cases, the actual yielding happens here.
     if (yieldPolicy->shouldYieldOrInterrupt()) {
-        auto yieldStatus = yieldPolicy->yieldOrInterrupt(_fetcher.get());
+        auto yieldStatus = yieldPolicy->yieldOrInterrupt();
 
         if (!yieldStatus.isOK()) {
             _failure = true;
@@ -161,10 +160,6 @@ Status MultiPlanStage::tryYield(PlanYieldPolicy* yieldPolicy) {
             return yieldStatus;
         }
     }
-
-    // We're done using the fetcher, so it should be freed. We don't want to
-    // use the same RecordFetcher twice.
-    _fetcher.reset();
 
     return Status::OK();
 }
@@ -236,11 +231,11 @@ Status MultiPlanStage::pickBestPlan(PlanYieldPolicy* yieldPolicy) {
     std::vector<size_t> candidateOrder = ranking->candidateOrder;
 
     CandidatePlan& bestCandidate = _candidates[_bestPlanIdx];
-    std::list<WorkingSetID>& alreadyProduced = bestCandidate.results;
+    const auto& alreadyProduced = bestCandidate.results;
     const auto& bestSolution = bestCandidate.solution;
 
     LOG(5) << "Winning solution:\n" << redact(bestSolution->toString());
-    LOG(2) << "Winning plan: " << redact(Explain::getPlanSummary(bestCandidate.root));
+    LOG(2) << "Winning plan: " << Explain::getPlanSummary(bestCandidate.root);
 
     _backupPlanIdx = kNoSuchPlan;
     if (bestSolution->hasBlockingStage && (0 == alreadyProduced.size())) {
@@ -277,10 +272,10 @@ Status MultiPlanStage::pickBestPlan(PlanYieldPolicy* yieldPolicy) {
 
             LOG(1) << "Winning plan tied with runner-up. Not caching."
                    << " ns: " << _collection->ns() << " " << redact(_query->toStringShort())
-                   << " winner score: " << ranking->scores[0] << " winner summary: "
-                   << redact(Explain::getPlanSummary(_candidates[winnerIdx].root))
+                   << " winner score: " << ranking->scores[0]
+                   << " winner summary: " << Explain::getPlanSummary(_candidates[winnerIdx].root)
                    << " runner-up score: " << ranking->scores[1] << " runner-up summary: "
-                   << redact(Explain::getPlanSummary(_candidates[runnerUpIdx].root));
+                   << Explain::getPlanSummary(_candidates[runnerUpIdx].root);
         }
 
         if (alreadyProduced.empty()) {
@@ -291,8 +286,8 @@ Status MultiPlanStage::pickBestPlan(PlanYieldPolicy* yieldPolicy) {
             size_t winnerIdx = ranking->candidateOrder[0];
             LOG(1) << "Winning plan had zero results. Not caching."
                    << " ns: " << _collection->ns() << " " << redact(_query->toStringShort())
-                   << " winner score: " << ranking->scores[0] << " winner summary: "
-                   << redact(Explain::getPlanSummary(_candidates[winnerIdx].root));
+                   << " winner score: " << ranking->scores[0]
+                   << " winner summary: " << Explain::getPlanSummary(_candidates[winnerIdx].root);
         }
     }
 
@@ -360,7 +355,7 @@ bool MultiPlanStage::workAllPlans(size_t numResults, PlanYieldPolicy* yieldPolic
             // Ensure that the BSONObj underlying the WorkingSetMember is owned in case we choose to
             // return the results from the 'candidate' plan.
             member->makeObjOwnedIfNeeded();
-            candidate.results.push_back(id);
+            candidate.results.push(id);
 
             // Once a plan returns enough results, stop working.
             if (candidate.results.size() >= numResults) {
@@ -371,14 +366,9 @@ bool MultiPlanStage::workAllPlans(size_t numResults, PlanYieldPolicy* yieldPolic
             // Assumes that the ranking will pick this plan.
             doneWorking = true;
         } else if (PlanStage::NEED_YIELD == state) {
-            if (id == WorkingSet::INVALID_ID) {
-                if (!yieldPolicy->canAutoYield())
-                    throw WriteConflictException();
-            } else {
-                WorkingSetMember* member = candidate.ws->get(id);
-                invariant(member->hasFetcher());
-                // Transfer ownership of the fetcher and yield.
-                _fetcher.reset(member->releaseFetcher());
+            invariant(id == WorkingSet::INVALID_ID);
+            if (!yieldPolicy->canAutoYield()) {
+                throw WriteConflictException();
             }
 
             if (yieldPolicy->canAutoYield()) {
@@ -408,45 +398,6 @@ bool MultiPlanStage::workAllPlans(size_t numResults, PlanYieldPolicy* yieldPolic
     }
 
     return !doneWorking;
-}
-
-namespace {
-
-void invalidateHelper(OperationContext* opCtx,
-                      WorkingSet* ws,  // may flag for review
-                      const RecordId& recordId,
-                      list<WorkingSetID>* idsToInvalidate,
-                      const Collection* collection) {
-    for (auto it = idsToInvalidate->begin(); it != idsToInvalidate->end(); ++it) {
-        WorkingSetMember* member = ws->get(*it);
-        if (member->hasRecordId() && member->recordId == recordId) {
-            WorkingSetCommon::fetchAndInvalidateRecordId(opCtx, member, collection);
-        }
-    }
-}
-
-}  // namespace
-
-void MultiPlanStage::doInvalidate(OperationContext* opCtx,
-                                  const RecordId& recordId,
-                                  InvalidationType type) {
-    if (_failure) {
-        return;
-    }
-
-    if (bestPlanChosen()) {
-        CandidatePlan& bestPlan = _candidates[_bestPlanIdx];
-        invalidateHelper(opCtx, bestPlan.ws, recordId, &bestPlan.results, _collection);
-        if (hasBackupPlan()) {
-            CandidatePlan& backupPlan = _candidates[_backupPlanIdx];
-            invalidateHelper(opCtx, backupPlan.ws, recordId, &backupPlan.results, _collection);
-        }
-    } else {
-        for (size_t ix = 0; ix < _candidates.size(); ++ix) {
-            invalidateHelper(
-                opCtx, _candidates[ix].ws, recordId, &_candidates[ix].results, _collection);
-        }
-    }
 }
 
 bool MultiPlanStage::hasBackupPlan() const {

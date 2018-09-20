@@ -80,7 +80,9 @@ public:
     }
 
     bool isAuthenticated() override {
-        UASSERT_NOT_IMPLEMENTED;
+        // It should always be okay to check whether you're authenticated, but on embedded
+        // it should always return false
+        return false;
     }
 
     UserNameIterator getAuthenticatedUserNames() override {
@@ -120,7 +122,7 @@ public:
         return Status::OK();
     }
 
-    Status checkAuthForInsert(OperationContext*, const NamespaceString&, const BSONObj&) override {
+    Status checkAuthForInsert(OperationContext*, const NamespaceString&) override {
         return Status::OK();
     }
 

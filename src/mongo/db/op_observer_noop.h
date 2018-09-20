@@ -36,7 +36,7 @@ class OpObserverNoop : public OpObserver {
 public:
     void onCreateIndex(OperationContext* opCtx,
                        const NamespaceString& nss,
-                       OptionalCollectionUUID uuid,
+                       CollectionUUID uuid,
                        BSONObj indexDoc,
                        bool fromMigrate) override {}
     void onInserts(OperationContext* opCtx,
@@ -110,7 +110,7 @@ public:
                        const NamespaceString& collectionName,
                        OptionalCollectionUUID uuid) override {}
     void onTransactionCommit(OperationContext* opCtx, bool wasPrepared) override{};
-    void onTransactionPrepare(OperationContext* opCtx) override{};
+    void onTransactionPrepare(OperationContext* opCtx, const OplogSlot& prepareOpTime) override{};
     void onTransactionAbort(OperationContext* opCtx) override{};
     void onReplicationRollback(OperationContext* opCtx,
                                const RollbackObserverInfo& rbInfo) override {}

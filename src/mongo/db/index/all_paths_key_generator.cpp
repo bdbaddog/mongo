@@ -62,7 +62,7 @@ void popPathComponent(BSONElement elem, bool enclosingObjIsArray, FieldRef* path
 constexpr StringData AllPathsKeyGenerator::kSubtreeSuffix;
 
 std::unique_ptr<ProjectionExecAgg> AllPathsKeyGenerator::createProjectionExec(
-    const BSONObj& keyPattern, const BSONObj& pathProjection) {
+    BSONObj keyPattern, BSONObj pathProjection) {
     // We should never have a key pattern that contains more than a single element.
     invariant(keyPattern.nFields() == 1);
 
@@ -99,20 +99,19 @@ AllPathsKeyGenerator::AllPathsKeyGenerator(BSONObj keyPattern,
 
 void AllPathsKeyGenerator::generateKeys(BSONObj inputDoc,
                                         BSONObjSet* keys,
-                                        MultikeyPathsMock* multikeyPaths) const {
-    FieldRef workingPath;
-    _traverseAllPaths(
-        _projExec->applyProjection(inputDoc), false, &workingPath, keys, multikeyPaths);
+                                        BSONObjSet* multikeyPaths) const {
+    FieldRef rootPath;
+    _traverseAllPaths(_projExec->applyProjection(inputDoc), false, &rootPath, keys, multikeyPaths);
 }
 
 void AllPathsKeyGenerator::_traverseAllPaths(BSONObj obj,
                                              bool objIsArray,
                                              FieldRef* path,
                                              BSONObjSet* keys,
-                                             MultikeyPathsMock* multikeyPaths) const {
+                                             BSONObjSet* multikeyPaths) const {
     for (const auto elem : obj) {
-        // If this element is an empty object, fast-path skip it.
-        if (elem.type() == BSONType::Object && elem.Obj().isEmpty())
+        // If the element's fieldName contains a ".", fast-path skip it because it's not queryable.
+        if (elem.fieldNameStringData().find('.', 0) != std::string::npos)
             continue;
 
         // Append the element's fieldname to the path, if the enclosing object is not an array.
@@ -128,6 +127,9 @@ void AllPathsKeyGenerator::_traverseAllPaths(BSONObj obj,
                 _addMultiKey(*path, multikeyPaths);
 
             case BSONType::Object:
+                if (_addKeyForEmptyLeaf(elem, *path, keys))
+                    break;
+
                 _traverseAllPaths(
                     elem.Obj(), elem.type() == BSONType::Array, path, keys, multikeyPaths);
                 break;
@@ -153,20 +155,40 @@ bool AllPathsKeyGenerator::_addKeyForNestedArray(BSONElement elem,
     return false;
 }
 
+bool AllPathsKeyGenerator::_addKeyForEmptyLeaf(BSONElement elem,
+                                               const FieldRef& fullPath,
+                                               BSONObjSet* keys) const {
+    invariant(elem.isABSONObj());
+    if (elem.embeddedObject().isEmpty()) {
+        // In keeping with the behaviour of regular indexes, an empty object is indexed as-is while
+        // empty arrays are indexed as 'undefined'.
+        _addKey(elem.type() == BSONType::Array ? BSONElement{} : elem, fullPath, keys);
+        return true;
+    }
+    return false;
+}
+
 void AllPathsKeyGenerator::_addKey(BSONElement elem,
                                    const FieldRef& fullPath,
                                    BSONObjSet* keys) const {
-    // AllPaths keys are of the form { "": "path.to.field", "": <collation-aware value> }
+    // AllPaths keys are of the form { "": "path.to.field", "": <collation-aware value> }.
     BSONObjBuilder bob;
     bob.append("", fullPath.dottedField());
-    CollationIndexKey::collationAwareIndexKeyAppend(elem, _collator, &bob);
+    if (elem) {
+        CollationIndexKey::collationAwareIndexKeyAppend(elem, _collator, &bob);
+    } else {
+        bob.appendUndefined("");
+    }
     keys->insert(bob.obj());
 }
 
-void AllPathsKeyGenerator::_addMultiKey(const FieldRef& fullPath,
-                                        MultikeyPathsMock* multikeyPaths) const {
-    // Multikey paths are denoted by an entry of the form { "": 1, "": "path.to.array" }.
-    multikeyPaths->insert(BSON("" << 1 << "" << fullPath.dottedField()));
+void AllPathsKeyGenerator::_addMultiKey(const FieldRef& fullPath, BSONObjSet* multikeyPaths) const {
+    // Multikey paths are denoted by a key of the form { "": 1, "": "path.to.array" }. The argument
+    // 'multikeyPaths' may be nullptr if the access method is being used in an operation which does
+    // not require multikey path generation.
+    if (multikeyPaths) {
+        multikeyPaths->insert(BSON("" << 1 << "" << fullPath.dottedField()));
+    }
 }
 
 }  // namespace mongo

@@ -111,14 +111,19 @@ Message DBClientCursor::_assembleInit() {
             return assembleCommandRequest(_client, ns.db(), opts, query);
         }
     } else if (_useFindCommand) {
-        auto qr = QueryRequest::fromLegacyQuery(ns,
+        // The caller supplies a 'query' object which may have $-prefixed directives in the format
+        // expected for a legacy OP_QUERY. Therefore, we use the legacy parsing code supplied by
+        // QueryRequest. When actually issuing the request to the remote node, we will assemble a
+        // find command.
+        auto qr = QueryRequest::fromLegacyQuery(_nsOrUuid,
                                                 query,
                                                 fieldsToReturn ? *fieldsToReturn : BSONObj(),
                                                 nToSkip,
                                                 nextBatchSize(),
                                                 opts);
-        if (qr.isOK() && !qr.getValue()->isExplain() && !qr.getValue()->isExhaust()) {
-            BSONObj cmd = qr.getValue()->asFindCommand();
+        if (qr.isOK() && !qr.getValue()->isExplain()) {
+            BSONObj cmd = _nsOrUuid.uuid() ? qr.getValue()->asFindCommandWithUuid()
+                                           : qr.getValue()->asFindCommand();
             if (auto readPref = query["$readPreference"]) {
                 // QueryRequest doesn't handle $readPreference.
                 cmd = BSONObjBuilder(std::move(cmd)).append(readPref).obj();
@@ -126,6 +131,13 @@ Message DBClientCursor::_assembleInit() {
             return assembleCommandRequest(_client, ns.db(), opts, std::move(cmd));
         }
         // else use legacy OP_QUERY request.
+        // Legacy OP_QUERY request does not support UUIDs.
+        if (_nsOrUuid.uuid()) {
+            // If there was a problem building the query request, report that.
+            uassertStatusOK(qr.getStatus());
+            // Otherwise it must have been explain.
+            uasserted(50937, "Query by UUID is not supported for explain queries.");
+        }
     }
 
     _useFindCommand = false;  // Make sure we handle the reply correctly.
@@ -144,7 +156,12 @@ Message DBClientCursor::_assembleGetMore() {
                                   boost::none,   // awaitDataTimeout
                                   boost::none,   // term
                                   boost::none);  // lastKnownCommittedOptime
-        return assembleCommandRequest(_client, ns.db(), opts, gmr.toBSON());
+        auto msg = assembleCommandRequest(_client, ns.db(), opts, gmr.toBSON());
+        // Set the exhaust flag if needed.
+        if (opts & QueryOption_Exhaust && msg.operation() == dbMsg) {
+            OpMsg::setFlag(&msg, OpMsg::kExhaustSupported);
+        }
+        return msg;
     } else {
         // Assemble a legacy getMore request.
         return makeGetMoreMessage(ns.ns(), cursorId, nextBatchSize(), opts);
@@ -204,7 +221,10 @@ bool DBClientCursor::initLazyFinish(bool& retry) {
 }
 
 void DBClientCursor::requestMore() {
-    if (opts & QueryOption_Exhaust) {
+    // For exhaust queries, once the stream has been initiated we get data blasted to us
+    // from the remote server, without a need to send any more 'getMore' requests.
+    const auto isExhaust = opts & QueryOption_Exhaust;
+    if (isExhaust && (!_useFindCommand || _connectionHasPendingReplies)) {
         return exhaustReceiveMore();
     }
 
@@ -233,9 +253,13 @@ void DBClientCursor::requestMore() {
     });
 }
 
-/** with QueryOption_Exhaust, the server just blasts data at us (marked at end with cursorid==0). */
+/**
+ * With QueryOption_Exhaust, the server just blasts data at us. The end of a stream is marked with a
+ * cursor id of 0.
+ */
 void DBClientCursor::exhaustReceiveMore() {
-    verify(cursorId && batch.pos == batch.objs.size());
+    verify(cursorId);
+    verify(batch.pos == batch.objs.size());
     uassert(40675, "Cannot have limit for exhaust query", !haveLimit);
     Message response;
     verify(_client);
@@ -248,6 +272,13 @@ void DBClientCursor::exhaustReceiveMore() {
 BSONObj DBClientCursor::commandDataReceived(const Message& reply) {
     int op = reply.operation();
     invariant(op == opReply || op == dbMsg);
+
+    // Check if the reply indicates that it is part of an exhaust stream.
+    const auto isExhaust = OpMsg::isFlagSet(reply, OpMsg::kMoreToCome);
+    _connectionHasPendingReplies = isExhaust;
+    if (isExhaust) {
+        _lastRequestId = reply.header().getId();
+    }
 
     auto commandReply = _client->parseCommandReplyMessage(_client->getServerAddress(), reply);
     auto commandStatus = getStatusFromCommandResult(commandReply->getCommandReply());
@@ -282,6 +313,10 @@ void DBClientCursor::dataReceived(const Message& reply, bool& retry, string& hos
         cursorId = 0;  // Don't try to kill cursor if we get back an error.
         auto cr = uassertStatusOK(CursorResponse::parseFromBSON(commandDataReceived(reply)));
         cursorId = cr.getCursorId();
+        uassert(50935,
+                "Received a getMore response with a cursor id of 0 and the moreToCome flag set.",
+                !(_connectionHasPendingReplies && cursorId == 0));
+
         ns = cr.getNSS();  // Unlike OP_REPLY, find command can change the ns to use for getMores.
         batch.objs = cr.releaseBatch();
         return;
@@ -451,7 +486,7 @@ void DBClientCursor::attach(AScopedConnection* conn) {
 }
 
 DBClientCursor::DBClientCursor(DBClientBase* client,
-                               const std::string& ns,
+                               const NamespaceStringOrUUID& nsOrUuid,
                                const BSONObj& query,
                                int nToReturn,
                                int nToSkip,
@@ -459,7 +494,7 @@ DBClientCursor::DBClientCursor(DBClientBase* client,
                                int queryOptions,
                                int batchSize)
     : DBClientCursor(client,
-                     ns,
+                     nsOrUuid,
                      query,
                      0,  // cursorId
                      nToReturn,
@@ -470,13 +505,13 @@ DBClientCursor::DBClientCursor(DBClientBase* client,
                      {}) {}
 
 DBClientCursor::DBClientCursor(DBClientBase* client,
-                               const std::string& ns,
+                               const NamespaceStringOrUUID& nsOrUuid,
                                long long cursorId,
                                int nToReturn,
                                int queryOptions,
                                std::vector<BSONObj> initialBatch)
     : DBClientCursor(client,
-                     ns,
+                     nsOrUuid,
                      BSONObj(),  // query
                      cursorId,
                      nToReturn,
@@ -487,7 +522,7 @@ DBClientCursor::DBClientCursor(DBClientBase* client,
                      std::move(initialBatch)) {}  // batchSize
 
 DBClientCursor::DBClientCursor(DBClientBase* client,
-                               const std::string& ns,
+                               const NamespaceStringOrUUID& nsOrUuid,
                                const BSONObj& query,
                                long long cursorId,
                                int nToReturn,
@@ -499,8 +534,9 @@ DBClientCursor::DBClientCursor(DBClientBase* client,
     : batch{std::move(initialBatch)},
       _client(client),
       _originalHost(_client->getServerAddress()),
-      ns(ns),
-      _isCommand(nsIsFull(ns) ? nsToCollectionSubstring(ns) == "$cmd" : false),
+      _nsOrUuid(nsOrUuid),
+      ns(nsOrUuid.nss() ? *nsOrUuid.nss() : NamespaceString(nsOrUuid.dbname())),
+      _isCommand(ns.isCommand()),
       query(query),
       nToReturn(nToReturn),
       haveLimit(nToReturn > 0 && !(queryOptions & QueryOption_CursorTailable)),
@@ -513,8 +549,11 @@ DBClientCursor::DBClientCursor(DBClientBase* client,
       _ownCursor(true),
       wasError(false),
       _enabledBSONVersion(Validator<BSONObj>::enabledBSONVersion()) {
-    if (queryOptions & QueryOptionLocal_forceOpQuery)
+    if (queryOptions & QueryOptionLocal_forceOpQuery) {
+        // Legacy OP_QUERY does not support UUIDs.
+        invariant(!_nsOrUuid.uuid());
         _useFindCommand = false;
+    }
 }
 
 DBClientCursor::~DBClientCursor() {

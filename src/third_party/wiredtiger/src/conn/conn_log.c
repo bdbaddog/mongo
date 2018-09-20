@@ -277,6 +277,15 @@ __logmgr_config(
 	if (!reconfig) {
 		WT_RET(__wt_config_gets(session, cfg, "log.file_max", &cval));
 		conn->log_file_max = (wt_off_t)cval.val;
+		/*
+		 * With the default log file extend configuration or if the log
+		 * file extension size is larger than the configured maximum log
+		 * file size, set the log file extension size to the configured
+		 * maximum log file size.
+		 */
+		if (conn->log_extend_len == WT_CONFIG_UNSET ||
+		    conn->log_extend_len > conn->log_file_max)
+			conn->log_extend_len = conn->log_file_max;
 		WT_STAT_CONN_SET(session, log_max_filesize, conn->log_file_max);
 	}
 
@@ -299,13 +308,6 @@ __logmgr_config(
 		    session, cfg, "log.recover", 0, &cval));
 		if (WT_STRING_MATCH("error", cval.str, cval.len))
 			FLD_SET(conn->log_flags, WT_CONN_LOG_RECOVER_ERR);
-		else if (WT_STRING_MATCH("salvage", cval.str, cval.len)) {
-			if (F_ISSET(conn, WT_CONN_READONLY))
-				WT_RET_MSG(session, EINVAL,
-				    "Readonly configuration incompatible with "
-				    "log=(recover=salvage)");
-			FLD_SET(conn->log_flags, WT_CONN_LOG_RECOVER_SALVAGE);
-		}
 	}
 
 	WT_RET(__wt_config_gets(session, cfg, "log.zero_fill", &cval));
@@ -890,7 +892,6 @@ __log_wrlsn_server(void *arg)
 	__wt_log_wrlsn(session, NULL);
 	if (0) {
 err:		WT_PANIC_MSG(session, ret, "log wrlsn server error");
-
 	}
 	return (WT_THREAD_RET_VALUE);
 }

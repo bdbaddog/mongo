@@ -26,10 +26,11 @@ function CollectionValidator() {
 
         const full = obj.full;
 
-        let success = true;
+        // Failed collection validation results are saved in failed_res.
+        let full_res = {ok: 1, failed_res: []};
 
         // Don't run validate on view namespaces.
-        let filter = {type: "collection"};
+        let filter = {type: 'collection'};
         if (jsTest.options().skipValidationOnInvalidViewDefinitions) {
             // If skipValidationOnInvalidViewDefinitions=true, then we avoid resolving the view
             // catalog on the admin database.
@@ -56,7 +57,7 @@ function CollectionValidator() {
 
         let collInfo = db.getCollectionInfos(filter);
         for (let collDocument of collInfo) {
-            const coll = db.getCollection(collDocument["name"]);
+            const coll = db.getCollection(collDocument['name']);
             const res = coll.validate(full);
 
             if (!res.ok || !res.valid) {
@@ -74,27 +75,37 @@ function CollectionValidator() {
                 print('Collection validation failed on host ' + host + ' with response: ' +
                       tojson(res));
                 dumpCollection(coll, 100);
-                success = false;
+                full_res.failed_res.push(res);
+                full_res.ok = 0;
             }
         }
 
-        return success;
+        return full_res;
     };
 
     // Run a separate thread to validate collections on each server in parallel.
-    const validateCollectionsThread = function(validatorFunc, host, testData) {
-        TestData = testData;  // Pass the TestData object from main thread.
-
+    const validateCollectionsThread = function(validatorFunc, host) {
         try {
             print('Running validate() on ' + host);
             const conn = new Mongo(host);
             conn.setSlaveOk();
             jsTest.authenticate(conn);
 
+            if (jsTest.options().forceValidationWithFeatureCompatibilityVersion) {
+                let adminDB = conn.getDB('admin');
+                // Make sure this node has the desired FCV.
+                assert.soon(() => {
+                    return adminDB.system.version.findOne({_id: 'featureCompatibilityVersion'})
+                               .version ===
+                        jsTest.options().forceValidationWithFeatureCompatibilityVersion;
+                });
+            }
+
             const dbNames = conn.getDBNames();
             for (let dbName of dbNames) {
-                if (!validatorFunc(conn.getDB(dbName), {full: true})) {
-                    return {ok: 0, host: host};
+                const validateRes = validatorFunc(conn.getDB(dbName), {full: true});
+                if (validateRes.ok !== 1) {
+                    return {ok: 0, host: host, validateRes: validateRes};
                 }
             }
             return {ok: 1};
@@ -105,15 +116,30 @@ function CollectionValidator() {
         }
     };
 
-    this.validateNodes = function(hostList) {
+    this.validateNodes = function(hostList, setFCVHost) {
         // We run the scoped threads in a try/finally block in case any thread throws an exception,
         // in which case we want to still join all the threads.
         let threads = [];
+        let adminDB;
+        let originalFCV;
+
+        if (jsTest.options().forceValidationWithFeatureCompatibilityVersion) {
+            let conn = new Mongo(setFCVHost);
+            adminDB = conn.getDB('admin');
+            originalFCV =
+                adminDB.system.version.findOne({_id: 'featureCompatibilityVersion'}).version;
+            if (originalFCV !== jsTest.options().forceValidationWithFeatureCompatibilityVersion) {
+                assert.commandWorked(adminDB.adminCommand({
+                    setFeatureCompatibilityVersion:
+                        jsTest.options().forceValidationWithFeatureCompatibilityVersion
+                }));
+            }
+        }
 
         try {
             hostList.forEach(host => {
-                const thread = new ScopedThread(
-                    validateCollectionsThread, this.validateCollections, host, TestData);
+                const thread =
+                    new ScopedThread(validateCollectionsThread, this.validateCollections, host);
                 threads.push(thread);
                 thread.start();
             });
@@ -127,6 +153,10 @@ function CollectionValidator() {
             returnData.forEach(res => {
                 assert.commandWorked(res, 'Collection validation failed');
             });
+        }
+
+        if (jsTest.options().forceValidationWithFeatureCompatibilityVersion !== originalFCV) {
+            assert.commandWorked(adminDB.runCommand({setFeatureCompatibilityVersion: originalFCV}));
         }
     };
 }

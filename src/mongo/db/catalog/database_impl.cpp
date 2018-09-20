@@ -219,10 +219,11 @@ Collection* DatabaseImpl::_getOrCreateCollectionInstance(OperationContext* opCtx
     auto uuid = cce->getCollectionOptions(opCtx).uuid;
 
     unique_ptr<RecordStore> rs(_dbEntry->getRecordStore(nss.ns()));
-    invariant(
-        rs.get(),
-        str::stream() << "Record store did not exist. Collection: " << nss.ns() << " UUID: "
-                      << (uuid ? uuid->toString() : "none"));  // if cce exists, so should this
+    if (rs.get() == nullptr) {
+        severe() << "Record store did not exist. Collection: " << nss.ns() << " UUID: "
+                 << (uuid ? uuid->toString() : "none");  // if cce exists, so should this
+        fassertFailedNoTrace(50936);
+    }
 
     // Not registering AddCollectionChange since this is for collections that already exist.
     Collection* coll = new Collection(opCtx, nss.ns(), uuid, cce.release(), rs.release(), _dbEntry);
@@ -247,7 +248,6 @@ DatabaseImpl::DatabaseImpl(Database* const this_,
     : _name(name.toString()),
       _dbEntry(dbEntry),
       _profileName(_name + ".system.profile"),
-      _indexesName(_name + ".system.indexes"),
       _viewsName(_name + "." + DurableViewCatalog::viewsCollectionName().toString()),
       _durableViews(DurableViewCatalogImpl(this_)),
       _views(&_durableViews),

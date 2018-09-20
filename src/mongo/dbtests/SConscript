@@ -39,7 +39,6 @@ env.Library(
     source=[
         'mock/mock_conn_registry.cpp',
         'mock/mock_dbclient_connection.cpp',
-        'mock/mock_dbclient_cursor.cpp',
         'mock/mock_remote_db_server.cpp',
         'mock/mock_replica_set.cpp'
     ],
@@ -52,6 +51,7 @@ env.Library(
 dbtest = env.Program(
     target="dbtest",
     source=[
+        'all_paths_multikey_persistence_test.cpp',
         'basictests.cpp',
         'clienttests.cpp',
         'commandtests.cpp',
@@ -91,7 +91,6 @@ dbtest = env.Program(
         'query_stage_ensure_sorted.cpp',
         'query_stage_fetch.cpp',
         'query_stage_ixscan.cpp',
-        'query_stage_keep.cpp',
         'query_stage_limit_skip.cpp',
         'query_stage_merge_sort.cpp',
         'query_stage_near.cpp',
@@ -129,11 +128,14 @@ dbtest = env.Program(
         "$BUILD_DIR/mongo/db/repl/drop_pending_collection_reaper",
         "$BUILD_DIR/mongo/db/repl/repl_coordinator_interface",
         "$BUILD_DIR/mongo/db/repl/replication_consistency_markers_impl",
+        "$BUILD_DIR/mongo/db/repl/replication_recovery",
         "$BUILD_DIR/mongo/db/repl/replmocks",
+        "$BUILD_DIR/mongo/db/repl/serveronly_repl",
         "$BUILD_DIR/mongo/db/repl/storage_interface_impl",
         "$BUILD_DIR/mongo/db/serveronly",
         "$BUILD_DIR/mongo/db/sessions_collection_standalone",
         "$BUILD_DIR/mongo/db/storage/kv/kv_engine_core",
+        "$BUILD_DIR/mongo/db/storage/kv/kv_storage_engine",
         "$BUILD_DIR/mongo/transport/transport_layer_manager",
         "$BUILD_DIR/mongo/util/clock_source_mock",
         "$BUILD_DIR/mongo/util/net/network",

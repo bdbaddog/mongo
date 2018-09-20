@@ -54,12 +54,21 @@ public:
     }
 
     bool isSharded(OperationContext* opCtx, const NamespaceString& ns) override {
+        return false;
+    }
+
+    void insert(const boost::intrusive_ptr<ExpressionContext>& expCtx,
+                const NamespaceString& ns,
+                std::vector<BSONObj>&& objs) override {
         MONGO_UNREACHABLE;
     }
 
-    BSONObj insert(const boost::intrusive_ptr<ExpressionContext>& expCtx,
-                   const NamespaceString& ns,
-                   const std::vector<BSONObj>& objs) override {
+    void update(const boost::intrusive_ptr<ExpressionContext>& expCtx,
+                const NamespaceString& ns,
+                std::vector<BSONObj>&& queries,
+                std::vector<BSONObj>&& updates,
+                bool upsert,
+                bool multi) final {
         MONGO_UNREACHABLE;
     }
 
@@ -113,11 +122,12 @@ public:
         MONGO_UNREACHABLE;
     }
 
-    std::vector<BSONObj> getCurrentOps(OperationContext* opCtx,
+    std::vector<BSONObj> getCurrentOps(const boost::intrusive_ptr<ExpressionContext>& expCtx,
                                        CurrentOpConnectionsMode connMode,
                                        CurrentOpSessionsMode sessionMode,
                                        CurrentOpUserMode userMode,
-                                       CurrentOpTruncateMode truncateMode) const override {
+                                       CurrentOpTruncateMode truncateMode,
+                                       CurrentOpCursorMode cursorMode) const override {
         MONGO_UNREACHABLE;
     }
 
@@ -125,8 +135,8 @@ public:
         MONGO_UNREACHABLE;
     }
 
-    std::pair<std::vector<FieldPath>, bool> collectDocumentKeyFields(OperationContext*,
-                                                                     UUID) const override {
+    std::pair<std::vector<FieldPath>, bool> collectDocumentKeyFields(
+        OperationContext* opCtx, NamespaceStringOrUUID nssOrUUID) const override {
         MONGO_UNREACHABLE;
     }
 
@@ -139,9 +149,37 @@ public:
         MONGO_UNREACHABLE;
     }
 
-    std::vector<GenericCursor> getCursors(
-        const boost::intrusive_ptr<ExpressionContext>& expCtx) const {
+    std::vector<GenericCursor> getIdleCursors(const boost::intrusive_ptr<ExpressionContext>& expCtx,
+                                              CurrentOpUserMode userMode) const {
         MONGO_UNREACHABLE;
+    }
+
+    void fsyncLock(OperationContext* opCtx) final {
+        MONGO_UNREACHABLE;
+    }
+
+    void fsyncUnlock(OperationContext* opCtx) final {
+        MONGO_UNREACHABLE;
+    }
+
+    BackupCursorState openBackupCursor(OperationContext* opCtx) final {
+        MONGO_UNREACHABLE;
+    }
+
+    void closeBackupCursor(OperationContext* opCtx, std::uint64_t cursorId) final {
+        MONGO_UNREACHABLE;
+    }
+
+    std::vector<BSONObj> getMatchingPlanCacheEntryStats(OperationContext*,
+                                                        const NamespaceString&,
+                                                        const MatchExpression*) const override {
+        MONGO_UNREACHABLE;
+    }
+
+    bool uniqueKeyIsSupportedByIndex(const boost::intrusive_ptr<ExpressionContext>& expCtx,
+                                     const NamespaceString& nss,
+                                     const std::set<FieldPath>& uniqueKeyPaths) const override {
+        return true;
     }
 };
 }  // namespace mongo

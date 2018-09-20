@@ -31,21 +31,6 @@ env.CppUnitTest(
     ],
 )
 
-env.Library(
-    target='sharding_connection_hook',
-    source=[
-        'sharding_connection_hook.cpp',
-        'sharding_network_connection_hook.cpp',
-    ],
-    LIBDEPS=[
-        '$BUILD_DIR/mongo/s/coreshard',
-        '$BUILD_DIR/mongo/s/sharding_legacy_api',
-    ],
-    LIBDEPS_PRIVATE=[
-        '$BUILD_DIR/mongo/db/auth/internal_user_auth',
-    ],
-)
-
 env.CppUnitTest(
     target='shard_registry_test',
     source=[
@@ -104,6 +89,7 @@ env.CppUnitTest(
         '$BUILD_DIR/mongo/db/auth/authmocks',
         '$BUILD_DIR/mongo/db/repl/replmocks',
         '$BUILD_DIR/mongo/db/service_context_d_test_fixture',
+        '$BUILD_DIR/mongo/s/grid',
         'shard_local',
     ],
 )

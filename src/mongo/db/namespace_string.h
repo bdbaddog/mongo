@@ -60,6 +60,10 @@ public:
     // Name for the system views collection
     static constexpr StringData kSystemDotViewsCollectionName = "system.views"_sd;
 
+    // Prefix for orphan collections
+    static constexpr StringData kOrphanCollectionPrefix = "orphan."_sd;
+    static constexpr StringData kOrphanCollectionDb = "local"_sd;
+
     // Namespace for storing configuration data, which needs to be replicated if the server is
     // running as a replica set. Documents in this collection should represent some configuration
     // state of the server, which needs to be recovered/consulted at startup. Each document in this
@@ -224,9 +228,6 @@ public:
     bool isLocal() const {
         return db() == kLocalDb;
     }
-    bool isSystemDotIndexes() const {
-        return coll() == "system.indexes";
-    }
     bool isSystemDotProfile() const {
         return coll() == "system.profile";
     }
@@ -259,6 +260,9 @@ public:
     }
     bool isNormal() const {
         return normal(_ns);
+    }
+    bool isOrphanCollection() const {
+        return db() == kOrphanCollectionDb && coll().startsWith(kOrphanCollectionPrefix);
     }
 
     /**
@@ -347,10 +351,6 @@ public:
      */
     std::string getSisterNS(StringData local) const;
 
-    std::string getSystemIndexesCollection() const {
-        return db().toString() + ".system.indexes";
-    }
-
     NamespaceString getCommandNS() const {
         return {db(), "$cmd"};
     }
@@ -419,7 +419,7 @@ public:
      * samples:
      *   good:
      *     foo
-     *     system.indexes
+     *     system.views
      *   bad:
      *     $foo
      * @param coll - a collection name component of a namespace

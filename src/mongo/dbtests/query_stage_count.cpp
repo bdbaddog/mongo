@@ -122,8 +122,7 @@ public:
     void update(const RecordId& oldrecordId, const BSONObj& newDoc) {
         WriteUnitOfWork wunit(&_opCtx);
         BSONObj oldDoc = _coll->getRecordStore()->dataFor(&_opCtx, oldrecordId).releaseToBson();
-        OplogUpdateEntryArgs args;
-        args.nss = _coll->ns();
+        CollectionUpdateArgs args;
         _coll->updateDocument(&_opCtx,
                               oldrecordId,
                               Snapshotted<BSONObj>(_opCtx.recoveryUnit()->getSnapshotId(), oldDoc),
@@ -207,8 +206,7 @@ public:
         IndexDescriptor* descriptor = indexes[0];
 
         // We are not testing indexing here so use maximal bounds
-        IndexScanParams params;
-        params.descriptor = descriptor;
+        IndexScanParams params(&_opCtx, *descriptor);
         params.bounds.isSimpleRange = true;
         params.bounds.startKey = BSON("" << 0);
         params.bounds.endKey = BSON("" << kDocuments + 1);
@@ -306,10 +304,8 @@ public:
             // At this point, our first interjection, we've counted _recordIds[0]
             // and are about to count _recordIds[1]
             WriteUnitOfWork wunit(&_opCtx);
-            count_stage.invalidate(&_opCtx, _recordIds[interjection], INVALIDATION_DELETION);
             remove(_recordIds[interjection]);
 
-            count_stage.invalidate(&_opCtx, _recordIds[interjection + 1], INVALIDATION_DELETION);
             remove(_recordIds[interjection + 1]);
             wunit.commit();
         }
@@ -330,11 +326,9 @@ public:
     // At the point which this is called we are in between the first and second record
     void interject(CountStage& count_stage, int interjection) {
         if (interjection == 0) {
-            count_stage.invalidate(&_opCtx, _recordIds[0], INVALIDATION_MUTATION);
             OID id1 = _coll->docFor(&_opCtx, _recordIds[0]).value().getField("_id").OID();
             update(_recordIds[0], BSON("_id" << id1 << "x" << 100));
 
-            count_stage.invalidate(&_opCtx, _recordIds[1], INVALIDATION_MUTATION);
             OID id2 = _coll->docFor(&_opCtx, _recordIds[1]).value().getField("_id").OID();
             update(_recordIds[1], BSON("_id" << id2 << "x" << 100));
         }

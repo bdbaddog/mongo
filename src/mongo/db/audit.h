@@ -60,7 +60,9 @@ namespace audit {
 class CommandInterface {
 public:
     virtual ~CommandInterface() = default;
-    virtual void redactForLogging(mutablebson::Document* cmdObj) const = 0;
+    virtual StringData sensitiveFieldName() const = 0;
+    virtual void snipForLogging(mutablebson::Document* cmdObj) const = 0;
+    virtual StringData getName() const = 0;
     virtual NamespaceString ns() const = 0;
     virtual bool redactArgs() const = 0;
 };
@@ -310,14 +312,6 @@ void logRemoveShard(Client* client, StringData shardname);
  * Logs the result of a shardCollection command.
  */
 void logShardCollection(Client* client, StringData ns, const BSONObj& keyPattern, bool unique);
-
-
-/*
- * Appends an array of user/db pairs and an array of role/db pairs
- * to the provided metadata builder. The users and roles are extracted from the current client.
- * They are to be the impersonated users and roles for a Command run by an internal user.
- */
-void writeImpersonatedUsersToMetadata(OperationContext* opCtx, BSONObjBuilder* metadataBob);
 
 }  // namespace audit
 }  // namespace mongo

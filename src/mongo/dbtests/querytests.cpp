@@ -274,7 +274,7 @@ public:
         insert(ns, BSON("a" << 1));
         insert(ns, BSON("a" << 2));
         insert(ns, BSON("a" << 3));
-        unique_ptr<DBClientCursor> cursor = _client.query(ns, BSONObj(), 2);
+        unique_ptr<DBClientCursor> cursor = _client.query(NamespaceString(ns), BSONObj(), 2);
         long long cursorId = cursor->getCursorId();
         cursor->decouple();
         cursor.reset();
@@ -310,7 +310,7 @@ public:
         }
 
         // Create a cursor on the collection, with a batch size of 200.
-        unique_ptr<DBClientCursor> cursor = _client.query(ns, "", 0, 0, 0, 0, 200);
+        unique_ptr<DBClientCursor> cursor = _client.query(NamespaceString(ns), "", 0, 0, 0, 0, 200);
 
         // Count 500 results, spanning a few batches of documents.
         for (int i = 0; i < 500; ++i) {
@@ -353,7 +353,7 @@ public:
         }
 
         // Create a cursor on the collection, with a batch size of 200.
-        unique_ptr<DBClientCursor> cursor = _client.query(ns, "", 0, 0, 0, 0, 200);
+        unique_ptr<DBClientCursor> cursor = _client.query(NamespaceString(ns), "", 0, 0, 0, 0, 200);
         CursorId cursorId = cursor->getCursorId();
 
         // Count 500 results, spanning a few batches of documents.
@@ -397,19 +397,19 @@ public:
     }
 
     void testLimit(int limit) {
-        ASSERT_EQUALS(_client.query(ns, BSONObj(), limit)->itcount(), limit);
+        ASSERT_EQUALS(_client.query(NamespaceString(ns), BSONObj(), limit)->itcount(), limit);
     }
     void run() {
         for (int i = 0; i < 1000; i++)
             insert(ns, BSON(GENOID << "i" << i));
 
-        ASSERT_EQUALS(_client.query(ns, BSONObj(), 1)->itcount(), 1);
-        ASSERT_EQUALS(_client.query(ns, BSONObj(), 10)->itcount(), 10);
-        ASSERT_EQUALS(_client.query(ns, BSONObj(), 101)->itcount(), 101);
-        ASSERT_EQUALS(_client.query(ns, BSONObj(), 999)->itcount(), 999);
-        ASSERT_EQUALS(_client.query(ns, BSONObj(), 1000)->itcount(), 1000);
-        ASSERT_EQUALS(_client.query(ns, BSONObj(), 1001)->itcount(), 1000);
-        ASSERT_EQUALS(_client.query(ns, BSONObj(), 0)->itcount(), 1000);
+        ASSERT_EQUALS(_client.query(NamespaceString(ns), BSONObj(), 1)->itcount(), 1);
+        ASSERT_EQUALS(_client.query(NamespaceString(ns), BSONObj(), 10)->itcount(), 10);
+        ASSERT_EQUALS(_client.query(NamespaceString(ns), BSONObj(), 101)->itcount(), 101);
+        ASSERT_EQUALS(_client.query(NamespaceString(ns), BSONObj(), 999)->itcount(), 999);
+        ASSERT_EQUALS(_client.query(NamespaceString(ns), BSONObj(), 1000)->itcount(), 1000);
+        ASSERT_EQUALS(_client.query(NamespaceString(ns), BSONObj(), 1001)->itcount(), 1000);
+        ASSERT_EQUALS(_client.query(NamespaceString(ns), BSONObj(), 0)->itcount(), 1000);
     }
 };
 
@@ -429,8 +429,12 @@ public:
         insert(ns, BSON("a" << 0));
         insert(ns, BSON("a" << 1));
         insert(ns, BSON("a" << 2));
-        unique_ptr<DBClientCursor> c = _client.query(
-            ns, Query().hint(BSON("$natural" << 1)), 2, 0, 0, QueryOption_CursorTailable);
+        unique_ptr<DBClientCursor> c = _client.query(NamespaceString(ns),
+                                                     Query().hint(BSON("$natural" << 1)),
+                                                     2,
+                                                     0,
+                                                     0,
+                                                     QueryOption_CursorTailable);
         ASSERT(0 != c->getCursorId());
         while (c->more())
             c->next();
@@ -457,13 +461,21 @@ public:
 
         const char* ns = "unittests.querytests.EmptyTail";
         _client.createCollection(ns, 1900, true);
-        unique_ptr<DBClientCursor> c = _client.query(
-            ns, Query().hint(BSON("$natural" << 1)), 2, 0, 0, QueryOption_CursorTailable);
+        unique_ptr<DBClientCursor> c = _client.query(NamespaceString(ns),
+                                                     Query().hint(BSON("$natural" << 1)),
+                                                     2,
+                                                     0,
+                                                     0,
+                                                     QueryOption_CursorTailable);
         ASSERT_EQUALS(0, c->getCursorId());
         ASSERT(c->isDead());
         insert(ns, BSON("a" << 0));
-        c = _client.query(
-            ns, QUERY("a" << 1).hint(BSON("$natural" << 1)), 2, 0, 0, QueryOption_CursorTailable);
+        c = _client.query(NamespaceString(ns),
+                          QUERY("a" << 1).hint(BSON("$natural" << 1)),
+                          2,
+                          0,
+                          0,
+                          QueryOption_CursorTailable);
         ASSERT(0 != c->getCursorId());
         ASSERT(!c->isDead());
     }
@@ -484,8 +496,12 @@ public:
         _client.createCollection(ns, 8192, true, 2);
         insert(ns, BSON("a" << 0));
         insert(ns, BSON("a" << 1));
-        unique_ptr<DBClientCursor> c = _client.query(
-            ns, Query().hint(BSON("$natural" << 1)), 2, 0, 0, QueryOption_CursorTailable);
+        unique_ptr<DBClientCursor> c = _client.query(NamespaceString(ns),
+                                                     Query().hint(BSON("$natural" << 1)),
+                                                     2,
+                                                     0,
+                                                     0,
+                                                     QueryOption_CursorTailable);
         c->next();
         c->next();
         ASSERT(!c->more());
@@ -512,8 +528,12 @@ public:
         _client.createCollection(ns, 8192, true, 2);
         insert(ns, BSON("a" << 0));
         insert(ns, BSON("a" << 1));
-        unique_ptr<DBClientCursor> c = _client.query(
-            ns, Query().hint(BSON("$natural" << 1)), 2, 0, 0, QueryOption_CursorTailable);
+        unique_ptr<DBClientCursor> c = _client.query(NamespaceString(ns),
+                                                     Query().hint(BSON("$natural" << 1)),
+                                                     2,
+                                                     0,
+                                                     0,
+                                                     QueryOption_CursorTailable);
         c->next();
         c->next();
         ASSERT(!c->more());
@@ -542,8 +562,12 @@ public:
         _client.createCollection(ns, 1330, true);
         insert(ns, BSON("a" << 0));
         insert(ns, BSON("a" << 1));
-        unique_ptr<DBClientCursor> c = _client.query(
-            ns, Query().hint(BSON("$natural" << 1)), 2, 0, 0, QueryOption_CursorTailable);
+        unique_ptr<DBClientCursor> c = _client.query(NamespaceString(ns),
+                                                     Query().hint(BSON("$natural" << 1)),
+                                                     2,
+                                                     0,
+                                                     0,
+                                                     QueryOption_CursorTailable);
         c->next();
         c->next();
         ASSERT(!c->more());
@@ -563,8 +587,9 @@ public:
     void run() {
         const char* ns = "unittests.querytests.TailCappedOnly";
         _client.insert(ns, BSONObj());
-        ASSERT_THROWS(_client.query(ns, BSONObj(), 0, 0, 0, QueryOption_CursorTailable),
-                      AssertionException);
+        ASSERT_THROWS(
+            _client.query(NamespaceString(ns), BSONObj(), 0, 0, 0, QueryOption_CursorTailable),
+            AssertionException);
     }
 };
 
@@ -602,12 +627,12 @@ public:
                            info);
         insertA(ns, 0);
         insertA(ns, 1);
-        unique_ptr<DBClientCursor> c1 =
-            _client.query(ns, QUERY("a" << GT << -1), 0, 0, 0, QueryOption_CursorTailable);
+        unique_ptr<DBClientCursor> c1 = _client.query(
+            NamespaceString(ns), QUERY("a" << GT << -1), 0, 0, 0, QueryOption_CursorTailable);
         OID id;
         id.init("000000000000000000000000");
-        unique_ptr<DBClientCursor> c2 =
-            _client.query(ns, QUERY("value" << GT << id), 0, 0, 0, QueryOption_CursorTailable);
+        unique_ptr<DBClientCursor> c2 = _client.query(
+            NamespaceString(ns), QUERY("value" << GT << id), 0, 0, 0, QueryOption_CursorTailable);
         c1->next();
         c1->next();
         ASSERT(!c1->more());
@@ -646,7 +671,7 @@ public:
         insert(ns, BSON("ts" << Timestamp(1000, 1)));
         insert(ns, BSON("ts" << Timestamp(1000, 2)));
         unique_ptr<DBClientCursor> c =
-            _client.query(ns,
+            _client.query(NamespaceString(ns),
                           QUERY("ts" << GT << Timestamp(1000, 1)).hint(BSON("$natural" << 1)),
                           0,
                           0,
@@ -657,7 +682,7 @@ public:
         ASSERT(!c->more());
 
         insert(ns, BSON("ts" << Timestamp(1000, 3)));
-        c = _client.query(ns,
+        c = _client.query(NamespaceString(ns),
                           QUERY("ts" << GT << Timestamp(1000, 1)).hint(BSON("$natural" << 1)),
                           0,
                           0,
@@ -690,7 +715,7 @@ public:
         insert(ns, BSON("ts" << Timestamp(1000, 1)));
         insert(ns, BSON("ts" << Timestamp(1000, 2)));
         unique_ptr<DBClientCursor> c = _client.query(
-            ns,
+            NamespaceString(ns),
             QUERY("ts" << GT << Timestamp(1000, 1)).hint(BSON("$natural" << 1)).explain(),
             0,
             0,
@@ -878,9 +903,6 @@ public:
         _client.insert(ns, BSON("a" << 4 << "b" << 3));
         ASSERT_EQUALS(ErrorCodes::DuplicateKey,
                       dbtests::createIndex(&_opCtx, ns, BSON("a" << 1), true));
-        ASSERT_EQUALS(
-            0U,
-            _client.count("unittests.system.indexes", BSON("ns" << ns << "name" << NE << "_id_")));
     }
 };
 
@@ -906,7 +928,9 @@ public:
         const char* ns = "unittests.querytests.Size";
         _client.insert(ns, fromjson("{a:[1,2,3]}"));
         ASSERT_OK(dbtests::createIndex(&_opCtx, ns, BSON("a" << 1)));
-        ASSERT(_client.query(ns, QUERY("a" << mongo::BSIZE << 3).hint(BSON("a" << 1)))->more());
+        ASSERT(_client
+                   .query(NamespaceString(ns), QUERY("a" << mongo::BSIZE << 3).hint(BSON("a" << 1)))
+                   ->more());
     }
 };
 
@@ -918,10 +942,13 @@ public:
     void run() {
         const char* ns = "unittests.querytests.IndexedArray";
         _client.insert(ns, fromjson("{a:[1,2,3]}"));
-        ASSERT(_client.query(ns, Query("{a:[1,2,3]}"))->more());
+        ASSERT(_client.query(NamespaceString(ns), Query("{a:[1,2,3]}"))->more());
         ASSERT_OK(dbtests::createIndex(&_opCtx, ns, BSON("a" << 1)));
-        ASSERT(_client.query(ns, Query("{a:{$in:[1,[1,2,3]]}}").hint(BSON("a" << 1)))->more());
-        ASSERT(_client.query(ns, Query("{a:[1,2,3]}").hint(BSON("a" << 1)))->more());  // SERVER-146
+        ASSERT(
+            _client.query(NamespaceString(ns), Query("{a:{$in:[1,[1,2,3]]}}").hint(BSON("a" << 1)))
+                ->more());
+        ASSERT(_client.query(NamespaceString(ns), Query("{a:[1,2,3]}").hint(BSON("a" << 1)))
+                   ->more());  // SERVER-146
     }
 };
 
@@ -941,10 +968,14 @@ public:
 private:
     void check(const string& hintField) {
         const char* ns = "unittests.querytests.InsideArray";
-        ASSERT(_client.query(ns, Query("{a:[[1],2]}").hint(BSON(hintField << 1)))->more());
-        ASSERT(_client.query(ns, Query("{a:[1]}").hint(BSON(hintField << 1)))->more());
-        ASSERT(_client.query(ns, Query("{a:2}").hint(BSON(hintField << 1)))->more());
-        ASSERT(!_client.query(ns, Query("{a:1}").hint(BSON(hintField << 1)))->more());
+        ASSERT(_client.query(NamespaceString(ns), Query("{a:[[1],2]}").hint(BSON(hintField << 1)))
+                   ->more());
+        ASSERT(_client.query(NamespaceString(ns), Query("{a:[1]}").hint(BSON(hintField << 1)))
+                   ->more());
+        ASSERT(
+            _client.query(NamespaceString(ns), Query("{a:2}").hint(BSON(hintField << 1)))->more());
+        ASSERT(
+            !_client.query(NamespaceString(ns), Query("{a:1}").hint(BSON(hintField << 1)))->more());
     }
 };
 
@@ -958,8 +989,10 @@ public:
         _client.insert(ns, fromjson("{'_id':1,a:[1]}"));
         _client.insert(ns, fromjson("{'_id':2,a:[[1]]}"));
         ASSERT_OK(dbtests::createIndex(&_opCtx, ns, BSON("a" << 1)));
-        ASSERT_EQUALS(
-            1, _client.query(ns, Query("{a:[1]}").hint(BSON("a" << 1)))->next().getIntField("_id"));
+        ASSERT_EQUALS(1,
+                      _client.query(NamespaceString(ns), Query("{a:[1]}").hint(BSON("a" << 1)))
+                          ->next()
+                          .getIntField("_id"));
     }
 };
 
@@ -979,8 +1012,10 @@ public:
 private:
     void check(const string& hintField) {
         const char* ns = "unittests.querytests.SubobjArr";
-        ASSERT(_client.query(ns, Query("{'a.b':1}").hint(BSON(hintField << 1)))->more());
-        ASSERT(_client.query(ns, Query("{'a.b':[1]}").hint(BSON(hintField << 1)))->more());
+        ASSERT(_client.query(NamespaceString(ns), Query("{'a.b':1}").hint(BSON(hintField << 1)))
+                   ->more());
+        ASSERT(_client.query(NamespaceString(ns), Query("{'a.b':[1]}").hint(BSON(hintField << 1)))
+                   ->more());
     }
 };
 
@@ -997,7 +1032,7 @@ public:
         _client.insert(ns, BSON("a" << 2 << "b" << 1));
         _client.insert(ns, BSON("a" << 2 << "b" << 2));
 
-        ASSERT_EQUALS(4, count(_client.query(ns, BSONObj())));
+        ASSERT_EQUALS(4, count(_client.query(NamespaceString(ns), BSONObj())));
         BSONObj hints[] = {BSONObj(), BSON("a" << 1 << "b" << 1)};
         for (int i = 0; i < 2; ++i) {
             check(0, 0, 3, 3, 4, hints[i]);
@@ -1022,7 +1057,7 @@ private:
         q = q.minKey(BSON("a" << minA << "b" << minB)).maxKey(BSON("a" << maxA << "b" << maxB));
         if (!hint.isEmpty())
             q.hint(hint);
-        return _client.query(ns, q);
+        return _client.query(NamespaceString(ns), q);
     }
     void check(
         int minA, int minB, int maxA, int maxB, int expectedCount, const BSONObj& hint = empty_) {
@@ -1161,7 +1196,7 @@ public:
         _client.dropCollection("unittests.querytests.DifferentNumbers");
     }
     void t(const char* ns) {
-        unique_ptr<DBClientCursor> cursor = _client.query(ns, Query().sort("7"));
+        unique_ptr<DBClientCursor> cursor = _client.query(NamespaceString(ns), Query().sort("7"));
         while (cursor->more()) {
             BSONObj o = cursor->next();
             verify(o.valid(BSONVersion::kLatest));
@@ -1307,7 +1342,7 @@ public:
         int a = count();
 
         unique_ptr<DBClientCursor> c =
-            _client.query(ns(),
+            _client.query(NamespaceString(ns()),
                           QUERY("i" << GT << 0).hint(BSON("$natural" << 1)),
                           0,
                           0,
@@ -1469,13 +1504,14 @@ public:
 
         for (int k = 0; k < 5; ++k) {
             _client.insert(ns(), BSON("ts" << Timestamp(1000, i++)));
-            unsigned min = _client.query(ns(), Query().sort(BSON("$natural" << 1)))
-                               ->next()["ts"]
-                               .timestamp()
-                               .getInc();
+            unsigned min =
+                _client.query(NamespaceString(ns()), Query().sort(BSON("$natural" << 1)))
+                    ->next()["ts"]
+                    .timestamp()
+                    .getInc();
             for (unsigned j = -1; j < i; ++j) {
                 unique_ptr<DBClientCursor> c =
-                    _client.query(ns(),
+                    _client.query(NamespaceString(ns()),
                                   QUERY("ts" << GTE << Timestamp(1000, j)),
                                   0,
                                   0,
@@ -1525,13 +1561,14 @@ public:
 
         for (int k = 0; k < 5; ++k) {
             _client.insert(ns(), BSON("ts" << Timestamp(1000, i++)));
-            unsigned min = _client.query(ns(), Query().sort(BSON("$natural" << 1)))
-                               ->next()["ts"]
-                               .timestamp()
-                               .getInc();
+            unsigned min =
+                _client.query(NamespaceString(ns()), Query().sort(BSON("$natural" << 1)))
+                    ->next()["ts"]
+                    .timestamp()
+                    .getInc();
             for (unsigned j = -1; j < i; ++j) {
                 unique_ptr<DBClientCursor> c =
-                    _client.query(ns(),
+                    _client.query(NamespaceString(ns()),
                                   QUERY("ts" << GTE << Timestamp(1000, j)),
                                   0,
                                   0,
@@ -1569,8 +1606,12 @@ public:
         size_t startNumCursors = numCursorsOpen();
 
         // Check OplogReplay mode with missing collection.
-        unique_ptr<DBClientCursor> c0 = _client.query(
-            ns(), QUERY("ts" << GTE << Timestamp(1000, 50)), 0, 0, 0, QueryOption_OplogReplay);
+        unique_ptr<DBClientCursor> c0 = _client.query(NamespaceString(ns()),
+                                                      QUERY("ts" << GTE << Timestamp(1000, 50)),
+                                                      0,
+                                                      0,
+                                                      0,
+                                                      QueryOption_OplogReplay);
         ASSERT(!c0->more());
 
         BSONObj info;
@@ -1587,15 +1628,23 @@ public:
                                   info));
 
         // Check OplogReplay mode with empty collection.
-        unique_ptr<DBClientCursor> c = _client.query(
-            ns(), QUERY("ts" << GTE << Timestamp(1000, 50)), 0, 0, 0, QueryOption_OplogReplay);
+        unique_ptr<DBClientCursor> c = _client.query(NamespaceString(ns()),
+                                                     QUERY("ts" << GTE << Timestamp(1000, 50)),
+                                                     0,
+                                                     0,
+                                                     0,
+                                                     QueryOption_OplogReplay);
         ASSERT(!c->more());
 
         // Check with some docs in the collection.
         for (int i = 100; i < 150; _client.insert(ns(), BSON("ts" << Timestamp(1000, i++))))
             ;
-        c = _client.query(
-            ns(), QUERY("ts" << GTE << Timestamp(1000, 50)), 0, 0, 0, QueryOption_OplogReplay);
+        c = _client.query(NamespaceString(ns()),
+                          QUERY("ts" << GTE << Timestamp(1000, 50)),
+                          0,
+                          0,
+                          0,
+                          QueryOption_OplogReplay);
         ASSERT(c->more());
         ASSERT_EQUALS(100u, c->next()["ts"].timestamp().getInc());
 
@@ -1613,6 +1662,35 @@ public:
         BSONObj result;
         _client.runCommand("admin", BSON("whatsmyuri" << 1), result);
         ASSERT_EQUALS("", result["you"].str());
+    }
+};
+
+class QueryByUuid : public CollectionBase {
+public:
+    QueryByUuid() : CollectionBase("QueryByUuid") {}
+
+    void run() {
+        CollectionOptions coll_opts;
+        coll_opts.uuid = UUID::gen();
+        {
+            Lock::GlobalWrite lk(&_opCtx);
+            OldClientContext context(&_opCtx, ns());
+            WriteUnitOfWork wunit(&_opCtx);
+            context.db()->createCollection(&_opCtx, ns(), coll_opts, false);
+            wunit.commit();
+        }
+        insert(ns(), BSON("a" << 1));
+        insert(ns(), BSON("a" << 2));
+        insert(ns(), BSON("a" << 3));
+        unique_ptr<DBClientCursor> cursor =
+            _client.query(NamespaceStringOrUUID("unittests", *coll_opts.uuid), BSONObj());
+        ASSERT_EQUALS(string(ns()), cursor->getns());
+        for (int i = 1; i <= 3; ++i) {
+            ASSERT(cursor->more());
+            BSONObj obj(cursor->next());
+            ASSERT_EQUALS(obj["a"].Int(), i);
+        }
+        ASSERT(!cursor->more());
     }
 };
 
@@ -1673,7 +1751,7 @@ public:
         {
             // With five results and a batch size of 5, a cursor is created since we don't know
             // there are no more results.
-            std::unique_ptr<DBClientCursor> c = _client.query(ns(), Query(), 5);
+            std::unique_ptr<DBClientCursor> c = _client.query(NamespaceString(ns()), Query(), 5);
             ASSERT(c->more());
             ASSERT_NE(0, c->getCursorId());
             for (int i = 0; i < 5; ++i) {
@@ -1685,7 +1763,7 @@ public:
         {
             // With a batchsize of 6 we know there are no more results so we don't create a
             // cursor.
-            std::unique_ptr<DBClientCursor> c = _client.query(ns(), Query(), 6);
+            std::unique_ptr<DBClientCursor> c = _client.query(NamespaceString(ns()), Query(), 6);
             ASSERT(c->more());
             ASSERT_EQ(0, c->getCursorId());
         }
@@ -1781,6 +1859,7 @@ public:
         add<FindingStartPartiallyFull>();
         add<FindingStartStale>();
         add<WhatsMyUri>();
+        add<QueryByUuid>();
         add<Exhaust>();
         add<QueryReadsAll>();
         add<queryobjecttests::names1>();

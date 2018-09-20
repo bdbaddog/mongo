@@ -32,8 +32,10 @@
 
 #include "mongo/embedded/service_entry_point_embedded.h"
 
+#include "mongo/db/read_concern.h"
 #include "mongo/db/service_entry_point_common.h"
 #include "mongo/embedded/not_implemented.h"
+#include "mongo/embedded/periodic_runner_embedded.h"
 
 namespace mongo {
 
@@ -43,23 +45,47 @@ public:
         return false;
     }
 
-    void waitForReadConcern(OperationContext*,
-                            const CommandInvocation*,
-                            const OpMsgRequest&) const override {}
+    void waitForReadConcern(OperationContext* opCtx,
+                            const CommandInvocation* invocation,
+                            const OpMsgRequest& request) const override {
+        auto rcStatus = mongo::waitForReadConcern(
+            opCtx, repl::ReadConcernArgs::get(opCtx), invocation->allowsAfterClusterTime());
+        uassertStatusOK(rcStatus);
+    }
 
-    void waitForWriteConcern(OperationContext*,
-                             const CommandInvocation*,
-                             const repl::OpTime&,
-                             BSONObjBuilder&) const override {}
+    void waitForWriteConcern(OperationContext* opCtx,
+                             const CommandInvocation* invocation,
+                             const repl::OpTime& lastOpBeforeRun,
+                             BSONObjBuilder& commandResponseBuilder) const override {
+        WriteConcernResult res;
+        auto waitForWCStatus =
+            mongo::waitForWriteConcern(opCtx, lastOpBeforeRun, opCtx->getWriteConcern(), &res);
 
-    void waitForLinearizableReadConcern(OperationContext*) const override {}
+        CommandHelpers::appendCommandWCStatus(commandResponseBuilder, waitForWCStatus, res);
+    }
 
-    void uassertCommandDoesNotSpecifyWriteConcern(const BSONObj&) const override {}
+    void waitForLinearizableReadConcern(OperationContext* opCtx) const override {
+        if (repl::ReadConcernArgs::get(opCtx).getLevel() ==
+            repl::ReadConcernLevel::kLinearizableReadConcern) {
+            uassertStatusOK(mongo::waitForLinearizableReadConcern(opCtx));
+        }
+    }
+
+    void uassertCommandDoesNotSpecifyWriteConcern(const BSONObj& cmd) const override {
+        if (commandSpecifiesWriteConcern(cmd)) {
+            uasserted(ErrorCodes::InvalidOptions, "Command does not support writeConcern");
+        }
+    }
 
     void attachCurOpErrInfo(OperationContext*, const BSONObj&) const override {}
 };
 
 DbResponse ServiceEntryPointEmbedded::handleRequest(OperationContext* opCtx, const Message& m) {
+    // Only one thread will pump at a time and concurrent calls to this will skip the pumping and go
+    // directly to handleRequest. This means that the jobs in the periodic runner can't provide any
+    // guarantees of the state (that they have run).
+    checked_cast<PeriodicRunnerEmbedded*>(opCtx->getServiceContext()->getPeriodicRunner())
+        ->tryPump();
     return ServiceEntryPointCommon::handleRequest(opCtx, m, Hooks{});
 }
 
@@ -69,11 +95,15 @@ void ServiceEntryPointEmbedded::startSession(transport::SessionHandle session) {
 
 void ServiceEntryPointEmbedded::endAllSessions(transport::Session::TagMask tags) {}
 
+Status ServiceEntryPointEmbedded::start() {
+    UASSERT_NOT_IMPLEMENTED;
+}
+
 bool ServiceEntryPointEmbedded::shutdown(Milliseconds timeout) {
     UASSERT_NOT_IMPLEMENTED;
 }
 
-ServiceEntryPoint::Stats ServiceEntryPointEmbedded::sessionStats() const {
+void ServiceEntryPointEmbedded::appendStats(BSONObjBuilder*) const {
     UASSERT_NOT_IMPLEMENTED;
 }
 

@@ -50,6 +50,7 @@
 #include "mongo/db/repl/repl_client_info.h"
 #include "mongo/db/s/collection_sharding_runtime.h"
 #include "mongo/db/s/sharding_state.h"
+#include "mongo/db/s/sharding_statistics.h"
 #include "mongo/db/server_parameters.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/write_concern.h"
@@ -123,7 +124,17 @@ boost::optional<Date_t> CollectionRangeDeleter::cleanUpNextRange(
         const auto scopedCollectionMetadata =
             metadataManager->getActiveMetadata(metadataManager, boost::none);
 
-        if (!forTestOnly && (!collection || !scopedCollectionMetadata->isSharded())) {
+        if (!scopedCollectionMetadata) {
+            LOG(0) << "Abandoning any range deletions because the metadata for " << nss.ns()
+                   << " was reset";
+            stdx::lock_guard<stdx::mutex> lk(css->_metadataManager->_managerLock);
+            css->_metadataManager->_clearAllCleanups(lk);
+            return boost::none;
+        }
+
+        const auto& metadata = *scopedCollectionMetadata;
+
+        if (!forTestOnly && (!collection || !metadata->isSharded())) {
             if (!collection) {
                 LOG(0) << "Abandoning any range deletions left over from dropped " << nss.ns();
             } else {
@@ -136,9 +147,9 @@ boost::optional<Date_t> CollectionRangeDeleter::cleanUpNextRange(
             return boost::none;
         }
 
-        if (!forTestOnly && scopedCollectionMetadata->getCollVersion().epoch() != epoch) {
+        if (!forTestOnly && metadata->getCollVersion().epoch() != epoch) {
             LOG(1) << "Range deletion task for " << nss.ns() << " epoch " << epoch << " woke;"
-                   << " (current is " << scopedCollectionMetadata->getCollVersion() << ")";
+                   << " (current is " << metadata->getCollVersion() << ")";
             return boost::none;
         }
 
@@ -209,7 +220,7 @@ boost::optional<Date_t> CollectionRangeDeleter::cleanUpNextRange(
 
         try {
             wrote = self->_doDeletion(
-                opCtx, collection, scopedCollectionMetadata->getKeyPattern(), *range, maxToDelete);
+                opCtx, collection, metadata->getKeyPattern(), *range, maxToDelete);
         } catch (const DBException& e) {
             wrote = e.toStatus();
             warning() << e.what();
@@ -377,6 +388,7 @@ StatusWith<int> CollectionRangeDeleter::_doDeletion(OperationContext* opCtx,
                       << redact(restoreStateStatus);
             break;
         }
+        ShardingStatistics::get(opCtx).countDocsDeletedOnDonor.addAndFetch(1);
 
     } while (++numDeleted < maxToDelete);
 

@@ -33,6 +33,7 @@
 #include "mongo/bson/bsonobj.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/s/catalog/type_chunk.h"
+#include "mongo/s/catalog/type_tags.h"
 #include "mongo/s/shard_id.h"
 #include "mongo/s/shard_key_pattern.h"
 
@@ -88,21 +89,39 @@ public:
         const ShardId& databasePrimaryShardId,
         const Timestamp& validAfter,
         const std::vector<BSONObj>& splitPoints,
-        const std::vector<ShardId>& shardIds,
+        const std::vector<ShardId>& allShardIds,
         const int numContiguousChunksPerShard = 1);
 
     /**
-     * Creates and writes to the config server the first chunks for a newly sharded collection.
-     * Returns the created chunks.
+     * Produces the initial chunks that need to be written for a collection which is being
+     * newly-sharded based on the given tags. Chunks that do not correspond to any pre-defined
+     * zones are assigned to available shards in a round-robin fashion.
      */
-    static ShardCollectionConfig writeFirstChunksToConfig(
-        OperationContext* opCtx,
+    static ShardCollectionConfig generateShardCollectionInitialZonedChunks(
         const NamespaceString& nss,
         const ShardKeyPattern& shardKeyPattern,
-        const ShardId& primaryShardId,
-        const std::vector<BSONObj>& splitPoints,
-        const bool distributeInitialChunks,
-        const int numContiguousChunksPerShard = 1);
-};
+        const Timestamp& validAfter,
+        const std::vector<TagsType>& tags,
+        const StringMap<std::vector<ShardId>>& tagToShards,
+        const std::vector<ShardId>& allShardIds);
 
+    /**
+     * Creates the first chunks for a newly sharded collection.
+     * Returns the created chunks.
+     */
+    static ShardCollectionConfig createFirstChunks(OperationContext* opCtx,
+                                                   const NamespaceString& nss,
+                                                   const ShardKeyPattern& shardKeyPattern,
+                                                   const ShardId& primaryShardId,
+                                                   const std::vector<BSONObj>& splitPoints,
+                                                   const std::vector<TagsType>& tags,
+                                                   const bool distributeInitialChunks,
+                                                   const int numContiguousChunksPerShard = 1);
+
+    /**
+     * Writes to the config server the first chunks for a newly sharded collection.
+     */
+    static void writeFirstChunksToConfig(
+        OperationContext* opCtx, const InitialSplitPolicy::ShardCollectionConfig& initialChunks);
+};
 }  // namespace mongo

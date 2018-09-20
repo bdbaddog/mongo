@@ -152,6 +152,7 @@ env.CppUnitTest(
         '$BUILD_DIR/mongo/db/db_raii',
         '$BUILD_DIR/mongo/db/namespace_string',
         '$BUILD_DIR/mongo/db/op_observer_d',
+        '$BUILD_DIR/mongo/db/repl/drop_pending_collection_reaper',
         '$BUILD_DIR/mongo/db/repl/optime',
         '$BUILD_DIR/mongo/db/repl/repl_coordinator_interface',
         '$BUILD_DIR/mongo/db/repl/replmocks',
@@ -201,6 +202,7 @@ env.Library(
         'database_holder',
         '$BUILD_DIR/mongo/base',
         '$BUILD_DIR/mongo/db/namespace_string',
+        '$BUILD_DIR/mongo/db/service_context',
         '$BUILD_DIR/mongo/db/storage/storage_options',
     ],
 )
@@ -235,16 +237,6 @@ env.Library(
     LIBDEPS=[
         'database_holder',
         '$BUILD_DIR/mongo/base',
-    ],
-)
-
-env.Library(
-    target='index_create_impl_servers',
-    source=[
-        'index_create_impl_servers.cpp',
-    ],
-    LIBDEPS_PRIVATE=[
-        'catalog_impl',
     ],
 )
 
@@ -315,11 +307,6 @@ env.Library(
         'rename_collection.cpp',
     ],
     LIBDEPS=[
-        'collection',
-        'collection_options',
-        'database',
-        'index_catalog',
-        'index_create',
         '$BUILD_DIR/mongo/base',
         '$BUILD_DIR/mongo/db/background',
         '$BUILD_DIR/mongo/db/db_raii',
@@ -327,6 +314,11 @@ env.Library(
         '$BUILD_DIR/mongo/db/server_options_core',
         '$BUILD_DIR/mongo/db/views/views',
         '$BUILD_DIR/mongo/db/write_ops',
+        'collection_options',
+        'collection',
+        'database',
+        'index_catalog',
+        'index_create',
     ],
 )
 
@@ -376,6 +368,7 @@ env.CppUnitTest(
         '$BUILD_DIR/mongo/db/auth/authmocks',
         '$BUILD_DIR/mongo/db/db_raii',
         '$BUILD_DIR/mongo/db/namespace_string',
+        '$BUILD_DIR/mongo/db/op_observer',
         '$BUILD_DIR/mongo/db/repl/drop_pending_collection_reaper',
         '$BUILD_DIR/mongo/db/repl/oplog',
         '$BUILD_DIR/mongo/db/repl/optime',
@@ -395,6 +388,7 @@ env.CppUnitTest(
         '$BUILD_DIR/mongo/db/auth/authmocks',
         '$BUILD_DIR/mongo/db/db_raii',
         '$BUILD_DIR/mongo/db/namespace_string',
+        '$BUILD_DIR/mongo/db/op_observer',
         '$BUILD_DIR/mongo/db/repl/drop_pending_collection_reaper',
         '$BUILD_DIR/mongo/db/repl/oplog',
         '$BUILD_DIR/mongo/db/repl/optime',

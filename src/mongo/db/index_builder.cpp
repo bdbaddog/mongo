@@ -119,6 +119,7 @@ std::string IndexBuilder::name() const {
 
 void IndexBuilder::run() {
     Client::initThread(name().c_str());
+    ON_BLOCK_EXIT([] { Client::destroy(); });
     LOG(2) << "IndexBuilder building index " << _index;
 
     auto opCtx = cc().makeOperationContext();
@@ -133,8 +134,6 @@ void IndexBuilder::run() {
     NamespaceString ns(_index["ns"].String());
 
     Lock::DBLock dlk(opCtx.get(), ns.db(), MODE_X);
-    OldClientContext ctx(opCtx.get(), ns.getSystemIndexesCollection());
-
     Database* db = DatabaseHolder::getDatabaseHolder().get(opCtx.get(), ns.db().toString());
 
     Status status = _build(opCtx.get(), db, true, &dlk);

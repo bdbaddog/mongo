@@ -41,7 +41,6 @@
 #include "mongo/db/catalog/document_validation.h"
 #include "mongo/db/cloner.h"
 #include "mongo/db/commands.h"
-#include "mongo/db/commands/copydb.h"
 #include "mongo/db/commands/rename_collection.h"
 #include "mongo/db/db.h"
 #include "mongo/db/index_builder.h"
@@ -129,9 +128,8 @@ public:
 
         // In order to clone a namespace, a user must be allowed to both create and write to that
         // namespace. There exist namespaces that are legal to create but not write to (e.g.
-        // system.profile), and there exist namespaces that are legal to write to but not create
-        // (e.g. system.indexes), so we must check that it is legal to both create and write to the
-        // namespace.
+        // system.profile), and there exist namespaces that are legal to write to but not create,
+        // so we must check that it is legal to both create and write to the namespace.
         auto allowedCreateStatus = userAllowedCreateNS(dbname, nsToCollectionSubstring(ns));
         uassertStatusOK(allowedCreateStatus);
         auto allowedWriteStatus = userAllowedWriteNS(dbname, nsToCollectionSubstring(ns));

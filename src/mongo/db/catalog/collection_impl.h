@@ -37,9 +37,7 @@
 namespace mongo {
 class IndexConsistency;
 class UUIDCatalog;
-class CollectionImpl final : virtual public Collection::Impl,
-                             virtual CappedCallback,
-                             virtual UpdateNotifier {
+class CollectionImpl final : virtual public Collection::Impl, virtual CappedCallback {
 private:
     static const int kMagicNumber = 1357924;
 
@@ -203,7 +201,7 @@ public:
                             const BSONObj& newDoc,
                             bool indexesAffected,
                             OpDebug* opDebug,
-                            OplogUpdateEntryArgs* args) final;
+                            CollectionUpdateArgs* args) final;
 
     bool updateWithDamagesSupported() const final;
 
@@ -219,7 +217,7 @@ public:
                                                      const Snapshotted<RecordData>& oldRec,
                                                      const char* damageSource,
                                                      const mutablebson::DamageVector& damages,
-                                                     OplogUpdateEntryArgs* args) final;
+                                                     CollectionUpdateArgs* args) final;
 
     // -----------
 
@@ -371,8 +369,6 @@ private:
      * Returns a non-ok Status if document does not pass this collection's validator.
      */
     Status checkValidation(OperationContext* opCtx, const BSONObj& document) const;
-
-    Status recordStoreGoingToUpdateInPlace(OperationContext* opCtx, const RecordId& loc);
 
     Status aboutToDeleteCapped(OperationContext* opCtx, const RecordId& loc, RecordData data);
 

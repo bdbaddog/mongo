@@ -29,7 +29,7 @@
 
 #include "mongo/dbtests/mock/mock_dbclient_connection.h"
 
-#include "mongo/dbtests/mock/mock_dbclient_cursor.h"
+#include "mongo/client/dbclient_mockcursor.h"
 #include "mongo/util/net/socket_exception.h"
 #include "mongo/util/time_support.h"
 
@@ -74,18 +74,19 @@ std::pair<rpc::UniqueReply, DBClientBase*> MockDBClientConnection::runCommandWit
 }
 
 
-std::unique_ptr<mongo::DBClientCursor> MockDBClientConnection::query(const string& ns,
-                                                                     mongo::Query query,
-                                                                     int nToReturn,
-                                                                     int nToSkip,
-                                                                     const BSONObj* fieldsToReturn,
-                                                                     int queryOptions,
-                                                                     int batchSize) {
+std::unique_ptr<mongo::DBClientCursor> MockDBClientConnection::query(
+    const NamespaceStringOrUUID& nsOrUuid,
+    mongo::Query query,
+    int nToReturn,
+    int nToSkip,
+    const BSONObj* fieldsToReturn,
+    int queryOptions,
+    int batchSize) {
     checkConnection();
 
     try {
         mongo::BSONArray result(_remoteServer->query(_remoteServerInstanceID,
-                                                     ns,
+                                                     nsOrUuid,
                                                      query,
                                                      nToReturn,
                                                      nToSkip,
@@ -94,7 +95,7 @@ std::unique_ptr<mongo::DBClientCursor> MockDBClientConnection::query(const strin
                                                      batchSize));
 
         std::unique_ptr<mongo::DBClientCursor> cursor;
-        cursor.reset(new MockDBClientCursor(this, result));
+        cursor.reset(new DBClientMockCursor(this, BSONArray(result.copy()), batchSize));
         return cursor;
     } catch (const mongo::DBException&) {
         _isFailed = true;
@@ -121,23 +122,14 @@ string MockDBClientConnection::toString() const {
     return _remoteServer->toString();
 }
 
-unsigned long long MockDBClientConnection::query(stdx::function<void(const BSONObj&)> f,
-                                                 const string& ns,
-                                                 mongo::Query query,
-                                                 const BSONObj* fieldsToReturn,
-                                                 int queryOptions) {
-    verify(false);
-    return 0;
-}
-
 unsigned long long MockDBClientConnection::query(
     stdx::function<void(mongo::DBClientCursorBatchIterator&)> f,
-    const std::string& ns,
+    const NamespaceStringOrUUID& nsOrUuid,
     mongo::Query query,
     const mongo::BSONObj* fieldsToReturn,
-    int queryOptions) {
-    verify(false);
-    return 0;
+    int queryOptions,
+    int batchSize) {
+    return DBClientBase::query(f, nsOrUuid, query, fieldsToReturn, queryOptions, batchSize);
 }
 
 uint64_t MockDBClientConnection::getSockCreationMicroSec() const {

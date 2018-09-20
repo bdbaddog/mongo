@@ -32,7 +32,6 @@
 #include "mongo/bson/bsonobj.h"
 #include "mongo/db/curop.h"
 #include "mongo/db/operation_context.h"
-#include "mongo/db/storage/record_fetcher.h"
 #include "mongo/util/fail_point_service.h"
 #include "mongo/util/time_support.h"
 
@@ -69,7 +68,12 @@ void QueryYield::yieldAllLocks(OperationContext* opCtx,
     // Track the number of yields in CurOp.
     CurOp::get(opCtx)->yielded();
 
-    MONGO_FAIL_POINT_PAUSE_WHILE_SET(setYieldAllLocksHang);
+    MONGO_FAIL_POINT_BLOCK(setYieldAllLocksHang, config) {
+        StringData ns{config.getData().getStringField("namespace")};
+        if (ns.empty() || ns == planExecNS.ns()) {
+            MONGO_FAIL_POINT_PAUSE_WHILE_SET(setYieldAllLocksHang);
+        }
+    }
 
     MONGO_FAIL_POINT_BLOCK(setYieldAllLocksWait, customWait) {
         const BSONObj& data = customWait.getData();

@@ -302,6 +302,14 @@ file_config = format_meta + file_runtime_config + [
     Config('leaf_item_max', '0', r'''
         historic term for leaf_key_max and leaf_value_max''',
         min=0, undoc=True),
+    Config('memory_page_image_max', '0', r'''
+        the maximum in-memory page image represented by a single storage block.
+        Depending on compression efficiency, compression can create storage
+        blocks which require significant resources to re-instantiate in the
+        cache, penalizing the performance of future point updates. The value
+        limits the maximum in-memory page image a storage block will need. If
+        set to 0, a default of 4 times \c leaf_page_max is used''',
+        min='0'),
     Config('memory_page_max', '5MB', r'''
         the maximum size a page can grow to in memory before being
         reconciled to disk.  The specified size will be adjusted to a lower
@@ -700,7 +708,8 @@ wiredtiger_open_log_configuration = [
             information'''),
         Config('file_max', '100MB', r'''
             the maximum size of log files''',
-            min='100KB', max='2GB'),
+            min='100KB',    # !!! Must match WT_LOG_FILE_MIN
+            max='2GB'),    # !!! Must match WT_LOG_FILE_MAX
         Config('path', '"."', r'''
             the name of a directory into which log files are written. The
             directory must already exist. If the value is not an absolute path,
@@ -709,7 +718,7 @@ wiredtiger_open_log_configuration = [
         Config('recover', 'on', r'''
             run recovery or error if recovery needs to run after an
             unclean shutdown''',
-            choices=['error', 'on', 'salvage'])
+            choices=['error', 'on'])
     ]),
 ]
 
@@ -854,7 +863,11 @@ wiredtiger_open_common =\
         file extension configuration.  If set, extend files of the set
         type in allocations of the set size, instead of a block at a
         time as each new block is written.  For example,
-        <code>file_extend=(data=16MB)</code>''',
+        <code>file_extend=(data=16MB)</code>. If set to 0, disable the file
+        extension for the set type. For log files, the allowed range is
+        between 100KB and 2GB; values larger than the configured maximum log
+        size and the default config would extend log files in allocations of
+        the maximum log file size.''',
         type='list', choices=['data', 'log']),
     Config('hazard_max', '1000', r'''
         maximum number of simultaneous hazard pointers per session
@@ -872,6 +885,14 @@ wiredtiger_open_common =\
         open connection in read-only mode.  The database must exist.  All
         methods that may modify a database are disabled.  See @ref readonly
         for more information''',
+        type='boolean'),
+    Config('salvage', 'false', r'''
+        open connection and salvage any WiredTiger-owned database and log
+        files that it detects as corrupted. This API should only be used
+        after getting an error return of WT_TRY_SALVAGE.
+        Salvage rebuilds files in place, overwriting existing files.
+        We recommend making a backup copy of all files with the
+        WiredTiger prefix prior to passing this flag.''',
         type='boolean'),
     Config('session_max', '100', r'''
         maximum expected number of sessions (including server
@@ -1120,6 +1141,10 @@ methods = {
         ignore the encodings for the key and value, manage data as if
         the formats were \c "u".  See @ref cursor_raw for details''',
         type='boolean'),
+    Config('read_once', 'false', r'''
+        results that are brought into cache from disk by this cursor will be
+        given less priority in the cache.''',
+        type='boolean'),
     Config('readonly', 'false', r'''
         only query operations are supported by this cursor. An error is
         returned if a modification is attempted using the cursor.  The
@@ -1152,6 +1177,16 @@ methods = {
         if non-empty, backup the list of objects; valid only for a
         backup data source''',
         type='list'),
+]),
+
+'WT_SESSION.query_timestamp' : Method([
+    Config('get', 'read', r'''
+        specify which timestamp to query: \c commit returns the most recently
+        set commit_timestamp.  \c first_commit returns the first set
+        commit_timestamp.  \c prepare returns the timestamp used in preparing a
+        transaction.  \c read returns the timestamp at which the transaction is
+        reading at.  See @ref transaction_timestamps''',
+        choices=['commit', 'first_commit', 'prepare', 'read']),
 ]),
 
 'WT_SESSION.rebalance' : Method([]),
@@ -1418,12 +1453,14 @@ methods = {
         specify which timestamp to query: \c all_committed returns the largest
         timestamp such that all timestamps up to that value have committed,
         \c oldest returns the most recent \c oldest_timestamp set with
-        WT_CONNECTION::set_timestamp, \c pinned returns the minimum of the
-        \c oldest_timestamp and the read timestamps of all active readers, and
-        \c stable returns the most recent \c stable_timestamp set with
-        WT_CONNECTION::set_timestamp.  See @ref transaction_timestamps''',
+        WT_CONNECTION::set_timestamp, \c oldest_reader returns the
+        minimum of the read timestamps of all active readers \c pinned returns
+        the minimum of the\c oldest_timestamp and the read timestamps of all
+        active readers, and \c stable returns the most recent
+        \c stable_timestamp set with WT_CONNECTION::set_timestamp. See
+        @ref transaction_timestamps''',
         choices=['all_committed','last_checkpoint',
-            'oldest','pinned','recovery','stable']),
+            'oldest','oldest_reader','pinned','recovery','stable']),
 ]),
 
 'WT_CONNECTION.set_timestamp' : Method([

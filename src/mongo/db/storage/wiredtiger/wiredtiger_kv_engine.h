@@ -35,6 +35,7 @@
 #include <memory>
 #include <string>
 
+#include <boost/filesystem/path.hpp>
 #include <wiredtiger.h>
 
 #include "mongo/bson/ordering.h"
@@ -81,43 +82,43 @@ public:
     void setRecordStoreExtraOptions(const std::string& options);
     void setSortedDataInterfaceExtraOptions(const std::string& options);
 
-    virtual bool supportsDocLocking() const;
+    virtual bool supportsDocLocking() const override;
 
-    virtual bool supportsDirectoryPerDB() const;
+    virtual bool supportsDirectoryPerDB() const override;
 
-    virtual bool isDurable() const {
+    virtual bool isDurable() const override {
         return _durable;
     }
 
-    virtual bool isEphemeral() const {
+    virtual bool isEphemeral() const override {
         return _ephemeral;
     }
 
-    virtual RecoveryUnit* newRecoveryUnit();
+    virtual RecoveryUnit* newRecoveryUnit() override;
 
     virtual Status createRecordStore(OperationContext* opCtx,
                                      StringData ns,
                                      StringData ident,
-                                     const CollectionOptions& options) {
+                                     const CollectionOptions& options) override {
         return createGroupedRecordStore(opCtx, ns, ident, options, KVPrefix::kNotPrefixed);
     }
 
     virtual std::unique_ptr<RecordStore> getRecordStore(OperationContext* opCtx,
                                                         StringData ns,
                                                         StringData ident,
-                                                        const CollectionOptions& options) {
+                                                        const CollectionOptions& options) override {
         return getGroupedRecordStore(opCtx, ns, ident, options, KVPrefix::kNotPrefixed);
     }
 
     virtual Status createSortedDataInterface(OperationContext* opCtx,
                                              StringData ident,
-                                             const IndexDescriptor* desc) {
+                                             const IndexDescriptor* desc) override {
         return createGroupedSortedDataInterface(opCtx, ident, desc, KVPrefix::kNotPrefixed);
     }
 
     virtual SortedDataInterface* getSortedDataInterface(OperationContext* opCtx,
                                                         StringData ident,
-                                                        const IndexDescriptor* desc) {
+                                                        const IndexDescriptor* desc) override {
         return getGroupedSortedDataInterface(opCtx, ident, desc, KVPrefix::kNotPrefixed);
     }
 
@@ -125,37 +126,37 @@ public:
                                             StringData ns,
                                             StringData ident,
                                             const CollectionOptions& options,
-                                            KVPrefix prefix);
+                                            KVPrefix prefix) override;
 
     virtual std::unique_ptr<RecordStore> getGroupedRecordStore(OperationContext* opCtx,
                                                                StringData ns,
                                                                StringData ident,
                                                                const CollectionOptions& options,
-                                                               KVPrefix prefix);
+                                                               KVPrefix prefix) override;
 
     virtual Status createGroupedSortedDataInterface(OperationContext* opCtx,
                                                     StringData ident,
                                                     const IndexDescriptor* desc,
-                                                    KVPrefix prefix);
+                                                    KVPrefix prefix) override;
 
     virtual SortedDataInterface* getGroupedSortedDataInterface(OperationContext* opCtx,
                                                                StringData ident,
                                                                const IndexDescriptor* desc,
-                                                               KVPrefix prefix);
+                                                               KVPrefix prefix) override;
 
-    virtual Status dropIdent(OperationContext* opCtx, StringData ident);
+    virtual Status dropIdent(OperationContext* opCtx, StringData ident) override;
 
     virtual void alterIdentMetadata(OperationContext* opCtx,
                                     StringData ident,
-                                    const IndexDescriptor* desc);
+                                    const IndexDescriptor* desc) override;
 
     virtual Status okToRename(OperationContext* opCtx,
                               StringData fromNS,
                               StringData toNS,
                               StringData ident,
-                              const RecordStore* originalRecordStore) const;
+                              const RecordStore* originalRecordStore) const override;
 
-    virtual int flushAllFiles(OperationContext* opCtx, bool sync);
+    virtual int flushAllFiles(OperationContext* opCtx, bool sync) override;
 
     virtual Status beginBackup(OperationContext* opCtx) override;
 
@@ -166,15 +167,20 @@ public:
 
     virtual void endNonBlockingBackup(OperationContext* opCtx) override;
 
-    virtual int64_t getIdentSize(OperationContext* opCtx, StringData ident);
+    virtual int64_t getIdentSize(OperationContext* opCtx, StringData ident) override;
 
-    virtual Status repairIdent(OperationContext* opCtx, StringData ident);
+    virtual Status repairIdent(OperationContext* opCtx, StringData ident) override;
 
-    virtual bool hasIdent(OperationContext* opCtx, StringData ident) const;
+    virtual Status recoverOrphanedIdent(OperationContext* opCtx,
+                                        StringData ns,
+                                        StringData ident,
+                                        const CollectionOptions& options) override;
 
-    std::vector<std::string> getAllIdents(OperationContext* opCtx) const;
+    virtual bool hasIdent(OperationContext* opCtx, StringData ident) const override;
 
-    virtual void cleanShutdown();
+    std::vector<std::string> getAllIdents(OperationContext* opCtx) const override;
+
+    virtual void cleanShutdown() override;
 
     SnapshotManager* getSnapshotManager() const final {
         return &_sessionCache->snapshotManager();
@@ -182,7 +188,8 @@ public:
 
     void setJournalListener(JournalListener* jl) final;
 
-    virtual void setStableTimestamp(Timestamp stableTimestamp) override;
+    virtual void setStableTimestamp(Timestamp stableTimestamp,
+                                    boost::optional<Timestamp> maximumTruncationTimestamp) override;
 
     virtual void setInitialDataTimestamp(Timestamp initialDataTimestamp) override;
 
@@ -212,7 +219,15 @@ public:
 
     virtual Timestamp getAllCommittedTimestamp() const override;
 
-    bool supportsReadConcernSnapshot() const final;
+    bool supportsReadConcernSnapshot() const final override;
+
+    /*
+     * This function is called when replication has completed a batch.  In this function, we
+     * refresh our oplog visiblity read-at-timestamp value.
+     */
+    void replicationBatchIsComplete() const override;
+
+    bool isCacheUnderPressure(OperationContext* opCtx) const override;
 
     // wiredtiger specific
     // Calls WT_CONNECTION::reconfigure on the underlying WT_CONNECTION
@@ -257,12 +272,6 @@ public:
         return _oplogManager.get();
     }
 
-    /*
-     * This function is called when replication has completed a batch.  In this function, we
-     * refresh our oplog visiblity read-at-timestamp value.
-     */
-    void replicationBatchIsComplete() const override;
-
     /**
      * Sets the implementation for `initRsOplogBackgroundThread` (allowing tests to skip the
      * background job, for example). Intended to be called from a MONGO_INITIALIZER and therefore in
@@ -280,8 +289,6 @@ public:
 
     static void appendGlobalStats(BSONObjBuilder& b);
 
-    bool isCacheUnderPressure(OperationContext* opCtx) const override;
-
     /**
      * These are timestamp access functions for serverStatus to be able to report the actual
      * snapshot window size.
@@ -291,12 +298,64 @@ public:
 
     Timestamp getInitialDataTimestamp() const;
 
+    /**
+     * Returns the data file path associated with an ident on disk. Returns boost::none if the data
+     * file can not be found. This will attempt to locate a file even if the storage engine's own
+     * metadata is not aware of the ident. This is intented for database repair purposes only.
+     */
+    boost::optional<boost::filesystem::path> getDataFilePathForIdent(StringData ident) const;
+
+    /**
+     * Returns the minimum possible Timestamp value in the oplog that replication may need for
+     * recovery in the event of a rollback. This value gets updated on every `setStableTimestamp`
+     * call.
+     */
+    Timestamp getOplogNeededForRollback() const;
+
+    /**
+     * Returns the minimum possible Timestamp value in the oplog that replication may need for
+     * recovery in the event of a crash. This value gets updated every time a checkpoint is
+     * completed. This value is typically a lagged version of what's needed for rollback.
+     *
+     * Returns boost::none when called on an ephemeral database.
+     */
+    boost::optional<Timestamp> getOplogNeededForCrashRecovery() const;
+
+    /**
+     * Returns oplog that may not be truncated. This method is a function of oplog needed for
+     * rollback and oplog needed for crash recovery. This method considers different states the
+     * storage engine can be running in, such as running in in-memory mode.
+     *
+     * This method returning Timestamp::min() implies no oplog should be truncated and
+     * Timestamp::max() means oplog can be truncated freely based on user oplog size
+     * configuration.
+     */
+    Timestamp getPinnedOplog() const;
+
 private:
     class WiredTigerJournalFlusher;
     class WiredTigerCheckpointThread;
 
+    /**
+     * Opens a connection on the WiredTiger database 'path' with the configuration 'wtOpenConfig'.
+     * Only returns when successful. Intializes both '_conn' and '_fileVersion'.
+     *
+     * If corruption is detected and _inRepairMode is 'true', attempts to salvage the WiredTiger
+     * metadata.
+     */
+    void _openWiredTiger(const std::string& path, const std::string& wtOpenConfig);
+
     Status _salvageIfNeeded(const char* uri);
     void _ensureIdentPath(StringData ident);
+
+    /**
+     * Recreates a WiredTiger ident from the provided URI by dropping and recreating the ident.
+     * This moves aside the existing data file, if one exists, with an added ".corrupt" suffix.
+     *
+     * Returns DataModifiedByRepair if the rebuild was successful, and any other error on failure.
+     * This will never return Status::OK().
+     */
+    Status _rebuildIdent(WT_SESSION* session, const char* uri);
 
     bool _hasUri(WT_SESSION* session, const std::string& uri) const;
 
@@ -333,6 +392,7 @@ private:
     void _setOldestTimestamp(Timestamp newOldestTimestamp, bool force);
 
     WT_CONNECTION* _conn;
+    WiredTigerFileVersion _fileVersion;
     WiredTigerEventHandler _eventHandler;
     std::unique_ptr<WiredTigerSessionCache> _sessionCache;
     ClockSource* const _clockSource;
@@ -368,11 +428,11 @@ private:
 
     std::unique_ptr<WiredTigerSession> _backupSession;
     Timestamp _recoveryTimestamp;
-    WiredTigerFileVersion _fileVersion;
 
     // Tracks the stable and oldest timestamps we've set on the storage engine.
     AtomicWord<std::uint64_t> _oldestTimestamp;
     AtomicWord<std::uint64_t> _stableTimestamp;
+    AtomicWord<std::uint64_t> _oplogNeededForRollback{Timestamp::min().asULL()};
 
     // Timestamp of data at startup. Used internally to advise checkpointing and recovery to a
     // timestamp. Provided by replication layer because WT does not persist timestamps.

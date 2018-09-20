@@ -47,16 +47,17 @@ class Environment;
 
 struct SSLParams {
     enum class Protocols { TLS1_0, TLS1_1, TLS1_2 };
-    AtomicInt32 sslMode;            // --sslMode - the SSL operation mode, see enum SSLModes
+    AtomicInt32 sslMode;            // --tlsMode - the TLS operation mode, see enum SSLModes
     std::string sslPEMTempDHParam;  // --setParameter OpenSSLDiffieHellmanParameters=file : PEM file
                                     // with DH parameters.
-    std::string sslPEMKeyFile;      // --sslPEMKeyFile
-    std::string sslPEMKeyPassword;  // --sslPEMKeyPassword
-    std::string sslClusterFile;     // --sslInternalKeyFile
-    std::string sslClusterPassword;  // --sslInternalKeyPassword
-    std::string sslCAFile;           // --sslCAFile
-    std::string sslCRLFile;          // --sslCRLFile
-    std::string sslCipherConfig;     // --sslCipherConfig
+    std::string sslPEMKeyFile;      // --tlsPEMKeyFile
+    std::string sslPEMKeyPassword;  // --tlsPEMKeyPassword
+    std::string sslClusterFile;     // --tlsInternalKeyFile
+    std::string sslClusterPassword;  // --tlsInternalKeyPassword
+    std::string sslCAFile;           // --tlsCAFile
+    std::string sslClusterCAFile;    // --tlsClusterCAFile
+    std::string sslCRLFile;          // --tlsCRLFile
+    std::string sslCipherConfig;     // --tlsCipherConfig
 
     struct CertificateSelector {
         std::string subject;
@@ -71,6 +72,7 @@ struct SSLParams {
 #endif
 
     std::vector<Protocols> sslDisabledProtocols;  // --sslDisabledProtocols
+    std::vector<Protocols> tlsLogVersions;        // --tlsLogVersion
     bool sslWeakCertificateValidation = false;    // --sslWeakCertificateValidation
     bool sslFIPSMode = false;                     // --sslFIPSMode
     bool sslAllowInvalidCertificates = false;     // --sslAllowInvalidCertificates
@@ -80,6 +82,7 @@ struct SSLParams {
     bool disableNonSSLConnectionLoggingSet = false;
     bool suppressNoTLSPeerCertificateWarning =
         false;  // --setParameter suppressNoTLSPeerCertificateWarning
+    bool tlsWithholdClientCertificate = false;  // --setParameter tlsWithholdClientCertificate
 
     SSLParams() {
         sslMode.store(SSLMode_disabled);

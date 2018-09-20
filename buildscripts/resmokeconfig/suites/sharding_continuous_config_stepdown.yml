@@ -64,7 +64,6 @@ selector:
   - jstests/sharding/tag_range.js
   - jstests/sharding/top_chunk_autosplit.js
   - jstests/sharding/count_config_servers.js
-  - jstests/sharding/conf_server_write_concern_metadata.js
   - jstests/sharding/split_large_key.js
   - jstests/sharding/balancer_window.js
   # No retries on direct writes to the config/admin databases on the config servers
@@ -97,6 +96,7 @@ selector:
   - jstests/sharding/move_chunk_insert_with_write_retryability.js
   - jstests/sharding/move_chunk_remove_with_write_retryability.js
   - jstests/sharding/move_chunk_update_with_write_retryability.js
+  - jstests/sharding/txn_coordinator_commands_basic_requirements.js
   # Runs setShardVersion/getShardVersion against the config server and we don't support retries
   # for this command
   - jstests/sharding/major_version_check.js
@@ -165,6 +165,17 @@ selector:
   # Checks for an exact number of matching entries in the profiler, which will fail if a command
   # gets retried due to a stepdown.
   - jstests/sharding/database_and_shard_versioning_all_commands.js
+  # Calls removeShard/removeshard which is not idempotent and these tests expect it to be run an exact number of times
+  - jstests/sharding/addshard5.js
+  - jstests/sharding/auth_add_shard.js
+  - jstests/sharding/remove3.js
+  - jstests/sharding/authCommands.js
+  #  - jstests/sharding/addshard2.js
+  #  - jstests/sharding/configsvr_metadata_commands_require_majority_write_concern.js
+  #  - jstests/sharding/convert_to_and_from_sharded.js
+  #  - jstests/sharding/names.js
+  #  - jstests/sharding/remove1.js
+  #  - jstests/sharding/remove2.js
 
 executor:
   config:

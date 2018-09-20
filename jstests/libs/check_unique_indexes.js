@@ -3,28 +3,38 @@
 /**
  * Verifies that all unique indexes belonging to all collections on all databases on the server
  * are in correct data format version.
+ *
+ * TODO: SERVER-36547: Once we are past 4.2 release, make this script FCV independent.
+ * After 4.2 we can just assert if we do not see the correct index versions.
  */
-function checkUniqueIndexFormatVersion(adminDB, currentFCV) {
-    let getParameterResult =
-        adminDB.runCommand({getParameter: 1, createTimestampSafeUniqueIndex: 1});
-    assert.commandWorked(getParameterResult);
-    // TODO(SERVER-34489) Remove this check when upgrade/downgrade is ready.
-    if (!getParameterResult.createTimestampSafeUniqueIndex)
-        return;
-
-    // Data format version is WiredTiger specific and not required to be tested for other storage
-    // engines.
+function checkUniqueIndexFormatVersion(adminDB) {
+    // Data format version is WiredTiger specific and not required to be tested for other
+    // storage engines.
     const isWiredTiger =
         assert.commandWorked(adminDB.serverStatus()).storageEngine.name === "wiredTiger";
     if (!isWiredTiger)
         return;
 
-    let res = assert.commandWorked(adminDB.runCommand({"listDatabases": 1}));
+    // Unique indexes got an upgrade in 4.2, their WiredTiger specific internal version has changed
+    // since then
+    const newUniqIdxFCV = "4.2";
+
+    // Obtain the current FCV version
+    let res =
+        assert.commandWorked(adminDB.runCommand({getParameter: 1, featureCompatibilityVersion: 1}));
+    let currentFCV = res["featureCompatibilityVersion"]["version"];
+
+    res = assert.commandWorked(adminDB.runCommand({"listDatabases": 1}));
     let databaseList = res.databases;
 
     databaseList.forEach(function(database) {
         let currentDatabase = adminDB.getSiblingDB(database.name);
-        currentDatabase.getCollectionInfos().forEach(function(c) {
+        // Get the list of collections including collections that are pending drop. This is to
+        // ensure that every unique index has the correct format version.
+        let collectionsWithPending =
+            currentDatabase.runCommand("listCollections", {includePendingDrops: true})
+                .cursor.firstBatch;
+        collectionsWithPending.forEach(function(c) {
             let currentCollection = currentDatabase.getCollection(c.name);
             currentCollection.getIndexes().forEach(function(index) {
                 if (index.unique) {
@@ -32,12 +42,13 @@ function checkUniqueIndexFormatVersion(adminDB, currentFCV) {
                                   .next()
                                   .storageStats.indexDetails[index.name]
                                   .metadata.formatVersion;
-                    // Unique indexes are expected to have new format version only with latest FCV.
+                    // Unique indexes are expected to have new format version only post
+                    // newUniqIdxFCV
                     if (index.v === 2) {
-                        if (currentFCV === latestFCV)
+                        if (currentFCV === newUniqIdxFCV)
                             assert.eq(ifv,
-                                      10,
-                                      "Expected index format version 10 for unique index: " +
+                                      12,
+                                      "Expected index format version 12 for unique index: " +
                                           tojson(index));
                         else
                             assert.eq(ifv,
@@ -45,10 +56,10 @@ function checkUniqueIndexFormatVersion(adminDB, currentFCV) {
                                       "Expected index format version 8 for unique index: " +
                                           tojson(index));
                     } else {
-                        if (currentFCV === latestFCV)
+                        if (currentFCV === newUniqIdxFCV)
                             assert.eq(ifv,
-                                      9,
-                                      "Expected index format version 9 for unique index: " +
+                                      11,
+                                      "Expected index format version 11 for unique index: " +
                                           tojson(index));
                         else
                             assert.eq(ifv,

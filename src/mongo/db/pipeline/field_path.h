@@ -119,4 +119,12 @@ private:
     // lookup.
     std::vector<size_t> _fieldPathDotPosition;
 };
+
+inline bool operator<(const FieldPath& lhs, const FieldPath& rhs) {
+    return lhs.fullPath() < rhs.fullPath();
+}
+
+inline bool operator==(const FieldPath& lhs, const FieldPath& rhs) {
+    return lhs.fullPath() == rhs.fullPath();
+}
 }

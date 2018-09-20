@@ -47,7 +47,7 @@
 #include "mongo/db/s/sharding_state.h"
 #include "mongo/db/server_options.h"
 #include "mongo/db/server_parameters.h"
-#include "mongo/db/session_catalog.h"
+#include "mongo/db/transaction_participant.h"
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/grid.h"
 #include "mongo/util/log.h"
@@ -207,9 +207,9 @@ Status waitForReadConcern(OperationContext* opCtx,
     // If we are in a direct client within a transaction, then we may be holding locks, so it is
     // illegal to wait for read concern. This is fine, since the outer operation should have handled
     // waiting for read concern.
-    auto session = OperationContextSession::get(opCtx);
-    if (opCtx->getClient()->isInDirectClient() && session &&
-        session->inMultiDocumentTransaction()) {
+    auto txnParticipant = TransactionParticipant::get(opCtx);
+    if (opCtx->getClient()->isInDirectClient() && txnParticipant &&
+        txnParticipant->inMultiDocumentTransaction()) {
         return Status::OK();
     }
 
@@ -220,8 +220,8 @@ Status waitForReadConcern(OperationContext* opCtx,
     // concern is not yet supported with atClusterTime.
     //
     // TODO SERVER-34620: Re-enable speculative behavior when "atClusterTime" is specified.
-    const bool speculative =
-        session && session->inMultiDocumentTransaction() && !readConcernArgs.getArgsAtClusterTime();
+    const bool speculative = txnParticipant && txnParticipant->inMultiDocumentTransaction() &&
+        !readConcernArgs.getArgsAtClusterTime();
 
     if (readConcernArgs.getLevel() == repl::ReadConcernLevel::kLinearizableReadConcern) {
         if (replCoord->getReplicationMode() != repl::ReplicationCoordinator::modeReplSet) {
@@ -295,7 +295,11 @@ Status waitForReadConcern(OperationContext* opCtx,
                     "node needs to be a replica set member to use readConcern: snapshot"};
         }
         if (speculative) {
-            session->setSpeculativeTransactionOpTimeToLastApplied(opCtx);
+            txnParticipant->setSpeculativeTransactionOpTime(
+                opCtx,
+                readConcernArgs.getOriginalLevel() == repl::ReadConcernLevel::kSnapshotReadConcern
+                    ? SpeculativeTransactionOpTime::kAllCommitted
+                    : SpeculativeTransactionOpTime::kLastApplied);
         }
     }
 
@@ -334,7 +338,12 @@ Status waitForReadConcern(OperationContext* opCtx,
         LOG(debugLevel) << "Using 'committed' snapshot: " << CurOp::get(opCtx)->opDescription();
     }
 
-    if (readConcernArgs.getLevel() == repl::ReadConcernLevel::kAvailableReadConcern) {
+    // Only snapshot, linearizable and afterClusterTime reads should block on prepared transactions.
+    // We don't ignore prepare conflicts if we are in a direct client in case this overrides
+    // behavior set by a higher-level operation.
+    if (readConcernArgs.getLevel() != repl::ReadConcernLevel::kSnapshotReadConcern &&
+        readConcernArgs.getLevel() != repl::ReadConcernLevel::kLinearizableReadConcern &&
+        !afterClusterTime && !atClusterTime && !opCtx->getClient()->isInDirectClient()) {
         opCtx->recoveryUnit()->setIgnorePrepared(true);
     }
 

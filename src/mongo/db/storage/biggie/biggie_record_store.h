@@ -94,8 +94,7 @@ public:
     virtual Status updateRecord(OperationContext* opCtx,
                                 const RecordId& oldLocation,
                                 const char* data,
-                                int len,
-                                UpdateNotifier* notifier);
+                                int len);
 
     virtual bool updateWithDamagesSupported() const;
 
@@ -144,7 +143,7 @@ private:
         StringData _ident;
         std::string _prefix;
         std::string _postfix;
-        StringStore::iterator it;
+        StringStore::const_iterator it;
         boost::optional<std::string> _savedPosition;
         bool _needFirstSeek{true};
 
@@ -166,7 +165,7 @@ private:
         StringData _ident;
         std::string _prefix;
         std::string _postfix;
-        StringStore::reverse_iterator it;
+        StringStore::const_reverse_iterator it;
         boost::optional<std::string> _savedPosition;
         bool _needFirstSeek{true};
 

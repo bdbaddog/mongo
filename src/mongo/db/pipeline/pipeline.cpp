@@ -38,7 +38,6 @@
 #include "mongo/db/jsobj.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/pipeline/accumulator.h"
-#include "mongo/db/pipeline/cluster_aggregation_planner.h"
 #include "mongo/db/pipeline/document.h"
 #include "mongo/db/pipeline/document_source.h"
 #include "mongo/db/pipeline/document_source_geo_near.h"
@@ -70,12 +69,12 @@ using std::vector;
 
 namespace dps = ::mongo::dotted_path_support;
 
-using ChangeStreamRequirement = DocumentSource::StageConstraints::ChangeStreamRequirement;
-using HostTypeRequirement = DocumentSource::StageConstraints::HostTypeRequirement;
-using PositionRequirement = DocumentSource::StageConstraints::PositionRequirement;
-using DiskUseRequirement = DocumentSource::StageConstraints::DiskUseRequirement;
-using FacetRequirement = DocumentSource::StageConstraints::FacetRequirement;
-using StreamType = DocumentSource::StageConstraints::StreamType;
+using ChangeStreamRequirement = StageConstraints::ChangeStreamRequirement;
+using HostTypeRequirement = StageConstraints::HostTypeRequirement;
+using PositionRequirement = StageConstraints::PositionRequirement;
+using DiskUseRequirement = StageConstraints::DiskUseRequirement;
+using FacetRequirement = StageConstraints::FacetRequirement;
+using StreamType = StageConstraints::StreamType;
 
 constexpr MatchExpressionParser::AllowedFeatureSet Pipeline::kAllowedMatcherFeatures;
 constexpr MatchExpressionParser::AllowedFeatureSet Pipeline::kGeoNearMatcherFeatures;
@@ -335,25 +334,6 @@ bool Pipeline::usedDisk() {
         _sources.begin(), _sources.end(), [](const auto& stage) { return stage->usedDisk(); });
 }
 
-std::unique_ptr<Pipeline, PipelineDeleter> Pipeline::splitForSharded() {
-    invariant(!isSplitForShards());
-    invariant(!isSplitForMerge());
-
-    // Create and initialize the shard spec we'll return. We start with an empty pipeline on the
-    // shards and all work being done in the merger. Optimizations can move operations between
-    // the pipelines to be more efficient.
-    std::unique_ptr<Pipeline, PipelineDeleter> shardPipeline(new Pipeline(pCtx),
-                                                             PipelineDeleter(pCtx->opCtx));
-
-    cluster_aggregation_planner::performSplitPipelineOptimizations(shardPipeline.get(), this);
-    shardPipeline->_splitState = SplitState::kSplitForShards;
-    _splitState = SplitState::kSplitForMerge;
-
-    stitch();
-
-    return shardPipeline;
-}
-
 BSONObj Pipeline::getInitialQuery() const {
     if (_sources.empty())
         return BSONObj();
@@ -399,12 +379,13 @@ bool Pipeline::canRunOnMongos() const {
 }
 
 bool Pipeline::requiredToRunOnMongos() const {
-    invariant(!isSplitForShards());
+    invariant(_splitState != SplitState::kSplitForShards);
 
     for (auto&& stage : _sources) {
         // If this pipeline is capable of splitting before the mongoS-only stage, then the pipeline
         // as a whole is not required to run on mongoS.
-        if (isUnsplit() && dynamic_cast<NeedsMergerDocumentSource*>(stage.get())) {
+        if (_splitState == SplitState::kUnsplit &&
+            dynamic_cast<NeedsMergerDocumentSource*>(stage.get())) {
             return false;
         }
 
@@ -495,6 +476,48 @@ void Pipeline::addFinalSource(intrusive_ptr<DocumentSource> source) {
         source->setSource(_sources.back().get());
     }
     _sources.push_back(source);
+}
+
+boost::optional<StringMap<std::string>> Pipeline::renamedPaths(
+    SourceContainer::const_reverse_iterator rstart,
+    SourceContainer::const_reverse_iterator rend,
+    std::set<std::string> pathsOfInterest) {
+    // Use a vector to give a path id to each input path. A path's id is its index in the vector.
+    const std::vector<string> inputPaths(pathsOfInterest.begin(), pathsOfInterest.end());
+    std::vector<string> currentPaths(pathsOfInterest.begin(), pathsOfInterest.end());
+
+    // Loop backwards over the stages. We will re-use 'pathsOfInterest', modifying that set each
+    // time to be the current set of field's we're interested in. At the same time, we will maintain
+    // 'currentPaths'. 'pathsOfInterest' is used to compute the renames, while 'currentPaths' is
+    // used to tie a path back to its id.
+    //
+    // Interestingly, 'currentPaths' may contain duplicates. For example, if a stage like
+    // {$addFields: {a: "$b"}} duplicates the value of "a" and both paths are of interest, then
+    // 'currentPaths' may begin as ["a", "b"] representing the paths after the $addFields stage, but
+    // becomes ["a", "a"] via the rename.
+    for (auto it = rstart; it != rend; ++it) {
+        boost::optional<StringMap<string>> renamed = (*it)->renamedPaths(pathsOfInterest);
+        if (!renamed) {
+            return boost::none;
+        }
+        pathsOfInterest.clear();
+        for (std::size_t pathId = 0; pathId < inputPaths.size(); ++pathId) {
+            currentPaths[pathId] = (*renamed)[currentPaths[pathId]];
+            pathsOfInterest.insert(currentPaths[pathId]);
+        }
+    }
+
+    // We got all the way through the pipeline via renames! Construct the mapping from path at the
+    // end of the pipeline to path at the beginning.
+    StringMap<string> renameMap;
+    for (std::size_t pathId = 0; pathId < currentPaths.size(); ++pathId) {
+        renameMap[inputPaths[pathId]] = currentPaths[pathId];
+    }
+    return renameMap;
+}
+
+boost::optional<StringMap<string>> Pipeline::renamedPaths(std::set<string> pathsOfInterest) const {
+    return renamedPaths(_sources.rbegin(), _sources.rend(), std::move(pathsOfInterest));
 }
 
 DepsTracker Pipeline::getDependencies(DepsTracker::MetadataAvailable metadataAvailable) const {

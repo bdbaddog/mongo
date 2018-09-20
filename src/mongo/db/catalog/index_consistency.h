@@ -74,11 +74,13 @@ struct IndexInfo {
     // The number of long keys that are not indexed for the index.
     int64_t numLongKeys;
     // The number of records that have a key in their document that referenced back to the
-    // this index
+    // this index.
     int64_t numRecords;
     // Keeps track of how many indexes were removed (-1) and added (+1) after the
     // point of validity was set for this index.
     int64_t numExtraIndexKeys;
+    // A hashed set of indexed multikey paths (applies to $** indexes only).
+    std::set<uint32_t> hashedMultikeyMetadataPaths;
 };
 
 class IndexConsistency final {
@@ -91,17 +93,25 @@ public:
                      const bool background);
 
     /**
-     * Helper functions for `_addDocKey`, `_removeDocKey`, `_addIndexKey`,
-     * and `_removeIndexKey` for concurrency control.
+     * Helper functions for `_addDocKey` and `_addIndexKey` for concurrency control.
      */
     void addDocKey(const KeyString& ks, int indexNumber);
-    void removeDocKey(const KeyString& ks, int indexNumber);
     void addIndexKey(const KeyString& ks, int indexNumber);
-    void removeIndexKey(const KeyString& ks, int indexNumber);
+
+    /**
+     * To validate $** multikey metadata paths, we first scan the collection and add a hash of all
+     * multikey paths encountered to a set. We then scan the index for multikey metadata path
+     * entries and remove any path encountered. As we expect the index to contain a super-set of
+     * the collection paths, a non-empty set represents an invalid index.
+     */
+    void addMultikeyMetadataPath(const KeyString& ks, int indexNumber);
+    void removeMultikeyMetadataPath(const KeyString& ks, int indexNumber);
+    size_t getMultikeyMetadataPathCount(int indexNumber);
 
     /**
      * Add one to the `_longKeys` count for the given `indexNs`.
      * This is required because index keys > `KeyString::kMaxKeyBytes` are not indexed.
+     * TODO SERVER-36385: Completely remove the key size check in 4.4
      */
     void addLongIndexKey(int indexNumber);
 
@@ -136,39 +146,6 @@ public:
     int64_t getNumExtraIndexKeys(int indexNumber) const;
 
     /**
-     * This is the entry point for the IndexObserver to apply its observed changes
-     * while it is listening for changes in the IndexAccessMethod.
-     *
-     * This method ensures that during the collection scan stage, inserted, removed and
-     * updated documents are reflected in the index key counts.
-     * It does this by:
-     * 1) Setting the yield point for the collection scan to inform us when we should
-     *    get a new snapshot so we won't scan stale records.
-     * 2) Calling the appropriate `addDocKey` and `removeDocKey` functions if the
-     *    record comes before or equal to our last processed RecordId.
-     *
-     * The IndexObserver will call this method while it is observing changes during
-     * the index scan stage of the collection validation. It ensures we maintain
-     * a pre-image of the indexes since we established the point of validity, which
-     * was determined when the collection scan stage completed.
-     * It does this by:
-     * 1) Setting the yield point for the index scan to inform us when we should get
-     *    a new snapshot so we won't scan stale index entries. The difference between
-     *    this and the collection scan is that it will only set the yield point for the
-     *    index that is currently being scanned, since when we start the next index, we
-     *    will yield before we begin and we would have the latest snapshot.
-     * 2) Calling the appropriate `addIndexKey` and `removeIndexKey` functions for indexes
-     *    that haven't started scanning and are not finished, or they are scanning the
-     *    index and the index changes are after the last processed index entry.
-     * 3) In addition, we maintain the number of external index changes here so that
-     *    after we finish the index scan, we can remove the extra number of operations
-     *    that happened after the point of validity.
-     */
-    void applyChange(const IndexDescriptor* descriptor,
-                     const boost::optional<IndexKeyEntry>& indexEntry,
-                     ValidationOperation operation);
-
-    /**
      * Moves the `_stage` variable to the next corresponding stage in the following order:
      * `DOCUMENT` -> `INDEX`
      * `INDEX` -> `NONE`
@@ -182,61 +159,9 @@ public:
     ValidationStage getStage() const;
 
     /**
-     * Sets `_lastProcessedRecordId` to `recordId`.
-     */
-    void setLastProcessedRecordId(RecordId recordId);
-
-    /**
-     * Sets `_lastProcessedIndexEntry` to the KeyString of `indexEntry`.
-     */
-    void setLastProcessedIndexEntry(const IndexDescriptor& descriptor,
-                                    const boost::optional<IndexKeyEntry>& indexEntry);
-
-    /**
-     * Informs the IndexConsistency instance that the index scan is beginning to scan the index
-     * with namespace `indexNs`. This gives us a chance to clean up after the previous index and
-     * setup for the new index.
-     */
-    void notifyStartIndex(int indexNumber);
-
-    /**
-     * Informs the IndexConsistency instance that the index scan has finished scanning the index
-     * with namespace `indexNs`. This allows us to clean up just like in `notifyStartIndex` and to
-     * set the index to a finished state so that the hooks are prevented from affecting it.
-     */
-    void notifyDoneIndex(int indexNumber);
-
-    /**
      * Returns the index number for the corresponding index namespace's.
      */
     int getIndexNumber(const std::string& indexNs);
-
-    /**
-     * Returns true if a new snapshot should be accquired.
-     * If the `recordId` is equal to or greater than `_yieldAtRecordId` then we must get
-     * a new snapshot otherwise we will use stale data.
-     * Otherwise we do not need a new snapshot and can continue with the collection scan.
-     */
-    bool shouldGetNewSnapshot(const RecordId recordId) const;
-
-    /**
-     * Returns true if a new snapshot should be accquired.
-     * If the `keyString` is equal to or greater than `_yieldAtIndexEntry` then we must get
-     * a new snapshot otherwise we will use stale data.
-     * Otherwise we do not need a new snapshot and can continue with the index scan.
-     */
-    bool shouldGetNewSnapshot(const KeyString& keyString) const;
-
-    /**
-     * Gives up the lock that the collection is currently held in and requests the
-     * the collection again in LockMode `mode`
-     */
-    void relockCollectionWithMode(LockMode mode);
-
-    /**
-     * Returns true if the ElapsedTracker says its time to yield during background validation.
-     */
-    bool scanLimitHit();
 
 private:
     OperationContext* _opCtx;
@@ -244,7 +169,6 @@ private:
     const NamespaceString _nss;
     const RecordStore* _recordStore;
     std::unique_ptr<Lock::CollectionLock> _collLk;
-    const bool _isBackground;
     ElapsedTracker _tracker;
 
     // We map the hashed KeyString values to a bucket which contain the count of how many
@@ -264,23 +188,11 @@ private:
     // A mapping of index numbers to IndexInfo
     std::map<int, IndexInfo> _indexesInfo;
 
-    // RecordId of the last processed document during the collection scan.
-    boost::optional<RecordId> _lastProcessedRecordId = boost::none;
-
-    // KeyString of the last processed index entry during the index scan.
-    std::unique_ptr<KeyString> _lastProcessedIndexEntry = nullptr;
-
     // The current index namespace being scanned in the index scan phase.
     int _currentIndex = -1;
 
     // The stage that the validation is currently on.
     ValidationStage _stage = ValidationStage::DOCUMENT;
-
-    // Contains the RecordId of when we should yield collection scan.
-    boost::optional<RecordId> _yieldAtRecordId = boost::none;
-
-    // Contains the KeyString of when we should yield during the index scan.
-    std::unique_ptr<KeyString> _yieldAtIndexEntry = nullptr;
 
     // Threshold for the number of errors to record before returning "There are too many errors".
     static const int _kErrorThreshold = 100;
@@ -298,76 +210,14 @@ private:
     void _addDocKey_inlock(const KeyString& ks, int indexNumber);
 
     /**
-     * Given the document's key KeyString, decrement the corresponding `_indexKeyCount`
-     * by hashing it.
-     */
-    void _removeDocKey_inlock(const KeyString& ks, int indexNumber);
-
-    /**
      * Given the index entry's KeyString, decrement the corresponding `_indexKeyCount`
      * by hashing it.
      */
     void _addIndexKey_inlock(const KeyString& ks, int indexNumber);
 
     /**
-     * Given the index entry's KeyString, increment the corresponding `_indexKeyCount`
-     * by hashing it.
-     */
-    void _removeIndexKey_inlock(const KeyString& ks, int indexNumber);
-
-    /**
-     * Returns true if the index for the given `indexNs` has finished being scanned by
-     * the validation, otherwise it returns false.
-     */
-    bool _isIndexFinished_inlock(int indexNumber) const;
-
-    /**
-     * Returns true if this is the current `indexNs` being scanned
-     * by validation, otherwise it returns false.
-     */
-    bool _isIndexScanning_inlock(int indexNumber) const;
-
-    /**
-     * Allows the IndexObserver to set a yield point at `recordId` so that during the collection
-     * scan we must yield before processing the record. This is a preventive measure so the
-     * collection scan doesn't scan stale records.
-     */
-    void _setYieldAtRecord_inlock(const RecordId recordId);
-
-    /**
-     * Allows the IndexObserver to set a yield point at the KeyString of `indexEntry` so that
-     * during the index scan we must yield before processing the index entry.
-     * This is a preventive measure so the index scan doesn't scan stale index entries.
-     */
-    void _setYieldAtIndexEntry_inlock(const KeyString& keyString);
-
-    /**
-     * Returns true if the `recordId` is before or equal to the last processed
-     * RecordId.
-     */
-    bool _isBeforeLastProcessedRecordId_inlock(RecordId recordId) const;
-
-    /**
-     * Returns true if the `keyString` is before or equal to the last processed
-     * index entry.
-     */
-    bool _isBeforeLastProcessedIndexEntry_inlock(const KeyString& keyString) const;
-
-    /**
      * Returns a hashed value from the given KeyString and index namespace.
      */
     uint32_t _hashKeyString(const KeyString& ks, int indexNumbers) const;
-
-    /**
-     * Used alongside `yield()` and `relockCollectionWithMode()` to ensure that after the execution
-     * of them it is safe to continue validating.
-     * Validation can be stopped for a number of reasons including:
-     * 1) The database was dropped.
-     * 2) The collection was dropped.
-     * 3) An index was added or removed in the collection being validated.
-     * 4) The operation was killed.
-     */
-    Status _throwExceptionIfError();
-
 };  // IndexConsistency
 }  // namespace mongo

@@ -500,6 +500,10 @@ var {
         let _lastUsed = new Date();
 
         this.client = new SessionAwareClient(client);
+        if (!serverSupports(kWireVersionSupportingLogicalSession)) {
+            throw new DriverSession.UnsupportedError(
+                "Logical Sessions are only supported on server versions 3.6 and greater.");
+        }
         this.handle = client._startSession();
 
         function serverSupports(wireVersion) {
@@ -517,6 +521,10 @@ var {
 
         this.getLastUsed = function getLastUsed() {
             return _lastUsed;
+        };
+
+        this.getTxnNumber = function getTxnNumber() {
+            return _txnNumber;
         };
 
         this.getTxnOptions = function getTxnOptions() {
@@ -732,9 +740,11 @@ var {
             return cmdObj;
         };
 
-        this.startTransaction = function startTransaction(txnOptsObj) {
-            // If the session is already in a transaction, raise an error.
-            if (this.isTxnActive()) {
+        this.startTransaction = function startTransaction(txnOptsObj, ignoreActiveTxn) {
+            // If the session is already in a transaction, raise an error. If retryNewTxnNum
+            // is true, don't raise an error. This is to allow multiple threads to try to
+            // use the same session in a concurrency workload.
+            if (this.isTxnActive() && !ignoreActiveTxn) {
                 throw new Error("Transaction already in progress on this session.");
             }
             if (!serverSupports(kWireVersionSupportingMultiDocumentTransactions)) {
@@ -829,7 +839,7 @@ var {
     };
 
     function makeDriverSessionConstructor(implMethods, defaultOptions = {}) {
-        return function(client, options = defaultOptions) {
+        var driverSessionConstructor = function(client, options = defaultOptions) {
             let _options = options;
             let _hasEnded = false;
 
@@ -861,6 +871,10 @@ var {
                     return null;
                 }
                 return this._serverSession.handle.getId();
+            };
+
+            this.getTxnNumber_forTesting = function getTxnNumber_forTesting() {
+                return this._serverSession.getTxnNumber();
             };
 
             this.getOperationTime = function getOperationTime() {
@@ -933,6 +947,11 @@ var {
                 this._serverSession.startTransaction(txnOptsObj);
             };
 
+            this.startTransaction_forTesting = function startTransaction_forTesting(
+                txnOptsObj = {}, {ignoreActiveTxn: ignoreActiveTxn = false} = {}) {
+                this._serverSession.startTransaction(txnOptsObj, ignoreActiveTxn);
+            };
+
             this.commitTransaction = function commitTransaction() {
                 assert.commandWorked(this._serverSession.commitTransaction(this));
             };
@@ -949,6 +968,19 @@ var {
                 return this._serverSession.abortTransaction(this);
             };
         };
+
+        // Having a specific Error for when logical sessions aren't supported by the server, allows
+        // the correct fallback behavior in this case (while propagating other errors).
+        driverSessionConstructor.UnsupportedError = function(message) {
+            this.name = "DriverSession.UnsupportedError";
+            this.message = message;
+            this.stack = this.toString() + "\n" + (new Error()).stack;
+        };
+        driverSessionConstructor.UnsupportedError.prototype = Object.create(Error.prototype);
+        driverSessionConstructor.UnsupportedError.prototype.constructor =
+            driverSessionConstructor.UnsupportedError;
+
+        return driverSessionConstructor;
     }
 
     const DriverSession = makeDriverSessionConstructor({

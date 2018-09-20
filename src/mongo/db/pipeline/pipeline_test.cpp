@@ -45,14 +45,17 @@
 #include "mongo/db/pipeline/document_source_out.h"
 #include "mongo/db/pipeline/document_source_project.h"
 #include "mongo/db/pipeline/document_source_sort.h"
+#include "mongo/db/pipeline/document_source_test_optimizations.h"
 #include "mongo/db/pipeline/document_value_test_util.h"
 #include "mongo/db/pipeline/expression_context_for_test.h"
 #include "mongo/db/pipeline/field_path.h"
 #include "mongo/db/pipeline/pipeline.h"
+#include "mongo/db/pipeline/stub_mongo_process_interface.h"
 #include "mongo/db/query/collation/collator_interface_mock.h"
 #include "mongo/db/query/query_test_service_context.h"
 #include "mongo/db/repl/replication_coordinator_mock.h"
 #include "mongo/dbtests/dbtests.h"
+#include "mongo/s/query/cluster_aggregation_planner.h"
 #include "mongo/unittest/death_test.h"
 
 namespace mongo {
@@ -1757,13 +1760,17 @@ public:
         mergePipe = uassertStatusOK(Pipeline::parse(request.getPipeline(), ctx));
         mergePipe->optimizePipeline();
 
-        shardPipe = mergePipe->splitForSharded();
-        ASSERT(shardPipe);
+        auto splitPipeline = cluster_aggregation_planner::splitPipeline(std::move(mergePipe));
 
-        ASSERT_VALUE_EQ(Value(shardPipe->writeExplainOps(ExplainOptions::Verbosity::kQueryPlanner)),
+        ASSERT_VALUE_EQ(Value(splitPipeline.shardsPipeline->writeExplainOps(
+                            ExplainOptions::Verbosity::kQueryPlanner)),
                         Value(shardPipeExpected["pipeline"]));
-        ASSERT_VALUE_EQ(Value(mergePipe->writeExplainOps(ExplainOptions::Verbosity::kQueryPlanner)),
+        ASSERT_VALUE_EQ(Value(splitPipeline.mergePipeline->writeExplainOps(
+                            ExplainOptions::Verbosity::kQueryPlanner)),
                         Value(mergePipeExpected["pipeline"]));
+
+        shardPipe = std::move(splitPipeline.shardsPipeline);
+        mergePipe = std::move(splitPipeline.mergePipeline);
     }
 
     virtual ~Base() {}
@@ -1936,7 +1943,7 @@ class ShardedSortMatchProjSkipLimBecomesMatchTopKSortSkipProj : public Base {
                "]";
     }
     string mergePipeJson() {
-        return "[{$sort: {sortKey: {a: 1}, mergePresorted: true, limit: 8}}"
+        return "[{$limit: 8}"
                ",{$skip: 3}"
                ",{$project: {_id: true, a: true}}"
                "]";
@@ -1974,7 +1981,7 @@ class ShardedSortProjLimBecomesTopKSortProj : public Base {
                "]";
     }
     string mergePipeJson() {
-        return "[{$sort: {sortKey: {a: 1}, mergePresorted: true, limit: 5}}"
+        return "[{$limit: 5}"
                ",{$project: {_id: true, a: true}}"
                "]";
     }
@@ -1994,8 +2001,7 @@ class ShardedSortGroupProjLimDoesNotBecomeTopKSortProjGroup : public Base {
                "]";
     }
     string mergePipeJson() {
-        return "[{$sort: {sortKey: {a: 1}, mergePresorted: true}}"
-               ",{$group : {_id: {a: '$a'}}}"
+        return "[{$group : {_id: {a: '$a'}}}"
                ",{$project: {_id: true, a: true}}"
                ",{$limit: 5}"
                "]";
@@ -2017,7 +2023,7 @@ class ShardedMatchSortProjLimBecomesMatchTopKSortProj : public Base {
                "]";
     }
     string mergePipeJson() {
-        return "[{$sort: {sortKey: {a: -1}, mergePresorted: true, limit: 6}}"
+        return "[{$limit: 6}"
                ",{$project: {_id: true, a: true}}"
                "]";
     }
@@ -2120,7 +2126,8 @@ class Out : public needsPrimaryShardMergerBase {
     }
     string mergePipeJson() {
         return "[{$out: {to: 'outColl', db: 'a', mode: '" +
-            WriteMode_serializer(WriteModeEnum::kModeReplaceCollection) + "'}}]";
+            WriteMode_serializer(WriteModeEnum::kModeReplaceCollection) +
+            "', uniqueKey: {_id: 1}}}]";
     }
 };
 
@@ -2180,7 +2187,7 @@ public:
     }
 };
 
-using HostTypeRequirement = DocumentSource::StageConstraints::HostTypeRequirement;
+using HostTypeRequirement = StageConstraints::HostTypeRequirement;
 using PipelineMustRunOnMongoSTest = AggregationContextFixture;
 
 TEST_F(PipelineMustRunOnMongoSTest, UnsplittablePipelineMustRunOnMongoS) {
@@ -2231,21 +2238,34 @@ DEATH_TEST_F(PipelineMustRunOnMongoSTest,
     // $_internalSplitPipeline.
     ASSERT_FALSE(pipeline->requiredToRunOnMongos());
 
-    auto shardPipe = pipeline->splitForSharded();
-    ASSERT(shardPipe);
+    auto splitPipeline = cluster_aggregation_planner::splitPipeline(std::move(pipeline));
+    ASSERT(splitPipeline.shardsPipeline);
+    ASSERT(splitPipeline.mergePipeline);
 
-    // The merge half of the pipeline must run on mongoS.
-    ASSERT_TRUE(pipeline->requiredToRunOnMongos());
+    ASSERT_TRUE(splitPipeline.mergePipeline->requiredToRunOnMongos());
 
     // Calling 'requiredToRunOnMongos' on the shard pipeline will hit an invariant.
-    shardPipe->requiredToRunOnMongos();
+    splitPipeline.shardsPipeline->requiredToRunOnMongos();
 }
+
+/**
+ * For the purpsoses of this test, assume every collection is unsharded. Stages may ask this during
+ * setup. For example, to compute its constraints, the $out stage needs to know if the output
+ * collection is sharded.
+ */
+class FakeMongoProcessInterface : public StubMongoProcessInterface {
+public:
+    bool isSharded(OperationContext* opCtx, const NamespaceString& ns) override {
+        return false;
+    }
+};
 
 TEST_F(PipelineMustRunOnMongoSTest, SplitMongoSMergePipelineAssertsIfShardStagePresent) {
     auto expCtx = getExpCtx();
 
     expCtx->allowDiskUse = true;
     expCtx->inMongos = true;
+    expCtx->mongoProcessInterface = std::make_shared<FakeMongoProcessInterface>();
 
     auto match = DocumentSourceMatch::create(fromjson("{x: 5}"), expCtx);
     auto split = DocumentSourceInternalSplitPipeline::create(expCtx, HostTypeRequirement::kNone);
@@ -2259,12 +2279,12 @@ TEST_F(PipelineMustRunOnMongoSTest, SplitMongoSMergePipelineAssertsIfShardStageP
     // $_internalSplitPipeline.
     ASSERT_FALSE(pipeline->requiredToRunOnMongos());
 
-    auto shardPipe = pipeline->splitForSharded();
-    ASSERT(shardPipe);
+    auto splitPipeline = cluster_aggregation_planner::splitPipeline(std::move(pipeline));
 
     // The merge pipeline must run on mongoS, but $out needs to run on  the primary shard.
-    ASSERT_THROWS_CODE(
-        pipeline->requiredToRunOnMongos(), AssertionException, ErrorCodes::IllegalOperation);
+    ASSERT_THROWS_CODE(splitPipeline.mergePipeline->requiredToRunOnMongos(),
+                       AssertionException,
+                       ErrorCodes::IllegalOperation);
 }
 
 TEST_F(PipelineMustRunOnMongoSTest, SplittablePipelineAssertsIfMongoSStageOnShardSideOfSplit) {
@@ -2672,6 +2692,201 @@ TEST_F(PipelineDependenciesTest, ShouldNotRequireTextScoreIfAvailableButDefinite
 }
 
 }  // namespace Dependencies
+
+namespace {
+TEST(PipelineRenameTracking, ReportsIdentityMapWhenEmpty) {
+    boost::intrusive_ptr<ExpressionContext> expCtx(new ExpressionContextForTest());
+    auto pipeline = unittest::assertGet(Pipeline::create({DocumentSourceMock::create()}, expCtx));
+    auto renames = pipeline->renamedPaths({"a", "b", "c.d"});
+    ASSERT(static_cast<bool>(renames));
+    auto nameMap = *renames;
+    ASSERT_EQ(nameMap.size(), 3UL);
+    ASSERT_EQ(nameMap["a"], "a");
+    ASSERT_EQ(nameMap["b"], "b");
+    ASSERT_EQ(nameMap["c.d"], "c.d");
+}
+
+class NoModifications : public DocumentSourceTestOptimizations {
+public:
+    NoModifications() : DocumentSourceTestOptimizations() {}
+    static boost::intrusive_ptr<NoModifications> create() {
+        return new NoModifications();
+    }
+
+    /**
+     * Returns a description which communicate that this stage modifies nothing.
+     */
+    GetModPathsReturn getModifiedPaths() const final {
+        return {GetModPathsReturn::Type::kFiniteSet, std::set<std::string>(), {}};
+    }
+};
+
+TEST(PipelineRenameTracking, ReportsIdentityWhenNoStageModifiesAnything) {
+    boost::intrusive_ptr<ExpressionContext> expCtx(new ExpressionContextForTest());
+    {
+        auto pipeline = unittest::assertGet(
+            Pipeline::create({DocumentSourceMock::create(), NoModifications::create()}, expCtx));
+        auto renames = pipeline->renamedPaths({"a", "b", "c.d"});
+        ASSERT(static_cast<bool>(renames));
+        auto nameMap = *renames;
+        ASSERT_EQ(nameMap.size(), 3UL);
+        ASSERT_EQ(nameMap["a"], "a");
+        ASSERT_EQ(nameMap["b"], "b");
+        ASSERT_EQ(nameMap["c.d"], "c.d");
+    }
+    {
+        auto pipeline = unittest::assertGet(Pipeline::create({DocumentSourceMock::create(),
+                                                              NoModifications::create(),
+                                                              NoModifications::create(),
+                                                              NoModifications::create()},
+                                                             expCtx));
+        auto renames = pipeline->renamedPaths({"a", "b", "c.d"});
+        ASSERT(static_cast<bool>(renames));
+        auto nameMap = *renames;
+        ASSERT_EQ(nameMap.size(), 3UL);
+        ASSERT_EQ(nameMap["a"], "a");
+        ASSERT_EQ(nameMap["b"], "b");
+        ASSERT_EQ(nameMap["c.d"], "c.d");
+    }
+}
+
+class NotSupported : public DocumentSourceTestOptimizations {
+public:
+    NotSupported() : DocumentSourceTestOptimizations() {}
+    static boost::intrusive_ptr<NotSupported> create() {
+        return new NotSupported();
+    }
+
+    /**
+     * Returns a description which communicate that this stage modifies nothing.
+     */
+    GetModPathsReturn getModifiedPaths() const final {
+        return {GetModPathsReturn::Type::kNotSupported, std::set<std::string>(), {}};
+    }
+};
+
+TEST(PipelineRenameTracking, DoesNotReportRenamesIfAStageDoesNotSupportTrackingThem) {
+    boost::intrusive_ptr<ExpressionContext> expCtx(new ExpressionContextForTest());
+    auto pipeline = unittest::assertGet(Pipeline::create({DocumentSourceMock::create(),
+                                                          NoModifications::create(),
+                                                          NotSupported::create(),
+                                                          NoModifications::create()},
+                                                         expCtx));
+    ASSERT_FALSE(static_cast<bool>(pipeline->renamedPaths({"a"})));
+    ASSERT_FALSE(static_cast<bool>(pipeline->renamedPaths({"a", "b"})));
+    ASSERT_FALSE(static_cast<bool>(pipeline->renamedPaths({"x", "yahoo", "c.d"})));
+}
+
+class RenamesAToB : public DocumentSourceTestOptimizations {
+public:
+    RenamesAToB() : DocumentSourceTestOptimizations() {}
+    static boost::intrusive_ptr<RenamesAToB> create() {
+        return new RenamesAToB();
+    }
+    GetModPathsReturn getModifiedPaths() const final {
+        return {GetModPathsReturn::Type::kFiniteSet, std::set<std::string>{}, {{"b", "a"}}};
+    }
+};
+
+TEST(PipelineRenameTracking, ReportsNewNamesWhenSingleStageRenames) {
+    boost::intrusive_ptr<ExpressionContext> expCtx(new ExpressionContextForTest());
+    auto pipeline = unittest::assertGet(
+        Pipeline::create({DocumentSourceMock::create(), RenamesAToB::create()}, expCtx));
+    {
+        auto renames = pipeline->renamedPaths({"b"});
+        ASSERT(static_cast<bool>(renames));
+        auto nameMap = *renames;
+        ASSERT_EQ(nameMap.size(), 1UL);
+        ASSERT_EQ(nameMap["b"], "a");
+    }
+    {
+        auto renames = pipeline->renamedPaths({"b", "c.d"});
+        ASSERT(static_cast<bool>(renames));
+        auto nameMap = *renames;
+        ASSERT_EQ(nameMap.size(), 2UL);
+        ASSERT_EQ(nameMap["b"], "a");
+        ASSERT_EQ(nameMap["c.d"], "c.d");
+    }
+    {
+        // This is strange; the mock stage reports to essentially duplicate the "a" field into "b".
+        // Because of this, both "b" and "a" should map to "a".
+        auto renames = pipeline->renamedPaths({"b", "a"});
+        ASSERT(static_cast<bool>(renames));
+        auto nameMap = *renames;
+        ASSERT_EQ(nameMap.size(), 2UL);
+        ASSERT_EQ(nameMap["b"], "a");
+        ASSERT_EQ(nameMap["a"], "a");
+    }
+}
+
+TEST(PipelineRenameTracking, ReportsIdentityMapWhenGivenEmptyIteratorRange) {
+    boost::intrusive_ptr<ExpressionContext> expCtx(new ExpressionContextForTest());
+    auto pipeline = unittest::assertGet(
+        Pipeline::create({DocumentSourceMock::create(), RenamesAToB::create()}, expCtx));
+    {
+        auto renames = Pipeline::renamedPaths(
+            pipeline->getSources().rbegin(), pipeline->getSources().rbegin(), {"b"});
+        ASSERT(static_cast<bool>(renames));
+        auto nameMap = *renames;
+        ASSERT_EQ(nameMap.size(), 1UL);
+        ASSERT_EQ(nameMap["b"], "b");
+    }
+    {
+        auto renames = Pipeline::renamedPaths(
+            pipeline->getSources().rbegin(), pipeline->getSources().rbegin(), {"b", "c.d"});
+        ASSERT(static_cast<bool>(renames));
+        auto nameMap = *renames;
+        ASSERT_EQ(nameMap.size(), 2UL);
+        ASSERT_EQ(nameMap["b"], "b");
+        ASSERT_EQ(nameMap["c.d"], "c.d");
+    }
+}
+
+class RenamesBToC : public DocumentSourceTestOptimizations {
+public:
+    RenamesBToC() : DocumentSourceTestOptimizations() {}
+    static boost::intrusive_ptr<RenamesBToC> create() {
+        return new RenamesBToC();
+    }
+    GetModPathsReturn getModifiedPaths() const final {
+        return {GetModPathsReturn::Type::kFiniteSet, std::set<std::string>{}, {{"c", "b"}}};
+    }
+};
+
+TEST(PipelineRenameTracking, ReportsNewNameAcrossMultipleRenames) {
+    boost::intrusive_ptr<ExpressionContext> expCtx(new ExpressionContextForTest());
+    auto pipeline = unittest::assertGet(Pipeline::create(
+        {DocumentSourceMock::create(), RenamesAToB::create(), RenamesBToC::create()}, expCtx));
+    auto renames = pipeline->renamedPaths({"c"});
+    ASSERT(static_cast<bool>(renames));
+    auto nameMap = *renames;
+    ASSERT_EQ(nameMap.size(), 1UL);
+    ASSERT_EQ(nameMap["c"], "a");
+}
+
+class RenamesBToA : public DocumentSourceTestOptimizations {
+public:
+    RenamesBToA() : DocumentSourceTestOptimizations() {}
+    static boost::intrusive_ptr<RenamesBToA> create() {
+        return new RenamesBToA();
+    }
+    GetModPathsReturn getModifiedPaths() const final {
+        return {GetModPathsReturn::Type::kFiniteSet, std::set<std::string>{}, {{"b", "a"}}};
+    }
+};
+
+TEST(PipelineRenameTracking, CanHandleBackAndForthRename) {
+    boost::intrusive_ptr<ExpressionContext> expCtx(new ExpressionContextForTest());
+    auto pipeline = unittest::assertGet(Pipeline::create(
+        {DocumentSourceMock::create(), RenamesAToB::create(), RenamesBToA::create()}, expCtx));
+    auto renames = pipeline->renamedPaths({"a"});
+    ASSERT(static_cast<bool>(renames));
+    auto nameMap = *renames;
+    ASSERT_EQ(nameMap.size(), 1UL);
+    ASSERT_EQ(nameMap["a"], "a");
+}
+
+}  // namespace
 
 class All : public Suite {
 public:

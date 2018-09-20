@@ -46,14 +46,9 @@ void DocumentSourceOutReplaceColl::initializeWriteNs() {
     _originalOutOptions = pExpCtx->mongoProcessInterface->getCollectionOptions(outputNs);
     _originalIndexes = conn->getIndexSpecs(outputNs.ns());
 
-    // Check if it's sharded or capped to make sure we have a chance of succeeding before we do
-    // all the work. If the collection becomes capped during processing, the collection options will
-    // have changed, and the $out will fail. If it becomes sharded during processing, the final
-    // rename will fail.
-    uassert(17017,
-            str::stream() << "namespace '" << outputNs.ns()
-                          << "' is sharded so it can't be used for $out'",
-            !pExpCtx->mongoProcessInterface->isSharded(pExpCtx->opCtx, outputNs));
+    // Check if it's capped to make sure we have a chance of succeeding before we do all the work.
+    // If the collection becomes capped during processing, the collection options will have changed,
+    // and the $out will fail.
     uassert(17152,
             str::stream() << "namespace '" << outputNs.ns()
                           << "' is capped so it can't be used for $out",
@@ -79,22 +74,22 @@ void DocumentSourceOutReplaceColl::initializeWriteNs() {
                 conn->runCommand(outputNs.db().toString(), cmd.done(), info));
     }
 
-    // Copy the indexes of the output collection to the temp collection.
-    for (auto indexSpec : _originalIndexes) {
-        MutableDocument index((Document(indexSpec)));
-        index.remove("_id");  // indexes shouldn't have _ids but some existing ones do
-        index["ns"] = Value(_tempNs.ns());
+    if (_originalIndexes.empty()) {
+        return;
+    }
 
-        BSONObj indexBson = index.freeze().toBson();
-        conn->insert(_tempNs.getSystemIndexesCollection(), indexBson);
-        BSONObj err = conn->getLastErrorDetailed();
-        uassert(16995,
-                str::stream() << "copying index for $out failed."
-                              << " index: "
-                              << indexBson
-                              << " error: "
-                              << err,
-                DBClientBase::getLastErrorString(err).empty());
+    // Copy the indexes of the output collection to the temp collection.
+    std::vector<BSONObj> tempNsIndexes;
+    for (const auto& indexSpec : _originalIndexes) {
+        // Replace the spec's 'ns' field value, which is the original collection, with the temp
+        // collection.
+        tempNsIndexes.push_back(indexSpec.addField(BSON("ns" << _tempNs.ns()).firstElement()));
+    }
+    try {
+        conn->createIndexes(_tempNs.ns(), tempNsIndexes);
+    } catch (DBException& ex) {
+        ex.addContext("Copying indexes for $out failed");
+        throw;
     }
 };
 

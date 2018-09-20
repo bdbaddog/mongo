@@ -108,7 +108,9 @@ Status SubplanStage::planSubqueries() {
     _orExpression = _query->root()->shallowClone();
     for (size_t i = 0; i < _plannerParams.indices.size(); ++i) {
         const IndexEntry& ie = _plannerParams.indices[i];
-        _indexMap[ie.name] = i;
+        const auto insertionRes = _indexMap.insert(std::make_pair(ie.identifier, i));
+        // Be sure the key was not already in the map.
+        invariant(insertionRes.second);
         LOG(5) << "Subplanner: index " << i << " is " << ie;
     }
 
@@ -185,7 +187,7 @@ namespace {
 Status tagOrChildAccordingToCache(PlanCacheIndexTree* compositeCacheData,
                                   SolutionCacheData* branchCacheData,
                                   MatchExpression* orChild,
-                                  const std::map<StringData, size_t>& indexMap) {
+                                  const std::map<IndexEntry::Identifier, size_t>& indexMap) {
     invariant(compositeCacheData);
 
     // We want a well-formed *indexed* solution.
@@ -252,9 +254,9 @@ Status SubplanStage::choosePlanForSubqueries(PlanYieldPolicy* yieldPolicy) {
 
             // We pass the SometimesCache option to the MPS because the SubplanStage currently does
             // not use the CachedPlanStage's eviction mechanism. We therefore are more conservative
-            // about putting a potentially bad plan into the cache in the subplan path.
-            // We temporarily add the MPS to _children to ensure that we pass down all
-            // save/restore/invalidate messages that can be generated if pickBestPlan yields.
+            // about putting a potentially bad plan into the cache in the subplan path.  We
+            // temporarily add the MPS to _children to ensure that we pass down all save/restore
+            // messages that can be generated if pickBestPlan yields.
             invariant(_children.empty());
             _children.emplace_back(
                 stdx::make_unique<MultiPlanStage>(getOpCtx(),

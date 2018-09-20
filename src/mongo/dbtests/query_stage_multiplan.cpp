@@ -139,8 +139,7 @@ unique_ptr<PlanStage> getIxScanPlan(OperationContext* opCtx,
     coll->getIndexCatalog()->findIndexesByKeyPattern(opCtx, BSON("foo" << 1), false, &indexes);
     ASSERT_EQ(indexes.size(), 1U);
 
-    IndexScanParams ixparams;
-    ixparams.descriptor = indexes[0];
+    IndexScanParams ixparams(opCtx, *indexes[0]);
     ixparams.bounds.isSimpleRange = true;
     ixparams.bounds.startKey = BSON("" << desiredFooValue);
     ixparams.bounds.endKey = BSON("" << desiredFooValue);
@@ -388,8 +387,6 @@ TEST_F(QueryStageMultiPlanTest, MPSBackupPlan) {
     // Get planner params.
     QueryPlannerParams plannerParams;
     fillOutPlannerParams(_opCtx.get(), collection, cq.get(), &plannerParams);
-    // Turn this off otherwise it pops up in some plans.
-    plannerParams.options &= ~QueryPlannerParams::KEEP_MUTATIONS;
 
     // Plan.
     auto statusWithSolutions = QueryPlanner::plan(*cq, plannerParams);

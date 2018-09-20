@@ -71,7 +71,7 @@ functions:
           MONGO_VERSION=$(git describe)
           # If we're going to compile the upstream wtdevelop repository for wiredtiger, add
           # that githash to version string.
-          if [ "${wtdevelop|}" = "-wtdevelop" ]; then
+          if [ "${compile-variant|}" = "-wtdevelop" ]; then
             WT_VERSION=$(cd src/third_party/wtdevelop; git describe | cut -c 9-)
             MONGO_VERSION="$MONGO_VERSION-wtdevelop-$WT_VERSION"
           fi
@@ -136,17 +136,17 @@ functions:
             load('jstests/hooks/run_validate_collections.actual.js');
           EOF
           fi
-          tar czf mongodb${wtdevelop|}.tar.gz mongodb
+          tar czf mongodb${compile-variant|}.tar.gz mongodb
     - command: s3.put
       params:
         aws_key: ${aws_key}
         aws_secret: ${aws_secret}
-        local_file: src/mongodb${wtdevelop|}.tar.gz
-        remote_file: ${project_dir}/${version_id}/${revision}/${platform}/mongodb${wtdevelop|}-${version_id}.tar.gz
+        local_file: src/mongodb${compile-variant|}.tar.gz
+        remote_file: ${project_dir}/${version_id}/${revision}/${platform}/mongodb${compile-variant|}-${version_id}.tar.gz
         bucket: mciuploads
         permissions: public-read
         content_type: ${content_type|application/x-gzip}
-        display_name: mongodb${wtdevelop|}.tar.gz
+        display_name: mongodb${compile-variant|}.tar.gz
 
   # NOTE: Unlike evergreen.yml, there's no conditional here. If called, this is never a noop!
   "use WiredTiger develop" :
@@ -189,7 +189,7 @@ functions:
           storageEngine: ${storageEngine}
           test_control: ${test}
           production: true
-          mongodb_binary_archive: "https://s3.amazonaws.com/mciuploads/${project_dir}/${version_id}/${revision}/${platform}/mongodb${wtdevelop|}-${version_id}.tar.gz"
+          mongodb_binary_archive: "https://s3.amazonaws.com/mciuploads/${project_dir}/${version_id}/${revision}/${platform}/mongodb${compile-variant|}-${version_id}.tar.gz"
           workloads_dir: ../src/workloads/workloads
           ycsb_dir: ../src/YCSB/YCSB
           linkbench_dir: ../src/linkbench/linkbench
@@ -235,6 +235,7 @@ functions:
           aws_secret_key: "${terraform_secret}"
           perf_jira_user: "${perf_jira_user}"
           perf_jira_pw: "${perf_jira_pw}"
+          dsi_analysis_atlas_user: "${dsi_analysis_atlas_user}"
           dsi_analysis_atlas_pw: "${dsi_analysis_atlas_pw}"
           EOF
           chmod 400 runtime_secret.yml
@@ -295,7 +296,7 @@ functions:
         script: |
           set -o errexit
           set -o verbose
-          TAG="3.6.5-Baseline"
+          TAG="4.0.2-Baseline"
           OVERRIDEFILE="../src/dsi/dsi/analysis/${branch_name}/system_perf_override.json"
           python -u ../src/dsi/dsi/analysis/post_run_check.py ${script_flags} --reports-analysis reports --perf-file perf.json --rev ${revision} --refTag $TAG --overrideFile $OVERRIDEFILE --project_id sys-perf --variant ${build_variant} --task ${task_name}
 
@@ -309,10 +310,21 @@ tasks:
     - command: manifest.load
     - command: git.get_project
       params:
+        directory: src
+    - func: "compile mongodb"
+
+- name: compile_enterprise
+  commands:
+    - command: manifest.load
+    - command: git.get_project
+      # In addition to mongo repo, checkout enterprise as module
+      params:
         revisions:
           enterprise: ${enterprise_rev}
         directory: src
     - func: "compile mongodb"
+      vars:
+        compile-variant: -enterprise
 
 - name: compile_wtdevelop
   commands:
@@ -327,7 +339,7 @@ tasks:
     - func: "use WiredTiger develop"
     - func: "compile mongodb"
       vars:
-        wtdevelop: -wtdevelop
+        compile-variant: -wtdevelop
 
 - name: linkbench
   priority: 5
@@ -663,8 +675,8 @@ buildvariants:
       - "linux-64-amzn-build"
   tasks:
     - name: compile
+    - name: compile_enterprise
     - name: compile_wtdevelop
-
 
 #######################################
 #         Linux Buildvariants         #
@@ -743,12 +755,13 @@ buildvariants:
     project_dir: *project_dir
     authentication: enabled
     storageEngine: wiredTiger
+    compile-variant: -enterprise
   run_on:
       - "rhel70-perf-single"
   depends_on:
-      - name: compile
+      - name: compile_enterprise
         variant: compile-linux-64-amzn
-  tasks: &standalonetasks
+  tasks:
     - name: industry_benchmarks
     - name: crud_workloads
     - name: smoke_test
@@ -896,7 +909,7 @@ buildvariants:
     cluster: single
     platform: linux
     project_dir: *project_dir
-    wtdevelop: -wtdevelop
+    compile-variant: -wtdevelop
     authentication: enabled
     storageEngine: wiredTiger
   run_on:
@@ -915,7 +928,7 @@ buildvariants:
     cluster: single
     platform: linux
     project_dir: *project_dir
-    wtdevelop: -wtdevelop
+    compile-variant: -wtdevelop
     authentication: enabled
     storageEngine: wiredTiger
   run_on:
@@ -934,7 +947,7 @@ buildvariants:
     cluster: replica
     platform: linux
     project_dir: *project_dir
-    wtdevelop: -wtdevelop
+    compile-variant: -wtdevelop
     authentication: enabled
     storageEngine: wiredTiger
   run_on:
@@ -954,7 +967,7 @@ buildvariants:
 #    cluster: shard-lite
 #    platform: linux
 #    project_dir: *project_dir
-#    wtdevelop: -wtdevelop
+#    compile-variant: -wtdevelop
 #    authentication: enabled
 #    storageEngine: wiredTiger
 #  run_on:

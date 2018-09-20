@@ -73,6 +73,7 @@ struct ShellGlobalParams {
     std::string writeMode = "commands";
     std::string readMode = "compatibility";
     bool shouldRetryWrites = false;
+    bool shouldUseImplicitSessions = true;
 
     boost::optional<rpc::ProtocolSet> rpcProtocols = boost::none;
 
@@ -94,4 +95,6 @@ bool handlePreValidationMongoShellOptions(const moe::Environment& params,
                                           const std::vector<std::string>& args);
 
 Status storeMongoShellOptions(const moe::Environment& params, const std::vector<std::string>& args);
+
+void redactPasswordOptions(int argc, char** argv);
 }

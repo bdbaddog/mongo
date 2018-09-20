@@ -53,9 +53,7 @@ public:
     static const char kFindCommandName[];
     static const char kShardVersionField[];
 
-    QueryRequest(NamespaceString nss);
-
-    QueryRequest(CollectionUUID uuid);
+    explicit QueryRequest(NamespaceStringOrUUID nss);
 
     /**
      * Returns a non-OK status if any property of the QR has a bad value (e.g. a negative skip
@@ -85,9 +83,12 @@ public:
 
     /**
      * Converts this QR into a find command.
+     * The withUuid variants make a UUID-based find command instead of a namespace-based ones.
      */
     BSONObj asFindCommand() const;
+    BSONObj asFindCommandWithUuid() const;
     void asFindCommand(BSONObjBuilder* cmdBuilder) const;
+    void asFindCommandWithUuid(BSONObjBuilder* cmdBuilder) const;
 
     /**
      * Converts this QR into an aggregation using $match. If this QR has options that cannot be
@@ -393,7 +394,7 @@ public:
     /**
      * Parse the provided legacy query object and parameters to construct a QueryRequest.
      */
-    static StatusWith<std::unique_ptr<QueryRequest>> fromLegacyQuery(NamespaceString nss,
+    static StatusWith<std::unique_ptr<QueryRequest>> fromLegacyQuery(NamespaceStringOrUUID nsOrUuid,
                                                                      const BSONObj& queryObj,
                                                                      const BSONObj& proj,
                                                                      int ntoskip,
@@ -433,6 +434,11 @@ private:
      * Add the meta projection to this object if needed.
      */
     void addMetaProjection();
+
+    /**
+     * Common code for UUID and namespace-based find commands.
+     */
+    void asFindCommandInternal(BSONObjBuilder* cmdBuilder) const;
 
     NamespaceString _nss;
     OptionalCollectionUUID _uuid;

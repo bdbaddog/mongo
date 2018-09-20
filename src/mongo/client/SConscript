@@ -217,6 +217,18 @@ env.CppIntegrationTest(
     ],
 )
 
+env.CppIntegrationTest(
+    target='dbclient_connection_integration_test',
+    source=[
+        'dbclient_connection_integration_test.cpp',
+    ],
+    LIBDEPS=[
+        'clientdriver_network',
+        '$BUILD_DIR/mongo/transport/transport_layer_egress_init',
+        '$BUILD_DIR/mongo/util/version_impl',
+    ],
+)
+
 env.Library(
     target='async_client',
     source=[
@@ -350,5 +362,15 @@ env.CppUnitTest(
         'remote_command_retry_scheduler',
         '$BUILD_DIR/mongo/executor/thread_pool_task_executor_test_fixture',
         '$BUILD_DIR/mongo/unittest/task_executor_proxy',
+    ],
+)
+
+env.CppUnitTest(
+    target='dbclient_cursor_test',
+    source=[
+        'dbclient_cursor_test.cpp',
+    ],
+    LIBDEPS=[
+        '$BUILD_DIR/mongo/client/clientdriver_network',
     ],
 )

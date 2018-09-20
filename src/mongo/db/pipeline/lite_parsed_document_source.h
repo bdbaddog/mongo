@@ -128,6 +128,15 @@ public:
     }
 
     /**
+     * Returns true if the involved namespace 'nss' is allowed to be sharded. The behavior is to
+     * allow by default and stages should opt-out if foreign collections are not allowed to be
+     * sharded.
+     */
+    virtual bool allowShardedForeignCollection(NamespaceString nss) const {
+        return true;
+    }
+
+    /**
      * Verifies that this stage is allowed to run with the specified read concern. Throws a
      * UserException if not compatible.
      */
@@ -158,7 +167,7 @@ public:
 };
 
 /**
- * Helper class for DocumentSources which which reference one or more foreign collections.
+ * Helper class for DocumentSources which reference one or more foreign collections.
  */
 class LiteParsedDocumentSourceForeignCollections : public LiteParsedDocumentSource {
 public:
@@ -178,8 +187,18 @@ public:
         return _requiredPrivileges;
     }
 
-private:
+    /**
+     * Returns true if 'nss' is in the list of foreign namespaces for this DocumentSource. By
+     * default, no involved namespace is allowed to be sharded.
+     */
+    bool allowShardedForeignCollection(NamespaceString nss) const {
+        return (_foreignNssSet.find(nss) == _foreignNssSet.end());
+    }
+
+protected:
     stdx::unordered_set<NamespaceString> _foreignNssSet;
+
+private:
     PrivilegeVector _requiredPrivileges;
 };
 }  // namespace mongo

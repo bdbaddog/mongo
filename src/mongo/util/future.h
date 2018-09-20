@@ -39,9 +39,12 @@
 #include "mongo/platform/atomic_word.h"
 #include "mongo/stdx/condition_variable.h"
 #include "mongo/stdx/mutex.h"
+#include "mongo/stdx/type_traits.h"
 #include "mongo/stdx/utility.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/debug_util.h"
+#include "mongo/util/functional.h"
+#include "mongo/util/interruptible.h"
 #include "mongo/util/intrusive_counter.h"
 #include "mongo/util/scopeguard.h"
 
@@ -74,21 +77,6 @@ struct FakeVoid {};
 template <typename T>
 using VoidToFakeVoid = std::conditional_t<std::is_void<T>::value, FakeVoid, T>;
 
-/**
- * This is a poor-man's implementation of c++17 std::is_invocable. We should replace it with the
- * stdlib one once we can make call() use std::invoke.
- */
-template <typename Func,
-          typename... Args,
-          typename = typename std::result_of<Func && (Args && ...)>::type>
-auto is_invocable_impl(Func&& func, Args&&... args) -> std::true_type;
-auto is_invocable_impl(...) -> std::false_type;
-
-template <typename Func, typename... Args>
-struct is_invocable
-    : public decltype(is_invocable_impl(std::declval<Func>(), std::declval<Args>()...)) {};
-
-
 // call(func, FakeVoid) -> func(Status::OK())
 // This simulates the implicit Status/T overloading you get by taking a StatusWith<T> that doesn't
 // work for Status/void and Status.
@@ -119,8 +107,9 @@ inline auto call(Func&& func) {
 
 template <typename Func>
 inline auto call(Func&& func, FakeVoid) {
-    auto useStatus =
-        std::integral_constant<bool, (!is_invocable<Func>() && is_invocable<Func, Status>())>();
+    auto useStatus = std::integral_constant<bool,
+                                            (!stdx::is_invocable<Func>() &&
+                                             stdx::is_invocable<Func, Status>())>();
     return callVoidOrStatus(func, useStatus);
 }
 
@@ -327,7 +316,7 @@ public:
     virtual ~SharedStateBase() = default;
 
     // Only called by future side.
-    void wait() noexcept {
+    void wait(Interruptible* interruptible) {
         if (state.load(std::memory_order_acquire) == SSBState::kFinished)
             return;
 
@@ -342,7 +331,7 @@ public:
         }
 
         stdx::unique_lock<stdx::mutex> lk(mx);
-        cv->wait(lk, [&] {
+        interruptible->waitForConditionOrInterrupt(*cv, lk, [&] {
             // The mx locking above is insufficient to establish an acquire if state transitions to
             // kFinished before we get here, but we aquire mx before the producer does.
             return state.load(std::memory_order_acquire) == SSBState::kFinished;
@@ -422,7 +411,7 @@ public:
     boost::intrusive_ptr<SharedStateBase> continuation;  // F
 
     // Takes this as argument and usually writes to continuation.
-    std::function<void(SharedStateBase* input)> callback;  // F
+    unique_function<void(SharedStateBase* input)> callback;  // F
 
 
     // These are only used to signal completion to blocking waiters. Benchmarks showed that it was
@@ -498,28 +487,38 @@ using future_details::Future;
  *
  * If the result is ready when producing the Future, it is more efficient to use
  * makeReadyFutureWith() or Future<T>::makeReady() than to use a Promise<T>.
+ *
+ * A default constructed `Promise` is in a null state.  Null `Promises` can only be assigned over
+ * and destroyed. It is a programmer error to call any methods on a null `Promise`.  Any methods
+ * that complete a `Promise` leave it in the null state.
  */
 template <typename T>
 class future_details::Promise {
 public:
     using value_type = T;
 
+    /**
+     * Creates a null `Promise`.
+     */
     Promise() = default;
 
     ~Promise() {
-        if (MONGO_unlikely(_sharedState)) {
-            _sharedState->setError({ErrorCodes::BrokenPromise, "broken promise"});
-        }
+        breakPromiseIfNeeded();
     }
 
     Promise(const Promise&) = delete;
     Promise& operator=(const Promise&) = delete;
 
-    // If we want to enable move-assignability, we need to handle breaking the promise on the old
-    // value of this.
-    Promise& operator=(Promise&&) = delete;
 
-    // The default move construction is fine.
+    /**
+     * Breaks this `Promise`, if not fulfilled and not in a null state.
+     */
+    Promise& operator=(Promise&& p) noexcept {
+        breakPromiseIfNeeded();
+        _sharedState = std::move(p._sharedState);
+        return *this;
+    }
+
     Promise(Promise&&) = default;
 
     /**
@@ -582,13 +581,16 @@ public:
 
     static auto makePromiseFutureImpl() {
         struct PromiseAndFuture {
-            Promise<T> promise;
+            Promise<T> promise{make_intrusive<SharedState<T>>()};
             Future<T> future = promise.getFuture();
         };
         return PromiseAndFuture();
     }
 
 private:
+    explicit Promise(boost::intrusive_ptr<SharedState<T>>&& sharedState)
+        : _sharedState(std::move(sharedState)) {}
+
     // This is not public because we found it frequently was involved in races.  The
     // `makePromiseFuture<T>` API avoids those races entirely.
     Future<T> getFuture() noexcept;
@@ -606,7 +608,14 @@ private:
         // Note: `this` is potentially dead, at this point.
     }
 
-    boost::intrusive_ptr<SharedState<T>> _sharedState = make_intrusive<SharedState<T>>();
+    // The current promise will be broken, if not already fulfilled.
+    void breakPromiseIfNeeded() {
+        if (MONGO_unlikely(_sharedState)) {
+            _sharedState->setError({ErrorCodes::BrokenPromise, "broken promise"});
+        }
+    }
+
+    boost::intrusive_ptr<SharedState<T>> _sharedState;
 };
 
 /**
@@ -745,37 +754,86 @@ public:
     }
 
     /**
+     * Returns when the future isReady().
+     *
+     * Throws if the interruptible passed is interrupted (explicitly or via deadline).
+     */
+    void wait(Interruptible* interruptible = Interruptible::notInterruptible()) const {
+        if (_immediate) {
+            return;
+        }
+
+        _shared->wait(interruptible);
+    }
+
+    /**
+     * Returns Status::OK() when the future isReady().
+     *
+     * Returns a non-okay status if the interruptible is interrupted.
+     */
+    Status waitNoThrow(Interruptible* interruptible = Interruptible::notInterruptible()) const
+        noexcept {
+        if (_immediate) {
+            return Status::OK();
+        }
+
+        try {
+            _shared->wait(interruptible);
+        } catch (const DBException& ex) {
+            return ex.toStatus();
+        }
+
+        return Status::OK();
+    }
+
+    /**
      * Gets the value out of this Future, blocking until it is ready.
      *
      * get() methods throw on error, while getNoThrow() returns a !OK status.
      *
      * These methods can be called multiple times, except for the rvalue overloads.
+     *
+     * Note: It is impossible to differentiate interruptible interruption from an error propagating
+     * down the future chain with these methods.  If you need to distinguish the two cases, call
+     * wait() first.
      */
-    T get() && {
-        return std::move(getImpl());
+    T get(Interruptible* interruptible = Interruptible::notInterruptible()) && {
+        return std::move(getImpl(interruptible));
     }
-    T& get() & {
-        return getImpl();
+    T& get(Interruptible* interruptible = Interruptible::notInterruptible()) & {
+        return getImpl(interruptible);
     }
-    const T& get() const& {
-        return const_cast<Future*>(this)->getImpl();
+    const T& get(Interruptible* interruptible = Interruptible::notInterruptible()) const& {
+        return const_cast<Future*>(this)->getImpl(interruptible);
     }
-    StatusWith<T> getNoThrow() && noexcept {
+    StatusWith<T> getNoThrow(Interruptible* interruptible = Interruptible::notInterruptible()) &&
+        noexcept {
         if (_immediate) {
             return std::move(*_immediate);
         }
 
-        _shared->wait();
+        try {
+            _shared->wait(interruptible);
+        } catch (const DBException& ex) {
+            return ex.toStatus();
+        }
+
         if (!_shared->status.isOK())
             return std::move(_shared->status);
         return std::move(*_shared->data);
     }
-    StatusWith<T> getNoThrow() const& noexcept {
+    StatusWith<T> getNoThrow(
+        Interruptible* interruptible = Interruptible::notInterruptible()) const& noexcept {
         if (_immediate) {
             return *_immediate;
         }
 
-        _shared->wait();
+        try {
+            _shared->wait(interruptible);
+        } catch (const DBException& ex) {
+            return ex.toStatus();
+        }
+
         if (!_shared->status.isOK())
             return _shared->status;
         return *_shared->data;
@@ -1084,12 +1142,12 @@ private:
     friend class Future;
     friend class Promise<T>;
 
-    T& getImpl() {
+    T& getImpl(Interruptible* interruptible) {
         if (_immediate) {
             return *_immediate;
         }
 
-        _shared->wait();
+        _shared->wait(interruptible);
         uassertStatusOK(_shared->status);
         return *(_shared->data);
     }
@@ -1236,12 +1294,22 @@ public:
         return _inner.isReady();
     }
 
-    void get() const {
-        _inner.get();
+    void wait(Interruptible* interruptible = Interruptible::notInterruptible()) const {
+        _inner.wait(interruptible);
     }
 
-    Status getNoThrow() const noexcept {
-        return _inner.getNoThrow().getStatus();
+    Status waitNoThrow(Interruptible* interruptible = Interruptible::notInterruptible()) const
+        noexcept {
+        return _inner.waitNoThrow(interruptible);
+    }
+
+    void get(Interruptible* interruptible = Interruptible::notInterruptible()) const {
+        _inner.get(interruptible);
+    }
+
+    Status getNoThrow(Interruptible* interruptible = Interruptible::notInterruptible()) const
+        noexcept {
+        return _inner.getNoThrow(interruptible).getStatus();
     }
 
     template <typename Func>  // Status -> void

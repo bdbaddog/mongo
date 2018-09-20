@@ -189,6 +189,44 @@ TEST_F(DocumentSourceGroupTest, ShouldCorrectlyTrackMemoryUsageBetweenPauses) {
     ASSERT_THROWS_CODE(group->getNext(), AssertionException, 16945);
 }
 
+TEST_F(DocumentSourceGroupTest, ShouldReportSingleFieldGroupKeyAsARename) {
+    auto expCtx = getExpCtx();
+    VariablesParseState vps = expCtx->variablesParseState;
+    auto groupByExpression = ExpressionFieldPath::parse(expCtx, "$x", vps);
+    auto group = DocumentSourceGroup::create(expCtx, groupByExpression, {});
+    auto modifiedPathsRet = group->getModifiedPaths();
+    ASSERT(modifiedPathsRet.type == DocumentSource::GetModPathsReturn::Type::kAllExcept);
+    ASSERT_EQ(modifiedPathsRet.paths.size(), 0UL);
+    ASSERT_EQ(modifiedPathsRet.renames.size(), 1UL);
+    ASSERT_EQ(modifiedPathsRet.renames["_id"], "x");
+}
+
+TEST_F(DocumentSourceGroupTest, ShouldReportMultipleFieldGroupKeysAsARename) {
+    auto expCtx = getExpCtx();
+    VariablesParseState vps = expCtx->variablesParseState;
+    auto x = ExpressionFieldPath::parse(expCtx, "$x", vps);
+    auto y = ExpressionFieldPath::parse(expCtx, "$y", vps);
+    auto groupByExpression = ExpressionObject::create(expCtx, {{"x", x}, {"y", y}});
+    auto group = DocumentSourceGroup::create(expCtx, groupByExpression, {});
+    auto modifiedPathsRet = group->getModifiedPaths();
+    ASSERT(modifiedPathsRet.type == DocumentSource::GetModPathsReturn::Type::kAllExcept);
+    ASSERT_EQ(modifiedPathsRet.paths.size(), 0UL);
+    ASSERT_EQ(modifiedPathsRet.renames.size(), 2UL);
+    ASSERT_EQ(modifiedPathsRet.renames["_id.x"], "x");
+    ASSERT_EQ(modifiedPathsRet.renames["_id.y"], "y");
+}
+
+TEST_F(DocumentSourceGroupTest, ShouldNotReportDottedGroupKeyAsARename) {
+    auto expCtx = getExpCtx();
+    VariablesParseState vps = expCtx->variablesParseState;
+    auto xDotY = ExpressionFieldPath::parse(expCtx, "$x.y", vps);
+    auto group = DocumentSourceGroup::create(expCtx, xDotY, {});
+    auto modifiedPathsRet = group->getModifiedPaths();
+    ASSERT(modifiedPathsRet.type == DocumentSource::GetModPathsReturn::Type::kAllExcept);
+    ASSERT_EQ(modifiedPathsRet.paths.size(), 0UL);
+    ASSERT_EQ(modifiedPathsRet.renames.size(), 0UL);
+}
+
 BSONObj toBson(const intrusive_ptr<DocumentSource>& source) {
     vector<Value> arr;
     source->serializeToArray(arr);
@@ -543,10 +581,11 @@ protected:
         // case only one shard is in use.
         NeedsMergerDocumentSource* splittable = dynamic_cast<NeedsMergerDocumentSource*>(group());
         ASSERT(splittable);
-        auto routerSources = splittable->getMergeSources();
-        ASSERT_EQ(routerSources.size(), 1UL);
-        ASSERT_NOT_EQUALS(group(), routerSources.front().get());
-        return routerSources.front();
+        auto mergeLogic = splittable->mergingLogic();
+        ASSERT(mergeLogic.mergingStage);
+        ASSERT_NOT_EQUALS(group(), mergeLogic.mergingStage);
+        ASSERT_FALSE(static_cast<bool>(mergeLogic.inputSortPattern));
+        return mergeLogic.mergingStage;
     }
     void checkResultSet(const intrusive_ptr<DocumentSource>& sink) {
         // Load the results from the DocumentSourceGroup and sort them by _id.

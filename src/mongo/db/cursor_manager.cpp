@@ -340,9 +340,11 @@ void CursorManager::appendAllActiveSessions(OperationContext* opCtx, LogicalSess
     globalCursorIdCache->visitAllCursorManagers(opCtx, &visitor);
 }
 
-std::vector<GenericCursor> CursorManager::getAllCursors(OperationContext* opCtx) {
+std::vector<GenericCursor> CursorManager::getIdleCursors(
+    OperationContext* opCtx, MongoProcessInterface::CurrentOpUserMode userMode) {
     std::vector<GenericCursor> cursors;
-    auto visitor = [&](CursorManager& mgr) { mgr.appendActiveCursors(&cursors); };
+    AuthorizationSession* ctxAuth = AuthorizationSession::get(opCtx->getClient());
+    auto visitor = [&](CursorManager& mgr) { mgr.appendIdleCursors(ctxAuth, userMode, &cursors); };
     globalCursorIdCache->visitAllCursorManagers(opCtx, &visitor);
 
     return cursors;
@@ -484,33 +486,6 @@ void CursorManager::invalidateAll(OperationContext* opCtx,
     }
 }
 
-void CursorManager::invalidateDocument(OperationContext* opCtx,
-                                       const RecordId& dl,
-                                       InvalidationType type) {
-    dassert(opCtx->lockState()->isCollectionLockedForMode(_nss.ns(), MODE_IX));
-    invariant(!isGlobalManager());  // The global cursor manager should never receive invalidations.
-    if (supportsDocLocking()) {
-        // If a storage engine supports doc locking, then we do not need to invalidate.
-        // The transactional boundaries of the operation protect us.
-        return;
-    }
-
-    auto allExecPartitions = _registeredPlanExecutors.lockAllPartitions();
-    for (auto&& partition : allExecPartitions) {
-        for (auto&& exec : partition) {
-            exec->invalidate(opCtx, dl, type);
-        }
-    }
-
-    auto allPartitions = _cursorMap->lockAllPartitions();
-    for (auto&& partition : allPartitions) {
-        for (auto&& entry : partition) {
-            auto exec = entry.second->getExecutor();
-            exec->invalidate(opCtx, dl, type);
-        }
-    }
-}
-
 bool CursorManager::cursorShouldTimeout_inlock(const ClientCursor* cursor, Date_t now) {
     if (cursor->isNoTimeout() || cursor->_operationUsingCursor) {
         return false;
@@ -647,16 +622,38 @@ void CursorManager::appendActiveSessions(LogicalSessionIdSet* lsids) const {
     }
 }
 
-void CursorManager::appendActiveCursors(std::vector<GenericCursor>* cursors) const {
+GenericCursor CursorManager::buildGenericCursor_inlock(const ClientCursor* cursor) const {
+    GenericCursor gc;
+    gc.setCursorId(cursor->_cursorid);
+    gc.setNs(cursor->nss());
+    gc.setLsid(cursor->getSessionId());
+    gc.setNDocsReturned(cursor->pos());
+    gc.setTailable(cursor->isTailable());
+    gc.setAwaitData(cursor->isAwaitData());
+    gc.setOriginatingCommand(cursor->getOriginatingCommandObj());
+    gc.setNoCursorTimeout(cursor->isNoTimeout());
+    return gc;
+}
+
+void CursorManager::appendIdleCursors(AuthorizationSession* ctxAuth,
+                                      MongoProcessInterface::CurrentOpUserMode userMode,
+                                      std::vector<GenericCursor>* cursors) const {
     auto allPartitions = _cursorMap->lockAllPartitions();
     for (auto&& partition : allPartitions) {
         for (auto&& entry : partition) {
             auto cursor = entry.second;
-            cursors->emplace_back();
-            auto& gc = cursors->back();
-            gc.setId(cursor->_cursorid);
-            gc.setNs(cursor->nss());
-            gc.setLsid(cursor->getSessionId());
+
+            // Exclude cursors that this user does not own if auth is enabled.
+            if (ctxAuth->getAuthorizationManager().isAuthEnabled() &&
+                userMode == MongoProcessInterface::CurrentOpUserMode::kExcludeOthers &&
+                !ctxAuth->isCoauthorizedWith(cursor->getAuthenticatedUsers())) {
+                continue;
+            }
+            // Exclude pinned cursors.
+            if (cursor->_operationUsingCursor) {
+                continue;
+            }
+            cursors->emplace_back(buildGenericCursor_inlock(cursor));
         }
     }
 }

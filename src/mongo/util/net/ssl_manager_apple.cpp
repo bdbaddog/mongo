@@ -1076,10 +1076,13 @@ public:
     SSLConnectionInterface* accept(Socket* socket, const char* initialBytes, int len) final;
 
     SSLPeerInfo parseAndValidatePeerCertificateDeprecated(const SSLConnectionInterface* conn,
-                                                          const std::string& remoteHost) final;
+                                                          const std::string& remoteHost,
+                                                          const HostAndPort& hostForLogging) final;
 
     StatusWith<boost::optional<SSLPeerInfo>> parseAndValidatePeerCertificate(
-        ::SSLContextRef conn, const std::string& remoteHost) final;
+        ::SSLContextRef conn,
+        const std::string& remoteHost,
+        const HostAndPort& hostForLogging) final;
 
     const SSLConfiguration& getSSLConfiguration() const final {
         return _sslConfiguration;
@@ -1096,7 +1099,20 @@ private:
     bool _suppressNoCertificateWarning;
     asio::ssl::apple::Context _clientCtx;
     asio::ssl::apple::Context _serverCtx;
-    CFUniquePtr<::CFArrayRef> _ca;
+
+    /* _clientCA represents the CA to use when acting as a client
+     * and validating remotes during outbound connections.
+     * This comes from, in order, --tlsCAFile, or the system CA.
+     */
+    CFUniquePtr<::CFArrayRef> _clientCA;
+
+    /* _serverCA represents the CA to use when acting as a server
+     * and validating remotes during inbound connections.
+     * This comes from --tlsClusterCAFile, if available,
+     * otherwise it inherits from _clientCA.
+     */
+    CFUniquePtr<::CFArrayRef> _serverCA;
+
     SSLConfiguration _sslConfiguration;
 };
 
@@ -1124,8 +1140,8 @@ SSLManagerApple::SSLManagerApple(const SSLParams& params, bool isServer)
 
     if (!params.sslCAFile.empty()) {
         auto ca = uassertStatusOK(loadPEM(params.sslCAFile, "", kLoadPEMStripKeys));
-        _ca = std::move(ca);
-        _sslConfiguration.hasCA = _ca && ::CFArrayGetCount(_ca.get());
+        _clientCA = std::move(ca);
+        _sslConfiguration.hasCA = _clientCA && ::CFArrayGetCount(_clientCA.get());
     }
 
     if (!params.sslCertificateSelector.empty() || !params.sslClusterCertificateSelector.empty()) {
@@ -1133,12 +1149,22 @@ SSLManagerApple::SSLManagerApple(const SSLParams& params, bool isServer)
         _sslConfiguration.hasCA = true;
     }
 
-    if (!_ca) {
+    if (!_clientCA) {
         // No explicit CA was specified, use the Keychain CA explicitly on client connects,
         // even though we're going to pretend it doesn't exist on server.
         ::CFArrayRef certs = nullptr;
         uassertOSStatusOK(SecTrustCopyAnchorCertificates(&certs));
-        _ca.reset(certs);
+        _clientCA.reset(certs);
+    }
+
+    if (!params.sslClusterCAFile.empty()) {
+        auto ca = uassertStatusOK(loadPEM(params.sslClusterCAFile, "", kLoadPEMStripKeys));
+        _serverCA = std::move(ca);
+    } else {
+        // No inbound CA specified, share a reference with outbound CA.
+        auto ca = _clientCA.get();
+        ::CFRetain(ca);
+        _serverCA.reset(ca);
     }
 }
 
@@ -1174,6 +1200,9 @@ StatusWith<std::pair<::SSLProtocol, ::SSLProtocol>> parseProtocolRange(const SSL
 Status SSLManagerApple::initSSLContext(asio::ssl::apple::Context* context,
                                        const SSLParams& params,
                                        ConnectionDirection direction) {
+    // Options.
+    context->allowInvalidHostnames = _allowInvalidHostnames;
+
     // Protocol Version.
     const auto swProto = parseProtocolRange(params);
     if (!swProto.isOK()) {
@@ -1208,6 +1237,10 @@ Status SSLManagerApple::initSSLContext(asio::ssl::apple::Context* context,
     };
 
     if (direction == ConnectionDirection::kOutgoing) {
+        if (params.tlsWithholdClientCertificate) {
+            return Status::OK();
+        }
+
         const auto status = selectCertificate(
             params.sslClusterCertificateSelector, params.sslClusterFile, params.sslClusterPassword);
         if (context->certs || !status.isOK()) {
@@ -1233,10 +1266,12 @@ SSLConnectionInterface* SSLManagerApple::accept(Socket* socket, const char* init
 }
 
 SSLPeerInfo SSLManagerApple::parseAndValidatePeerCertificateDeprecated(
-    const SSLConnectionInterface* conn, const std::string& remoteHost) {
+    const SSLConnectionInterface* conn,
+    const std::string& remoteHost,
+    const HostAndPort& hostForLogging) {
     auto ssl = checked_cast<const SSLConnectionApple*>(conn)->get();
 
-    auto swPeerSubjectName = parseAndValidatePeerCertificate(ssl, remoteHost);
+    auto swPeerSubjectName = parseAndValidatePeerCertificate(ssl, remoteHost, hostForLogging);
     // We can't use uassertStatusOK here because we need to throw a NetworkException.
     if (!swPeerSubjectName.isOK()) {
         throwSocketError(SocketErrorKind::CONNECT_ERROR, swPeerSubjectName.getStatus().reason());
@@ -1244,43 +1279,34 @@ SSLPeerInfo SSLManagerApple::parseAndValidatePeerCertificateDeprecated(
     return swPeerSubjectName.getValue().get_value_or(SSLPeerInfo());
 }
 
-void recordTLSVersion(::SSLContextRef ssl) {
+StatusWith<TLSVersion> mapTLSVersion(SSLContextRef ssl) {
     ::SSLProtocol protocol;
 
     uassertOSStatusOK(::SSLGetNegotiatedProtocolVersion(ssl, &protocol));
 
-    auto& counts = mongo::TLSVersionCounts::get(getGlobalServiceContext());
     switch (protocol) {
         case kTLSProtocol1:
-            counts.tls10.addAndFetch(1);
-            break;
+            return TLSVersion::kTLS10;
         case kTLSProtocol11:
-            counts.tls11.addAndFetch(1);
-            break;
+            return TLSVersion::kTLS11;
         case kTLSProtocol12:
-            counts.tls12.addAndFetch(1);
-            break;
-        // case kTLSProtocol13:
-        //     counts.tls13.addAndFetch(1);
-        //     break;
-        case kSSLProtocolUnknown:
-        case kSSLProtocol2:
-        case kSSLProtocol3:
-        case kSSLProtocol3Only:
-        case kTLSProtocol1Only:
-        case kSSLProtocolAll:
-        case kDTLSProtocol1:
-            // Do nothing
-            break;
+            return TLSVersion::kTLS12;
+        default:  // Some system headers may define additional protocols, so suppress warnings.
+            return TLSVersion::kUnknown;
     }
 }
 
 
 StatusWith<boost::optional<SSLPeerInfo>> SSLManagerApple::parseAndValidatePeerCertificate(
-    ::SSLContextRef ssl, const std::string& remoteHost) {
+    ::SSLContextRef ssl, const std::string& remoteHost, const HostAndPort& hostForLogging) {
 
     // Record TLS version stats
-    recordTLSVersion(ssl);
+    auto tlsVersionStatus = mapTLSVersion(ssl);
+    if (!tlsVersionStatus.isOK()) {
+        return tlsVersionStatus.getStatus();
+    }
+
+    recordTLSVersion(tlsVersionStatus.getValue(), hostForLogging);
 
     /* While we always have a system CA via the Keychain,
      * we'll pretend not to in terms of validation if the server
@@ -1325,8 +1351,12 @@ StatusWith<boost::optional<SSLPeerInfo>> SSLManagerApple::parseAndValidatePeerCe
         }
     }
 
-    if (_ca) {
-        auto status = ::SecTrustSetAnchorCertificates(cftrust.get(), _ca.get());
+    // When remoteHost is empty, it means we're handling an Inbound connection.
+    // In that case, we in a server role, so use the _serverCA,
+    // otherwise we're in a client role, so use that.
+    auto ca = remoteHost.empty() ? _serverCA.get() : _clientCA.get();
+    if (ca) {
+        auto status = ::SecTrustSetAnchorCertificates(cftrust.get(), ca);
         if (status == ::errSecSuccess) {
             status = ::SecTrustSetAnchorCertificatesOnly(cftrust.get(), true);
         }
@@ -1340,9 +1370,7 @@ StatusWith<boost::optional<SSLPeerInfo>> SSLManagerApple::parseAndValidatePeerCe
     auto result = ::kSecTrustResultInvalid;
     uassertOSStatusOK(::SecTrustEvaluate(cftrust.get(), &result), ErrorCodes::SSLHandshakeFailed);
     if ((result != ::kSecTrustResultProceed) && (result != ::kSecTrustResultUnspecified)) {
-        const bool proceed = _allowInvalidCertificates ||
-            (_allowInvalidHostnames && (result == ::kSecTrustResultRecoverableTrustFailure));
-        return badCert(explainTrustFailure(cftrust.get(), result), proceed);
+        return badCert(explainTrustFailure(cftrust.get(), result), _allowInvalidCertificates);
     }
 
     auto cert = ::SecTrustGetCertificateAtIndex(cftrust.get(), 0);

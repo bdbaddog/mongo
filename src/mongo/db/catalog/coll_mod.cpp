@@ -44,6 +44,7 @@
 #include "mongo/db/command_generic_argument.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/index/index_descriptor.h"
+#include "mongo/db/op_observer.h"
 #include "mongo/db/repl/repl_client_info.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/s/sharding_state.h"
@@ -474,9 +475,14 @@ Status collMod(OperationContext* opCtx,
 Status collModWithUpgrade(OperationContext* opCtx,
                           const NamespaceString& nss,
                           const BSONObj& cmdObj) {
-    // A cmdObj with an empty collMod, i.e. nFields = 1, implies that it is a Unique Index
-    // upgrade collMod.
-    bool upgradeUniqueIndex = createTimestampSafeUniqueIndex && (cmdObj.nFields() == 1);
+    // An empty collMod is used to upgrade unique index during FCV upgrade. If an application
+    // executes the empty collMod when the secondary is upgrading FCV it is fine to upgrade the
+    // unique index becuase the secondary will eventually get the real empty collMod. If the
+    // application issues an empty collMod when FCV is not upgrading or upgraded to 4.2 then the
+    // unique index should not be upgraded due to this collMod on the secondary.
+    bool upgradeUniqueIndex =
+        (cmdObj.nFields() == 1 && serverGlobalParams.featureCompatibility.isVersionInitialized() &&
+         serverGlobalParams.featureCompatibility.isVersionUpgradingOrUpgraded());
 
     // Update all non-replicated unique indexes on upgrade i.e. setFCV=4.2.
     if (upgradeUniqueIndex && nss == NamespaceString::kServerConfigurationNamespace) {
@@ -562,9 +568,6 @@ void _updateUniqueIndexesForDatabase(OperationContext* opCtx, const std::string&
 }
 
 void updateUniqueIndexesOnUpgrade(OperationContext* opCtx) {
-    if (!createTimestampSafeUniqueIndex)
-        return;
-
     // Update all unique indexes except the _id index.
     std::vector<std::string> dbNames;
     StorageEngine* storageEngine = opCtx->getServiceContext()->getStorageEngine();
@@ -595,9 +598,6 @@ void updateUniqueIndexesOnUpgrade(OperationContext* opCtx) {
 }
 
 Status updateNonReplicatedUniqueIndexes(OperationContext* opCtx) {
-    if (!createTimestampSafeUniqueIndex)
-        return Status::OK();
-
     // Update all unique indexes belonging to all non-replicated collections.
     // (_id indexes are not updated).
     std::vector<std::string> dbNames;

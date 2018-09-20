@@ -306,14 +306,11 @@ void KVCatalog::FeatureTracker::putInfo(OperationContext* opCtx, const FeatureBi
     if (_rid.isNull()) {
         // This is the first time a feature is being marked as in-use or not in-use, so we must
         // insert the feature document rather than update it.
-        // TODO SERVER-30638: using timestamp 0 for these inserts
         auto rid = _catalog->_rs->insertRecord(opCtx, obj.objdata(), obj.objsize(), Timestamp());
         fassert(40113, rid.getStatus());
         _rid = rid.getValue();
     } else {
-        UpdateNotifier* notifier = nullptr;
-        auto status =
-            _catalog->_rs->updateRecord(opCtx, _rid, obj.objdata(), obj.objsize(), notifier);
+        auto status = _catalog->_rs->updateRecord(opCtx, _rid, obj.objdata(), obj.objsize());
         fassert(40114, status);
     }
 }
@@ -422,7 +419,6 @@ Status KVCatalog::newCollection(OperationContext* opCtx,
         b.append("md", md.toBSON());
         obj = b.obj();
     }
-    // TODO SERVER-30638: using timestamp 0 for these inserts.
     StatusWith<RecordId> res = _rs->insertRecord(opCtx, obj.objdata(), obj.objsize(), Timestamp());
     if (!res.isOK())
         return res.getStatus();
@@ -519,7 +515,7 @@ void KVCatalog::putMetaData(OperationContext* opCtx,
     }
 
     LOG(3) << "recording new metadata: " << obj;
-    Status status = _rs->updateRecord(opCtx, loc, obj.objdata(), obj.objsize(), NULL);
+    Status status = _rs->updateRecord(opCtx, loc, obj.objdata(), obj.objsize());
     fassert(28521, status.isOK());
 }
 
@@ -544,7 +540,7 @@ Status KVCatalog::renameCollection(OperationContext* opCtx,
         b.appendElementsUnique(old);
 
         BSONObj obj = b.obj();
-        Status status = _rs->updateRecord(opCtx, loc, obj.objdata(), obj.objsize(), NULL);
+        Status status = _rs->updateRecord(opCtx, loc, obj.objdata(), obj.objsize());
         fassert(28522, status.isOK());
     }
 
@@ -626,5 +622,52 @@ bool KVCatalog::isUserDataIdent(StringData ident) const {
     return ident.find("index-") != std::string::npos || ident.find("index/") != std::string::npos ||
         ident.find("collection-") != std::string::npos ||
         ident.find("collection/") != std::string::npos;
+}
+
+bool KVCatalog::isCollectionIdent(StringData ident) const {
+    return ident.find("collection-") != std::string::npos ||
+        ident.find("collection/") != std::string::npos;
+}
+
+StatusWith<std::string> KVCatalog::newOrphanedIdent(OperationContext* opCtx, std::string ident) {
+    // The collection will be named local.orphan.xxxxx.
+    std::string identNs = ident;
+    std::replace(identNs.begin(), identNs.end(), '-', '_');
+    std::string ns = NamespaceString(NamespaceString::kOrphanCollectionDb,
+                                     NamespaceString::kOrphanCollectionPrefix + identNs)
+                         .ns();
+
+    stdx::lock_guard<stdx::mutex> lk(_identsLock);
+    Entry& old = _idents[ns];
+    if (!old.ident.empty()) {
+        return Status(ErrorCodes::NamespaceExists,
+                      str::stream() << ns << " already exists in the catalog");
+    }
+    opCtx->recoveryUnit()->registerChange(new AddIdentChange(this, ns));
+
+    // Generate a new UUID for the orphaned collection.
+    CollectionOptions optionsWithUUID;
+    optionsWithUUID.uuid.emplace(CollectionUUID::gen());
+    BSONObj obj;
+    {
+        BSONObjBuilder b;
+        b.append("ns", ns);
+        b.append("ident", ident);
+        BSONCollectionCatalogEntry::MetaData md;
+        md.ns = ns;
+        // Default options with newly generated UUID.
+        md.options = optionsWithUUID;
+        // Not Prefixed.
+        md.prefix = KVPrefix::kNotPrefixed;
+        b.append("md", md.toBSON());
+        obj = b.obj();
+    }
+    StatusWith<RecordId> res = _rs->insertRecord(opCtx, obj.objdata(), obj.objsize(), Timestamp());
+    if (!res.isOK())
+        return res.getStatus();
+
+    old = Entry(ident, res.getValue());
+    LOG(1) << "stored meta data for orphaned collection " << ns << " @ " << res.getValue();
+    return StatusWith<std::string>(std::move(ns));
 }
 }

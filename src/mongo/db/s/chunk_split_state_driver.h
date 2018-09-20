@@ -45,7 +45,7 @@ namespace mongo {
  * when it is decided that a split should be performed and then passed along to
  * the ChunkSplitter which will drive these state changes.
  */
-class ChunkSplitStateDriver {
+class ChunkSplitStateDriver final {
     MONGO_DISALLOW_COPYING(ChunkSplitStateDriver);
 
 public:
@@ -54,7 +54,7 @@ public:
      * constructs and returns a ChunkSplitStateDriver object. If it fails due to the
      * writesTracker already being locked, returns boost::none.
      */
-    static boost::optional<ChunkSplitStateDriver> tryInitiateSplit(
+    static std::shared_ptr<ChunkSplitStateDriver> tryInitiateSplit(
         std::shared_ptr<ChunkWritesTracker> writesTracker);
 
     /**
@@ -62,7 +62,7 @@ public:
      * doesn't try to cancel any ongoing split in its destructor. This
      * constructor is required for boost::optional.
      */
-    ChunkSplitStateDriver(ChunkSplitStateDriver&& other);
+    ChunkSplitStateDriver(ChunkSplitStateDriver&& other) noexcept;
 
     /**
      * Not needed.
@@ -79,6 +79,15 @@ public:
      * the split is later canceled.
      */
     void prepareSplit();
+
+    /**
+     * In the case that we trigger a split but decide not to split due to the
+     * actual size of a chunk on disk being too small, we update our estimate
+     * by abandoning the stashed bytes we had written prior to prepare. That
+     * way we won't continue to trigger splits on a chunk that is smaller than
+     * we currently estimate it to be.
+     */
+    void abandonPrepare();
 
     /**
      * Marks the split as committed, which means that shouldSplit will

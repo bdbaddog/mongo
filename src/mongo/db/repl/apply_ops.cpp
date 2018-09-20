@@ -50,6 +50,7 @@
 #include "mongo/db/query/collation/collation_spec.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/service_context.h"
+#include "mongo/db/transaction_participant.h"
 #include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/util/fail_point_service.h"
 #include "mongo/util/log.h"
@@ -70,14 +71,7 @@ MONGO_FAIL_POINT_DEFINE(applyOpsPauseBetweenOperations);
  */
 bool _parseAreOpsCrudOnly(const BSONObj& applyOpCmd) {
     for (const auto& elem : applyOpCmd.firstElement().Obj()) {
-        const char* names[] = {"ns", "op"};
-        BSONElement fields[2];
-        elem.Obj().getFields(2, names, fields);
-        BSONElement& fieldNs = fields[0];
-        BSONElement& fieldOp = fields[1];
-
-        const char* opType = fieldOp.valuestrsafe();
-        const StringData ns = fieldNs.valuestrsafe();
+        const char* opType = elem.Obj().getField("op").valuestrsafe();
 
         // All atomic ops have an opType of length 1.
         if (opType[0] == '\0' || opType[1] != '\0')
@@ -90,8 +84,7 @@ bool _parseAreOpsCrudOnly(const BSONObj& applyOpCmd) {
             case 'u':
                 break;
             case 'i':
-                if (nsToCollectionSubstring(ns) != "system.indexes")
-                    break;
+                break;
             // Fallthrough.
             default:
                 return false;
@@ -152,7 +145,7 @@ Status _applyOps(OperationContext* opCtx,
             // NamespaceNotFound.
             // Additionally for inserts, we fail early on non-existent collections.
             auto collection = db->getCollection(opCtx, nss);
-            if (!collection && !nss.isSystemDotIndexes() && (*opType == 'i' || *opType == 'u')) {
+            if (!collection && (*opType == 'i' || *opType == 'u')) {
                 uasserted(
                     ErrorCodes::AtomicityFailure,
                     str::stream()
@@ -210,7 +203,7 @@ Status _applyOps(OperationContext* opCtx,
                         }
 
                         AutoGetCollection autoColl(opCtx, nss, MODE_IX);
-                        if (!autoColl.getCollection() && !nss.isSystemDotIndexes()) {
+                        if (!autoColl.getCollection()) {
                             // For idempotency reasons, return success on delete operations.
                             if (*opType == 'd') {
                                 return Status::OK();
@@ -226,54 +219,12 @@ Status _applyOps(OperationContext* opCtx,
 
                         OldClientContext ctx(opCtx, nss.ns());
 
-                        if (!nss.isSystemDotIndexes()) {
-                            // We return the status rather than merely aborting so failure of CRUD
-                            // ops doesn't stop the applyOps from trying to process the rest of the
-                            // ops.  This is to leave the door open to parallelizing CRUD op
-                            // application in the future.
-                            return repl::applyOperation_inlock(
-                                opCtx, ctx.db(), opObj, alwaysUpsert, oplogApplicationMode);
-                        }
-
-                        auto fieldO = opObj["o"];
-                        BSONObj indexSpec;
-                        NamespaceString indexNss;
-                        std::tie(indexSpec, indexNss) =
-                            repl::prepForApplyOpsIndexInsert(fieldO, opObj, nss);
-                        if (!indexSpec["collation"]) {
-                            // If the index spec does not include a collation, explicitly specify
-                            // the simple collation, so the index does not inherit the collection
-                            // default collation.
-                            auto indexVersion = indexSpec["v"];
-                            // The index version is populated by prepForApplyOpsIndexInsert().
-                            invariant(indexVersion);
-                            if (indexVersion.isNumber() &&
-                                (indexVersion.numberInt() >=
-                                 static_cast<int>(IndexDescriptor::IndexVersion::kV2))) {
-                                BSONObjBuilder bob;
-                                bob.append("collation", CollationSpec::kSimpleSpec);
-                                bob.appendElements(indexSpec);
-                                indexSpec = bob.obj();
-                            }
-                        }
-                        BSONObjBuilder command;
-                        command.append("createIndexes", indexNss.coll());
-                        {
-                            BSONArrayBuilder indexes(command.subarrayStart("indexes"));
-                            indexes.append(indexSpec);
-                            indexes.doneFast();
-                        }
-                        const BSONObj commandObj = command.done();
-
-                        DBDirectClient client(opCtx);
-                        BSONObj infoObj;
-                        client.runCommand(nss.db().toString(), commandObj, infoObj);
-
-                        // Uassert to stop applyOps only when building indexes, but not for CRUD
-                        // ops.
-                        uassertStatusOK(getStatusFromCommandResult(infoObj));
-
-                        return Status::OK();
+                        // We return the status rather than merely aborting so failure of CRUD
+                        // ops doesn't stop the applyOps from trying to process the rest of the
+                        // ops.  This is to leave the door open to parallelizing CRUD op
+                        // application in the future.
+                        return repl::applyOperation_inlock(
+                            opCtx, ctx.db(), opObj, alwaysUpsert, oplogApplicationMode);
                     });
             } catch (const DBException& ex) {
                 ab.append(false);
@@ -305,6 +256,44 @@ Status _applyOps(OperationContext* opCtx,
     if (errors != 0) {
         return Status(ErrorCodes::UnknownError, "applyOps had one or more errors applying ops");
     }
+
+    return Status::OK();
+}
+
+Status _applyPrepareTransaction(OperationContext* opCtx,
+                                const std::string& dbName,
+                                const BSONObj& applyOpCmd,
+                                const ApplyOpsCommandInfo& info,
+                                repl::OplogApplication::Mode oplogApplicationMode,
+                                BSONObjBuilder* result,
+                                int* numApplied,
+                                BSONArrayBuilder* opsBuilder,
+                                const OpTime& optime) {
+    // Only run on secondary.
+    uassert(50945,
+            "applyOps with prepared flag is only used internally by secondaries.",
+            oplogApplicationMode == repl::OplogApplication::Mode::kSecondary);
+    uassert(
+        50946,
+        "applyOps with prepared must only include CRUD operations and cannot have precondition.",
+        !info.getPreCondition() && info.areOpsCrudOnly());
+
+    // Session has been checked out by sync_tail.
+    auto transaction = TransactionParticipant::get(opCtx);
+    invariant(transaction);
+
+    transaction->unstashTransactionResources(opCtx, "prepareTransaction");
+
+    // Abort transaction unconditionally for now.
+    // TODO: SERVER-35875 / SERVER-35877 Abort or commit transactions on secondaries accordingly.
+    ON_BLOCK_EXIT([&] { transaction->abortActiveTransaction(opCtx); });
+
+    auto status = _applyOps(
+        opCtx, dbName, applyOpCmd, info, oplogApplicationMode, result, numApplied, opsBuilder);
+    if (!status.isOK()) {
+        return status;
+    }
+    transaction->prepareTransaction(opCtx, optime);
 
     return Status::OK();
 }
@@ -390,6 +379,7 @@ Status applyOps(OperationContext* opCtx,
                 const std::string& dbName,
                 const BSONObj& applyOpCmd,
                 repl::OplogApplication::Mode oplogApplicationMode,
+                boost::optional<OpTime> optime,
                 BSONObjBuilder* result) {
     auto info = ApplyOpsCommandInfo::parse(applyOpCmd);
 
@@ -397,8 +387,9 @@ Status applyOps(OperationContext* opCtx,
     boost::optional<Lock::DBLock> dbWriteLock;
 
     // There's only one case where we are allowed to take the database lock instead of the global
-    // lock - no preconditions; only CRUD ops; and non-atomic mode.
-    if (!info.getPreCondition() && info.areOpsCrudOnly() && !info.getAllowAtomic()) {
+    // lock - no preconditions; only CRUD ops; non-atomic mode; and not for transaction prepare.
+    if (!info.getPreCondition() && info.areOpsCrudOnly() && !info.getAllowAtomic() &&
+        !info.getPrepare()) {
         dbWriteLock.emplace(opCtx, dbName, MODE_IX);
     } else {
         globalWriteLock.emplace(opCtx);
@@ -421,6 +412,21 @@ Status applyOps(OperationContext* opCtx,
     }
 
     int numApplied = 0;
+
+    // Apply prepare transaction operation if "prepare" is true.
+    if (info.getPrepare().get_value_or(false)) {
+        invariant(optime);
+        return _applyPrepareTransaction(opCtx,
+                                        dbName,
+                                        applyOpCmd,
+                                        info,
+                                        oplogApplicationMode,
+                                        result,
+                                        &numApplied,
+                                        nullptr,
+                                        *optime);
+    }
+
     if (!info.isAtomic()) {
         return _applyOps(
             opCtx, dbName, applyOpCmd, info, oplogApplicationMode, result, &numApplied, nullptr);

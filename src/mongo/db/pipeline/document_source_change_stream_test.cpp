@@ -88,8 +88,8 @@ struct MockMongoInterface final : public StubMongoProcessInterface {
 
     MockMongoInterface(std::vector<FieldPath> fields) : _fields(std::move(fields)) {}
 
-    std::pair<std::vector<FieldPath>, bool> collectDocumentKeyFields(OperationContext*,
-                                                                     UUID) const final {
+    std::pair<std::vector<FieldPath>, bool> collectDocumentKeyFields(
+        OperationContext*, NamespaceStringOrUUID) const final {
         return {_fields, false};
     }
 
@@ -453,12 +453,12 @@ TEST_F(ChangeStreamStageTest, TransformInsertDocKeyXAndId) {
     };
     checkTransformation(insert, expectedInsert, {{"x"}, {"_id"}});
     bool fromMigrate = false;  // also check actual "fromMigrate: false" not filtered
-    auto insert2 = makeOplogEntry(insert.getOpType(),     // op type
-                                  insert.getNamespace(),  // namespace
-                                  insert.getObject(),     // o
-                                  insert.getUuid(),       // uuid
-                                  fromMigrate,            // fromMigrate
-                                  insert.getObject2());   // o2
+    auto insert2 = makeOplogEntry(insert.getOpType(),    // op type
+                                  insert.getNss(),       // namespace
+                                  insert.getObject(),    // o
+                                  insert.getUuid(),      // uuid
+                                  fromMigrate,           // fromMigrate
+                                  insert.getObject2());  // o2
     checkTransformation(insert2, expectedInsert, {{"x"}, {"_id"}});
 }
 
@@ -628,12 +628,12 @@ TEST_F(ChangeStreamStageTest, TransformDelete) {
     checkTransformation(deleteEntry, expectedDelete);
 
     bool fromMigrate = false;  // also check actual "fromMigrate: false" not filtered
-    auto deleteEntry2 = makeOplogEntry(deleteEntry.getOpType(),     // op type
-                                       deleteEntry.getNamespace(),  // namespace
-                                       deleteEntry.getObject(),     // o
-                                       deleteEntry.getUuid(),       // uuid
-                                       fromMigrate,                 // fromMigrate
-                                       deleteEntry.getObject2());   // o2
+    auto deleteEntry2 = makeOplogEntry(deleteEntry.getOpType(),    // op type
+                                       deleteEntry.getNss(),       // namespace
+                                       deleteEntry.getObject(),    // o
+                                       deleteEntry.getUuid(),      // uuid
+                                       fromMigrate,                // fromMigrate
+                                       deleteEntry.getObject2());  // o2
 
     checkTransformation(deleteEntry2, expectedDelete);
 }
@@ -981,34 +981,6 @@ TEST_F(ChangeStreamStageTest, MatchFiltersNoOp) {
                                     << "new primary"));  // o
 
     checkTransformation(noOp, boost::none);
-}
-
-TEST_F(ChangeStreamStageTest, MatchFiltersCreateIndex) {
-    auto indexSpec = D{{"v", 2}, {"key", D{{"a", 1}}}, {"name", "a_1"_sd}, {"ns", nss.ns()}};
-    NamespaceString indexNs(nss.getSystemIndexesCollection());
-    bool fromMigrate = false;  // At the moment this makes no difference.
-    auto createIndex = makeOplogEntry(OpTypeEnum::kInsert,  // op type
-                                      indexNs,              // namespace
-                                      indexSpec.toBson(),   // o
-                                      boost::none,          // uuid
-                                      fromMigrate,          // fromMigrate
-                                      boost::none);         // o2
-
-    checkTransformation(createIndex, boost::none);
-}
-
-TEST_F(ChangeStreamStageTest, MatchFiltersCreateIndexFromMigrate) {
-    auto indexSpec = D{{"v", 2}, {"key", D{{"a", 1}}}, {"name", "a_1"_sd}, {"ns", nss.ns()}};
-    NamespaceString indexNs(nss.getSystemIndexesCollection());
-    bool fromMigrate = true;
-    auto createIndex = makeOplogEntry(OpTypeEnum::kInsert,  // op type
-                                      indexNs,              // namespace
-                                      indexSpec.toBson(),   // o
-                                      boost::none,          // uuid
-                                      fromMigrate,          // fromMigrate
-                                      boost::none);         // o2
-
-    checkTransformation(createIndex, boost::none);
 }
 
 TEST_F(ChangeStreamStageTest, TransformationShouldBeAbleToReParseSerializedStage) {
@@ -1428,12 +1400,12 @@ TEST_F(ChangeStreamStageDBTest, TransformDelete) {
     checkTransformation(deleteEntry, expectedDelete);
 
     bool fromMigrate = false;  // also check actual "fromMigrate: false" not filtered
-    auto deleteEntry2 = makeOplogEntry(deleteEntry.getOpType(),     // op type
-                                       deleteEntry.getNamespace(),  // namespace
-                                       deleteEntry.getObject(),     // o
-                                       deleteEntry.getUuid(),       // uuid
-                                       fromMigrate,                 // fromMigrate
-                                       deleteEntry.getObject2());   // o2
+    auto deleteEntry2 = makeOplogEntry(deleteEntry.getOpType(),    // op type
+                                       deleteEntry.getNss(),       // namespace
+                                       deleteEntry.getObject(),    // o
+                                       deleteEntry.getUuid(),      // uuid
+                                       fromMigrate,                // fromMigrate
+                                       deleteEntry.getObject2());  // o2
 
     checkTransformation(deleteEntry2, expectedDelete);
 }
@@ -1557,13 +1529,6 @@ TEST_F(ChangeStreamStageDBTest, MatchFiltersNoOp) {
                                      BSON("msg"
                                           << "new primary"));
     checkTransformation(noOp, boost::none);
-}
-
-TEST_F(ChangeStreamStageDBTest, MatchFiltersCreateIndex) {
-    auto indexSpec = D{{"v", 2}, {"key", D{{"a", 1}}}, {"name", "a_1"_sd}, {"ns", nss.ns()}};
-    NamespaceString indexNs(nss.getSystemIndexesCollection());
-    OplogEntry createIndex = makeOplogEntry(OpTypeEnum::kInsert, indexNs, indexSpec.toBson());
-    checkTransformation(createIndex, boost::none);
 }
 
 TEST_F(ChangeStreamStageDBTest, DocumentKeyShouldIncludeShardKeyFromResumeToken) {

@@ -95,6 +95,13 @@ class BSONObjStlIterator;
  */
 class BSONObj {
 public:
+    struct DefaultSizeTrait {
+        constexpr static int MaxSize = BSONObjMaxInternalSize;
+    };
+    struct LargeSizeTrait {
+        constexpr static int MaxSize = BufferMaxSize;
+    };
+
     // Declared in bsonobj_comparator_interface.h.
     class ComparatorInterface;
 
@@ -125,8 +132,9 @@ public:
     /** Construct a BSONObj from data in the proper format.
      *  Use this constructor when something else owns bsonData's buffer
     */
-    explicit BSONObj(const char* bsonData) {
-        init(bsonData);
+    template <typename Traits = DefaultSizeTrait>
+    explicit BSONObj(const char* bsonData, Traits t = Traits{}) {
+        init<Traits>(bsonData);
     }
 
     explicit BSONObj(ConstSharedBuffer ownedBuffer)
@@ -254,6 +262,11 @@ public:
                            int pretty = 0,
                            bool isArray = false) const;
 
+    void jsonStringStream(JsonStringFormat format,
+                          int pretty,
+                          bool isArray,
+                          std::stringstream& s) const;
+
     /** note: addFields always adds _id even if not specified */
     int addFields(BSONObj& from, std::set<std::string>& fields); /* returns n added */
 
@@ -274,8 +287,11 @@ public:
     */
     int nFields() const;
 
-    /** adds the field names to the fields set.  does NOT clear it (appends). */
-    int getFieldNames(std::set<std::string>& fields) const;
+    /**
+     * Returns a 'Container' populated with the field names of the object.
+     */
+    template <class Container>
+    Container getFieldNames() const;
 
     /** Get the field of the specified name. eoo() is true on the returned
         element if not found.
@@ -371,9 +387,12 @@ public:
     }
 
     /** performs a cursory check on the object's size only. */
+    template <typename Traits = DefaultSizeTrait>
     bool isValid() const {
+        static_assert(Traits::MaxSize > 0 && Traits::MaxSize <= std::numeric_limits<int>::max(),
+                      "BSONObj maximum size must be within possible limits");
         int x = objsize();
-        return x > 0 && x <= BSONObjMaxInternalSize;
+        return x > 0 && x <= Traits::MaxSize;
     }
 
     /**
@@ -556,12 +575,13 @@ public:
     }
 
 private:
-    void _assertInvalid() const;
+    void _assertInvalid(int maxSize) const;
 
+    template <typename Traits = DefaultSizeTrait>
     void init(const char* data) {
         _objdata = data;
-        if (!isValid())
-            _assertInvalid();
+        if (!isValid<Traits>())
+            _assertInvalid(Traits::MaxSize);
     }
 
     const char* _objdata;
@@ -838,4 +858,16 @@ inline void BSONObj::getFields(const std::array<StringData, N>& fieldNames,
             break;
     }
 }
+
+template <class Container>
+Container BSONObj::getFieldNames() const {
+    Container fields;
+    for (auto&& elem : *this) {
+        if (elem.eoo())
+            break;
+        fields.insert(elem.fieldName());
+    }
+    return fields;
+}
+
 }  // namespace mongo

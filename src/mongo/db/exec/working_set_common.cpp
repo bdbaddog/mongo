@@ -36,42 +36,10 @@
 #include "mongo/db/index/index_access_method.h"
 #include "mongo/db/query/canonical_query.h"
 #include "mongo/db/service_context.h"
-#include "mongo/db/service_context.h"
 
 namespace mongo {
 
-// static
-bool WorkingSetCommon::fetchAndInvalidateRecordId(OperationContext* opCtx,
-                                                  WorkingSetMember* member,
-                                                  const Collection* collection) {
-    // Already in our desired state.
-    if (member->getState() == WorkingSetMember::OWNED_OBJ) {
-        return true;
-    }
-
-    // We can't do anything without a RecordId.
-    if (!member->hasRecordId()) {
-        return false;
-    }
-
-    // Do the fetch, invalidate the DL.
-    member->obj = collection->docFor(opCtx, member->recordId);
-    member->obj.setValue(member->obj.value().getOwned());
-    member->recordId = RecordId();
-    member->transitionToOwnedObj();
-
-    return true;
-}
-
 void WorkingSetCommon::prepareForSnapshotChange(WorkingSet* workingSet) {
-    if (!supportsDocLocking()) {
-        // Non doc-locking storage engines use invalidations, so we don't need to examine the
-        // buffered working set ids. But we do need to clear the set of ids in order to keep our
-        // memory utilization in check.
-        workingSet->getAndClearYieldSensitiveIds();
-        return;
-    }
-
     for (auto id : workingSet->getAndClearYieldSensitiveIds()) {
         if (workingSet->isFree(id)) {
             continue;
@@ -91,9 +59,6 @@ bool WorkingSetCommon::fetch(OperationContext* opCtx,
                              WorkingSetID id,
                              unowned_ptr<SeekableRecordCursor> cursor) {
     WorkingSetMember* member = workingSet->get(id);
-
-    // The RecordFetcher should already have been transferred out of the WSM and used.
-    invariant(!member->hasFetcher());
 
     // We should have a RecordId but need to retrieve the obj. Get the obj now and reset all WSM
     // state appropriately.
@@ -117,10 +82,12 @@ bool WorkingSetCommon::fetch(OperationContext* opCtx,
             BSONObjSet keys = SimpleBSONObjComparator::kInstance.makeBSONObjSet();
             // There's no need to compute the prefixes of the indexed fields that cause the index to
             // be multikey when ensuring the keyData is still valid.
+            BSONObjSet* multikeyMetadataKeys = nullptr;
             MultikeyPaths* multikeyPaths = nullptr;
             member->keyData[i].index->getKeys(member->obj.value(),
                                               IndexAccessMethod::GetKeysMode::kEnforceConstraints,
                                               &keys,
+                                              multikeyMetadataKeys,
                                               multikeyPaths);
             if (!keys.count(member->keyData[i].keyData)) {
                 // document would no longer be at this position in the index.

@@ -181,8 +181,10 @@ public:
 
     virtual ResourceId getWaitingResource() const;
 
-    virtual void getLockerInfo(LockerInfo* lockerInfo) const;
-    virtual boost::optional<LockerInfo> getLockerInfo() const final;
+    virtual void getLockerInfo(LockerInfo* lockerInfo,
+                               const boost::optional<SingleThreadedLockStats> lockStatsBase) const;
+    virtual boost::optional<LockerInfo> getLockerInfo(
+        const boost::optional<SingleThreadedLockStats> lockStatsBase) const final;
 
     virtual bool saveLockStateAndUnlock(LockSnapshot* stateOut);
 
@@ -190,6 +192,14 @@ public:
     virtual void restoreLockState(const LockSnapshot& stateToRestore) {
         restoreLockState(nullptr, stateToRestore);
     }
+
+    void restoreLockStateWithTemporaryGlobalResource(
+        OperationContext* opCtx,
+        const LockSnapshot& stateToRestore,
+        LockManager::TemporaryResourceQueue* tempGlobalResource) override;
+
+    void replaceGlobalLockStateWithTemporaryGlobalResource(
+        LockManager::TemporaryResourceQueue* tempGlobalResource) override;
 
     virtual void releaseTicket();
     virtual void reacquireTicket(OperationContext* opCtx);

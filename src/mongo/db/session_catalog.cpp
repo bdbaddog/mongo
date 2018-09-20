@@ -40,6 +40,7 @@
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/service_context.h"
+#include "mongo/db/transaction_participant.h"
 #include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/stdx/memory.h"
 #include "mongo/util/log.h"
@@ -56,7 +57,7 @@ const auto operationSessionDecoration =
 
 SessionCatalog::~SessionCatalog() {
     stdx::lock_guard<stdx::mutex> lg(_mutex);
-    for (const auto& entry : _txnTable) {
+    for (const auto& entry : _sessions) {
         auto& sri = entry.second;
         invariant(!sri->checkedOut);
     }
@@ -64,7 +65,7 @@ SessionCatalog::~SessionCatalog() {
 
 void SessionCatalog::reset_forTest() {
     stdx::lock_guard<stdx::mutex> lg(_mutex);
-    _txnTable.clear();
+    _sessions.clear();
 }
 
 SessionCatalog* SessionCatalog::get(OperationContext* opCtx) {
@@ -127,6 +128,10 @@ ScopedCheckedOutSession SessionCatalog::checkOutSession(OperationContext* opCtx)
 
     stdx::unique_lock<stdx::mutex> ul(_mutex);
 
+    while (!_allowCheckingOutSessions) {
+        opCtx->waitForConditionOrInterrupt(_checkingOutSessionsAllowedCond, ul);
+    }
+
     auto sri = _getOrCreateSessionRuntimeInfo(ul, opCtx, lsid);
 
     // Wait until the session is no longer checked out
@@ -135,6 +140,7 @@ ScopedCheckedOutSession SessionCatalog::checkOutSession(OperationContext* opCtx)
 
     invariant(!sri->checkedOut);
     sri->checkedOut = true;
+    ++_numCheckedOutSessions;
 
     return ScopedCheckedOutSession(opCtx, ScopedSession(std::move(sri)));
 }
@@ -150,19 +156,20 @@ ScopedSession SessionCatalog::getOrCreateSession(OperationContext* opCtx,
         return ScopedSession(_getOrCreateSessionRuntimeInfo(ul, opCtx, lsid));
     }();
 
-    // Perform the refresh outside of the mutex
-    ss->refreshFromStorageIfNeeded(opCtx);
-
     return ss;
 }
 
 void SessionCatalog::invalidateSessions(OperationContext* opCtx,
                                         boost::optional<BSONObj> singleSessionDoc) {
-    uassert(40528,
-            str::stream() << "Direct writes against "
-                          << NamespaceString::kSessionTransactionsTableNamespace.ns()
-                          << " cannot be performed using a transaction or on a session.",
-            !opCtx->getLogicalSessionId());
+    auto replCoord = repl::ReplicationCoordinator::get(opCtx);
+    bool isReplSet = replCoord->getReplicationMode() == repl::ReplicationCoordinator::modeReplSet;
+    if (isReplSet) {
+        uassert(40528,
+                str::stream() << "Direct writes against "
+                              << NamespaceString::kSessionTransactionsTableNamespace.ns()
+                              << " cannot be performed using a transaction or on a session.",
+                !opCtx->getLogicalSessionId());
+    }
 
     const auto invalidateSessionFn = [&](WithLock, SessionRuntimeInfoMap::iterator it) {
         auto& sri = it->second;
@@ -171,7 +178,7 @@ void SessionCatalog::invalidateSessions(OperationContext* opCtx,
         // We cannot remove checked-out sessions from the cache, because operations expect to find
         // them there to check back in
         if (!sri->checkedOut) {
-            _txnTable.erase(it);
+            _sessions.erase(it);
         }
     };
 
@@ -181,13 +188,13 @@ void SessionCatalog::invalidateSessions(OperationContext* opCtx,
         const auto lsid = LogicalSessionId::parse(IDLParserErrorContext("lsid"),
                                                   singleSessionDoc->getField("_id").Obj());
 
-        auto it = _txnTable.find(lsid);
-        if (it != _txnTable.end()) {
+        auto it = _sessions.find(lsid);
+        if (it != _sessions.end()) {
             invalidateSessionFn(lg, it);
         }
     } else {
-        auto it = _txnTable.begin();
-        while (it != _txnTable.end()) {
+        auto it = _sessions.begin();
+        while (it != _sessions.end()) {
             invalidateSessionFn(lg, it++);
         }
     }
@@ -198,9 +205,9 @@ void SessionCatalog::scanSessions(OperationContext* opCtx,
                                   stdx::function<void(OperationContext*, Session*)> workerFn) {
     stdx::lock_guard<stdx::mutex> lg(_mutex);
 
-    LOG(2) << "Beginning scanSessions. Scanning " << _txnTable.size() << " sessions.";
+    LOG(2) << "Beginning scanSessions. Scanning " << _sessions.size() << " sessions.";
 
-    for (auto it = _txnTable.begin(); it != _txnTable.end(); ++it) {
+    for (auto it = _sessions.begin(); it != _sessions.end(); ++it) {
         // TODO SERVER-33850: Rename KillAllSessionsByPattern and
         // ScopedKillAllSessionsByPatternImpersonator to not refer to session kill.
         if (const KillAllSessionsByPattern* pattern = matcher.match(it->first)) {
@@ -213,10 +220,11 @@ void SessionCatalog::scanSessions(OperationContext* opCtx,
 std::shared_ptr<SessionCatalog::SessionRuntimeInfo> SessionCatalog::_getOrCreateSessionRuntimeInfo(
     WithLock, OperationContext* opCtx, const LogicalSessionId& lsid) {
     invariant(!opCtx->lockState()->inAWriteUnitOfWork());
+    invariant(_allowCheckingOutSessions);
 
-    auto it = _txnTable.find(lsid);
-    if (it == _txnTable.end()) {
-        it = _txnTable.emplace(lsid, std::make_shared<SessionRuntimeInfo>(lsid)).first;
+    auto it = _sessions.find(lsid);
+    if (it == _sessions.end()) {
+        it = _sessions.emplace(lsid, std::make_shared<SessionRuntimeInfo>(lsid)).first;
     }
 
     return it->second;
@@ -225,24 +233,50 @@ std::shared_ptr<SessionCatalog::SessionRuntimeInfo> SessionCatalog::_getOrCreate
 void SessionCatalog::_releaseSession(const LogicalSessionId& lsid) {
     stdx::lock_guard<stdx::mutex> lg(_mutex);
 
-    auto it = _txnTable.find(lsid);
-    invariant(it != _txnTable.end());
+    auto it = _sessions.find(lsid);
+    invariant(it != _sessions.end());
 
     auto& sri = it->second;
     invariant(sri->checkedOut);
 
     sri->checkedOut = false;
     sri->availableCondVar.notify_one();
+    --_numCheckedOutSessions;
+    if (_numCheckedOutSessions == 0) {
+        _allSessionsCheckedInCond.notify_all();
+    }
 }
 
-OperationContextSession::OperationContextSession(OperationContext* opCtx,
-                                                 bool checkOutSession,
-                                                 boost::optional<bool> autocommit,
-                                                 boost::optional<bool> startTransaction,
-                                                 StringData dbName,
-                                                 StringData cmdName)
-    : _opCtx(opCtx) {
+SessionCatalog::PreventCheckingOutSessionsBlock::PreventCheckingOutSessionsBlock(
+    SessionCatalog* sessionCatalog)
+    : _sessionCatalog(sessionCatalog) {
+    invariant(sessionCatalog);
 
+    stdx::lock_guard<stdx::mutex> lg(sessionCatalog->_mutex);
+    invariant(sessionCatalog->_allowCheckingOutSessions);
+    sessionCatalog->_allowCheckingOutSessions = false;
+}
+
+SessionCatalog::PreventCheckingOutSessionsBlock::~PreventCheckingOutSessionsBlock() {
+    stdx::lock_guard<stdx::mutex> lg(_sessionCatalog->_mutex);
+
+    invariant(!_sessionCatalog->_allowCheckingOutSessions);
+    _sessionCatalog->_allowCheckingOutSessions = true;
+    _sessionCatalog->_checkingOutSessionsAllowedCond.notify_all();
+}
+
+void SessionCatalog::PreventCheckingOutSessionsBlock::waitForAllSessionsToBeCheckedIn(
+    OperationContext* opCtx) {
+    stdx::unique_lock<stdx::mutex> ul(_sessionCatalog->_mutex);
+
+    invariant(!_sessionCatalog->_allowCheckingOutSessions);
+    while (_sessionCatalog->_numCheckedOutSessions > 0) {
+        opCtx->waitForConditionOrInterrupt(_sessionCatalog->_allSessionsCheckedInCond, ul);
+    }
+}
+
+OperationContextSession::OperationContextSession(OperationContext* opCtx, bool checkOutSession)
+    : _opCtx(opCtx) {
     if (!opCtx->getLogicalSessionId()) {
         return;
     }
@@ -254,10 +288,11 @@ OperationContextSession::OperationContextSession(OperationContext* opCtx,
     auto& checkedOutSession = operationSessionDecoration(opCtx);
     if (!checkedOutSession) {
         auto sessionTransactionTable = SessionCatalog::get(opCtx);
+        auto scopedCheckedOutSession = sessionTransactionTable->checkOutSession(opCtx);
         // We acquire a Client lock here to guard the construction of this session so that
         // references to this session are safe to use while the lock is held.
         stdx::lock_guard<Client> lk(*opCtx->getClient());
-        checkedOutSession.emplace(sessionTransactionTable->checkOutSession(opCtx));
+        checkedOutSession.emplace(std::move(scopedCheckedOutSession));
     } else {
         // The only reason to be trying to check out a session when you already have a session
         // checked out is if you're in DBDirectClient.
@@ -267,13 +302,7 @@ OperationContextSession::OperationContextSession(OperationContext* opCtx,
 
     const auto session = checkedOutSession->get();
     invariant(opCtx->getLogicalSessionId() == session->getSessionId());
-
-    checkedOutSession->get()->refreshFromStorageIfNeeded(opCtx);
-
-    if (opCtx->getTxnNumber()) {
-        checkedOutSession->get()->beginOrContinueTxn(
-            opCtx, *opCtx->getTxnNumber(), autocommit, startTransaction, dbName, cmdName);
-    }
+    session->setCurrentOperation(opCtx);
 }
 
 OperationContextSession::~OperationContextSession() {
@@ -284,10 +313,19 @@ OperationContextSession::~OperationContextSession() {
     }
 
     auto& checkedOutSession = operationSessionDecoration(_opCtx);
-    // We acquire a Client lock here to guard the destruction of this session so that references to
-    // this session are safe to use while the lock is held.
-    stdx::lock_guard<Client> lk(*_opCtx->getClient());
-    checkedOutSession.reset();
+    if (checkedOutSession) {
+        checkedOutSession->get()->clearCurrentOperation();
+
+        // Removing the checkedOutSession from the OperationContext must be done under the Client
+        // lock, but destruction of the checkedOutSession must not be, as it takes the
+        // SessionCatalog mutex, and other code may take the Client lock while holding that mutex.
+        stdx::unique_lock<Client> lk(*_opCtx->getClient());
+        ScopedCheckedOutSession sessionToDelete(std::move(checkedOutSession.get()));
+        // This destroys the moved-from ScopedCheckedOutSession, and must be done within the client
+        // lock.
+        checkedOutSession = boost::none;
+        lk.unlock();
+    }
 }
 
 Session* OperationContextSession::get(OperationContext* opCtx) {

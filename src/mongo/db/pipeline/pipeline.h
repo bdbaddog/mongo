@@ -48,9 +48,9 @@
 namespace mongo {
 class BSONObj;
 class BSONObjBuilder;
-class ExpressionContext;
-class DocumentSource;
 class CollatorInterface;
+class DocumentSource;
+class ExpressionContext;
 class OperationContext;
 class PipelineDeleter;
 
@@ -132,6 +132,19 @@ public:
      */
     static bool aggSupportsWriteConcern(const BSONObj& cmd);
 
+    /**
+     * Given 'pathsOfInterest' which describes a set of paths which the caller is interested in,
+     * returns boost::none if any of those paths are modified by the section of a pipeline
+     * described by 'rstart' and 'rend', or a mapping from their name at the end of the pipeline to
+     * their name at the beginning of the pipeline if they are preserved but possibly renamed by
+     * this pipeline. Note that the analysis proceeds backwards, so the iterators must be reverse
+     * iterators.
+     */
+    static boost::optional<StringMap<std::string>> renamedPaths(
+        SourceContainer::const_reverse_iterator rstart,
+        SourceContainer::const_reverse_iterator rend,
+        std::set<std::string> pathsOfInterest);
+
     const boost::intrusive_ptr<ExpressionContext>& getContext() const {
         return pCtx;
     }
@@ -172,37 +185,16 @@ public:
     bool usedDisk();
 
     /**
-     * Split the current Pipeline into a Pipeline for each shard, and a Pipeline that combines the
-     * results within mongos. This permanently alters this pipeline for the merging operation, and
-     * returns a Pipeline object that should be executed on each targeted shard.
-    */
-    std::unique_ptr<Pipeline, PipelineDeleter> splitForSharded();
-
-    /**
-     * Returns true if this pipeline has not been split.
+     * Communicates to the pipeline which part of a split pipeline it is when the pipeline has been
+     * split in two.
      */
-    bool isUnsplit() const {
-        return _splitState == SplitState::kUnsplit;
+    void setSplitState(SplitState state) {
+        _splitState = state;
     }
 
     /**
-     * Returns true if this pipeline is the part of a split pipeline which should be targeted to the
-     * shards.
-     */
-    bool isSplitForShards() const {
-        return _splitState == SplitState::kSplitForShards;
-    }
-
-    /**
-     * Returns true if this pipeline is the part of a split pipeline which is responsible for
-     * merging the results from the shards.
-     */
-    bool isSplitForMerge() const {
-        return _splitState == SplitState::kSplitForMerge;
-    }
-
-    /** If the pipeline starts with a $match, return its BSON predicate.
-     *  Returns empty BSON if the first stage isn't $match.
+     * If the pipeline starts with a stage which is or includes a query predicate (e.g. a $match),
+     * returns a BSON object representing that query. Otherwise, returns an empty BSON object.
      */
     BSONObj getInitialQuery() const;
 
@@ -270,6 +262,15 @@ public:
      * metadata is present on documents that are input to the front of the pipeline.
      */
     DepsTracker getDependencies(DepsTracker::MetadataAvailable metadataAvailable) const;
+
+    /**
+     * Given 'pathsOfInterest' which describes a set of paths which the caller is interested in,
+     * returns boost::none if any of those paths are modified by this pipeline, or a mapping from
+     * their name at the end of the pipeline to their name at the beginning of the pipeline if they
+     * are preserved but possibly renamed by this pipeline.
+     */
+    boost::optional<StringMap<std::string>> renamedPaths(
+        std::set<std::string> pathsOfInterest) const;
 
     const SourceContainer& getSources() const {
         return _sources;

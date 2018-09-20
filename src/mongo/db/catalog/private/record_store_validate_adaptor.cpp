@@ -35,6 +35,7 @@
 #include "mongo/bson/bsonobj.h"
 #include "mongo/db/catalog/index_catalog.h"
 #include "mongo/db/catalog/index_consistency.h"
+#include "mongo/db/index/all_paths_access_method.h"
 #include "mongo/db/index/index_access_method.h"
 #include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/matcher/expression.h"
@@ -45,6 +46,20 @@
 #include "mongo/util/log.h"
 
 namespace mongo {
+
+namespace {
+// TODO SERVER-36385: Completely remove the key size check in 4.4
+bool isLargeKeyDisallowed() {
+    return serverGlobalParams.featureCompatibility.getVersion() ==
+        ServerGlobalParams::FeatureCompatibility::Version::kFullyDowngradedTo40;
+}
+
+KeyString makeWildCardMultikeyMetadataKeyString(const BSONObj& indexKey) {
+    const auto multikeyMetadataOrd = Ordering::make(BSON("" << 1 << "" << 1));
+    const RecordId multikeyMetadataRecordId(RecordId::ReservedId::kAllPathsMultikeyMetadataId);
+    return {KeyString::kLatestVersion, indexKey, multikeyMetadataOrd, multikeyMetadataRecordId};
+}
+}
 
 Status RecordStoreValidateAdaptor::validate(const RecordId& recordId,
                                             const RecordData& record,
@@ -82,27 +97,35 @@ Status RecordStoreValidateAdaptor::validate(const RecordId& recordId,
         }
 
         BSONObjSet documentKeySet = SimpleBSONObjComparator::kInstance.makeBSONObjSet();
-        // There's no need to compute the prefixes of the indexed fields that cause the
-        // index to be multikey when validating the index keys.
-        MultikeyPaths* multikeyPaths = nullptr;
+        BSONObjSet multikeyMetadataKeys = SimpleBSONObjComparator::kInstance.makeBSONObjSet();
+        MultikeyPaths multikeyPaths;
         iam->getKeys(recordBson,
                      IndexAccessMethod::GetKeysMode::kEnforceConstraints,
                      &documentKeySet,
-                     multikeyPaths);
+                     &multikeyMetadataKeys,
+                     &multikeyPaths);
 
-        if (!descriptor->isMultikey(_opCtx) && documentKeySet.size() > 1) {
+        if (!descriptor->isMultikey(_opCtx) &&
+            iam->shouldMarkIndexAsMultikey(documentKeySet, multikeyMetadataKeys, multikeyPaths)) {
             std::string msg = str::stream() << "Index " << descriptor->indexName()
-                                            << " is not multi-key but has more than one"
-                                            << " key in document " << recordId;
+                                            << " is not multi-key, but a multikey path "
+                                            << " is present in document " << recordId;
             curRecordResults.errors.push_back(msg);
             curRecordResults.valid = false;
         }
 
+        for (const auto& key : multikeyMetadataKeys) {
+            _indexConsistency->addMultikeyMetadataPath(makeWildCardMultikeyMetadataKeyString(key),
+                                                       indexNumber);
+        }
+
         const auto& pattern = descriptor->keyPattern();
         const Ordering ord = Ordering::make(pattern);
+        bool largeKeyDisallowed = isLargeKeyDisallowed();
 
         for (const auto& key : documentKeySet) {
-            if (key.objsize() >= static_cast<int64_t>(KeyString::TypeBits::kMaxKeyBytes)) {
+            if (largeKeyDisallowed &&
+                key.objsize() >= static_cast<int64_t>(KeyString::TypeBits::kMaxKeyBytes)) {
                 // Index keys >= 1024 bytes are not indexed.
                 _indexConsistency->addLongIndexKey(indexNumber);
                 continue;
@@ -148,11 +171,28 @@ void RecordStoreValidateAdaptor::traverseIndex(const IndexAccessMethod* iam,
             results->valid = false;
         }
 
+        const RecordId kAllPathsMultikeyMetadataRecordId{
+            RecordId::ReservedId::kAllPathsMultikeyMetadataId};
+        if (descriptor->getIndexType() == IndexType::INDEX_ALLPATHS &&
+            indexEntry->loc == kAllPathsMultikeyMetadataRecordId) {
+            _indexConsistency->removeMultikeyMetadataPath(
+                makeWildCardMultikeyMetadataKeyString(indexEntry->key), indexNumber);
+            numKeys++;
+            continue;
+        }
+
         _indexConsistency->addIndexKey(*indexKeyString, indexNumber);
 
         numKeys++;
         isFirstEntry = false;
         prevIndexKeyString.swap(indexKeyString);
+    }
+
+    if (_indexConsistency->getMultikeyMetadataPathCount(indexNumber) > 0) {
+        results->errors.push_back(
+            str::stream() << "Index '" << descriptor->indexName()
+                          << "' has one or more missing multikey metadata index keys");
+        results->valid = false;
     }
 
     *numTraversedKeys = numKeys;
@@ -162,7 +202,6 @@ void RecordStoreValidateAdaptor::traverseRecordStore(RecordStore* recordStore,
                                                      ValidateCmdLevel level,
                                                      ValidateResults* results,
                                                      BSONObjBuilder* output) {
-
     long long nrecords = 0;
     long long dataSizeTotal = 0;
     long long nInvalid = 0;
@@ -185,12 +224,12 @@ void RecordStoreValidateAdaptor::traverseRecordStore(RecordStore* recordStore,
         Status status = validate(record->id, record->data, &validatedSize);
 
         // Checks to ensure isInRecordIdOrder() is being used properly.
-        if (prevRecordId.isNormal()) {
+        if (prevRecordId.isValid()) {
             invariant(prevRecordId < record->id);
         }
 
-        // While some storage engines, such as MMAPv1, may use padding, we still require
-        // that they return the unpadded record data.
+        // While some storage engines may use padding, we still require that they return the
+        // unpadded record data.
         if (!status.isOK() || validatedSize != static_cast<size_t>(dataSize)) {
             if (results->valid) {
                 // Only log once.
@@ -222,7 +261,7 @@ void RecordStoreValidateAdaptor::validateIndexKeyCount(IndexDescriptor* idx,
     auto totalKeys = numLongKeys + numIndexedKeys;
 
     bool hasTooFewKeys = false;
-    bool noErrorOnTooFewKeys = !failIndexKeyTooLong.load() && (_level != kValidateFull);
+    bool noErrorOnTooFewKeys = !failIndexKeyTooLongParam() && (_level != kValidateFull);
 
     if (idx->isIdIndex() && totalKeys != numRecs) {
         hasTooFewKeys = totalKeys < numRecs ? true : hasTooFewKeys;
@@ -237,7 +276,12 @@ void RecordStoreValidateAdaptor::validateIndexKeyCount(IndexDescriptor* idx,
         }
     }
 
-    if (results.valid && !idx->isMultikey(_opCtx) && totalKeys > numRecs) {
+    // Confirm that the number of index entries is not greater than the number of documents in the
+    // collection. This check is only valid for indexes that are not multikey (indexed arrays
+    // produce an index key per array entry) and not $** indexes which can produce index keys for
+    // multiple paths within a single document.
+    if (results.valid && !idx->isMultikey(_opCtx) &&
+        idx->getIndexType() != IndexType::INDEX_ALLPATHS && totalKeys > numRecs) {
         std::string err = str::stream()
             << "index " << idx->indexName() << " is not multi-key, but has more entries ("
             << numIndexedKeys << ") than documents in the index (" << numRecs - numLongKeys << ")";
@@ -269,4 +313,4 @@ void RecordStoreValidateAdaptor::validateIndexKeyCount(IndexDescriptor* idx,
         results.warnings.push_back(warning);
     }
 }
-}  // namespace
+}  // namespace mongo

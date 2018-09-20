@@ -44,6 +44,7 @@
 #include "mongo/util/hex.h"
 #include "mongo/util/log.h"
 #include "mongo/util/mongoutils/str.h"
+#include "mongo/util/scopeguard.h"
 #include "mongo/util/string_map.h"
 #include "mongo/util/stringutils.h"
 #include "mongo/util/uuid.h"
@@ -57,6 +58,14 @@ using std::string;
 
 string BSONElement::jsonString(JsonStringFormat format, bool includeFieldNames, int pretty) const {
     std::stringstream s;
+    BSONElement::jsonStringStream(format, includeFieldNames, pretty, s);
+    return s.str();
+}
+
+void BSONElement::jsonStringStream(JsonStringFormat format,
+                                   bool includeFieldNames,
+                                   int pretty,
+                                   std::stringstream& s) const {
     if (includeFieldNames)
         s << '"' << escape(fieldName()) << "\" : ";
     switch (type()) {
@@ -79,6 +88,8 @@ string BSONElement::jsonString(JsonStringFormat format, bool includeFieldNames, 
         case NumberDouble:
             if (number() >= -std::numeric_limits<double>::max() &&
                 number() <= std::numeric_limits<double>::max()) {
+                auto origPrecision = s.precision();
+                auto guard = MakeGuard([&s, origPrecision]() { s.precision(origPrecision); });
                 s.precision(16);
                 s << number();
             }
@@ -129,7 +140,7 @@ string BSONElement::jsonString(JsonStringFormat format, bool includeFieldNames, 
             }
             break;
         case Object:
-            s << embeddedObject().jsonString(format, pretty);
+            embeddedObject().jsonStringStream(format, pretty, false, s);
             break;
         case mongo::Array: {
             if (embeddedObject().isEmpty()) {
@@ -151,7 +162,7 @@ string BSONElement::jsonString(JsonStringFormat format, bool includeFieldNames, 
                     if (strtol(e.fieldName(), 0, 10) > count) {
                         s << "undefined";
                     } else {
-                        s << e.jsonString(format, false, pretty ? pretty + 1 : 0);
+                        e.jsonStringStream(format, false, pretty ? pretty + 1 : 0, s);
                         e = i.next();
                     }
                     count++;
@@ -198,10 +209,22 @@ string BSONElement::jsonString(JsonStringFormat format, bool includeFieldNames, 
 
             s << "{ \"$binary\" : \"";
             base64::encode(s, reader.view(), len);
-            s << "\", \"$type\" : \"" << hex;
+
+            auto origFill = s.fill();
+            auto origFmtF = s.flags();
+            auto origWidth = s.width();
+            auto guard = MakeGuard([&s, origFill, origFmtF, origWidth] {
+                s.fill(origFill);
+                s.setf(origFmtF);
+                s.width(origWidth);
+            });
+
+            s.setf(std::ios_base::hex, std::ios_base::basefield);
+
+            s << "\", \"$type\" : \"";
             s.width(2);
             s.fill('0');
-            s << type << dec;
+            s << type;
             s << "\" }";
             break;
         }
@@ -303,7 +326,6 @@ string BSONElement::jsonString(JsonStringFormat format, bool includeFieldNames, 
             string message = ss.str();
             massert(10312, message.c_str(), false);
     }
-    return s.str();
 }
 
 namespace {
@@ -546,7 +568,7 @@ bool BSONElement::binaryEqualValues(const BSONElement& rhs) const {
 
 BSONObj BSONElement::embeddedObjectUserCheck() const {
     if (MONGO_likely(isABSONObj()))
-        return BSONObj(value());
+        return BSONObj(value(), BSONObj::LargeSizeTrait{});
     std::stringstream ss;
     ss << "invalid parameter: expected an object (" << fieldName() << ")";
     uasserted(10065, ss.str());
@@ -555,7 +577,7 @@ BSONObj BSONElement::embeddedObjectUserCheck() const {
 
 BSONObj BSONElement::embeddedObject() const {
     verify(isABSONObj());
-    return BSONObj(value());
+    return BSONObj(value(), BSONObj::LargeSizeTrait{});
 }
 
 BSONObj BSONElement::codeWScopeObject() const {

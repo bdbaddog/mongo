@@ -391,7 +391,12 @@ class _CppHeaderFileWriter(_CppFileWriterBase):
         """Generate the declarations for the class constructors."""
         struct_type_info = struct_types.get_struct_info(struct)
 
-        self._writer.write_line(struct_type_info.get_constructor_method().get_declaration())
+        constructor = struct_type_info.get_constructor_method()
+        self._writer.write_line(constructor.get_declaration())
+
+        required_constructor = struct_type_info.get_required_constructor_method()
+        if len(required_constructor.args) != len(constructor.args):
+            self._writer.write_line(required_constructor.get_declaration())
 
     def gen_serializer_methods(self, struct):
         # type: (ast.Struct) -> None
@@ -845,10 +850,21 @@ class _CppSourceFileWriter(_CppFileWriterBase):
         else:
             self._writer.write_line('%s = std::move(values);' % (_get_field_member_name(field)))
 
-    def gen_field_deserializer(self, field, bson_object, bson_element):
-        # type: (ast.Field, unicode, unicode) -> None
+    def _gen_usage_check(self, field, bson_element, field_usage_check):
+        # type: (ast.Field, unicode, _FieldUsageCheckerBase) -> None
+        """Generate the field usage check and insert the required field check."""
+        if field_usage_check:
+            field_usage_check.add(field, bson_element)
+
+            if _is_required_serializer_field(field):
+                self._writer.write_line('%s = true;' % (_get_has_field_member_name(field)))
+
+    def gen_field_deserializer(self, field, bson_object, bson_element, field_usage_check):
+        # type: (ast.Field, unicode, unicode, _FieldUsageCheckerBase) -> None
         """Generate the C++ deserializer piece for a field."""
         if field.array:
+            self._gen_usage_check(field, bson_element, field_usage_check)
+
             self._gen_array_deserializer(field, bson_element)
             return
 
@@ -864,13 +880,17 @@ class _CppSourceFileWriter(_CppFileWriterBase):
                 method_name = writer.get_method_name_from_qualified_method_name(field.deserializer)
                 expression = "%s(%s)" % (method_name, bson_object)
 
+            self._gen_usage_check(field, bson_element, field_usage_check)
+
             self._writer.write_line('%s = %s;' % (_get_field_member_name(field), expression))
         else:
-            # May be an empty block if the type is 'any'
             predicate = _get_bson_type_check(bson_element, 'ctxt', field)
             if predicate:
                 predicate = "MONGO_likely(%s)" % (predicate)
             with self._predicate(predicate):
+
+                self._gen_usage_check(field, bson_element, field_usage_check)
+
                 object_value = self._gen_field_deserializer_expression(bson_element, field)
                 if field.chained_struct_field:
                     self._writer.write_line('%s.%s(%s);' %
@@ -928,37 +948,40 @@ class _CppSourceFileWriter(_CppFileWriterBase):
             self._writer.write_line('firstFieldFound = true;')
             self._writer.write_line('continue;')
 
-    def gen_constructors(self, struct):
-        # type: (ast.Struct) -> None
+    def _gen_constructor(self, struct, constructor, default_init):
+        # type: (ast.Struct, struct_types.MethodInfo, bool) -> None
         """Generate the C++ constructor definition."""
-
-        struct_type_info = struct_types.get_struct_info(struct)
-        constructor = struct_type_info.get_constructor_method()
 
         initializers = ['_%s(std::move(%s))' % (arg.name, arg.name) for arg in constructor.args]
 
         # Serialize non-has fields first
         # Initialize int and other primitive fields to -1 to prevent Coverity warnings.
-        for field in struct.fields:
-            needs_init = field.cpp_type and not field.array and cpp_types.is_primitive_scalar_type(
-                field.cpp_type)
-            if _is_required_serializer_field(field) and needs_init:
-                initializers.append(
-                    '%s(%s)' % (_get_field_member_name(field),
-                                cpp_types.get_primitive_scalar_type_default_value(field.cpp_type)))
+        if default_init:
+            for field in struct.fields:
+                needs_init = field.cpp_type and not field.array and cpp_types.is_primitive_scalar_type(
+                    field.cpp_type)
+                if _is_required_serializer_field(field) and needs_init:
+                    initializers.append(
+                        '%s(%s)' %
+                        (_get_field_member_name(field),
+                         cpp_types.get_primitive_scalar_type_default_value(field.cpp_type)))
 
         # Serialize the _dbName field second
         initializes_db_name = False
         if [arg for arg in constructor.args if arg.name == 'nss']:
-            initializers.append('_dbName(nss.db().toString())')
-            initializes_db_name = True
+            if [field for field in struct.fields if field.serialize_op_msg_request_only]:
+                initializers.append('_dbName(nss.db().toString())')
+                initializes_db_name = True
 
         # Serialize has fields third
         # Add _has{FIELD} bool members to ensure fields are set before serialization.
         for field in struct.fields:
             if _is_required_serializer_field(field) and not (field.name == "$db"
                                                              and initializes_db_name):
-                initializers.append('%s(false)' % _get_has_field_member_name(field))
+                if default_init:
+                    initializers.append('%s(false)' % _get_has_field_member_name(field))
+                else:
+                    initializers.append('%s(true)' % _get_has_field_member_name(field))
 
         if initializes_db_name:
             initializers.append('_hasDbName(true)')
@@ -970,13 +993,28 @@ class _CppSourceFileWriter(_CppFileWriterBase):
         with self._block('%s %s {' % (constructor.get_definition(), initializers_str), '}'):
             self._writer.write_line('// Used for initialization only')
 
+    def gen_constructors(self, struct):
+        # type: (ast.Struct) -> None
+        """Generate all the C++ constructor definitions."""
+
+        struct_type_info = struct_types.get_struct_info(struct)
+        constructor = struct_type_info.get_constructor_method()
+
+        self._gen_constructor(struct, constructor, True)
+
+        required_constructor = struct_type_info.get_required_constructor_method()
+        if len(required_constructor.args) != len(constructor.args):
+            #print(struct.name + ": "+  str(required_constructor.args))
+            self._gen_constructor(struct, required_constructor, False)
+
     def _gen_command_deserializer(self, struct, bson_object):
         # type: (ast.Struct, unicode) -> None
         """Generate the command field deserializer."""
 
         if isinstance(struct, ast.Command) and struct.command_field:
             with self._block('{', '}'):
-                self.gen_field_deserializer(struct.command_field, bson_object, "commandElement")
+                self.gen_field_deserializer(struct.command_field, bson_object, "commandElement",
+                                            None)
         else:
             struct_type_info = struct_types.get_struct_info(struct)
 
@@ -1021,16 +1059,14 @@ class _CppSourceFileWriter(_CppFileWriterBase):
                 field_predicate = 'fieldName == %s' % (_get_field_constant_name(field))
 
                 with self._predicate(field_predicate, not first_field):
-                    field_usage_check.add(field, "element")
 
                     if field.ignore:
+                        field_usage_check.add(field, "element")
+
                         self._writer.write_line('// ignore field')
                     else:
-                        if _is_required_serializer_field(field):
-                            self._writer.write_line('%s = true;' %
-                                                    (_get_has_field_member_name(field)))
-
-                        self.gen_field_deserializer(field, bson_object, "element")
+                        self.gen_field_deserializer(field, bson_object, "element",
+                                                    field_usage_check)
 
                 if first_field:
                     first_field = False
@@ -1056,7 +1092,7 @@ class _CppSourceFileWriter(_CppFileWriterBase):
                 continue
 
             # Simply generate deserializers since these are all 'any' types
-            self.gen_field_deserializer(field, bson_object, "element")
+            self.gen_field_deserializer(field, bson_object, "element", None)
             self._writer.write_empty_line()
 
         self._writer.write_empty_line()

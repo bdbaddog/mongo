@@ -97,6 +97,8 @@ assert = (function() {
     function _processMsg(msg) {
         if (typeof msg === "function") {
             return msg();
+        } else if (typeof msg === "object") {
+            return tojson(msg);
         }
 
         return msg;
@@ -108,8 +110,8 @@ assert = (function() {
                 if (msg.length !== 0) {
                     doassert("msg function cannot expect any parameters.");
                 }
-            } else if (typeof msg !== "string") {
-                doassert("msg parameter must be a string or a function.");
+            } else if (typeof msg !== "string" && typeof msg !== "object") {
+                doassert("msg parameter must be a string, function or object.");
             }
 
             if (msg && assert._debug) {
@@ -615,6 +617,15 @@ assert = (function() {
         return res;
     }
 
+    assert.commandWorkedOrFailedWithCode = function commandWorkedOrFailedWithCode(
+        res, errorCodeSet, msg) {
+        if (!res.ok) {
+            return assert.commandFailedWithCode(res, errorCodeSet, msg);
+        } else {
+            return assert.commandWorked(res, msg);
+        }
+    };
+
     assert.commandWorked = function(res, msg) {
         return _assertCommandWorked(res, msg, {ignoreWriteErrors: false});
     };
@@ -667,7 +678,7 @@ assert = (function() {
         }
 
         if (errMsg) {
-            doassert(_buildAssertionMessage(msg, errMsg));
+            doassert(_buildAssertionMessage(msg, errMsg), res);
         }
 
         return res;

@@ -34,6 +34,7 @@
 #include "mongo/base/status_with.h"
 #include "mongo/base/string_data.h"
 #include "mongo/bson/timestamp.h"
+#include "mongo/db/namespace_string.h"
 #include "mongo/db/storage/journal_listener.h"
 #include "mongo/db/storage/kv/kv_catalog.h"
 #include "mongo/db/storage/kv/kv_database_catalog_entry_base.h"
@@ -121,7 +122,8 @@ public:
 
     virtual void cleanShutdown();
 
-    virtual void setStableTimestamp(Timestamp stableTimestamp) override;
+    virtual void setStableTimestamp(Timestamp stableTimestamp,
+                                    boost::optional<Timestamp> maximumTruncationTimestamp) override;
 
     virtual void setInitialDataTimestamp(Timestamp initialDataTimestamp) override;
 
@@ -194,6 +196,20 @@ private:
                                          std::list<std::string>& toDrop,
                                          CollIter begin,
                                          CollIter end);
+
+    /**
+     * When called in a repair context (_options.forRepair=true), attempts to recover a collection
+     * whose entry is present in the KVCatalog, but missing from the KVEngine. Returns an error
+     * Status if called outside of a repair context or the implementation of
+     * KVEngine::recoverOrphanedIdent returns an error other than DataModifiedByRepair.
+     *
+     * Returns Status::OK if the collection was recovered in the KVEngine and a new record store was
+     * created. Recovery does not make any guarantees about the integrity of the data in the
+     * collection.
+     */
+    Status _recoverOrphanedCollection(OperationContext* opCtx,
+                                      const NamespaceString& collectionName,
+                                      StringData collectionIdent);
 
     void _dumpCatalog(OperationContext* opCtx);
 

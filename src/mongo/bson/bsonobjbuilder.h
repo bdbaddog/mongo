@@ -48,7 +48,7 @@
 #include "mongo/bson/util/builder.h"
 #include "mongo/platform/decimal128.h"
 #include "mongo/stdx/type_traits.h"
-#include "mongo/util/itoa.h"
+#include "mongo/util/decimal_counter.h"
 
 namespace mongo {
 
@@ -666,9 +666,10 @@ public:
      * The returned BSONObj will free the buffer when it is finished.
      * @return owned BSONObj
     */
+    template <typename BSONTraits = BSONObj::DefaultSizeTrait>
     BSONObj obj() {
         massert(10335, "builder does not own memory", owned());
-        auto out = done();
+        auto out = done<BSONTraits>();
         out.shareOwnershipWith(_b.release());
         return out;
     }
@@ -678,8 +679,9 @@ public:
         scope -- very important to keep in mind.  Use obj() if you
         would like the BSONObj to last longer than the builder.
     */
+    template <typename BSONTraits = BSONObj::DefaultSizeTrait>
     BSONObj done() {
-        return BSONObj(_done());
+        return BSONObj(_done(), BSONTraits{});
     }
 
     // Like 'done' above, but does not construct a BSONObj to return to the caller.
@@ -692,7 +694,7 @@ public:
         Intended use case: append a field if not already there.
     */
     BSONObj asTempObj() {
-        BSONObj temp(_done());
+        BSONObj temp(_done(), BSONObj::LargeSizeTrait{});
         _b.setlen(_b.len() - 1);  // next append should overwrite the EOO
         _b.reserveBytes(1);       // Rereserve room for the real EOO
         _doneCalled = false;
@@ -810,20 +812,20 @@ private:
 
 class BSONArrayBuilder {
 public:
-    BSONArrayBuilder() : _i(0), _b() {}
-    BSONArrayBuilder(BufBuilder& _b) : _i(0), _b(_b) {}
-    BSONArrayBuilder(int initialSize) : _i(0), _b(initialSize) {}
+    BSONArrayBuilder() {}
+    BSONArrayBuilder(BufBuilder& _b) : _b(_b) {}
+    BSONArrayBuilder(int initialSize) : _b(initialSize) {}
 
     template <typename T>
     BSONArrayBuilder& append(const T& x) {
-        ItoA itoa(_i++);
-        _b.append(itoa, x);
+        _b.append(_fieldCount, x);
+        ++_fieldCount;
         return *this;
     }
 
     BSONArrayBuilder& append(const BSONElement& e) {
-        ItoA itoa(_i++);
-        _b.appendAs(e, itoa);
+        _b.appendAs(e, _fieldCount);
+        ++_fieldCount;
         return *this;
     }
 
@@ -833,19 +835,19 @@ public:
 
     template <typename T>
     BSONArrayBuilder& operator<<(const T& x) {
-        ItoA itoa(_i++);
-        _b << itoa << x;
+        _b << _fieldCount << x;
+        ++_fieldCount;
         return *this;
     }
 
     void appendNull() {
-        ItoA itoa(_i++);
-        _b.appendNull(itoa);
+        _b.appendNull(_fieldCount);
+        ++_fieldCount;
     }
 
     void appendUndefined() {
-        ItoA itoa(_i++);
-        _b.appendUndefined(itoa);
+        _b.appendUndefined(_fieldCount);
+        ++_fieldCount;
     }
 
     /**
@@ -875,59 +877,57 @@ public:
 
     // These two just use next position
     BufBuilder& subobjStart() {
-        ItoA itoa(_i++);
-        return _b.subobjStart(itoa);
+        return _b.subobjStart(_fieldCount++);
     }
     BufBuilder& subarrayStart() {
-        ItoA itoa(_i++);
-        return _b.subarrayStart(itoa);
+        return _b.subarrayStart(_fieldCount++);
     }
 
     BSONArrayBuilder& appendRegex(StringData regex, StringData options = "") {
-        ItoA itoa(_i++);
-        _b.appendRegex(itoa, regex, options);
+        _b.appendRegex(_fieldCount, regex, options);
+        ++_fieldCount;
         return *this;
     }
 
     BSONArrayBuilder& appendBinData(int len, BinDataType type, const void* data) {
-        ItoA itoa(_i++);
-        _b.appendBinData(itoa, len, type, data);
+        _b.appendBinData(_fieldCount, len, type, data);
+        ++_fieldCount;
         return *this;
     }
 
     BSONArrayBuilder& appendCode(StringData code) {
-        ItoA itoa(_i++);
-        _b.appendCode(itoa, code);
+        _b.appendCode(_fieldCount, code);
+        ++_fieldCount;
         return *this;
     }
 
     BSONArrayBuilder& appendCodeWScope(StringData code, const BSONObj& scope) {
-        ItoA itoa(_i++);
-        _b.appendCodeWScope(itoa, code, scope);
+        _b.appendCodeWScope(_fieldCount, code, scope);
+        ++_fieldCount;
         return *this;
     }
 
     BSONArrayBuilder& appendTimeT(time_t dt) {
-        ItoA itoa(_i++);
-        _b.appendTimeT(itoa, dt);
+        _b.appendTimeT(_fieldCount, dt);
+        ++_fieldCount;
         return *this;
     }
 
     BSONArrayBuilder& appendDate(Date_t dt) {
-        ItoA itoa(_i++);
-        _b.appendDate(itoa, dt);
+        _b.appendDate(_fieldCount, dt);
+        ++_fieldCount;
         return *this;
     }
 
     BSONArrayBuilder& appendBool(bool val) {
-        ItoA itoa(_i++);
-        _b.appendBool(itoa, val);
+        _b.appendBool(_fieldCount, val);
+        ++_fieldCount;
         return *this;
     }
 
     BSONArrayBuilder& appendTimestamp(unsigned long long ts) {
-        ItoA itoa(_i++);
-        _b.appendTimestamp(itoa, ts);
+        _b.appendTimestamp(_fieldCount, ts);
+        ++_fieldCount;
         return *this;
     }
 
@@ -939,7 +939,7 @@ public:
         return _b.len();
     }
     int arrSize() const {
-        return _i;
+        return _fieldCount;
     }
 
     BufBuilder& bb() {
@@ -947,7 +947,7 @@ public:
     }
 
 private:
-    std::uint32_t _i;
+    DecimalCounter<uint32_t> _fieldCount;
     BSONObjBuilder _b;
 };
 

@@ -41,7 +41,6 @@
 #include "mongo/db/service_entry_point_mongod.h"
 #include "mongo/db/storage/storage_engine_init.h"
 #include "mongo/db/storage/storage_options.h"
-#include "mongo/unittest/temp_dir.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/mock_periodic_runner_impl.h"
 
@@ -52,11 +51,17 @@ namespace mongo {
 ServiceContextMongoDTest::ServiceContextMongoDTest()
     : ServiceContextMongoDTest("ephemeralForTest") {}
 
-ServiceContextMongoDTest::ServiceContextMongoDTest(std::string engine) {
+ServiceContextMongoDTest::ServiceContextMongoDTest(std::string engine)
+    : ServiceContextMongoDTest(engine, RepairAction::kNoRepair) {}
+
+ServiceContextMongoDTest::ServiceContextMongoDTest(std::string engine, RepairAction repair)
+    : _tempDir("service_context_d_test_fixture") {
 
     _stashedStorageParams.engine = std::exchange(storageGlobalParams.engine, std::move(engine));
     _stashedStorageParams.engineSetByUser =
         std::exchange(storageGlobalParams.engineSetByUser, true);
+    _stashedStorageParams.repair =
+        std::exchange(storageGlobalParams.repair, (repair == RepairAction::kRepair));
 
     auto const serviceContext = getServiceContext();
     serviceContext->setServiceEntryPoint(std::make_unique<ServiceEntryPointMongod>(serviceContext));
@@ -68,8 +73,7 @@ ServiceContextMongoDTest::ServiceContextMongoDTest(std::string engine) {
     auto runner = std::make_unique<MockPeriodicRunnerImpl>();
     serviceContext->setPeriodicRunner(std::move(runner));
 
-    unittest::TempDir tempDir("service_context_d_test_fixture");
-    storageGlobalParams.dbpath = tempDir.path();
+    storageGlobalParams.dbpath = _tempDir.path();
 
     initializeStorageEngine(serviceContext, StorageEngineInitFlags::kNone);
 
@@ -92,6 +96,7 @@ ServiceContextMongoDTest::~ServiceContextMongoDTest() {
     shutdownGlobalStorageEngineCleanly(getGlobalServiceContext());
     std::swap(storageGlobalParams.engine, _stashedStorageParams.engine);
     std::swap(storageGlobalParams.engineSetByUser, _stashedStorageParams.engineSetByUser);
+    std::swap(storageGlobalParams.repair, _stashedStorageParams.repair);
 }
 
 }  // namespace mongo
