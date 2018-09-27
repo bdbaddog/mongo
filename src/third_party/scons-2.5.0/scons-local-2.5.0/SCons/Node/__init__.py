@@ -1651,7 +1651,6 @@ class Node(object):
                 if changed:
                     lines.append("`%s' changed\n" % stringify(k))
 
-
         if len(lines) == 0 and old_bkids != new_bkids:
             lines.append("the dependency order changed:\n" +
                          "%sold: %s\n" % (' '*15, list(map(stringify, old_bkids))) +
