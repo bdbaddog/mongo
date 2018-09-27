@@ -3280,7 +3280,6 @@ class File(Base):
     __dmap_cache = {}
     __dmap_sig_cache = {}
 
-    @profile
     def _build_dependency_map(self, binfo):
         """
         Build mapping from file -> signature
@@ -3306,7 +3305,6 @@ class File(Base):
 
         return binfo.dependency_map
 
-    @profile
     def _get_previous_signatures(self, dmap):
         """
         Return a list of corresponding csigs from previous
@@ -3341,7 +3339,6 @@ class File(Base):
 
         return df
 
-    # @profile
     def changed_timestamp_then_content(self, target, prev_ni, node=None):
         """
         Used when decider for file is Timestamp-MD5
