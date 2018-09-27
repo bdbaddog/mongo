@@ -757,19 +757,7 @@ int _main(int argc, char* argv[], char** envp) {
     uassertStatusOK(tlPtr->start());
 
     // hide password from ps output
-    for (int i = 0; i < (argc - 1); ++i) {
-        StringData arg(argv[i]);
-        if (arg == "-p"_sd || arg == "--password"_sd) {
-            char* arg = argv[i + 1];
-            while (*arg) {
-                *arg++ = 'x';
-            }
-        } else if (MongoURI::isMongoURI(arg)) {
-            auto reformedURI = MongoURI::redact(arg);
-            auto length = arg.size();
-            ::strncpy(argv[i], reformedURI.data(), length);
-        }
-    }
+    redactPasswordOptions(argc, argv);
 
     if (!mongo::serverGlobalParams.quiet.load())
         cout << mongoShellVersion(VersionInfoInterface::instance()) << endl;
@@ -915,7 +903,7 @@ int _main(int argc, char* argv[], char** envp) {
     unique_ptr<mongo::Scope> scope(mongo::getGlobalScriptEngine()->newScope());
     shellMainScope = scope.get();
 
-    if (shellGlobalParams.runShell)
+    if (shellGlobalParams.runShell && !mongo::serverGlobalParams.quiet.load())
         cout << "type \"help\" for help" << endl;
 
     // Load and execute /etc/mongorc.js before starting shell

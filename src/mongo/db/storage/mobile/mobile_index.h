@@ -43,14 +43,18 @@ class MobileIndex : public SortedDataInterface {
 public:
     MobileIndex(OperationContext* opCtx, const IndexDescriptor* desc, const std::string& ident);
 
-    MobileIndex(bool isUnique, const Ordering& ordering, const std::string& ident);
+    MobileIndex(bool isUnique,
+                const Ordering& ordering,
+                const std::string& ident,
+                const std::string& collectionNamespace,
+                const std::string& indexName);
 
     virtual ~MobileIndex() {}
 
-    Status insert(OperationContext* opCtx,
-                  const BSONObj& key,
-                  const RecordId& recId,
-                  bool dupsAllowed) override;
+    StatusWith<SpecialFormatInserted> insert(OperationContext* opCtx,
+                                             const BSONObj& key,
+                                             const RecordId& recId,
+                                             bool dupsAllowed) override;
 
     void unindex(OperationContext* opCtx,
                  const BSONObj& key,
@@ -86,10 +90,10 @@ public:
      * Performs the insert into the table with the given key and value.
      */
     template <typename ValueType>
-    Status doInsert(OperationContext* opCtx,
-                    const KeyString& key,
-                    const ValueType& value,
-                    bool isTransactional = true);
+    StatusWith<SpecialFormatInserted> doInsert(OperationContext* opCtx,
+                                               const KeyString& key,
+                                               const ValueType& value,
+                                               bool isTransactional = true);
 
     Ordering getOrdering() const {
         return _ordering;
@@ -110,22 +114,15 @@ public:
 protected:
     bool _isDup(OperationContext* opCtx, const BSONObj& key, RecordId recId);
 
-    Status _dupKeyError(const BSONObj& key);
-
-    /**
-     * Checks if key size is too long.
-     */
-    static Status _checkKeySize(const BSONObj& key);
-
     /**
      * Performs the deletion from the table matching the given key.
      */
     void _doDelete(OperationContext* opCtx, const KeyString& key, KeyString* value = nullptr);
 
-    virtual Status _insert(OperationContext* opCtx,
-                           const BSONObj& key,
-                           const RecordId& recId,
-                           bool dupsAllowed) = 0;
+    virtual StatusWith<SpecialFormatInserted> _insert(OperationContext* opCtx,
+                                                      const BSONObj& key,
+                                                      const RecordId& recId,
+                                                      bool dupsAllowed) = 0;
 
     virtual void _unindex(OperationContext* opCtx,
                           const BSONObj& key,
@@ -140,6 +137,9 @@ protected:
     const Ordering _ordering;
     const KeyString::Version _keyStringVersion = KeyString::kLatestVersion;
     const std::string _ident;
+    const std::string _collectionNamespace;
+    const std::string _indexName;
+    const BSONObj _keyPattern;
 };
 
 class MobileIndexStandard final : public MobileIndex {
@@ -154,10 +154,10 @@ public:
                                                            bool isForward) const override;
 
 protected:
-    Status _insert(OperationContext* opCtx,
-                   const BSONObj& key,
-                   const RecordId& recId,
-                   bool dupsAllowed) override;
+    StatusWith<SpecialFormatInserted> _insert(OperationContext* opCtx,
+                                              const BSONObj& key,
+                                              const RecordId& recId,
+                                              bool dupsAllowed) override;
 
     void _unindex(OperationContext* opCtx,
                   const BSONObj& key,
@@ -177,10 +177,10 @@ public:
                                                            bool isForward) const override;
 
 protected:
-    Status _insert(OperationContext* opCtx,
-                   const BSONObj& key,
-                   const RecordId& recId,
-                   bool dupsAllowed) override;
+    StatusWith<SpecialFormatInserted> _insert(OperationContext* opCtx,
+                                              const BSONObj& key,
+                                              const RecordId& recId,
+                                              bool dupsAllowed) override;
 
     void _unindex(OperationContext* opCtx,
                   const BSONObj& key,

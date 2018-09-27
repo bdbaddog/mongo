@@ -26,6 +26,8 @@
  *    it in the license file.
  */
 
+#include "mongo/platform/basic.h"
+
 #include "mongo/embedded/mongoc_client.h"
 
 #include <mongoc.h>
@@ -207,7 +209,12 @@ int main(int argc, char** argv, char** envp) {
     StatusPtr status(mongo_embedded_v1_status_create());
     mongoc_init();
 
-    global_lib_handle = mongo_embedded_v1_lib_init(nullptr, status.get());
+    mongo_embedded_v1_init_params params;
+    params.log_flags = MONGO_EMBEDDED_V1_LOG_STDOUT;
+    params.log_callback = nullptr;
+    params.log_user_data = nullptr;
+
+    global_lib_handle = mongo_embedded_v1_lib_init(&params, status.get());
     if (global_lib_handle == nullptr) {
         std::cerr << "Error: " << mongo_embedded_v1_status_get_explanation(status.get());
         return EXIT_FAILURE;

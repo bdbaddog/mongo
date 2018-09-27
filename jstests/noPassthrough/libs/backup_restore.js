@@ -3,9 +3,9 @@
  * - 3 node replica set
  * - Mongo CRUD client
  * - Mongo FSM client
- * - fsyncLock (or stop) Secondary
+ * - fsyncLock, stop or open a backupCursor on a Secondary
  * - cp (or rsync) DB files
- * - fsyncUnlock (or start) Secondary
+ * - fsyncUnlock, start or close a backupCursor on the Secondary
  * - Start mongod as hidden secondary
  * - Wait until new hidden node becomes secondary
  *
@@ -132,7 +132,10 @@ var BackupRestoreTest = function(options) {
             var blacklist = [
                 // Disabled due to MongoDB restrictions and/or workload restrictions
                 'agg_group_external.js',  // uses >100MB of data, which can overwhelm test hosts
-                'agg_sort_external.js',   // uses >100MB of data, which can overwhelm test hosts
+                'agg_out_mode_insert_documents.js',
+                'agg_out_mode_replace_documents.js',
+                'agg_sort_external.js',  // uses >100MB of data, which can overwhelm test hosts
+                'agg_with_chunk_migrations.js',
                 'auth_create_role.js',
                 'auth_create_user.js',
                 'auth_drop_role.js',
@@ -145,6 +148,8 @@ var BackupRestoreTest = function(options) {
                 'multi_statement_transaction_atomicity_isolation.js',
                 'multi_statement_transaction_atomicity_isolation_multi_db.js',
                 'multi_statement_transaction_atomicity_isolation_repeated_reads.js',
+                'multi_statement_transaction_kill_sessions_atomicity_isolation.js',
+                'multi_statement_transaction_atomicity_isolation_metrics_test.js',
                 'multi_statement_transaction_simple.js',
                 'multi_statement_transaction_simple_repeated_reads.js',
                 'reindex_background.js',
@@ -167,6 +172,7 @@ var BackupRestoreTest = function(options) {
                 'sharded_splitChunk_partitioned.js',
                 'snapshot_read_catalog_operations.js',
                 'snapshot_read_kill_operations.js',
+                'snapshot_read_kill_op_only.js',
                 'update_rename.js',
                 'update_rename_noindex.js',
                 'yield_sort.js',
@@ -227,7 +233,7 @@ var BackupRestoreTest = function(options) {
         var testName = jsTest.name();
 
         // Backup type (must be specified)
-        var allowedBackupKeys = ['fsyncLock', 'stopStart', 'rolling'];
+        var allowedBackupKeys = ['fsyncLock', 'stopStart', 'rolling', 'backupCursor'];
         assert(options.backup, "Backup option not supplied");
         assert.contains(options.backup,
                         allowedBackupKeys,
@@ -353,6 +359,53 @@ var BackupRestoreTest = function(options) {
             print("Copied files:", tojson(copiedFiles));
             assert.gt(copiedFiles.length, 0, testName + ' no files copied');
             rst.start(secondary.nodeId, {}, true);
+        } else if (options.backup == 'backupCursor') {
+            resetDbpath(hiddenDbpath);
+            mkdir(hiddenDbpath + '/journal');
+            jsTestLog("Copying start: " + tojson({
+                          source: dbpathSecondary,
+                          destination: hiddenDbpath,
+                          sourceFiles: ls(dbpathSecondary),
+                          journalFiles: ls(dbpathSecondary + '/journal')
+                      }));
+
+            let backupCursor = secondary.getDB('admin').aggregate([{$backupCursor: {}}]);
+            assert(backupCursor.hasNext());
+            let doc = backupCursor.next();
+            assert(doc.hasOwnProperty('metadata'));
+            jsTestLog("Metadata doc: " + tojson({doc: doc}));
+
+            // Grab the dbpath, ensure it ends with a slash. Note that while the `dbpath` inputs
+            // may be in windows or unix format, the FS helpers for listing a directory and
+            // copying files (etc..)  treat them equally.
+            let dbpath = doc['metadata']['dbpath'];
+            if (dbpath.lastIndexOf('/') + 1 != dbpath.length &&
+                dbpath.lastIndexOf('\\') + 1 != dbpath.length) {
+                dbpath += '/';
+            }
+
+            while (backupCursor.hasNext()) {
+                doc = backupCursor.next();
+
+                let fileToCopy = doc['filename'];
+                // Ensure that the full path starts with the returned dbpath.
+                assert.eq(0, fileToCopy.search(dbpath));
+
+                // Grab the file path relative to the dbpath. Maintain that relation when copying
+                // to the `hiddenDbpath`.
+                let relativePath = fileToCopy.substr(dbpath.length);
+                jsTestLog("File copy: " +
+                          tojson({fileToCopy: fileToCopy, relativePath: relativePath}));
+                copyFile(fileToCopy, hiddenDbpath + '/' + relativePath);
+            }
+
+            copiedFiles = ls(hiddenDbpath);
+            jsTestLog("Copying End: " + tojson({
+                          destinationFiles: copiedFiles,
+                          destinationJournal: ls(hiddenDbpath + '/journal')
+                      }));
+            backupCursor.close();
+            assert.gt(copiedFiles.length, 0, testName + ' no files copied');
         }
 
         // Wait up to 5 minutes until restarted node is in state secondary.

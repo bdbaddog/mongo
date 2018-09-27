@@ -490,9 +490,9 @@ var Cluster = function(options) {
                     return;
                 }
 
-                if (!validateCollections(db.getSiblingDB(dbInfo.name), {full: true})) {
-                    throw new Error(phase + ' collection validation failed');
-                }
+                assert.commandWorked(
+                    validateCollections(db.getSiblingDB(dbInfo.name), {full: true}),
+                    phase + ' collection validation failed');
             });
         };
 
@@ -619,6 +619,13 @@ var Cluster = function(options) {
     this.isSteppingDownShards = function isSteppingDownShards() {
         return this.shouldPerformContinuousStepdowns() &&
             options.sharded.stepdownOptions.shardStepdown;
+    };
+
+    this.awaitReplication = () => {
+        assert(this.isReplication(), 'cluster does not contain replica sets');
+        for (let rst of replSets) {
+            rst.awaitReplication();
+        }
     };
 };
 

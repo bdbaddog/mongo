@@ -38,6 +38,7 @@
 
 #include "mongo/base/disallow_copying.h"
 #include "mongo/bson/mutable/document.h"
+#include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/client.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/commands/server_status_metric.h"
@@ -47,6 +48,7 @@
 #include "mongo/db/query/plan_summary_stats.h"
 #include "mongo/rpc/metadata/client_metadata.h"
 #include "mongo/rpc/metadata/client_metadata_ismaster.h"
+#include "mongo/rpc/metadata/impersonated_user_metadata.h"
 #include "mongo/util/hex.h"
 #include "mongo/util/log.h"
 #include "mongo/util/net/socket_utils.h"
@@ -249,6 +251,32 @@ void CurOp::reportCurrentOpForClient(OperationContext* opCtx,
     infoBuilder->append("currentOpTime",
                         opCtx->getServiceContext()->getPreciseClockSource()->now().toString());
 
+    auto authSession = AuthorizationSession::get(client);
+    // Depending on whether we're impersonating or not, this might be "effectiveUsers" or
+    // "userImpersonators".
+    const auto serializeAuthenticatedUsers = [&](StringData name) {
+        if (authSession->isAuthenticated()) {
+            BSONArrayBuilder users(infoBuilder->subarrayStart(name));
+            for (auto userIt = authSession->getAuthenticatedUserNames(); userIt.more();
+                 userIt.next()) {
+                userIt->serializeToBSON(&users);
+            }
+        }
+    };
+
+    auto maybeImpersonationData = rpc::getImpersonatedUserMetadata(clientOpCtx);
+    if (maybeImpersonationData) {
+        BSONArrayBuilder users(infoBuilder->subarrayStart("effectiveUsers"));
+        for (const auto& user : maybeImpersonationData->getUsers()) {
+            user.serializeToBSON(&users);
+        }
+
+        users.doneFast();
+        serializeAuthenticatedUsers("userImpersonators"_sd);
+    } else {
+        serializeAuthenticatedUsers("effectiveUsers"_sd);
+    }
+
     if (clientOpCtx) {
         infoBuilder->append("opid", clientOpCtx->getOpID());
         if (clientOpCtx->isKillPending()) {
@@ -264,7 +292,12 @@ void CurOp::reportCurrentOpForClient(OperationContext* opCtx,
     }
 }
 
-CurOp::CurOp(OperationContext* opCtx) : CurOp(opCtx, &_curopStack(opCtx)) {}
+CurOp::CurOp(OperationContext* opCtx) : CurOp(opCtx, &_curopStack(opCtx)) {
+    // If this is a sub-operation, we store the snapshot of lock stats as the base lock stats of the
+    // current operation.
+    if (_parent != nullptr)
+        _lockStatsBase = opCtx->lockState()->getLockerInfo(boost::none)->stats;
+}
 
 CurOp::CurOp(OperationContext* opCtx, CurOpStack* stack) : _stack(stack) {
     if (opCtx) {
@@ -364,7 +397,7 @@ bool CurOp::completeAndLogOperation(OperationContext* opCtx,
         client->getPrng().nextCanonicalDouble() < serverGlobalParams.sampleRate;
 
     if (shouldLogOp || (shouldSample && _debug.executionTimeMicros > slowMs * 1000LL)) {
-        const auto lockerInfo = opCtx->lockState()->getLockerInfo();
+        auto lockerInfo = opCtx->lockState()->getLockerInfo(_lockStatsBase);
         log(component) << _debug.report(client, *this, (lockerInfo ? &lockerInfo->stats : nullptr));
     }
 
@@ -522,7 +555,7 @@ string OpDebug::report(Client* client,
             const Command* curCommand = curop.getCommand();
             if (curCommand) {
                 mutablebson::Document cmdToLog(query, mutablebson::Document::kInPlaceDisabled);
-                curCommand->redactForLogging(&cmdToLog);
+                curCommand->snipForLogging(&cmdToLog);
                 s << curCommand->getName() << " ";
                 s << redact(cmdToLog.getObject());
             } else {
@@ -543,7 +576,7 @@ string OpDebug::report(Client* client,
     }
 
     if (!curop.getPlanSummary().empty()) {
-        s << " planSummary: " << redact(curop.getPlanSummary().toString());
+        s << " planSummary: " << curop.getPlanSummary().toString();
     }
 
     OPDEBUG_TOSTRING_HELP(nShards);

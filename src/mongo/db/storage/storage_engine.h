@@ -281,8 +281,6 @@ public:
      *
      * Generally, this method should not be called directly except by the repairDatabase()
      * free function.
-     *
-     * NOTE: MMAPv1 does not support this method and has its own repairDatabase() method.
      */
     virtual Status repairRecordStore(OperationContext* opCtx, const std::string& ns) = 0;
 
@@ -374,8 +372,18 @@ public:
     /**
      * Sets the highest timestamp at which the storage engine is allowed to take a checkpoint.
      * This timestamp can never decrease, and thus should be a timestamp that can never roll back.
+     *
+     * The maximumTruncationTimestamp (and newer) must not be truncated from the oplog in order to
+     * recover from the `stableTimestamp`.  `boost::none` implies there are no additional
+     * constraints to what may be truncated.
+     *
+     * For proper truncation of the oplog, this method requires min(stableTimestamp,
+     * maximumTruncationTimestamp) to be monotonically increasing (where `min(stableTimestamp,
+     * boost::none) => stableTimestamp`). Otherwise truncation can race and remove a document
+     * before a call to this method protects it.
      */
-    virtual void setStableTimestamp(Timestamp timestamp) {}
+    virtual void setStableTimestamp(Timestamp stableTimestamp,
+                                    boost::optional<Timestamp> maximumTruncationTimestamp) {}
 
     /**
      * Tells the storage engine the timestamp of the data at startup. This is necessary because

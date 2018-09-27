@@ -79,6 +79,13 @@ public:
             return requiredPrivileges;
         }
 
+        /**
+         * Lookup from a sharded collection is not allowed.
+         */
+        bool allowShardedForeignCollection(NamespaceString nss) const final {
+            return (_foreignNssSet.find(nss) == _foreignNssSet.end());
+        }
+
     private:
         const NamespaceString _fromNss;
         const stdx::unordered_set<NamespaceString> _foreignNssSet;
@@ -96,26 +103,11 @@ public:
      */
     GetModPathsReturn getModifiedPaths() const final;
 
-    StageConstraints constraints(Pipeline::SplitState pipeState) const final {
-        const bool mayUseDisk = wasConstructedWithPipelineSyntax() &&
-            std::any_of(_parsedIntrospectionPipeline->getSources().begin(),
-                        _parsedIntrospectionPipeline->getSources().end(),
-                        [](const auto& source) {
-                            return source->constraints().diskRequirement ==
-                                DiskUseRequirement::kWritesTmpData;
-                        });
-
-        StageConstraints constraints(StreamType::kStreaming,
-                                     PositionRequirement::kNone,
-                                     HostTypeRequirement::kPrimaryShard,
-                                     mayUseDisk ? DiskUseRequirement::kWritesTmpData
-                                                : DiskUseRequirement::kNoDiskUse,
-                                     FacetRequirement::kAllowed,
-                                     TransactionRequirement::kAllowed);
-
-        constraints.canSwapWithMatch = true;
-        return constraints;
-    }
+    /**
+     * Reports the StageConstraints of this $lookup instance. A $lookup constructed with pipeline
+     * syntax will inherit certain constraints from the stages in its pipeline.
+     */
+    StageConstraints constraints(Pipeline::SplitState) const final;
 
     DepsTracker::State getDependencies(DepsTracker* deps) const final;
 
@@ -127,7 +119,7 @@ public:
         return nullptr;
     }
 
-    std::list<boost::intrusive_ptr<DocumentSource>> getMergeSources() final {
+    MergingLogic mergingLogic() final {
         return {this};
     }
 

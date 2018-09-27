@@ -292,7 +292,7 @@ public:
     virtual ReplSettings::IndexPrefetchConfig getIndexPrefetchConfig() const override;
     virtual void setIndexPrefetchConfig(const ReplSettings::IndexPrefetchConfig cfg) override;
 
-    virtual Status stepUpIfEligible() override;
+    virtual Status stepUpIfEligible(bool skipDryRun) override;
 
     virtual Status abortCatchupIfNeeded() override;
 
@@ -608,6 +608,12 @@ private:
                                     const WriteConcernOptions& writeConcern);
 
     /**
+     * Returns an object with all of the information this node knows about the replica set's
+     * progress.
+     */
+    BSONObj _getReplicationProgress(WithLock wl) const;
+
+    /**
      * Returns true if the given writeConcern is satisfied up to "optime" or is unsatisfiable.
      *
      * If the writeConcern is 'majority', also waits for _currentCommittedSnapshot to be newer than
@@ -787,7 +793,8 @@ private:
      *
      * For V1 (raft) style elections the election path is:
      *      _startElectSelfV1() or _startElectSelfV1_inlock()
-     *      _onDryRunComplete()
+     *      _processDryRunResult() (may skip)
+     *      _startRealElection_inlock()
      *      _writeLastVoteForMyElection()
      *      _startVoteRequester_inlock()
      *      _onVoteRequestComplete()
@@ -801,7 +808,13 @@ private:
      * "originalTerm" was the term during which the dry run began, if the term has since
      * changed, do not run for election.
      */
-    void _onDryRunComplete(long long originalTerm);
+    void _processDryRunResult(long long originalTerm);
+
+    /**
+     * Begins executing a real election. This is called either a successful dry run, or when the
+     * dry run was skipped (which may be specified for a ReplSetStepUp).
+     */
+    void _startRealElection_inlock(long long originalTerm);
 
     /**
      * Writes the last vote in persistent storage after completing dry run successfully.

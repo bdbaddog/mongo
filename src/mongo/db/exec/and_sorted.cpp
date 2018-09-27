@@ -96,14 +96,10 @@ PlanStage::StageState AndSortedStage::getTargetRecordId(WorkingSetID* out) {
     if (PlanStage::ADVANCED == state) {
         WorkingSetMember* member = _ws->get(id);
 
-        // Maybe the child had an invalidation.  We intersect RecordId(s) so we can't do anything
-        // with this WSM.
-        if (!member->hasRecordId()) {
-            _ws->flagForReview(id);
-            return PlanStage::NEED_TIME;
-        }
-
-        verify(member->hasRecordId());
+        // The child must give us a WorkingSetMember with a record id, since we intersect index keys
+        // based on the record id. The planner ensures that the child stage can never produce an WSM
+        // with no record id.
+        invariant(member->hasRecordId());
 
         // We have a value from one child to AND with.
         _targetNode = 0;
@@ -158,14 +154,10 @@ PlanStage::StageState AndSortedStage::moveTowardTargetRecordId(WorkingSetID* out
     if (PlanStage::ADVANCED == state) {
         WorkingSetMember* member = _ws->get(id);
 
-        // Maybe the child had an invalidation.  We intersect RecordId(s) so we can't do anything
-        // with this WSM.
-        if (!member->hasRecordId()) {
-            _ws->flagForReview(id);
-            return PlanStage::NEED_TIME;
-        }
-
-        verify(member->hasRecordId());
+        // The child must give us a WorkingSetMember with a record id, since we intersect index keys
+        // based on the record id. The planner ensures that the child stage can never produce an WSM
+        // with no record id.
+        invariant(member->hasRecordId());
 
         if (member->recordId == _targetRecordId) {
             // The front element has hit _targetRecordId.  Don't move it forward anymore/work on
@@ -232,34 +224,6 @@ PlanStage::StageState AndSortedStage::moveTowardTargetRecordId(WorkingSetID* out
         }
 
         return state;
-    }
-}
-
-
-void AndSortedStage::doInvalidate(OperationContext* opCtx,
-                                  const RecordId& dl,
-                                  InvalidationType type) {
-    // TODO remove this since calling isEOF is illegal inside of doInvalidate().
-    if (isEOF()) {
-        return;
-    }
-
-    if (dl == _targetRecordId) {
-        // We're in the middle of moving children forward until they hit _targetRecordId, which is
-        // no
-        // longer a valid target.  If it's a deletion we can't AND it with anything, if it's a
-        // mutation the predicates implied by the AND may no longer be true.  So no matter what,
-        // fetch it, flag for review, and find another _targetRecordId.
-        ++_specificStats.flagged;
-
-        // The RecordId could still be a valid result so flag it and save it for later.
-        WorkingSetCommon::fetchAndInvalidateRecordId(opCtx, _ws->get(_targetId), _collection);
-        _ws->flagForReview(_targetId);
-
-        _targetId = WorkingSet::INVALID_ID;
-        _targetNode = numeric_limits<size_t>::max();
-        _targetRecordId = RecordId();
-        _workingTowardRep = std::queue<size_t>();
     }
 }
 

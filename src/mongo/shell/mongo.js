@@ -263,6 +263,10 @@ connect = function(url, user, pass) {
         }
     }
 
+    if (_shouldUseImplicitSessions()) {
+        chatty("Implicit session: " + db.getSession());
+    }
+
     // Implicit sessions should not be used when opening a connection. In particular, the buildInfo
     // command is erroneously marked as requiring auth in MongoDB 3.6 and therefore fails if a
     // logical session id is included in the request.
@@ -437,7 +441,15 @@ Mongo.prototype.startSession = function startSession(options = {}) {
     if (!options.hasOwnProperty("retryWrites") && this.hasOwnProperty("_retryWrites")) {
         options.retryWrites = this._retryWrites;
     }
-    return new DriverSession(this, options);
+    const newDriverSession = new DriverSession(this, options);
+
+    // Only log this message if we are running a test
+    if (typeof TestData === "object" && TestData.testName) {
+        jsTest.log("New session started with sessionID: " +
+                   tojson(newDriverSession.getSessionId()));
+    }
+
+    return newDriverSession;
 };
 
 Mongo.prototype._getDefaultSession = function getDefaultSession() {
@@ -445,12 +457,28 @@ Mongo.prototype._getDefaultSession = function getDefaultSession() {
     // a logical session id. These implicit sessions are intentionally not causally consistent. If
     // implicit sessions have been globally disabled, a dummy session is used instead of a real one.
     if (!this.hasOwnProperty("_defaultSession")) {
-        this._defaultSession = _shouldUseImplicitSessions()
-            ? this.startSession({causalConsistency: false})
-            : new _DummyDriverSession(this);
+        if (_shouldUseImplicitSessions()) {
+            try {
+                this._defaultSession = this.startSession({causalConsistency: false});
+            } catch (e) {
+                if (e instanceof DriverSession.UnsupportedError) {
+                    chatty("WARNING: No implicit session: " + e.message);
+                    this._setDummyDefaultSession();
+                } else {
+                    print("ERROR: Implicit session failed: " + e.message);
+                    throw(e);
+                }
+            }
+        } else {
+            this._setDummyDefaultSession();
+        }
         this._defaultSession._isExplicit = false;
     }
     return this._defaultSession;
+};
+
+Mongo.prototype._setDummyDefaultSession = function setDummyDefaultSession() {
+    this._defaultSession = new _DummyDriverSession(this);
 };
 
 Mongo.prototype.isCausalConsistency = function isCausalConsistency() {
@@ -485,29 +513,43 @@ Mongo.prototype.waitForClusterTime = function waitForClusterTime(maxRetries = 10
     throw new Error("failed waiting for non default clusterTime");
 };
 
-Mongo.prototype.watch = function(pipeline, options) {
-    pipeline = pipeline || [];
+/**
+ * Given the options object for a 'watch' helper, determines which options apply to the change
+ * stream stage, and which apply to the aggregate overall. Returns two objects: the change
+ * stream stage specification and the options for the aggregate command, respectively.
+ */
+Mongo.prototype._extractChangeStreamOptions = function(options) {
     options = options || {};
-    assert(pipeline instanceof Array, "'pipeline' argument must be an array");
     assert(options instanceof Object, "'options' argument must be an object");
 
-    let changeStreamStage = {
-        allChangesForCluster: true,
-        fullDocument: options.fullDocument || "default"
-    };
-    delete options.allChangesForCluster;
+    let changeStreamOptions = {fullDocument: options.fullDocument || "default"};
     delete options.fullDocument;
 
     if (options.hasOwnProperty("resumeAfter")) {
-        changeStreamStage.resumeAfter = options.resumeAfter;
+        changeStreamOptions.resumeAfter = options.resumeAfter;
         delete options.resumeAfter;
     }
 
+    if (options.hasOwnProperty("startAfter")) {
+        changeStreamOptions.startAfter = options.startAfter;
+        delete options.startAfter;
+    }
+
     if (options.hasOwnProperty("startAtOperationTime")) {
-        changeStreamStage.startAtOperationTime = options.startAtOperationTime;
+        changeStreamOptions.startAtOperationTime = options.startAtOperationTime;
         delete options.startAtOperationTime;
     }
 
-    pipeline.unshift({$changeStream: changeStreamStage});
-    return this.getDB("admin")._runAggregate({aggregate: 1, pipeline: pipeline}, options);
+    return [{$changeStream: changeStreamOptions}, options];
+};
+
+Mongo.prototype.watch = function(pipeline, options) {
+    pipeline = pipeline || [];
+    assert(pipeline instanceof Array, "'pipeline' argument must be an array");
+
+    let changeStreamStage;
+    [changeStreamStage, aggOptions] = this._extractChangeStreamOptions(options);
+    changeStreamStage.$changeStream.allChangesForCluster = true;
+    pipeline.unshift(changeStreamStage);
+    return this.getDB("admin")._runAggregate({aggregate: 1, pipeline: pipeline}, aggOptions);
 };

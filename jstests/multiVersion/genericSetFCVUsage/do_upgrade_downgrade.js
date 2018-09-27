@@ -44,8 +44,7 @@
                 if (c.name === "foo") {
                     let foo = testDB.getCollection(c.name);
                     assert.commandWorked(foo.createIndex({id: 1}, {unique: true}));
-                    assert.commandWorked(
-                        foo.createIndex({sno: 1}, {name: "sno_1"}, {unique: true, v: 1}));
+                    assert.commandWorked(foo.createIndex({sno: 1}, {unique: true, v: 1}));
                 }
             });
         }
@@ -67,7 +66,7 @@
                 let currentCollection = mdb.getCollection(c.name);
                 currentCollection.getIndexes().forEach(function(i) {
                     if (i.unique) {
-                        if (i.v === "1") {
+                        if (i.v === 1) {
                             unique_idx_v1.push(i);
                             return;
                         }
@@ -140,7 +139,7 @@
             // Ensure all collections have UUIDs and all unique indexes have new version in latest
             // featureCompatibilityVersion mode.
             checkCollectionUUIDs(adminDB);
-            checkUniqueIndexFormatVersion(adminDB, latestFCV);
+            checkUniqueIndexFormatVersion(adminDB);
 
             // Set featureCompatibilityVersion to last-stable.
             setFCV(adminDB, lastStableFCV);
@@ -180,7 +179,7 @@
         setFCV(adminDB, latestFCV);
         checkFCV(adminDB, latestFCV);
         checkCollectionUUIDs(adminDB);
-        checkUniqueIndexFormatVersion(adminDB, latestFCV);
+        checkUniqueIndexFormatVersion(adminDB);
 
         // Stop latest binary version mongod for the last time
         MongoRunner.stopMongod(conn);
@@ -223,11 +222,11 @@
             // Ensure all collections have UUIDs and unique indexes are in new version in latest
             // featureCompatibilityVersion mode on both primary and secondaries.
             checkCollectionUUIDs(primaryAdminDB);
-            checkUniqueIndexFormatVersion(primaryAdminDB, latestFCV);
+            checkUniqueIndexFormatVersion(primaryAdminDB);
             for (let j = 0; j < secondaries.length; j++) {
                 let secondaryAdminDB = secondaries[j].getDB("admin");
                 checkCollectionUUIDs(secondaryAdminDB);
-                checkUniqueIndexFormatVersion(secondaryAdminDB, latestFCV);
+                checkUniqueIndexFormatVersion(secondaryAdminDB);
             }
 
             // Change featureCompatibilityVersion to last-stable.
@@ -301,11 +300,11 @@
         }
 
         checkCollectionUUIDs(primaryAdminDB);
-        checkUniqueIndexFormatVersion(primaryAdminDB, latestFCV);
+        checkUniqueIndexFormatVersion(primaryAdminDB);
         for (let j = 0; j < secondaries.length; j++) {
             let secondaryAdminDB = secondaries[j].getDB("admin");
             checkCollectionUUIDs(secondaryAdminDB);
-            checkUniqueIndexFormatVersion(secondaryAdminDB, latestFCV);
+            checkUniqueIndexFormatVersion(secondaryAdminDB);
         }
 
         rst.stopSet();

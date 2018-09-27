@@ -157,11 +157,13 @@ public:
         MONGO_UNREACHABLE;
     }
 
-    virtual void getLockerInfo(LockerInfo* lockerInfo) const {
+    virtual void getLockerInfo(LockerInfo* lockerInfo,
+                               boost::optional<SingleThreadedLockStats> lockStatsBase) const {
         MONGO_UNREACHABLE;
     }
 
-    virtual boost::optional<LockerInfo> getLockerInfo() const {
+    virtual boost::optional<LockerInfo> getLockerInfo(
+        boost::optional<SingleThreadedLockStats> lockStatsBase) const {
         return boost::none;
     }
 
@@ -173,6 +175,18 @@ public:
         MONGO_UNREACHABLE;
     }
     virtual void restoreLockState(const LockSnapshot& stateToRestore) {
+        MONGO_UNREACHABLE;
+    }
+
+    void restoreLockStateWithTemporaryGlobalResource(
+        OperationContext* opCtx,
+        const LockSnapshot& stateToRestore,
+        LockManager::TemporaryResourceQueue* tempGlobalResource) override {
+        MONGO_UNREACHABLE;
+    }
+
+    void replaceGlobalLockStateWithTemporaryGlobalResource(
+        LockManager::TemporaryResourceQueue* tempGlobalResource) override {
         MONGO_UNREACHABLE;
     }
 

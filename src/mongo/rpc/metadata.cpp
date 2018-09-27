@@ -31,13 +31,14 @@
 #include "mongo/rpc/metadata.h"
 
 #include "mongo/client/read_preference.h"
+#include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/dbmessage.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/logical_clock.h"
 #include "mongo/db/logical_time_validator.h"
-#include "mongo/rpc/metadata/audit_metadata.h"
 #include "mongo/rpc/metadata/client_metadata_ismaster.h"
 #include "mongo/rpc/metadata/config_server_metadata.h"
+#include "mongo/rpc/metadata/impersonated_user_metadata.h"
 #include "mongo/rpc/metadata/logical_time_metadata.h"
 #include "mongo/rpc/metadata/sharding_metadata.h"
 #include "mongo/rpc/metadata/tracking_metadata.h"
@@ -50,20 +51,18 @@ BSONObj makeEmptyMetadata() {
     return BSONObj();
 }
 
-void readRequestMetadata(OperationContext* opCtx, const BSONObj& metadataObj) {
+void readRequestMetadata(OperationContext* opCtx, const BSONObj& metadataObj, bool requiresAuth) {
     BSONElement readPreferenceElem;
-    BSONElement auditElem;
     BSONElement configSvrElem;
     BSONElement trackingElem;
     BSONElement clientElem;
     BSONElement logicalTimeElem;
+    BSONElement impersonationElem;
 
     for (const auto& metadataElem : metadataObj) {
         auto fieldName = metadataElem.fieldNameStringData();
         if (fieldName == "$readPreference") {
             readPreferenceElem = metadataElem;
-        } else if (fieldName == AuditMetadata::fieldName()) {
-            auditElem = metadataElem;
         } else if (fieldName == ConfigServerMetadata::fieldName()) {
             configSvrElem = metadataElem;
         } else if (fieldName == ClientMetadata::fieldName()) {
@@ -72,6 +71,8 @@ void readRequestMetadata(OperationContext* opCtx, const BSONObj& metadataObj) {
             trackingElem = metadataElem;
         } else if (fieldName == LogicalTimeMetadata::fieldName()) {
             logicalTimeElem = metadataElem;
+        } else if (fieldName == kImpersonationMetadataSectionName) {
+            impersonationElem = metadataElem;
         }
     }
 
@@ -80,7 +81,7 @@ void readRequestMetadata(OperationContext* opCtx, const BSONObj& metadataObj) {
             uassertStatusOK(ReadPreferenceSetting::fromInnerBSON(readPreferenceElem));
     }
 
-    AuditMetadata::get(opCtx) = uassertStatusOK(AuditMetadata::readFromMetadata(auditElem));
+    readImpersonatedUserMetadata(impersonationElem, opCtx);
 
     uassertStatusOK(ClientMetadataIsMasterState::readFromMetadata(opCtx, clientElem));
 
@@ -96,6 +97,19 @@ void readRequestMetadata(OperationContext* opCtx, const BSONObj& metadataObj) {
             uassertStatusOK(rpc::LogicalTimeMetadata::readFromMetadata(logicalTimeElem));
 
         auto& signedTime = logicalTimeMetadata.getSignedTime();
+
+        if (!requiresAuth &&
+            AuthorizationManager::get(opCtx->getServiceContext())->isAuthEnabled() &&
+            (!signedTime.getProof() || *signedTime.getProof() == TimeProofService::TimeProof())) {
+
+            AuthorizationSession* authSession = AuthorizationSession::get(opCtx->getClient());
+            // The client is not authenticated and is not using localhost auth bypass.
+            if (authSession && !authSession->isAuthenticated() &&
+                !authSession->isUsingLocalhostBypass()) {
+                return;
+            }
+        }
+
         // LogicalTimeMetadata is default constructed if no cluster time metadata was sent, so a
         // default constructed SignedLogicalTime should be ignored.
         if (signedTime.getTime() != LogicalTime::kUninitialized) {

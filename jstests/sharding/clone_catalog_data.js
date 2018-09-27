@@ -54,10 +54,14 @@
 
     var res = fromShard.getDB('test').runCommand({listCollections: 1});
     assert.commandWorked(res);
-    var collections = res.cursor.firstBatch.filter(coll => coll.name != 'system.indexes');
+    var collections = res.cursor.firstBatch;
 
     collections.sort(sortByName);
     var coll2uuid = collections[1].info.uuid;
+
+    // Await replication on the config server to guarantee the collections database has been
+    // propagated to all config secondaries.
+    st.configRS.awaitReplication();
 
     // Have the other shard clone the DB from the primary.
     assert.commandWorked(toShard.adminCommand(
@@ -67,7 +71,7 @@
     res = toShard.getDB('test').runCommand({listCollections: 1});
     assert.commandWorked(res);
 
-    collections = res.cursor.firstBatch.filter(coll => coll.name != 'system.indexes');
+    collections = res.cursor.firstBatch;
 
     // There should be 2 collections: coll1, coll2
     assert.eq(collections.length, 2);
@@ -138,6 +142,10 @@
     checkCount(fromShard, 'coll2', 3);
     checkCount(toShard, 'coll1', 3);
     checkCount(toShard, 'coll2', 0);
+
+    // Await replication on the config server to guarantee the collections database has been
+    // propagated to all config secondaries.
+    st.configRS.awaitReplication();
 
     // Check that the command fails without writeConcern majority.
     assert.commandFailedWithCode(

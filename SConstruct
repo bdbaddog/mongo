@@ -469,7 +469,7 @@ add_option('variables-files',
     help="Specify variables files to load",
 )
 
-link_model_choices = ['auto', 'object', 'static', 'dynamic', 'dynamic-strict']
+link_model_choices = ['auto', 'object', 'static', 'dynamic', 'dynamic-strict', 'dynamic-sdk']
 add_option('link-model',
     choices=link_model_choices,
     default='auto',
@@ -609,7 +609,6 @@ def variable_tools_converter(val):
         "gziptool",
         'idl_tool',
         "jsheader",
-        "mergelib",
         "mongo_benchmark",
         "mongo_integrationtest",
         "mongo_unittest",
@@ -1282,8 +1281,8 @@ if link_model == "auto":
 
 # Windows can't currently support anything other than 'object' or 'static', until
 # we have both hygienic builds and have annotated functions for export.
-if env.TargetOSIs('windows') and link_model not in ['object', 'static']:
-    env.FatalError("Windows builds must use the 'object' or 'static' link models");
+if env.TargetOSIs('windows') and link_model not in ['object', 'static', 'dynamic-sdk']:
+    env.FatalError("Windows builds must use the 'object', 'dynamic-sdk', or 'static' link models")
 
 # The 'object' mode for libdeps is enabled by setting _LIBDEPS to $_LIBDEPS_OBJS. The other two
 # modes operate in library mode, enabled by setting _LIBDEPS to $_LIBDEPS_LIBS.
@@ -1292,11 +1291,24 @@ env['_LIBDEPS'] = '$_LIBDEPS_OBJS' if link_model == "object" else '$_LIBDEPS_LIB
 env['BUILDERS']['ProgramObject'] = env['BUILDERS']['StaticObject']
 env['BUILDERS']['LibraryObject'] = env['BUILDERS']['StaticObject']
 
+env['SHARPREFIX'] = '$LIBPREFIX'
+env['SHARSUFFIX'] = '${SHLIBSUFFIX}${LIBSUFFIX}'
+env['BUILDERS']['SharedArchive'] = SCons.Builder.Builder(
+    action=env['BUILDERS']['StaticLibrary'].action,
+    emitter='$SHAREMITTER',
+    prefix='$SHARPREFIX',
+    suffix='$SHARSUFFIX',
+    src_suffix=env['BUILDERS']['SharedLibrary'].src_suffix,
+)
+
 if link_model.startswith("dynamic"):
 
-    # Redirect the 'Library' target, which we always use instead of 'StaticLibrary' for things
-    # that can be built in either mode, to point to SharedLibrary.
-    env['BUILDERS']['Library'] = env['BUILDERS']['SharedLibrary']
+    def library(env, target, source, *args, **kwargs):
+        sharedLibrary = env.SharedLibrary(target, source, *args, **kwargs)
+        sharedArchive = env.SharedArchive(target, source=sharedLibrary[0].sources, *args, **kwargs)
+        return (sharedLibrary, sharedArchive)
+
+    env['BUILDERS']['Library'] = library
     env['BUILDERS']['LibraryObject'] = env['BUILDERS']['SharedObject']
 
     # TODO: Ideally, the conditions below should be based on a
@@ -1363,6 +1375,19 @@ if link_model.startswith("dynamic"):
                 if ('illegal_cyclic_or_unresolved_dependencies_whitelisted'
                     in target[0].get_env().get("LIBDEPS_TAGS", [])):
                     return ["-Wl,-undefined,dynamic_lookup"]
+                return []
+            env['LIBDEPS_TAG_EXPANSIONS'].append(libdeps_tags_expand_incomplete)
+    elif env.TargetOSIs('windows'):
+        if link_model == "dynamic-strict":
+            # Windows is strict by default
+            pass
+        else:
+            def libdeps_tags_expand_incomplete(source, target, env, for_signature):
+                # On windows, since it is strict by default, we need to add a flag
+                # when libraries are tagged incomplete.
+                if ('illegal_cyclic_or_unresolved_dependencies_whitelisted'
+                    in target[0].get_env().get("LIBDEPS_TAGS", [])):
+                    return ["/FORCE:UNRESOLVED"]
                 return []
             env['LIBDEPS_TAG_EXPANSIONS'].append(libdeps_tags_expand_incomplete)
     else:
@@ -1707,6 +1732,29 @@ if env.ToolchainIs('msvc'):
 
 if env.TargetOSIs('posix'):
 
+    # On linux, C code compiled with gcc/clang -std=c11 causes
+    # __STRICT_ANSI__ to be set, and that drops out all of the feature
+    # test definitions, resulting in confusing errors when we run C
+    # language configure checks and expect to be able to find newer
+    # POSIX things. Explicitly enabling _XOPEN_SOURCE fixes that, and
+    # should be mostly harmless as on Linux, these macros are
+    # cumulative. The C++ compiler already sets _XOPEN_SOURCE, and,
+    # notably, setting it again does not disable any other feature
+    # test macros, so this is safe to do. Other platforms like macOS
+    # and BSD have crazy rules, so don't try this there.
+    #
+    # Furthermore, as both C++ compilers appears to unconditioanlly
+    # define _GNU_SOURCE (because libstdc++ requires it), it seems
+    # prudent to explicitly add that too, so that C language checks
+    # see a consistent set of definitions.
+    if env.TargetOSIs('linux'):
+        env.AppendUnique(
+            CPPDEFINES=[
+                ('_XOPEN_SOURCE', 700),
+                '_GNU_SOURCE',
+            ],
+        )
+
     # Everything on OS X is position independent by default. Solaris doesn't support PIE.
     if not env.TargetOSIs('darwin', 'solaris'):
         if get_option('runtime-hardening') == "on":
@@ -1744,7 +1792,8 @@ if env.TargetOSIs('posix'):
     # SERVER-9761: Ensure early detection of missing symbols in dependent libraries at program
     # startup.
     if env.TargetOSIs('darwin'):
-        env.Append( LINKFLAGS=["-Wl,-bind_at_load"] )
+        if env.TargetOSIs('macOS'):
+            env.Append( LINKFLAGS=["-Wl,-bind_at_load"] )
     else:
         env.Append( LINKFLAGS=["-Wl,-z,now"] )
         env.Append( LINKFLAGS=["-rdynamic"] )
@@ -2093,6 +2142,11 @@ def doConfigure(myenv):
         # As of clang-3.4, this warning appears in v8, and gets escalated to an error.
         AddToCCFLAGSIfSupported(myenv, "-Wno-tautological-constant-out-of-range-compare")
 
+        # As of clang in Android NDK 17, these warnings appears in boost and/or ICU, and get escalated to errors
+        AddToCCFLAGSIfSupported(myenv, "-Wno-tautological-constant-compare")
+        AddToCCFLAGSIfSupported(myenv, "-Wno-tautological-unsigned-zero-compare")
+        AddToCCFLAGSIfSupported(myenv, "-Wno-tautological-unsigned-enum-zero-compare")
+
         # New in clang-3.4, trips up things mostly in third_party, but in a few places in the
         # primary mongo sources as well.
         AddToCCFLAGSIfSupported(myenv, "-Wno-unused-const-variable")
@@ -2145,6 +2199,10 @@ def doConfigure(myenv):
         # This warning was added in clang-5 and incorrectly flags our implementation of
         # exceptionToStatus(). See https://bugs.llvm.org/show_bug.cgi?id=34804
         AddToCCFLAGSIfSupported(myenv, "-Wno-exceptions")
+
+        # These warnings begin in gcc-8.2 and we should get rid of these disables at some point.
+        AddToCCFLAGSIfSupported(env, '-Wno-format-truncation')
+        AddToCXXFLAGSIfSupported(env, '-Wno-class-memaccess')
 
 
         # Check if we can set "-Wnon-virtual-dtor" when "-Werror" is set. The only time we can't set it is on
@@ -2672,6 +2730,10 @@ def doConfigure(myenv):
                     not AddToLINKFLAGSIfSupported(myenv, '-flto'):
                 myenv.ConfError("Link time optimization requested, "
                     "but selected compiler does not honor -flto" )
+
+            if myenv.TargetOSIs('darwin'):
+                AddToLINKFLAGSIfSupported(myenv, '-Wl,-object_path_lto,${TARGET}.lto')
+
         else:
             myenv.ConfError("Don't know how to enable --lto on current toolchain")
 

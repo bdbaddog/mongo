@@ -164,6 +164,29 @@ public:
      **/
     static std::unique_ptr<PlanStageStats> getWinningPlanTrialStats(PlanExecutor* exec);
 
+    /**
+     * Generates the execution stats section for the stats tree 'stats', adding the resulting BSON
+     * to 'out'.
+     *
+     * The 'totalTimeMillis' value passed here will be added to the top level of the execution stats
+     * section, but will not affect the reporting of timing for individual stages. If
+     * 'totalTimeMillis' is not set, we use the approximate timing information collected by the
+     * stages.
+     *
+     * Stats are generated at the verbosity specified by 'verbosity'.
+     **/
+    static void generateSinglePlanExecutionInfo(const PlanStageStats* stats,
+                                                ExplainOptions::Verbosity verbosity,
+                                                boost::optional<long long> totalTimeMillis,
+                                                BSONObjBuilder* out);
+
+    /**
+     * Serializes a PlanCacheEntry to the provided BSON object builder. The output format is
+     * intended to be human readable, and useful for debugging query performance problems related to
+     * the plan cache.
+     */
+    static void planCacheEntryToBSON(const PlanCacheEntry& entry, BSONObjBuilder* out);
+
 private:
     /**
      * Adds the 'queryPlanner' explain section to the BSON object being built
@@ -205,24 +228,6 @@ private:
                                       Status executePlanStatus,
                                       PlanStageStats* winningPlanTrialStats,
                                       BSONObjBuilder* out);
-
-    /**
-     * Generates the execution stats section for the stats tree 'stats',
-     * adding the resulting BSON to 'out'.
-     *
-     * The 'totalTimeMillis' value passed here will be added to the top level of
-     * the execution stats section, but will not affect the reporting of timing for
-     * individual stages. If 'totalTimeMillis' is not set, we use the approximate timing
-     * information collected by the stages.
-     *
-     * Stats are generated at the verbosity specified by 'verbosity'.
-     *
-     * This is a helper for generating explain BSON. It is used by generateExecutionInfo().
-     */
-    static void generateSinglePlanExecutionInfo(const PlanStageStats* stats,
-                                                ExplainOptions::Verbosity verbosity,
-                                                boost::optional<long long> totalTimeMillis,
-                                                BSONObjBuilder* out);
 
     /**
      * Adds the 'serverInfo' explain section to the BSON object being build

@@ -51,6 +51,7 @@
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/session_catalog.h"
+#include "mongo/db/transaction_participant.h"
 #include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/util/fail_point_service.h"
 #include "mongo/util/log.h"
@@ -69,14 +70,7 @@ MONGO_FAIL_POINT_DEFINE(doTxnPauseBetweenOperations);
  */
 bool _areOpsCrudOnly(const BSONObj& doTxnCmd) {
     for (const auto& elem : doTxnCmd.firstElement().Obj()) {
-        const char* names[] = {"ns", "op"};
-        BSONElement fields[2];
-        elem.Obj().getFields(2, names, fields);
-        BSONElement& fieldNs = fields[0];
-        BSONElement& fieldOp = fields[1];
-
-        const char* opType = fieldOp.valuestrsafe();
-        const StringData ns = fieldNs.valuestrsafe();
+        const char* opType = elem.Obj().getField("op").valuestrsafe();
 
         // All atomic ops have an opType of length 1.
         if (opType[0] == '\0' || opType[1] != '\0')
@@ -88,8 +82,7 @@ bool _areOpsCrudOnly(const BSONObj& doTxnCmd) {
             case 'u':
                 break;
             case 'i':
-                if (nsToCollectionSubstring(ns) != "system.indexes")
-                    break;
+                break;
             // Fallthrough.
             default:
                 return false;
@@ -270,9 +263,9 @@ Status doTxn(OperationContext* opCtx,
              BSONObjBuilder* result) {
     auto txnNumber = opCtx->getTxnNumber();
     uassert(ErrorCodes::InvalidOptions, "doTxn can only be run with a transaction ID.", txnNumber);
-    auto* session = OperationContextSession::get(opCtx);
-    uassert(ErrorCodes::InvalidOptions, "doTxn must be run within a session", session);
-    invariant(session->inMultiDocumentTransaction());
+    auto txnParticipant = TransactionParticipant::get(opCtx);
+    uassert(ErrorCodes::InvalidOptions, "doTxn must be run within a transaction", txnParticipant);
+    invariant(txnParticipant->inMultiDocumentTransaction());
     invariant(opCtx->getWriteUnitOfWork());
     uassert(
         ErrorCodes::InvalidOptions, "doTxn supports only CRUD opts.", _areOpsCrudOnly(doTxnCmd));
@@ -303,10 +296,10 @@ Status doTxn(OperationContext* opCtx,
 
         numApplied = 0;
         uassertStatusOK(_doTxn(opCtx, dbName, doTxnCmd, &intermediateResult, &numApplied));
-        session->commitUnpreparedTransaction(opCtx);
+        txnParticipant->commitUnpreparedTransaction(opCtx);
         result->appendElements(intermediateResult.obj());
     } catch (const DBException& ex) {
-        session->abortActiveTransaction(opCtx);
+        txnParticipant->abortActiveUnpreparedOrStashPreparedTransaction(opCtx);
         BSONArrayBuilder ab;
         ++numApplied;
         for (int j = 0; j < numApplied; j++)

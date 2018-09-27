@@ -68,9 +68,6 @@
  *  nodes {Array.<Mongo>} - connection to replica set members
  */
 
-/* Global default timeout variable */
-const kReplDefaultTimeoutMS = 10 * 60 * 1000;
-
 var ReplSetTest = function(opts) {
     'use strict';
 
@@ -95,7 +92,9 @@ var ReplSetTest = function(opts) {
 
     var _causalConsistency;
 
-    this.kDefaultTimeoutMS = kReplDefaultTimeoutMS;
+    // Some code still references kDefaultTimeoutMS as a (non-static) member variable, so make sure
+    // it's still accessible that way.
+    this.kDefaultTimeoutMS = ReplSetTest.kDefaultTimeoutMS;
     var oplogName = 'oplog.rs';
 
     // Publicly exposed variables
@@ -811,15 +810,19 @@ var ReplSetTest = function(opts) {
         return this.getSecondaries(timeout)[0];
     };
 
+    function isNodeArbiter(node) {
+        return node.getDB('admin').isMaster('admin').arbiterOnly;
+    }
+
     this.getArbiters = function() {
-        var arbiters = [];
-        for (var i = 0; i < this.nodes.length; i++) {
-            var node = this.nodes[i];
+        let arbiters = [];
+        for (let i = 0; i < this.nodes.length; i++) {
+            const node = this.nodes[i];
 
             let isArbiter = false;
 
             assert.retryNoExcept(() => {
-                isArbiter = node.getDB('admin').isMaster('admin').arbiterOnly;
+                isArbiter = isNodeArbiter(node);
                 return true;
             }, `Could not call 'isMaster' on ${node}.`, 3, 1000);
 
@@ -1239,17 +1242,10 @@ var ReplSetTest = function(opts) {
         let master = rst.getPrimary();
         let id = tojson(rst.nodeList());
 
-        // Algorithm precondition: All nodes must be in primary/secondary state.
-        //
-        // 1) Perform a majority write. This will guarantee the primary updates its commit point
-        //    to the value of this write.
-        //
-        // 2) Perform a second write. This will guarantee that all nodes will update their commit
-        //    point to a time that is >= the previous write. That will trigger a stable checkpoint
-        //    on all persisted storage engine nodes.
-        // TODO(SERVER-33248): Remove this block. We should not need to prod the replica set to
-        // advance the commit point if the commit point being lagged is sufficient to choose a
-        // sync source.
+        // All nodes must be in primary/secondary state prior to this point. Perform a majority
+        // write to ensure there is a committed operation on the set. The commit point will
+        // propagate to all members and trigger a stable checkpoint on all persisted storage engines
+        // nodes.
         function advanceCommitPoint(master) {
             // Shadow 'db' so that we can call 'advanceCommitPoint' directly on the primary node.
             let db = master.getDB('admin');
@@ -1259,8 +1255,6 @@ var ReplSetTest = function(opts) {
                     "data": {"awaitLastStableRecoveryTimestamp": 1},
                     "writeConcern": {"w": "majority", "wtimeout": ReplSetTest.kDefaultTimeoutMS}
                 }));
-                assert.commandWorked(db.adminCommand(
-                    {"appendOplogNote": 1, "data": {"awaitLastStableRecoveryTimestamp": 2}}));
             };
 
             // TODO(SERVER-14017): Remove this extra sub-shell in favor of a cleaner authentication
@@ -1692,8 +1686,10 @@ var ReplSetTest = function(opts) {
         var activeException = false;
 
         // Lock the primary to prevent the TTL monitor from deleting expired documents in
-        // the background while we are getting the dbhashes of the replica set members.
-        assert.commandWorked(primary.adminCommand({fsync: 1, lock: 1}),
+        // the background while we are getting the dbhashes of the replica set members. It's not
+        // important if the storage engine fails to perform its fsync operation. The only
+        // requirement is that writes are locked out.
+        assert.commandWorked(primary.adminCommand({fsync: 1, lock: 1, allowFsyncFailure: true}),
                              'failed to lock the primary');
         try {
             this.awaitReplication(null, null, slaves);
@@ -2010,42 +2006,53 @@ var ReplSetTest = function(opts) {
      */
     function checkOplogs(rst, slaves, msgPrefix = 'checkOplogs') {
         slaves = slaves || rst._slaves;
-        var OplogReader = function(mongo) {
-            this.next = function() {
-                if (!this.cursor)
+        const kCappedPositionLostSentinel = Object.create(null);
+        const OplogReader = function(mongo) {
+            this._safelyPerformCursorOperation = function(name, operation, onCappedPositionLost) {
+                if (!this.cursor) {
                     throw new Error("OplogReader is not open!");
+                }
 
-                var nextDoc = this.cursor.next();
-                if (nextDoc)
-                    this.lastDoc = nextDoc;
-                return nextDoc;
-            };
+                if (this._cursorExhausted) {
+                    return onCappedPositionLost;
+                }
 
-            this.hasNext = function() {
-                if (!this.cursor)
-                    throw new Error("OplogReader is not open!");
                 try {
-                    return this.cursor.hasNext();
+                    return operation(this.cursor);
                 } catch (err) {
-                    print("Error: hasNext threw '" + err.message + "' on " + this.mongo.host);
+                    print("Error: " + name + " threw '" + err.message + "' on " + this.mongo.host);
                     // Occasionally, the capped collection will get truncated while we are iterating
                     // over it. Since we are iterating over the collection in reverse, getting a
                     // truncated item means we've reached the end of the list, so return false.
                     if (err.code === ErrorCodes.CappedPositionLost) {
                         this.cursor.close();
-                        return false;
+                        this._cursorExhausted = true;
+                        return onCappedPositionLost;
                     }
 
                     throw err;
                 }
             };
 
+            this.next = function() {
+                this._safelyPerformCursorOperation('next', function(cursor) {
+                    return cursor.next();
+                }, kCappedPositionLostSentinel);
+            };
+
+            this.hasNext = function() {
+                this._safelyPerformCursorOperation('hasNext', function(cursor) {
+                    return cursor.hasNext();
+                }, false);
+            };
+
             this.query = function(ts) {
-                var coll = this.getOplogColl();
-                var query = {ts: {$gte: ts ? ts : new Timestamp()}};
+                const coll = this.getOplogColl();
+                const query = {ts: {$gte: ts ? ts : new Timestamp()}};
                 // Set the cursor to read backwards, from last to first. We also set the cursor not
                 // to time out since it may take a while to process each batch and a test may have
                 // changed "cursorTimeoutMillis" to a short time period.
+                this._cursorExhausted = false;
                 this.cursor = coll.find(query).sort({$natural: -1}).noCursorTimeout();
             };
 
@@ -2057,18 +2064,28 @@ var ReplSetTest = function(opts) {
                 return this.mongo.getDB("local")[oplogName];
             };
 
-            this.lastDoc = null;
             this.cursor = null;
+            this._cursorExhausted = true;
             this.mongo = mongo;
         };
 
+        function assertOplogEntriesEq(oplogEntry0, oplogEntry1, reader0, reader1, prevOplogEntry) {
+            if (!bsonBinaryEqual(oplogEntry0, oplogEntry1)) {
+                const query = prevOplogEntry ? {ts: {$lte: prevOplogEntry.ts}} : {};
+                rst.nodes.forEach(node => this.dumpOplog(node, query, 100));
+                const log = msgPrefix + ", non-matching oplog entries for the following nodes: \n" +
+                    reader0.mongo.host + ": " + tojsononeline(oplogEntry0) + "\n" +
+                    reader1.mongo.host + ": " + tojsononeline(oplogEntry1);
+                assert(false, log);
+            }
+        }
+
         if (slaves.length >= 1) {
-            var readers = [];
-            var smallestTS = new Timestamp(Math.pow(2, 32) - 1, Math.pow(2, 32) - 1);
-            var nodes = rst.nodes;
-            var rsSize = nodes.length;
-            var firstReaderIndex;
-            for (var i = 0; i < rsSize; i++) {
+            let readers = [];
+            let smallestTS = new Timestamp(Math.pow(2, 32) - 1, Math.pow(2, 32) - 1);
+            const nodes = rst.nodes;
+            let firstReaderIndex;
+            for (let i = 0; i < nodes.length; i++) {
                 const node = nodes[i];
 
                 if (rst._master !== node && !slaves.includes(node)) {
@@ -2076,17 +2093,15 @@ var ReplSetTest = function(opts) {
                 }
 
                 // Arbiters have no documents in the oplog.
-                const isArbiter = node.getDB('admin').isMaster('admin').arbiterOnly;
-                if (isArbiter) {
+                if (isNodeArbiter(node)) {
                     continue;
                 }
 
                 readers[i] = new OplogReader(node);
-                var currTS = readers[i].getFirstDoc().ts;
+                const currTS = readers[i].getFirstDoc().ts;
                 // Find the reader which has the smallestTS. This reader should have the most
                 // number of documents in the oplog.
-                if (currTS.t < smallestTS.t ||
-                    (currTS.t == smallestTS.t && currTS.i < smallestTS.i)) {
+                if (timestampCmp(currTS, smallestTS) < 0) {
                     smallestTS = currTS;
                     firstReaderIndex = i;
                 }
@@ -2096,25 +2111,27 @@ var ReplSetTest = function(opts) {
 
             // Read from the reader which has the most oplog entries.
             // Note, we read the oplog backwards from last to first.
-            var firstReader = readers[firstReaderIndex];
-            var prevOplogEntry;
+            const firstReader = readers[firstReaderIndex];
+            let prevOplogEntry;
             while (firstReader.hasNext()) {
-                var oplogEntry = firstReader.next();
-                for (i = 0; i < rsSize; i++) {
+                const oplogEntry = firstReader.next();
+                if (oplogEntry === kCappedPositionLostSentinel) {
+                    // When using legacy OP_QUERY/OP_GET_MORE reads against mongos, it is
+                    // possible for hasNext() to return true but for next() to throw an exception.
+                    break;
+                }
+
+                for (let i = 0; i < nodes.length; i++) {
                     // Skip reading from this reader if the index is the same as firstReader or
                     // the cursor is exhausted.
                     if (i === firstReaderIndex || !(readers[i] && readers[i].hasNext())) {
                         continue;
                     }
-                    var otherOplogEntry = readers[i].next();
-                    if (!bsonBinaryEqual(oplogEntry, otherOplogEntry)) {
-                        var query = prevOplogEntry ? {ts: {$lte: prevOplogEntry.ts}} : {};
-                        rst.nodes.forEach(node => this.dumpOplog(node, query, 100));
-                        var log = msgPrefix +
-                            ", non-matching oplog entries for the following nodes: \n" +
-                            firstReader.mongo.host + ": " + tojsononeline(oplogEntry) + "\n" +
-                            readers[i].mongo.host + ": " + tojsononeline(otherOplogEntry);
-                        assert(false, log);
+
+                    const otherOplogEntry = readers[i].next();
+                    if (otherOplogEntry && otherOplogEntry !== kCappedPositionLostSentinel) {
+                        assertOplogEntriesEq(
+                            oplogEntry, otherOplogEntry, firstReader, readers[i], prevOplogEntry);
                     }
                 }
                 prevOplogEntry = oplogEntry;
@@ -2579,10 +2596,9 @@ var ReplSetTest = function(opts) {
 };
 
 /**
- * Declare kDefaultTimeoutMS as a static property so we don't have to initialize
- * a ReplSetTest object to use it.
+ *  Global default timeout (10 minutes).
  */
-ReplSetTest.kDefaultTimeoutMS = kReplDefaultTimeoutMS;
+ReplSetTest.kDefaultTimeoutMS = 10 * 60 * 1000;
 
 /**
  * Set of states that the replica set can be in. Used for the wait functions.

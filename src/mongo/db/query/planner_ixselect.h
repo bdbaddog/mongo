@@ -46,21 +46,32 @@ public:
     /**
      * Return all the fields in the tree rooted at 'node' that we can use an index on
      * in order to answer the query.
+     */
+    static void getFields(const MatchExpression* node, stdx::unordered_set<std::string>* out);
+
+    /**
+     * Similar to other getFields() method, but with 'prefix' argument which is a path prefix to be
+     * prepended to any fields mentioned in predicates encountered.
      *
-     * The 'prefix' argument is a path prefix to be prepended to any fields mentioned in
-     * predicates encountered.  Some array operators specify a path prefix.
+     * Public for testing.
      */
     static void getFields(const MatchExpression* node,
                           std::string prefix,
                           stdx::unordered_set<std::string>* out);
 
     /**
-     * Find all indices prefixed by fields we have predicates over.  Only these indices are
+     * Finds all indices that correspond to the hinted index. Matches the index both by name and by
+     * key pattern.
+     */
+    static std::vector<IndexEntry> findIndexesByHint(const BSONObj& hintedIndex,
+                                                     const std::vector<IndexEntry>& allIndices);
+
+    /**
+     * Finds all indices prefixed by fields we have predicates over.  Only these indices are
      * useful in answering the query.
      */
-    static void findRelevantIndices(const stdx::unordered_set<std::string>& fields,
-                                    const std::vector<IndexEntry>& indices,
-                                    std::vector<IndexEntry>* out);
+    static std::vector<IndexEntry> findRelevantIndices(
+        const stdx::unordered_set<std::string>& fields, const std::vector<IndexEntry>& allIndices);
 
     /**
      * Return true if the index key pattern field 'keyPatternElt' (which belongs to 'index' and is
@@ -133,6 +144,13 @@ public:
     static void stripUnneededAssignments(MatchExpression* node,
                                          const std::vector<IndexEntry>& indices);
 
+    /**
+     * Given a list of IndexEntries and fields used by a query's match expression, return a list
+     * "expanded" indexes (where the $** indexes in the given list have been expanded).
+     */
+    static std::vector<IndexEntry> expandIndexes(const stdx::unordered_set<std::string>& fields,
+                                                 const std::vector<IndexEntry>& relevantIndices);
+
 private:
     /**
      * Used to keep track of if any $elemMatch predicates were encountered when walking a
@@ -160,6 +178,7 @@ private:
                              const std::vector<IndexEntry>& indices,
                              const CollatorInterface* collator,
                              const ElemMatchContext& elemMatchContext);
+
     /**
      * Amend the RelevantTag lists for all predicates in the subtree rooted at 'node' to remove
      * invalid assignments to text indexes.
@@ -212,6 +231,17 @@ private:
      * predicate on every geo field in the index.
      */
     static void stripInvalidAssignmentsTo2dsphereIndices(MatchExpression* node,
+                                                         const std::vector<IndexEntry>& indices);
+
+    /**
+     * This function strips RelevantTag assignments to expanded 'allPaths' indexes, in cases where
+     * the assignment is incompatible with the query.
+     *
+     * Specifically, if the query has a TEXT node with both 'text' and 'allPaths' indexes present,
+     * then the 'allPaths' index will mark itself as relevant to the '_fts' path reported by the
+     * TEXT node. We therefore remove any such misassigned 'allPaths' tags here.
+     */
+    static void stripInvalidAssignmentsToAllPathsIndexes(MatchExpression* root,
                                                          const std::vector<IndexEntry>& indices);
 
     /**

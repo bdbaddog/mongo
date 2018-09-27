@@ -43,6 +43,9 @@ class IndexCatalogEntry;
  */
 SortedDataInterface* getEphemeralForTestBtreeImpl(const Ordering& ordering,
                                                   bool isUnique,
+                                                  const std::string& collectionNamespace,
+                                                  const std::string& indexName,
+                                                  const BSONObj& keyPattern,
                                                   std::shared_ptr<void>* dataInOut);
 
 }  // namespace mongo

@@ -37,13 +37,35 @@ namespace mongo {
 /**
  * Class which is responsible for generating and providing access to AllPaths index keys. Any index
  * created with { "$**": ±1 } or { "path.$**": ±1 } uses this class.
+ *
+ * $** indexes store a special metadata key for each path in the index that is multikey. This class
+ * provides an interface to access the multikey metadata: see getMultikeyPathSet().
  */
-class AllPathsAccessMethod : public IndexAccessMethod {
+class AllPathsAccessMethod final : public IndexAccessMethod {
 public:
     AllPathsAccessMethod(IndexCatalogEntry* allPathsState, SortedDataInterface* btree);
 
+    /**
+     * Returns 'true' if the index should become multikey on the basis of the passed arguments.
+     * Because it is possible for a $** index to generate multiple keys per document without any of
+     * them lying along a multikey (i.e. array) path, this method will only return 'true' if one or
+     * more multikey metadata keys have been generated; that is, if the 'multikeyMetadataKeys'
+     * BSONObjSet is non-empty.
+     */
+    bool shouldMarkIndexAsMultikey(const BSONObjSet& keys,
+                                   const BSONObjSet& multikeyMetadataKeys,
+                                   const MultikeyPaths& multikeyPaths) const final;
+
+    /**
+     * Returns the set of paths included in this $** index that could be multikey.
+     */
+    std::set<FieldRef> getMultikeyPathSet(OperationContext*) const final;
+
 private:
-    void doGetKeys(const BSONObj& obj, BSONObjSet* keys, MultikeyPaths* multikeyPaths) const final;
+    void doGetKeys(const BSONObj& obj,
+                   BSONObjSet* keys,
+                   BSONObjSet* multikeyMetadataKeys,
+                   MultikeyPaths* multikeyPaths) const final;
 
     const AllPathsKeyGenerator _keyGen;
 };

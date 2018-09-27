@@ -313,7 +313,8 @@ Status WiredTigerRecoveryUnit::obtainMajorityCommittedSnapshot() {
 
 boost::optional<Timestamp> WiredTigerRecoveryUnit::getPointInTimeReadTimestamp() const {
     if (_timestampReadSource == ReadSource::kProvided ||
-        _timestampReadSource == ReadSource::kLastAppliedSnapshot) {
+        _timestampReadSource == ReadSource::kLastAppliedSnapshot ||
+        _timestampReadSource == ReadSource::kAllCommittedSnapshot) {
         invariant(!_readAtTimestamp.isNull());
         return _readAtTimestamp;
     }
@@ -358,7 +359,8 @@ void WiredTigerRecoveryUnit::_txnOpen() {
             // We reset _majorityCommittedSnapshot to the actual read timestamp used when the
             // transaction was started.
             _majorityCommittedSnapshot =
-                _sessionCache->snapshotManager().beginTransactionOnCommittedSnapshot(session);
+                _sessionCache->snapshotManager().beginTransactionOnCommittedSnapshot(
+                    session, _ignorePrepared);
             break;
         }
         case ReadSource::kLastApplied: {
@@ -369,6 +371,13 @@ void WiredTigerRecoveryUnit::_txnOpen() {
                 WiredTigerBeginTxnBlock(session, _ignorePrepared).done();
             }
             break;
+        }
+        case ReadSource::kAllCommittedSnapshot: {
+            if (_readAtTimestamp.isNull()) {
+                _readAtTimestamp = _beginTransactionAtAllCommittedTimestamp(session);
+                break;
+            }
+            // Intentionally continue to the next case to read at the _readAtTimestamp.
         }
         case ReadSource::kLastAppliedSnapshot: {
             // Only ever read the last applied timestamp once, and continue reusing it for
@@ -399,6 +408,24 @@ void WiredTigerRecoveryUnit::_txnOpen() {
     _active = true;
 }
 
+Timestamp WiredTigerRecoveryUnit::_beginTransactionAtAllCommittedTimestamp(WT_SESSION* session) {
+    WiredTigerBeginTxnBlock txnOpen(session, _ignorePrepared);
+    Timestamp txnTimestamp = Timestamp(_oplogManager->fetchAllCommittedValue(session->connection));
+    auto status =
+        txnOpen.setTimestamp(txnTimestamp, WiredTigerBeginTxnBlock::RoundToOldest::kRound);
+    fassert(50948, status);
+
+    // Since this is not in a critical section, we might have rounded to oldest between
+    // calling getAllCommitted and setTimestamp.  We need to get the actual read timestamp we
+    // used.
+    char buf[(2 * 8 /*bytes in hex*/) + 1 /*nul terminator*/];
+    auto wtstatus = session->query_timestamp(session, buf, "get=read");
+    invariantWTOK(wtstatus);
+    uint64_t read_timestamp;
+    fassert(50949, parseNumberFromStringWithBase(buf, 16, &read_timestamp));
+    txnOpen.done();
+    return Timestamp(read_timestamp);
+}
 
 Status WiredTigerRecoveryUnit::setTimestamp(Timestamp timestamp) {
     _ensureSession();
@@ -531,12 +558,6 @@ WiredTigerCursor::WiredTigerCursor(const std::string& uri,
     _ru = WiredTigerRecoveryUnit::get(opCtx);
     _session = _ru->getSession();
     _cursor = _session->getCursor(uri, tableId, forRecordStore);
-    if (!_cursor) {
-        // It could be an index file or a data file here.
-        error() << "Failed to get the cursor for uri: " << uri;
-        error() << "This may be due to missing data files. " << kWTRepairMsg;
-        fassertFailedNoTrace(50883);
-    }
 }
 
 WiredTigerCursor::~WiredTigerCursor() {

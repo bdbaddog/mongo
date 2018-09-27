@@ -167,7 +167,7 @@ class Graph(object):
         for node_key in self.nodes:
             print("Node", self.nodes[node_key]['node'])
             for to_node in self.nodes[node_key]['next_nodes']:
-                print(" ->", to_node)
+                print(" ->", self.nodes[to_node]['node'])
 
     def to_graph(self, nodes=None, message=None):
         """Return the 'to_graph'."""
@@ -180,7 +180,8 @@ class Graph(object):
         sb.append('digraph "mongod+lock-status" {')
         for node_key in self.nodes:
             for next_node_key in self.nodes[node_key]['next_nodes']:
-                sb.append('    "{}" -> "{}";'.format(node_key, next_node_key))
+                sb.append('    "{}" -> "{}";'.format(self.nodes[node_key]['node'],
+                                                     self.nodes[next_node_key]['node']))
         for node_key in self.nodes:
             color = ""
             if nodes and node_key in nodes:
@@ -190,7 +191,8 @@ class Graph(object):
             # character.
             escaped_label = str(self.nodes[node_key]['node']).replace('"', '\\"')
 
-            sb.append('    "{}" [label="{}" {}]'.format(node_key, escaped_label, color))
+            sb.append('    "{}" [label="{}" {}]'.format(self.nodes[node_key]['node'], escaped_label,
+                                                        color))
         sb.append("}")
         return "\n".join(sb)
 
@@ -303,7 +305,10 @@ def find_mutex_holder(graph, thread_dict, show):
 
 def find_lock_manager_holders(graph, thread_dict, show):  # pylint: disable=too-many-locals
     """Find lock manager holders."""
-    frame = find_frame(r'mongo::LockerImpl\<.*\>::')
+    # In versions of MongoDB 4.0 and older, the LockerImpl class is templatized with a boolean
+    # parameter. With the removal of the MMAPv1 storage engine in MongoDB 4.2, the LockerImpl class
+    # is no longer templatized.
+    frame = find_frame(r'mongo::LockerImpl(?:\<.*\>)?::')
     if not frame:
         return
 
@@ -312,7 +317,16 @@ def find_lock_manager_holders(graph, thread_dict, show):  # pylint: disable=too-
     (_, lock_waiter_lwpid, _) = gdb.selected_thread().ptid
     lock_waiter = thread_dict[lock_waiter_lwpid]
 
-    locker_ptr_type = gdb.lookup_type("mongo::LockerImpl<false>").pointer()
+    try:
+        locker_ptr_type = gdb.lookup_type("mongo::LockerImpl<false>").pointer()
+    except gdb.error as err:
+        # If we don't find the templatized version of the LockerImpl class, then we try to find the
+        # non-templatized version.
+        if not err.args[0].startswith("No type named"):
+            raise
+
+        locker_ptr_type = gdb.lookup_type("mongo::LockerImpl").pointer()
+
     lock_head = gdb.parse_and_eval(
         "mongo::getGlobalLockManager()->_getBucket(resId)->findOrInsert(resId)")
 
@@ -333,8 +347,8 @@ def find_lock_manager_holders(graph, thread_dict, show):  # pylint: disable=too-
             print("MongoDB Lock at {} ({}) held by {} waited on by {}".format(
                 lock_head, lock_request["mode"], lock_holder, lock_waiter))
         if graph:
-            graph.add_edge(lock_waiter, Lock(long(lock_head), "MongoDB lock"))
-            graph.add_edge(Lock(long(lock_head), "MongoDB lock"), lock_holder)
+            graph.add_edge(lock_waiter, Lock(long(lock_head), lock_request["mode"]))
+            graph.add_edge(Lock(long(lock_head), lock_request["mode"]), lock_holder)
         lock_request_ptr = lock_request["next"]
 
 

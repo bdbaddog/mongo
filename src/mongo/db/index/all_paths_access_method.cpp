@@ -40,12 +40,56 @@ AllPathsAccessMethod::AllPathsAccessMethod(IndexCatalogEntry* allPathsState,
       _keyGen(
           _descriptor->keyPattern(), _descriptor->pathProjection(), _btreeState->getCollator()) {}
 
+bool AllPathsAccessMethod::shouldMarkIndexAsMultikey(const BSONObjSet& keys,
+                                                     const BSONObjSet& multikeyMetadataKeys,
+                                                     const MultikeyPaths& multikeyPaths) const {
+    return !multikeyMetadataKeys.empty();
+}
+
 void AllPathsAccessMethod::doGetKeys(const BSONObj& obj,
                                      BSONObjSet* keys,
+                                     BSONObjSet* multikeyMetadataKeys,
                                      MultikeyPaths* multikeyPaths) const {
-    // TODO SERVER-35748: Until MultikeyPaths has been updated to facilitate 'allPaths' indexes, we
-    // use AllPathsKeyGenerator::MultikeyPathsMock to separate multikey paths from RecordId keys.
-    auto multikeyPathsMock = SimpleBSONObjComparator::kInstance.makeBSONObjSet();
-    _keyGen.generateKeys(obj, keys, &multikeyPathsMock);
+    _keyGen.generateKeys(obj, keys, multikeyMetadataKeys);
 }
+
+std::set<FieldRef> AllPathsAccessMethod::getMultikeyPathSet(OperationContext* opCtx) const {
+    auto cursor = newCursor(opCtx);
+    // All of the keys storing multikeyness metadata are prefixed by a value of 1. Establish an
+    // index cursor which will scan this range.
+    const BSONObj metadataKeyRangeBegin = BSON("" << 1 << "" << MINKEY);
+    const BSONObj metadataKeyRangeEnd = BSON("" << 1 << "" << MAXKEY);
+
+    constexpr bool inclusive = true;
+    cursor->setEndPosition(metadataKeyRangeEnd, inclusive);
+    auto entry = cursor->seek(metadataKeyRangeBegin, inclusive);
+
+    // Iterate the cursor, copying the multikey paths into an in-memory set.
+    std::set<FieldRef> multikeyPaths{};
+    while (entry) {
+        // Validate that the key contains the expected RecordId.
+        invariant(entry->loc.isReserved());
+        invariant(entry->loc.repr() ==
+                  static_cast<int64_t>(RecordId::ReservedId::kAllPathsMultikeyMetadataId));
+
+        // Validate that the first piece of the key is the integer 1.
+        BSONObjIterator iter(entry->key);
+        invariant(iter.more());
+        const auto firstElem = iter.next();
+        invariant(firstElem.isNumber());
+        invariant(firstElem.numberInt() == 1);
+        invariant(iter.more());
+
+        // Extract the path from the second piece of the key.
+        const auto secondElem = iter.next();
+        invariant(!iter.more());
+        invariant(secondElem.type() == BSONType::String);
+        multikeyPaths.emplace(secondElem.valueStringData());
+
+        entry = cursor->next();
+    }
+
+    return multikeyPaths;
+}
+
 }  // namespace mongo

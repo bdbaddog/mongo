@@ -88,6 +88,9 @@ MONGO_FAIL_POINT_DEFINE(initialSyncHangBeforeFinish);
 // operation.
 MONGO_FAIL_POINT_DEFINE(initialSyncHangBeforeGettingMissingDocument);
 
+// Failpoint which causes the initial sync function to hang before creating the oplog.
+MONGO_FAIL_POINT_DEFINE(initialSyncHangBeforeCreatingOplog);
+
 // Failpoint which stops the applier.
 MONGO_FAIL_POINT_DEFINE(rsSyncApplyStop);
 
@@ -378,6 +381,12 @@ void InitialSyncer::setScheduleDbWorkFn_forTest(const CollectionCloner::Schedule
     _scheduleDbWorkFn = work;
 }
 
+void InitialSyncer::setStartCollectionClonerFn(
+    const StartCollectionClonerFn& startCollectionCloner) {
+    LockGuard lk(_mutex);
+    _startCollectionClonerFn = startCollectionCloner;
+}
+
 void InitialSyncer::_setUp_inlock(OperationContext* opCtx, std::uint32_t initialSyncMaxAttempts) {
     // 'opCtx' is passed through from startup().
     _replicationProcess->getConsistencyMarkers()->setInitialSyncFlag(opCtx);
@@ -506,7 +515,7 @@ void InitialSyncer::_chooseSyncSourceCallback(
     std::uint32_t chooseSyncSourceAttempt,
     std::uint32_t chooseSyncSourceMaxAttempts,
     std::shared_ptr<OnCompletionGuard> onCompletionGuard) {
-    stdx::lock_guard<stdx::mutex> lock(_mutex);
+    stdx::unique_lock<stdx::mutex> lock(_mutex);
     // Cancellation should be treated the same as other errors. In this case, the most likely cause
     // of a failed _chooseSyncSourceCallback() task is a cancellation triggered by
     // InitialSyncer::shutdown() or the task executor shutting down.
@@ -553,6 +562,17 @@ void InitialSyncer::_chooseSyncSourceCallback(
             return;
         }
         return;
+    }
+
+    if (MONGO_FAIL_POINT(initialSyncHangBeforeCreatingOplog)) {
+        // This log output is used in js tests so please leave it.
+        log() << "initial sync - initialSyncHangBeforeCreatingOplog fail point "
+                 "enabled. Blocking until fail point is disabled.";
+        lock.unlock();
+        while (MONGO_FAIL_POINT(initialSyncHangBeforeCreatingOplog) && !_isShuttingDown()) {
+            mongo::sleepsecs(1);
+        }
+        lock.lock();
     }
 
     // There is no need to schedule separate task to create oplog collection since we are already in
@@ -822,6 +842,9 @@ void InitialSyncer::_fcvFetcherCallback(const StatusWith<Fetcher::QueryResponse>
         // to the CollectionCloner so that CollectionCloner's default TaskRunner can be disabled to
         // facilitate testing.
         _initialSyncState->dbsCloner->setScheduleDbWorkFn_forTest(_scheduleDbWorkFn);
+    }
+    if (_startCollectionClonerFn) {
+        _initialSyncState->dbsCloner->setStartCollectionClonerFn(_startCollectionClonerFn);
     }
 
     LOG(2) << "Starting DatabasesCloner: " << _initialSyncState->dbsCloner->toString();
@@ -1127,9 +1150,9 @@ void InitialSyncer::_rollbackCheckerCheckForRollbackCallback(
     // Update all unique indexes belonging to non-replicated collections on secondaries. See comment
     // in ReplicationCoordinatorExternalStateImpl::initializeReplSetStorage() for the explanation of
     // why we do this.
-    // TODO: SERVER-34489 should add a check for latest FCV before making the upgrade call when
-    // upgrade downgrade is ready.
-    if (createTimestampSafeUniqueIndex) {
+    if (serverGlobalParams.featureCompatibility.isVersionInitialized() &&
+        serverGlobalParams.featureCompatibility.getVersion() ==
+            ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo42) {
         auto opCtx = makeOpCtx();
         auto updateStatus = _storage->upgradeNonReplicatedUniqueIndexes(opCtx.get());
         if (!updateStatus.isOK()) {

@@ -241,8 +241,13 @@ StatusWith<CursorId> ClusterCursorManager::registerCursor(
         do {
             // The server has always generated positive values for CursorId (which is a signed
             // type), so we use std::abs() here on the prefix for consistency with this historical
-            // behavior.
-            containerPrefix = static_cast<uint32_t>(std::abs(_pseudoRandom.nextInt32()));
+            // behavior. If the random number generated is INT_MIN, calling std::abs on it is
+            // undefined behavior on 2's complement systems so we need to generate a new number.
+            int32_t randomNumber = 0;
+            do {
+                randomNumber = _pseudoRandom.nextInt32();
+            } while (randomNumber == std::numeric_limits<int32_t>::min());
+            containerPrefix = static_cast<uint32_t>(std::abs(randomNumber));
         } while (_cursorIdPrefixToNamespaceMap.count(containerPrefix) > 0);
         _cursorIdPrefixToNamespaceMap[containerPrefix] = nss;
 
@@ -567,7 +572,22 @@ void ClusterCursorManager::appendActiveSessions(LogicalSessionIdSet* lsids) cons
     }
 }
 
-std::vector<GenericCursor> ClusterCursorManager::getAllCursors() const {
+GenericCursor ClusterCursorManager::CursorEntry::cursorToGenericCursor(
+    CursorId cursorId, const NamespaceString& ns) const {
+    invariant(_cursor);
+    GenericCursor gc;
+    gc.setCursorId(cursorId);
+    gc.setNs(ns);
+    gc.setLsid(_cursor->getLsid());
+    gc.setNDocsReturned(_cursor->getNumReturnedSoFar());
+    gc.setTailable(_cursor->isTailable());
+    gc.setAwaitData(_cursor->isTailableAndAwaitData());
+    gc.setOriginatingCommand(_cursor->getOriginatingCommand());
+    gc.setNoCursorTimeout(getLifetimeType() == CursorLifetime::Immortal);
+    return gc;
+}
+
+std::vector<GenericCursor> ClusterCursorManager::getIdleCursors() const {
     std::vector<GenericCursor> cursors;
 
     stdx::lock_guard<stdx::mutex> lk(_mutex);
@@ -576,16 +596,13 @@ std::vector<GenericCursor> ClusterCursorManager::getAllCursors() const {
         for (const auto& cursorIdEntryPair : nsContainerPair.second.entryMap) {
             const CursorEntry& entry = cursorIdEntryPair.second;
 
-            if (entry.isKillPending()) {
-                // Don't include sessions for killed cursors.
+            if (entry.isKillPending() || entry.getOperationUsingCursor()) {
+                // Don't include sessions for killed or pinned cursors.
                 continue;
             }
 
-            cursors.emplace_back();
-            auto& gc = cursors.back();
-            gc.setId(cursorIdEntryPair.first);
-            gc.setNs(nsContainerPair.first);
-            gc.setLsid(entry.getLsid());
+            cursors.emplace_back(
+                entry.cursorToGenericCursor(cursorIdEntryPair.first, nsContainerPair.first));
         }
     }
 

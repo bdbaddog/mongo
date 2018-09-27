@@ -42,6 +42,7 @@
 #include "mongo/db/query/internal_plans.h"
 #include "mongo/db/repl/optime.h"
 #include "mongo/db/repl/replication_process.h"
+#include "mongo/db/s/sharding_statistics.h"
 #include "mongo/db/s/start_chunk_clone_request.h"
 #include "mongo/db/service_context.h"
 #include "mongo/executor/remote_command_request.h"
@@ -83,6 +84,20 @@ BSONObj createRequestWithSessionId(StringData commandName,
     builder.append("waitForSteadyOrDone", waitForSteadyOrDone);
     sessionId.append(&builder);
     return builder.obj();
+}
+
+bool shouldApplyOplogToSession(const repl::OplogEntry& oplog,
+                               const ChunkRange& range,
+                               const ShardKeyPattern& keyPattern) {
+    // Skip appending CRUD operations that don't pertain to the ChunkRange being migrated.
+    if (oplog.isCrudOpType()) {
+        auto shardKey = keyPattern.extractShardKeyFromDoc(oplog.getOperationToApply());
+        if (!range.containsKey(shardKey)) {
+            return false;
+        }
+    }
+
+    return true;
 }
 
 }  // namespace
@@ -266,9 +281,11 @@ Status MigrationChunkClonerSourceLegacy::awaitUntilCriticalSectionIsAppropriate(
         }
 
         if (res["ns"].str() != _args.getNss().ns() ||
-            res["from"].str() != _donorConnStr.toString() || !res["min"].isABSONObj() ||
-            res["min"].Obj().woCompare(_args.getMinKey()) != 0 || !res["max"].isABSONObj() ||
-            res["max"].Obj().woCompare(_args.getMaxKey()) != 0 ||
+            (res.hasField("fromShardId")
+                 ? (res["fromShardId"].str() != _args.getFromShardId().toString())
+                 : (res["from"].str() != _donorConnStr.toString())) ||
+            !res["min"].isABSONObj() || res["min"].Obj().woCompare(_args.getMinKey()) != 0 ||
+            !res["max"].isABSONObj() || res["max"].Obj().woCompare(_args.getMaxKey()) != 0 ||
             !_sessionId.matches(migrationSessionIdStatus.getValue())) {
             // This can happen when the destination aborted the migration and received another
             // recvChunk before this thread sees the transition to the abort state. This is
@@ -452,6 +469,7 @@ Status MigrationChunkClonerSourceLegacy::nextCloneBatch(OperationContext* opCtx,
             }
 
             arrBuilder->append(doc.value());
+            ShardingStatistics::get(opCtx).countDocsClonedOnDonor.addAndFetch(1);
         }
     }
 
@@ -669,17 +687,18 @@ void MigrationChunkClonerSourceLegacy::_xfer(OperationContext* opCtx,
 
 boost::optional<repl::OpTime> MigrationChunkClonerSourceLegacy::nextSessionMigrationBatch(
     OperationContext* opCtx, BSONArrayBuilder* arrBuilder) {
-    repl::OpTime opTimeToWait;
-
     if (!_sessionCatalogSource) {
         return boost::none;
     }
 
+    repl::OpTime opTimeToWaitIfWaitingForMajority;
+    const ChunkRange range(_args.getMinKey(), _args.getMaxKey());
+
     while (_sessionCatalogSource->hasMoreOplog()) {
         auto result = _sessionCatalogSource->getLastFetchedOplog();
 
-        if (!result.oplog) {
-            // Last fetched turned out empty, try to see if there are more
+        if (!result.oplog ||
+            !shouldApplyOplogToSession(result.oplog.get(), range, _shardKeyPattern)) {
             _sessionCatalogSource->fetchNextOplog(opCtx);
             continue;
         }
@@ -695,16 +714,17 @@ boost::optional<repl::OpTime> MigrationChunkClonerSourceLegacy::nextSessionMigra
         }
 
         arrBuilder->append(oplogDoc);
+
         _sessionCatalogSource->fetchNextOplog(opCtx);
 
         if (result.shouldWaitForMajority) {
-            if (opTimeToWait < newOpTime) {
-                opTimeToWait = newOpTime;
+            if (opTimeToWaitIfWaitingForMajority < newOpTime) {
+                opTimeToWaitIfWaitingForMajority = newOpTime;
             }
         }
     }
 
-    return boost::make_optional(opTimeToWait);
+    return boost::make_optional(opTimeToWaitIfWaitingForMajority);
 }
 
 }  // namespace mongo

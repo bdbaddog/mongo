@@ -284,7 +284,7 @@ BSONObj shouldRetryWrites(const BSONObj&, void* data) {
 }
 
 BSONObj shouldUseImplicitSessions(const BSONObj&, void* data) {
-    return BSON("" << true);
+    return BSON("" << shellGlobalParams.shouldUseImplicitSessions);
 }
 
 BSONObj interpreterVersion(const BSONObj& a, void* data) {
@@ -299,6 +299,10 @@ BSONObj fileExistsJS(const BSONObj& a, void*) {
     return BSON("" << fileExists(a.firstElement().valuestrsafe()));
 }
 
+BSONObj isInteractive(const BSONObj& a, void*) {
+    return BSON("" << shellGlobalParams.runShell);
+}
+
 void installShellUtils(Scope& scope) {
     scope.injectNative("getMemInfo", JSGetMemInfo);
     scope.injectNative("_replMonitorStats", replMonitorStats);
@@ -311,6 +315,7 @@ void installShellUtils(Scope& scope) {
     scope.injectNative("computeSHA256Block", computeSHA256Block);
     scope.injectNative("convertShardKeyToHashed", convertShardKeyToHashed);
     scope.injectNative("fileExists", fileExistsJS);
+    scope.injectNative("isInteractive", isInteractive);
 
 #ifndef MONGO_SAFE_SHELL
     // can't launch programs

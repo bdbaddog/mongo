@@ -42,6 +42,13 @@ var ElectionHandoffTest = (function() {
 
         jsTestLog("Stepping down primary...");
 
+        // Make sure all secondaries are ready before stepping down. We must additionally
+        // make sure that the primary is aware that the secondaries are ready and caught up
+        // to the primary's lastApplied, so we issue a dummy write and wait on its optime.
+        assert.writeOK(primary.getDB("test").secondariesMustBeCaughtUpToHere.insert(
+            {"a": 1}, {writeConcern: {w: rst.nodes.length}}));
+        rst.awaitNodesAgreeOnAppliedOpTime();
+
         // Step down the current primary.
         assert.adminCommandWorkedAllowingNetworkError(primary, {
             replSetStepDown: kStepDownPeriodSecs,
@@ -57,9 +64,8 @@ var ElectionHandoffTest = (function() {
 
         // If there are only two nodes in the set, verify that the old primary voted "yes".
         if (numNodes === 2) {
-            checkLog.contains(
-                expectedCandidate,
-                `VoteRequester(term ${term} dry run) received a yes vote from ${primary.host}`);
+            checkLog.contains(expectedCandidate,
+                              `skipping dry run and running for election in term ${term+1}`);
             checkLog.contains(
                 expectedCandidate,
                 `VoteRequester(term ${term+1}) received a yes vote from ${primary.host}`);

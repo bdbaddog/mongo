@@ -42,14 +42,16 @@ public:
      * Creates a new transformation stage from the given specification.
      */
     static boost::intrusive_ptr<DocumentSourceChangeStreamTransform> create(
-        const boost::intrusive_ptr<ExpressionContext>&, BSONObj changeStreamSpec);
+        const boost::intrusive_ptr<ExpressionContext>&,
+        const ServerGlobalParams::FeatureCompatibility::Version&,
+        BSONObj changeStreamSpec);
 
     Document applyTransformation(const Document& input);
     DepsTracker::State getDependencies(DepsTracker* deps) const final;
     DocumentSource::GetModPathsReturn getModifiedPaths() const final;
 
     Value serialize(boost::optional<ExplainOptions::Verbosity> explain) const;
-    DocumentSource::StageConstraints constraints(Pipeline::SplitState pipeState) const final;
+    StageConstraints constraints(Pipeline::SplitState pipeState) const final;
     DocumentSource::GetNextResult getNext();
     const char* getSourceName() const {
         return DocumentSourceChangeStream::kStageName.rawData();
@@ -57,7 +59,8 @@ public:
 
 private:
     // This constructor is private, callers should use the 'create()' method above.
-    DocumentSourceChangeStreamTransform(const boost::intrusive_ptr<ExpressionContext>& expCtx,
+    DocumentSourceChangeStreamTransform(const boost::intrusive_ptr<ExpressionContext>&,
+                                        const ServerGlobalParams::FeatureCompatibility::Version&,
                                         BSONObj changeStreamSpec);
 
     struct DocumentKeyCacheEntry {
@@ -146,6 +149,11 @@ private:
 
     // Set to true if this transformation stage can be run on the collectionless namespace.
     bool _isIndependentOfAnyCollection;
+
+    // '_fcv' is used to determine which version of the resume token to generate for each change.
+    // This is a snapshot of what the feature compatibility version was at the time the stream was
+    // opened or resumed.
+    ServerGlobalParams::FeatureCompatibility::Version _fcv;
 };
 
 }  // namespace mongo

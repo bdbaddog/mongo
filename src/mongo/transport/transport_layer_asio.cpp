@@ -86,13 +86,6 @@ public:
         _timer->cancel();
     }
 
-    Future<void> waitFor(Milliseconds timeout, const BatonHandle& baton = nullptr) override {
-        if (baton) {
-            return _asyncWait([&] { return baton->waitFor(*this, timeout); }, baton);
-        } else {
-            return _asyncWait([&] { _timer->expires_after(timeout.toSystemDuration()); });
-        }
-    }
 
     Future<void> waitUntil(Date_t expiration, const BatonHandle& baton = nullptr) override {
         if (baton) {
@@ -114,7 +107,7 @@ private:
             });
 
         } catch (asio::system_error& ex) {
-            return Future<void>::makeReady(errorCodeToStatus(ex.code()));
+            return futurize(ex.code());
         }
     }
 
@@ -538,34 +531,39 @@ Future<SessionHandle> TransportLayerASIO::asyncConnect(HostAndPort peer,
     }
 
     if (timeout > Milliseconds{0} && timeout < Milliseconds::max()) {
-        connector->timeoutTimer.waitFor(timeout).getAsync([connector](Status status) {
-            if (status == ErrorCodes::CallbackCanceled || connector->done.swap(true)) {
-                return;
-            }
+        connector->timeoutTimer.waitUntil(reactor->now() + timeout)
+            .getAsync([connector](Status status) {
+                if (status == ErrorCodes::CallbackCanceled || connector->done.swap(true)) {
+                    return;
+                }
 
-            connector->promise.setError(
-                makeConnectError({ErrorCodes::NetworkTimeout, "Connecting timed out"},
-                                 connector->peer,
-                                 connector->resolvedEndpoint));
+                connector->promise.setError(
+                    makeConnectError({ErrorCodes::NetworkTimeout, "Connecting timed out"},
+                                     connector->peer,
+                                     connector->resolvedEndpoint));
 
-            std::error_code ec;
-            stdx::lock_guard<stdx::mutex> lk(connector->mutex);
-            connector->resolver.cancel();
-            if (connector->session) {
-                connector->session->end();
-            } else {
-                connector->socket.cancel(ec);
-            }
-        });
+                std::error_code ec;
+                stdx::lock_guard<stdx::mutex> lk(connector->mutex);
+                connector->resolver.cancel();
+                if (connector->session) {
+                    connector->session->end();
+                } else {
+                    connector->socket.cancel(ec);
+                }
+            });
     }
 
     connector->resolver.asyncResolve(connector->peer, _listenerOptions.enableIPv6)
         .then([connector](WrappedResolver::EndpointVector results) {
-            stdx::unique_lock<stdx::mutex> lk(connector->mutex);
-            connector->resolvedEndpoint = results.front();
-            connector->socket.open(connector->resolvedEndpoint->protocol());
-            connector->socket.non_blocking(true);
-            lk.unlock();
+            try {
+                stdx::lock_guard<stdx::mutex> lk(connector->mutex);
+
+                connector->resolvedEndpoint = results.front();
+                connector->socket.open(connector->resolvedEndpoint->protocol());
+                connector->socket.non_blocking(true);
+            } catch (asio::system_error& ex) {
+                return futurize(ex.code());
+            }
 
             return connector->socket.async_connect(*connector->resolvedEndpoint, UseFuture{});
         })

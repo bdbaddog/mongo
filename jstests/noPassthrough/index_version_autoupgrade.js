@@ -109,13 +109,6 @@
         return coll;
     }, true);
 
-    // Test that the "repairDatabase" command doesn't upgrade existing indexes to the latest
-    // version.
-    testIndexVersionAutoUpgrades(function(coll) {
-        assert.commandWorked(coll.getDB().runCommand({repairDatabase: 1}));
-        return coll;
-    }, false);
-
     // Test that the "compact" command doesn't upgrade existing indexes to the latest version.
     testIndexVersionAutoUpgrades(function(coll) {
         var res = coll.getDB().runCommand({compact: coll.getName()});
@@ -129,16 +122,6 @@
         return coll;
     }, false);
 
-    // Test that the "copydb" command doesn't upgrade existing indexes to the latest version.
-    testIndexVersionAutoUpgrades(function(coll) {
-        assert.commandWorked(coll.getDB().adminCommand({
-            copydb: 1,
-            fromdb: coll.getDB().getName(),
-            todb: "copied",
-        }));
-        return coll.getDB().getSiblingDB("copied")[coll.getName()];
-    }, false);
-
     // Test that the "cloneCollection" command doesn't upgrade existing indexes to the latest
     // version.
     var cloneConn = MongoRunner.runMongod({});
@@ -148,19 +131,6 @@
         assert.commandWorked(cloneDB.runCommand({
             cloneCollection: coll.getFullName(),
             from: conn.host,
-        }));
-        return cloneDB[coll.getName()];
-    }, false);
-    MongoRunner.stopMongod(cloneConn);
-
-    // Test that the "clone" command doesn't upgrade existing indexes to the latest version.
-    cloneConn = MongoRunner.runMongod({});
-    assert.neq(null, cloneConn, "mongod was unable to start up");
-    testIndexVersionAutoUpgrades(function(coll) {
-        var cloneDB = cloneConn.getDB(coll.getDB().getName());
-        assert.commandWorked(cloneDB.runCommand({
-            clone: conn.host,
-            fromDB: coll.getDB().getName(),
         }));
         return cloneDB[coll.getName()];
     }, false);

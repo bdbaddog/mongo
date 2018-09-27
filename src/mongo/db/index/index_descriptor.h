@@ -33,7 +33,9 @@
 #include <set>
 #include <string>
 
+#include "mongo/db/catalog/index_catalog.h"
 #include "mongo/db/index/multikey_paths.h"
+#include "mongo/db/index_names.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/server_options.h"
 #include "mongo/util/assert_util.h"
@@ -42,7 +44,6 @@
 namespace mongo {
 
 class Collection;
-class IndexCatalog;
 class IndexCatalogEntry;
 class IndexCatalogEntryContainer;
 class OperationContext;
@@ -56,7 +57,7 @@ class OperationContext;
  */
 class IndexDescriptor {
 public:
-    enum class IndexVersion { kV0 = 0, kV1 = 1, kV2 = 2 };
+    enum class IndexVersion { kV1 = 1, kV2 = 2 };
     static constexpr IndexVersion kLatestIndexVersion = IndexVersion::kV2;
 
     static constexpr StringData k2dIndexBitsFieldName = "bits"_sd;
@@ -91,6 +92,7 @@ public:
     IndexDescriptor(Collection* collection, const std::string& accessMethodName, BSONObj infoObj)
         : _collection(collection),
           _accessMethodName(accessMethodName),
+          _indexType(IndexNames::nameToType(accessMethodName)),
           _infoObj(infoObj.getOwned()),
           _numFields(infoObj.getObjectField(IndexDescriptor::kKeyPatternFieldName).nFields()),
           _keyPattern(infoObj.getObjectField(IndexDescriptor::kKeyPatternFieldName).getOwned()),
@@ -104,11 +106,9 @@ public:
           _cachedEntry(NULL) {
         _indexNamespace = makeIndexNamespace(_parentNS, _indexName);
 
-        _version = IndexVersion::kV0;
         BSONElement e = _infoObj[IndexDescriptor::kIndexVersionFieldName];
-        if (e.isNumber()) {
-            _version = static_cast<IndexVersion>(e.numberInt());
-        }
+        fassert(50942, e.isNumber());
+        _version = static_cast<IndexVersion>(e.numberInt());
     }
 
 
@@ -191,6 +191,11 @@ public:
     // Return the name of the access method we must use to access this index's data.
     const std::string& getAccessMethodName() const {
         return _accessMethodName;
+    }
+
+    // Returns the type of the index associated with this descriptor.
+    IndexType getIndexType() const {
+        return _indexType;
     }
 
     //
@@ -279,6 +284,8 @@ private:
 
     // What access method should we use for this index?
     std::string _accessMethodName;
+
+    IndexType _indexType;
 
     // The BSONObj describing the index.  Accessed through the various members above.
     const BSONObj _infoObj;

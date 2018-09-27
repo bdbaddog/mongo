@@ -69,7 +69,6 @@ public:
     void doRestoreState() final;
     void doDetachFromOperationContext() final;
     void doReattachToOperationContext() final;
-    void doInvalidate(OperationContext* opCtx, const RecordId& dl, InvalidationType type) final;
 
     /**
      * ID Hack has a very strict criteria for the queries it supports.
@@ -113,12 +112,6 @@ private:
 
     // Do we need to add index key metadata for returnKey?
     bool _addKeyMetadata;
-
-    // If we want to return a RecordId and it points to something that's not in memory,
-    // we return a "please page this in" result. We add a RecordFetcher given back to us by the
-    // storage engine to the WSM. The RecordFetcher is used by the PlanExecutor when it handles
-    // the fetch request.
-    WorkingSetID _idBeingPagedIn;
 
     IDHackStats _specificStats;
 };

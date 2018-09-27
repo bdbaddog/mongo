@@ -38,7 +38,6 @@
 #include "mongo/db/exec/scoped_timer.h"
 #include "mongo/db/exec/working_set_computed_data.h"
 #include "mongo/db/index/index_access_method.h"
-#include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/query/index_bounds_builder.h"
 #include "mongo/stdx/memory.h"
 #include "mongo/util/log.h"
@@ -60,41 +59,36 @@ namespace mongo {
 const char* IndexScan::kStageType = "IXSCAN";
 
 IndexScan::IndexScan(OperationContext* opCtx,
-                     const IndexScanParams& params,
+                     IndexScanParams params,
                      WorkingSet* workingSet,
                      const MatchExpression* filter)
     : PlanStage(kStageType, opCtx),
       _workingSet(workingSet),
-      _iam(params.descriptor->getIndexCatalog()->getIndex(params.descriptor)),
-      _keyPattern(params.descriptor->keyPattern().getOwned()),
+      _iam(params.accessMethod),
+      _keyPattern(params.keyPattern.getOwned()),
       _scanState(INITIALIZING),
       _filter(filter),
       _shouldDedup(true),
       _forward(params.direction == 1),
-      _params(params),
-      _startKeyInclusive(IndexBounds::isStartIncludedInBound(params.bounds.boundInclusion)),
-      _endKeyInclusive(IndexBounds::isEndIncludedInBound(params.bounds.boundInclusion)) {
-    // We can't always access the descriptor in the call to getStats() so we pull
-    // any info we need for stats reporting out here.
+      _params(std::move(params)),
+      _startKeyInclusive(IndexBounds::isStartIncludedInBound(_params.bounds.boundInclusion)),
+      _endKeyInclusive(IndexBounds::isEndIncludedInBound(_params.bounds.boundInclusion)) {
+    _specificStats.indexName = _params.name;
     _specificStats.keyPattern = _keyPattern;
-    if (BSONElement collationElement = _params.descriptor->getInfoElement("collation")) {
-        invariant(collationElement.isABSONObj());
-        _specificStats.collation = collationElement.Obj().getOwned();
-    }
-    _specificStats.indexName = _params.descriptor->indexName();
-    _specificStats.isMultiKey = _params.descriptor->isMultikey(getOpCtx());
-    _specificStats.multiKeyPaths = _params.descriptor->getMultikeyPaths(getOpCtx());
-    _specificStats.isUnique = _params.descriptor->unique();
-    _specificStats.isSparse = _params.descriptor->isSparse();
-    _specificStats.isPartial = _params.descriptor->isPartial();
-    _specificStats.indexVersion = static_cast<int>(_params.descriptor->version());
+    _specificStats.isMultiKey = _params.isMultiKey;
+    _specificStats.multiKeyPaths = _params.multikeyPaths;
+    _specificStats.isUnique = _params.isUnique;
+    _specificStats.isSparse = _params.isSparse;
+    _specificStats.isPartial = _params.isPartial;
+    _specificStats.indexVersion = static_cast<int>(_params.version);
+    _specificStats.collation = _params.collation.getOwned();
 }
 
 boost::optional<IndexKeyEntry> IndexScan::initIndexScan() {
     if (_params.doNotDedup) {
         _shouldDedup = false;
     } else {
-        _shouldDedup = _params.descriptor->isMultikey(getOpCtx());
+        _shouldDedup = _params.isMultiKey;
     }
 
     // Perform the possibly heavy-duty initialization of the underlying index cursor.
@@ -155,7 +149,7 @@ PlanStage::StageState IndexScan::doWork(WorkingSetID* out) {
         // In debug mode, check that the cursor isn't lying to us.
         if (kDebugBuild && !_startKey.isEmpty()) {
             int cmp = kv->key.woCompare(_startKey,
-                                        Ordering::make(_params.descriptor->keyPattern()),
+                                        Ordering::make(_keyPattern),
                                         /*compareFieldNames*/ false);
             if (cmp == 0)
                 dassert(_startKeyInclusive);
@@ -164,7 +158,7 @@ PlanStage::StageState IndexScan::doWork(WorkingSetID* out) {
 
         if (kDebugBuild && !_endKey.isEmpty()) {
             int cmp = kv->key.woCompare(_endKey,
-                                        Ordering::make(_params.descriptor->keyPattern()),
+                                        Ordering::make(_keyPattern),
                                         /*compareFieldNames*/ false);
             if (cmp == 0)
                 dassert(_endKeyInclusive);
@@ -262,22 +256,6 @@ void IndexScan::doDetachFromOperationContext() {
 void IndexScan::doReattachToOperationContext() {
     if (_indexCursor)
         _indexCursor->reattachToOperationContext(getOpCtx());
-}
-
-void IndexScan::doInvalidate(OperationContext* opCtx, const RecordId& dl, InvalidationType type) {
-    // The only state we're responsible for holding is what RecordIds to drop.  If a document
-    // mutates the underlying index cursor will deal with it.
-    if (INVALIDATION_MUTATION == type) {
-        return;
-    }
-
-    // If we see this RecordId again, it may not be the same document it was before, so we want
-    // to return it if we see it again.
-    stdx::unordered_set<RecordId, RecordId::Hasher>::iterator it = _returned.find(dl);
-    if (it != _returned.end()) {
-        ++_specificStats.seenInvalidated;
-        _returned.erase(it);
-    }
 }
 
 std::unique_ptr<PlanStageStats> IndexScan::getStats() {

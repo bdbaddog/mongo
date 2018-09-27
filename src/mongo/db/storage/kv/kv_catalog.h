@@ -92,6 +92,8 @@ public:
 
     bool isUserDataIdent(StringData ident) const;
 
+    bool isCollectionIdent(StringData ident) const;
+
     FeatureTracker* getFeatureTracker() const {
         invariant(_featureTracker);
         return _featureTracker.get();
@@ -100,6 +102,14 @@ public:
     RecordStore* getRecordStore() {
         return _rs;
     }
+
+    /**
+     * Create an entry in the catalog for an orphaned collection found in the
+     * storage engine. Return the generated ns of the collection.
+     * Note that this function does not recreate the _id index on the collection because it does not
+     * have access to index catalog.
+     */
+    StatusWith<std::string> newOrphanedIdent(OperationContext* opCtx, std::string ident);
 
 private:
     class AddIdentChange;

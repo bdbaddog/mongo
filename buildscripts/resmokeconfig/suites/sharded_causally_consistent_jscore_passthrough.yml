@@ -15,15 +15,13 @@ selector:
   - jstests/core/apitest_db.js  # serverStatus output doesn't have storageEngine.
   - jstests/core/apitest_db_profile_level.js  # profiling.
   - jstests/core/apply_ops*.js  # applyOps, SERVER-1439.
-  - jstests/core/bypass_doc_validation.js  # copyDatabase
+  - jstests/core/bypass_doc_validation.js  # sharded $out output not permitted
   - jstests/core/capped*.js  # capped collections.
   - jstests/core/check_shard_index.js  # checkShardingIndex.
   - jstests/core/collection_truncate.js  # emptycapped.
   - jstests/core/compact_keeps_indexes.js  # compact.
   - jstests/core/currentop.js  # uses fsync.
-  - jstests/core/auth_copydb.js # copyDatabase.
   - jstests/core/collmod_without_uuid.js # applyOps, SERVER-1439
-  - jstests/core/copydb.js # copyDatabase.
   - jstests/core/dbadmin.js  # "local" database.
   - jstests/core/dbhash.js  # dbhash.
   - jstests/core/dbhash2.js  # dbhash.
@@ -33,17 +31,12 @@ selector:
   - jstests/core/fsync.js  # uses fsync.
   - jstests/core/geo_haystack*.js  # geoSearch.
   - jstests/core/geo_update_btree2.js  # notablescan.
-  - jstests/core/index_bigkeys_nofail.js  # failIndexKeyTooLong.
-  - jstests/core/index_bigkeys_validation.js  # failIndexKeyTooLong.
   - jstests/core/index_id_options.js  # "local" database.
   - jstests/core/index9.js  # "local" database.
   - jstests/core/mr_replaceIntoDB.js  # MapReduceResult, SERVER-20495.
   - jstests/core/profile*.js  # profiling.
   - jstests/core/queryoptimizera.js  # "local" database.
   - jstests/core/rename*.js # renameCollection.
-  - jstests/core/repair_database.js # repairDatabase
-  - jstests/core/repair_database_input_validation.js # repairDatabase
-  - jstests/core/repair_server12955.js # repairDatabase
   - jstests/core/stages*.js  # stageDebug.
   - jstests/core/tailable_cursor_invalidation.js # capped collections.
   - jstests/core/tailable_getmore_batch_size.js # capped collections.
@@ -60,7 +53,6 @@ selector:
   # additional hashed shard key indexes that are automatically added by this passthrough.
   - jstests/core/bad_index_plugin.js
   - jstests/core/create_indexes.js
-  - jstests/core/indexOtherNamespace.js
   - jstests/core/list_indexes_non_existent_ns.js
   - jstests/core/rename6.js
   # The following tests fail because they expect no databases to be created. However a DB is created
@@ -136,12 +128,9 @@ selector:
   - jstests/core/orf.js #explain.executionStats is not CC
   # The `dbstats` command builds in-memory structures that are not causally consistent.
   - jstests/core/dbstats.js
-  # TODO SERVER-33248: Remove this test from the blacklist. The secondary can get stuck without a
-  # sync source if the RestartCatalog command kills its oplog fetching cursor, which blocks
-  # secondary majority reads.
-  - jstests/core/restart_catalog.js
   exclude_with_any_tags:
   # Tests tagged with the following will fail because they assume collections are not sharded.
+  - assumes_against_mongod_not_mongos
   - assumes_no_implicit_collection_creation_after_drop
   - assumes_no_implicit_index_creation
   - assumes_unsharded_collection

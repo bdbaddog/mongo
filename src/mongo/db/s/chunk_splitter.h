@@ -75,9 +75,15 @@ public:
     void onStepDown();
 
     /**
+     * Blocks until all chunk split tasks in the underlying thread pool have
+     * completed (that is, until the thread pool is idle)
+     */
+    void waitForIdle();
+
+    /**
      * Schedules an autosplit task. This function throws on scheduling failure.
      */
-    void trySplitting(ChunkSplitStateDriver chunkSplitStateDriver,
+    void trySplitting(std::shared_ptr<ChunkSplitStateDriver> chunkSplitStateDriver,
                       const NamespaceString& nss,
                       const BSONObj& min,
                       const BSONObj& max,
@@ -92,7 +98,7 @@ private:
      * original owner. This optimization presumes that the user is doing writes with increasing or
      * decreasing shard key values.
      */
-    void _runAutosplit(ChunkSplitStateDriver chunkSplitStateDriver,
+    void _runAutosplit(std::shared_ptr<ChunkSplitStateDriver> chunkSplitStateDriver,
                        const NamespaceString& nss,
                        const BSONObj& min,
                        const BSONObj& max,

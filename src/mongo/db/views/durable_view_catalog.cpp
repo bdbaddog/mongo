@@ -95,12 +95,13 @@ Status DurableViewCatalogImpl::iterate(OperationContext* opCtx, Callback callbac
         }
 
         const auto viewName = viewDef["_id"].str();
-        const auto collectionNameIsValid = NamespaceString::validCollectionComponent(viewName);
-        valid &= collectionNameIsValid;
+        const auto viewNameIsValid = NamespaceString::validCollectionComponent(viewName) &&
+            NamespaceString::validDBName(nsToDatabaseSubstring(viewName));
+        valid &= viewNameIsValid;
 
         // Only perform validation via NamespaceString if the collection name has been determined to
         // be valid. If not valid then the NamespaceString constructor will uassert.
-        if (collectionNameIsValid) {
+        if (viewNameIsValid) {
             NamespaceString viewNss(viewName);
             valid &= viewNss.isValid() && viewNss.db() == _db->name();
         }
@@ -144,13 +145,12 @@ void DurableViewCatalogImpl::upsert(OperationContext* opCtx,
     RecordId id = Helpers::findOne(opCtx, systemViews, BSON("_id" << name.ns()), requireIndex);
 
     Snapshotted<BSONObj> oldView;
-    if (!id.isNormal() || !systemViews->findDoc(opCtx, id, &oldView)) {
+    if (!id.isValid() || !systemViews->findDoc(opCtx, id, &oldView)) {
         LOG(2) << "insert view " << view << " into " << _db->getSystemViewsName();
         uassertStatusOK(
             systemViews->insertDocument(opCtx, InsertStatement(view), &CurOp::get(opCtx)->debug()));
     } else {
-        OplogUpdateEntryArgs args;
-        args.nss = systemViewsNs;
+        CollectionUpdateArgs args;
         args.update = view;
         args.criteria = BSON("_id" << name.ns());
         args.fromMigrate = false;
@@ -168,7 +168,7 @@ void DurableViewCatalogImpl::remove(OperationContext* opCtx, const NamespaceStri
         return;
     const bool requireIndex = false;
     RecordId id = Helpers::findOne(opCtx, systemViews, BSON("_id" << name.ns()), requireIndex);
-    if (!id.isNormal())
+    if (!id.isValid())
         return;
 
     LOG(2) << "remove view " << name << " from " << _db->getSystemViewsName();

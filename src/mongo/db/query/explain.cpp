@@ -51,6 +51,7 @@
 #include "mongo/db/query/stage_builder.h"
 #include "mongo/db/server_options.h"
 #include "mongo/db/server_parameters.h"
+#include "mongo/util/hex.h"
 #include "mongo/util/mongoutils/str.h"
 #include "mongo/util/net/socket_utils.h"
 #include "mongo/util/version.h"
@@ -329,7 +330,6 @@ void Explain::statsToBSON(const PlanStageStats& stats,
         bob->appendNumber("saveState", stats.common.yields);
         bob->appendNumber("restoreState", stats.common.unyields);
         bob->appendNumber("isEOF", stats.common.isEOF);
-        bob->appendNumber("invalidates", stats.common.invalidates);
     }
 
     // Stage-specific stats
@@ -340,8 +340,6 @@ void Explain::statsToBSON(const PlanStageStats& stats,
             bob->appendNumber("memUsage", spec->memUsage);
             bob->appendNumber("memLimit", spec->memLimit);
 
-            bob->appendNumber("flaggedButPassed", spec->flaggedButPassed);
-            bob->appendNumber("flaggedInProgress", spec->flaggedInProgress);
             for (size_t i = 0; i < spec->mapAfterChild.size(); ++i) {
                 bob->appendNumber(string(stream() << "mapAfterChild_" << i),
                                   spec->mapAfterChild[i]);
@@ -351,7 +349,6 @@ void Explain::statsToBSON(const PlanStageStats& stats,
         AndSortedStats* spec = static_cast<AndSortedStats*>(stats.specific.get());
 
         if (verbosity >= ExplainOptions::Verbosity::kExecStats) {
-            bob->appendNumber("flagged", spec->flagged);
             for (size_t i = 0; i < spec->failedAnd.size(); ++i) {
                 bob->appendNumber(string(stream() << "failedAnd_" << i), spec->failedAnd[i]);
             }
@@ -404,7 +401,6 @@ void Explain::statsToBSON(const PlanStageStats& stats,
 
         if (verbosity >= ExplainOptions::Verbosity::kExecStats) {
             bob->appendNumber("nWouldDelete", spec->docsDeleted);
-            bob->appendNumber("nInvalidateSkips", spec->nInvalidateSkips);
         }
     } else if (STAGE_DISTINCT_SCAN == stats.stageType) {
         DistinctScanStats* spec = static_cast<DistinctScanStats*>(stats.specific.get());
@@ -506,7 +502,6 @@ void Explain::statsToBSON(const PlanStageStats& stats,
             bob->appendNumber("seeks", spec->seeks);
             bob->appendNumber("dupsTested", spec->dupsTested);
             bob->appendNumber("dupsDropped", spec->dupsDropped);
-            bob->appendNumber("seenInvalidated", spec->seenInvalidated);
         }
     } else if (STAGE_OR == stats.stageType) {
         OrStats* spec = static_cast<OrStats*>(stats.specific.get());
@@ -514,7 +509,6 @@ void Explain::statsToBSON(const PlanStageStats& stats,
         if (verbosity >= ExplainOptions::Verbosity::kExecStats) {
             bob->appendNumber("dupsTested", spec->dupsTested);
             bob->appendNumber("dupsDropped", spec->dupsDropped);
-            bob->appendNumber("recordIdsForgotten", spec->recordIdsForgotten);
         }
     } else if (STAGE_LIMIT == stats.stageType) {
         LimitStats* spec = static_cast<LimitStats*>(stats.specific.get());
@@ -576,7 +570,6 @@ void Explain::statsToBSON(const PlanStageStats& stats,
         if (verbosity >= ExplainOptions::Verbosity::kExecStats) {
             bob->appendNumber("nMatched", spec->nMatched);
             bob->appendNumber("nWouldModify", spec->nModified);
-            bob->appendNumber("nInvalidateSkips", spec->nInvalidateSkips);
             bob->appendBool("wouldInsert", spec->inserted);
             bob->appendBool("fastmodinsert", spec->fastmodinsert);
         }
@@ -649,11 +642,13 @@ void Explain::generatePlannerInfo(PlanExecutor* exec,
     // Find whether there is an index filter set for the query shape. The 'indexFilterSet'
     // field will always be false in the case of EOF or idhack plans.
     bool indexFilterSet = false;
+    boost::optional<uint32_t> queryHash;
     if (collection && exec->getCanonicalQuery()) {
         const CollectionInfoCache* infoCache = collection->infoCache();
         const QuerySettings* querySettings = infoCache->getQuerySettings();
         PlanCacheKey planCacheKey =
             infoCache->getPlanCache()->computeKey(*exec->getCanonicalQuery());
+        queryHash = PlanCache::computeQueryHash(planCacheKey);
         if (auto allowedIndicesFilter = querySettings->getAllowedIndicesFilter(planCacheKey)) {
             // Found an index filter set on the query shape.
             indexFilterSet = true;
@@ -672,6 +667,10 @@ void Explain::generatePlannerInfo(PlanExecutor* exec,
         if (query->getCollator()) {
             plannerBob.append("collation", query->getCollator()->getSpec().toBSON());
         }
+    }
+
+    if (queryHash) {
+        plannerBob.append("queryHash", unsignedIntToFixedLengthHex(*queryHash));
     }
 
     BSONObjBuilder winningPlanBob(plannerBob.subobjStart("winningPlan"));
@@ -986,6 +985,46 @@ void Explain::getSummaryStats(const PlanExecutor& exec, PlanSummaryStats* statsO
             statsOut->fromMultiPlanner = true;
         }
     }
+}
+
+void Explain::planCacheEntryToBSON(const PlanCacheEntry& entry, BSONObjBuilder* out) {
+    BSONObjBuilder shapeBuilder(out->subobjStart("createdFromQuery"));
+    shapeBuilder.append("query", entry.query);
+    shapeBuilder.append("sort", entry.sort);
+    shapeBuilder.append("projection", entry.projection);
+    if (!entry.collation.isEmpty()) {
+        shapeBuilder.append("collation", entry.collation);
+    }
+    shapeBuilder.doneFast();
+    out->append("queryHash", unsignedIntToFixedLengthHex(entry.queryHash));
+
+    // Append whether or not the entry is active.
+    out->append("isActive", entry.isActive);
+    out->append("works", static_cast<long long>(entry.works));
+
+    BSONObjBuilder cachedPlanBob(out->subobjStart("cachedPlan"));
+    Explain::statsToBSON(
+        *entry.decision->stats[0], &cachedPlanBob, ExplainOptions::Verbosity::kQueryPlanner);
+    cachedPlanBob.doneFast();
+
+    out->append("timeOfCreation", entry.timeOfCreation);
+
+    BSONArrayBuilder creationBuilder(out->subarrayStart("creationExecStats"));
+    for (auto&& stat : entry.decision->stats) {
+        BSONObjBuilder planBob(creationBuilder.subobjStart());
+        Explain::generateSinglePlanExecutionInfo(
+            stat.get(), ExplainOptions::Verbosity::kExecAllPlans, boost::none, &planBob);
+        planBob.doneFast();
+    }
+    creationBuilder.doneFast();
+
+    BSONArrayBuilder scoresBuilder(out->subarrayStart("candidatePlanScores"));
+    for (double score : entry.decision->scores) {
+        scoresBuilder.append(score);
+    }
+    scoresBuilder.doneFast();
+
+    out->append("indexFilterSet", entry.plannerData[0]->indexFilterApplied);
 }
 
 }  // namespace mongo

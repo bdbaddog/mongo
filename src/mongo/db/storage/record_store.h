@@ -37,7 +37,6 @@
 #include "mongo/db/exec/collection_scan_common.h"
 #include "mongo/db/record_id.h"
 #include "mongo/db/storage/record_data.h"
-#include "mongo/db/storage/record_fetcher.h"
 
 namespace mongo {
 
@@ -48,7 +47,6 @@ struct CompactStats;
 class MAdvise;
 class NamespaceDetails;
 class OperationContext;
-class RecordFetcher;
 
 class RecordStoreCompactAdaptor;
 class RecordStore;
@@ -70,16 +68,6 @@ public:
 protected:
     // Can't delete through base pointer.
     ~DocWriter() = default;
-};
-
-/**
- * @see RecordStore::updateRecord
- */
-class UpdateNotifier {
-public:
-    virtual ~UpdateNotifier() {}
-    virtual Status recordStoreGoingToUpdateInPlace(OperationContext* opCtx,
-                                                   const RecordId& loc) = 0;
 };
 
 /**
@@ -109,12 +97,12 @@ enum ValidateCmdLevel : int {
  * inside that context. Any cursor acquired inside a transaction is invalid outside
  * of that transaction, instead use the save and restore methods to reestablish the cursor.
  *
- * Any method other than invalidate and the save methods may throw WriteConflictException. If
- * that happens, the cursor may not be used again until it has been saved and successfully
- * restored. If next() or restore() throw a WCE the cursor's position will be the same as before
- * the call (strong exception guarantee). All other methods leave the cursor in a valid state
- * but with an unspecified position (basic exception guarantee). If any exception other than
- * WCE is thrown, the cursor must be destroyed, which is guaranteed not to leak any resources.
+ * Any method other than the save method may throw WriteConflictException. If that happens, the
+ * cursor may not be used again until it has been saved and successfully restored. If next() or
+ * restore() throw a WCE the cursor's position will be the same as before the call (strong exception
+ * guarantee). All other methods leave the cursor in a valid state but with an unspecified position
+ * (basic exception guarantee). If any exception other than WCE is thrown, the cursor must be
+ * destroyed, which is guaranteed not to leak any resources.
  *
  * Any returned unowned BSON is only valid until the next call to any method on this
  * interface.
@@ -193,36 +181,6 @@ public:
      * "saved" state, so callers must still call restoreState to use this object.
      */
     virtual void reattachToOperationContext(OperationContext* opCtx) = 0;
-
-    /**
-     * Inform the cursor that this id is being invalidated. Must be called between save and restore.
-     * The opCtx is that of the operation causing the invalidation, not the opCtx using the cursor.
-     *
-     * WARNING: Storage engines other than MMAPv1 should use the default implementation,
-     *          and not depend on this being called.
-     */
-    virtual void invalidate(OperationContext* opCtx, const RecordId& id) {}
-
-    //
-    // RecordFetchers
-    //
-    // Storage engines which do not support document-level locking hold locks at collection or
-    // database granularity. As an optimization, these locks can be yielded when a record needs
-    // to be fetched from secondary storage. If this method returns non-NULL, then it indicates
-    // that the query system layer should yield its locks, following the protocol defined by the
-    // RecordFetcher class, so that a potential page fault is triggered out of the lock.
-    //
-    // Storage engines which support document-level locking need not implement this.
-    //
-    // TODO see if these can be replaced by WriteConflictException.
-    //
-
-    /**
-     * Returns a RecordFetcher if needed for a call to next() or none if unneeded.
-     */
-    virtual std::unique_ptr<RecordFetcher> fetcherForNext() const {
-        return {};
-    }
 };
 
 /**
@@ -256,13 +214,6 @@ public:
      */
     virtual void saveUnpositioned() {
         save();
-    }
-
-    /**
-     * Returns a RecordFetcher if needed to fetch the provided Record or none if unneeded.
-     */
-    virtual std::unique_ptr<RecordFetcher> fetcherForId(const RecordId& id) const {
-        return {};
     }
 };
 
@@ -419,15 +370,13 @@ public:
     }
 
     /**
-     * @param notifier - Only used by record stores which do not support doc-locking. Called only
-     *                   in the case of an in-place update. Called just before the in-place write
-     *                   occurs.
+     * Updates the record with id 'recordId', replacing its contents with those described by
+     * 'data' and 'len'.
      */
     virtual Status updateRecord(OperationContext* opCtx,
-                                const RecordId& oldLocation,
+                                const RecordId& recordId,
                                 const char* data,
-                                int len,
-                                UpdateNotifier* notifier) = 0;
+                                int len) = 0;
 
     /**
      * @return Returns 'false' if this record store does not implement

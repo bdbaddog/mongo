@@ -272,10 +272,11 @@ public:
     SSLConnectionInterface* accept(Socket* socket, const char* initialBytes, int len) final;
 
     SSLPeerInfo parseAndValidatePeerCertificateDeprecated(const SSLConnectionInterface* conn,
-                                                          const std::string& remoteHost) final;
+                                                          const std::string& remoteHost,
+                                                          const HostAndPort& hostForLogging) final;
 
     StatusWith<boost::optional<SSLPeerInfo>> parseAndValidatePeerCertificate(
-        PCtxtHandle ssl, const std::string& remoteHost) final;
+        PCtxtHandle ssl, const std::string& remoteHost, const HostAndPort& hostForLogging) final;
 
 
     const SSLConfiguration& getSSLConfiguration() const final {
@@ -297,7 +298,15 @@ private:
                                 SSLX509Name* subjectName,
                                 Date_t* serverCertificateExpirationDate);
 
-    Status _initChainEngines(bool hasCAFile);
+    struct CAEngine {
+        CERT_CHAIN_ENGINE_CONFIG machineConfig;
+        UniqueCertChainEngine machine;
+        CERT_CHAIN_ENGINE_CONFIG userConfig;
+        UniqueCertChainEngine user;
+        UniqueCertStore CAstore;
+    };
+
+    Status _initChainEngines(CAEngine* engine);
 
 private:
     bool _weakValidation;
@@ -314,17 +323,21 @@ private:
     std::array<PCCERT_CONTEXT, 1> _clientCertificates;
     std::array<PCCERT_CONTEXT, 1> _serverCertificates;
 
+    /* _clientEngine represents the CA to use when acting as a client
+     * and validating remotes during outbound connections.
+     * This comes from, in order, --tlsCAFile, or the system CA.
+     */
+    CAEngine _clientEngine;
+
+    /* _serverEngine represents the CA to use when acting as a server
+     * and validating remotes during inbound connections.
+     * This comes from --tlsClusterCAFile, if available,
+     * otherwise it inherits from _clientEngine.
+     */
+    CAEngine _serverEngine;
+
     UniqueCertificate _sslCertificate;
     UniqueCertificate _sslClusterCertificate;
-
-    UniqueCertStore _certStore;
-
-    std::array<HCERTSTORE, 1> _additionalCertStores;
-    CERT_CHAIN_ENGINE_CONFIG _chainEngineConfigMachine;
-    UniqueCertChainEngine _chainEngineMachine;
-
-    CERT_CHAIN_ENGINE_CONFIG _chainEngineConfigUser;
-    UniqueCertChainEngine _chainEngineUser;
 };
 
 MONGO_INITIALIZER(SSLManager)(InitializerContext*) {
@@ -411,7 +424,8 @@ SSLManagerWindows::SSLManagerWindows(const SSLParams& params, bool isServer)
             CertificateExpirationMonitor(_sslConfiguration.serverCertificateExpirationDate);
     }
 
-    uassertStatusOK(_initChainEngines(!params.sslCAFile.empty()));
+    uassertStatusOK(_initChainEngines(&_serverEngine));
+    uassertStatusOK(_initChainEngines(&_clientEngine));
 }
 
 StatusWith<UniqueCertChainEngine> initChainEngine(CERT_CHAIN_ENGINE_CONFIG* chainEngineConfig,
@@ -439,23 +453,23 @@ StatusWith<UniqueCertChainEngine> initChainEngine(CERT_CHAIN_ENGINE_CONFIG* chai
     return {chainEngine};
 }
 
-Status SSLManagerWindows::_initChainEngines(bool hasCAFile) {
-    auto swMachine =
-        initChainEngine(&_chainEngineConfigMachine, _certStore, CERT_CHAIN_USE_LOCAL_MACHINE_STORE);
+Status SSLManagerWindows::_initChainEngines(CAEngine* engine) {
+    auto swMachine = initChainEngine(
+        &engine->machineConfig, engine->CAstore, CERT_CHAIN_USE_LOCAL_MACHINE_STORE);
 
     if (!swMachine.isOK()) {
         return swMachine.getStatus();
     }
 
-    _chainEngineMachine = std::move(swMachine.getValue());
+    engine->machine = std::move(swMachine.getValue());
 
-    auto swUser = initChainEngine(&_chainEngineConfigUser, _certStore, 0);
+    auto swUser = initChainEngine(&engine->userConfig, engine->CAstore, 0);
 
     if (!swUser.isOK()) {
         return swUser.getStatus();
     }
 
-    _chainEngineUser = std::move(swUser.getValue());
+    engine->user = std::move(swUser.getValue());
 
     return Status::OK();
 }
@@ -1180,7 +1194,18 @@ Status SSLManagerWindows::_loadCertificates(const SSLParams& params) {
             return swChain.getStatus();
         }
 
-        _certStore = std::move(swChain.getValue());
+        _clientEngine.CAstore = std::move(swChain.getValue());
+    }
+
+    const auto serverCAFile =
+        params.sslClusterCAFile.empty() ? params.sslCAFile : params.sslClusterCAFile;
+    if (!serverCAFile.empty()) {
+        auto swChain = readCertChains(serverCAFile, params.sslCRLFile);
+        if (!swChain.isOK()) {
+            return swChain.getStatus();
+        }
+
+        _serverEngine.CAstore = std::move(swChain.getValue());
     }
 
     if (hasCertificateSelector(params.sslCertificateSelector)) {
@@ -1228,7 +1253,6 @@ Status SSLManagerWindows::initSSLContext(SCHANNEL_CRED* cred,
     cred->dwVersion = SCHANNEL_CRED_VERSION;
     cred->dwFlags = SCH_USE_STRONG_CRYPTO;  // Use strong crypto;
 
-    cred->hRootStore = _certStore;
 
     uint32_t supportedProtocols = 0;
 
@@ -1236,6 +1260,7 @@ Status SSLManagerWindows::initSSLContext(SCHANNEL_CRED* cred,
         supportedProtocols = SP_PROT_TLS1_SERVER | SP_PROT_TLS1_0_SERVER | SP_PROT_TLS1_1_SERVER |
             SP_PROT_TLS1_2_SERVER;
 
+        cred->hRootStore = _serverEngine.CAstore;
         cred->dwFlags = cred->dwFlags          // flags
             | SCH_CRED_REVOCATION_CHECK_CHAIN  // Check certificate revocation
             | SCH_CRED_SNI_CREDENTIAL          // Pass along SNI creds
@@ -1246,6 +1271,7 @@ Status SSLManagerWindows::initSSLContext(SCHANNEL_CRED* cred,
         supportedProtocols = SP_PROT_TLS1_CLIENT | SP_PROT_TLS1_0_CLIENT | SP_PROT_TLS1_1_CLIENT |
             SP_PROT_TLS1_2_CLIENT;
 
+        cred->hRootStore = _clientEngine.CAstore;
         cred->dwFlags = cred->dwFlags           // Flags
             | SCH_CRED_REVOCATION_CHECK_CHAIN   // Check certificate revocation
             | SCH_CRED_NO_SERVERNAME_CHECK      // Do not validate server name against cert
@@ -1276,7 +1302,7 @@ Status SSLManagerWindows::initSSLContext(SCHANNEL_CRED* cred,
     }
 
     if (direction == ConnectionDirection::kOutgoing) {
-        if (_clientCertificates[0]) {
+        if (_clientCertificates[0] && !params.tlsWithholdClientCertificate) {
             cred->cCreds = 1;
             cred->paCred = _clientCertificates.data();
         }
@@ -1457,11 +1483,14 @@ Status SSLManagerWindows::_validateCertificate(PCCERT_CONTEXT cert,
 }
 
 SSLPeerInfo SSLManagerWindows::parseAndValidatePeerCertificateDeprecated(
-    const SSLConnectionInterface* conn, const std::string& remoteHost) {
+    const SSLConnectionInterface* conn,
+    const std::string& remoteHost,
+    const HostAndPort& hostForLogging) {
     auto swPeerSubjectName = parseAndValidatePeerCertificate(
         const_cast<SSLConnectionWindows*>(static_cast<const SSLConnectionWindows*>(conn))
             ->_engine.native_handle(),
-        remoteHost);
+        remoteHost,
+        hostForLogging);
     // We can't use uassertStatusOK here because we need to throw a SocketException.
     if (!swPeerSubjectName.isOK()) {
         throwSocketError(SocketErrorKind::CONNECT_ERROR, swPeerSubjectName.getStatus().reason());
@@ -1632,7 +1661,7 @@ Status validatePeerCertificate(const std::string& remoteHost,
     return Status::OK();
 }
 
-Status recordTLSVersion(PCtxtHandle ssl) {
+StatusWith<TLSVersion> mapTLSVersion(PCtxtHandle ssl) {
     SecPkgContext_ConnectionInfo connInfo;
 
     SECURITY_STATUS ss = QueryContextAttributes(ssl, SECPKG_ATTR_CONNECTION_INFO, &connInfo);
@@ -1643,36 +1672,31 @@ Status recordTLSVersion(PCtxtHandle ssl) {
                                     << ss);
     }
 
-    auto& counts = mongo::TLSVersionCounts::get(getGlobalServiceContext());
     switch (connInfo.dwProtocol) {
         case SP_PROT_TLS1_CLIENT:
         case SP_PROT_TLS1_SERVER:
-            counts.tls10.addAndFetch(1);
-            break;
+            return TLSVersion::kTLS10;
         case SP_PROT_TLS1_1_CLIENT:
         case SP_PROT_TLS1_1_SERVER:
-            counts.tls11.addAndFetch(1);
-            break;
+            return TLSVersion::kTLS11;
         case SP_PROT_TLS1_2_CLIENT:
         case SP_PROT_TLS1_2_SERVER:
-            counts.tls12.addAndFetch(1);
-            break;
+            return TLSVersion::kTLS12;
         default:
-            // Do nothing
-            break;
+            return TLSVersion::kUnknown;
     }
-
-    return Status::OK();
 }
 
 StatusWith<boost::optional<SSLPeerInfo>> SSLManagerWindows::parseAndValidatePeerCertificate(
-    PCtxtHandle ssl, const std::string& remoteHost) {
+    PCtxtHandle ssl, const std::string& remoteHost, const HostAndPort& hostForLogging) {
     PCCERT_CONTEXT cert;
 
-    auto countStatus = recordTLSVersion(ssl);
-    if (!countStatus.isOK()) {
-        return countStatus;
+    auto tlsVersionStatus = mapTLSVersion(ssl);
+    if (!tlsVersionStatus.isOK()) {
+        return tlsVersionStatus.getStatus();
     }
+
+    recordTLSVersion(tlsVersionStatus.getValue(), hostForLogging);
 
     if (!_sslConfiguration.hasCA && isSSLServer)
         return {boost::none};
@@ -1702,10 +1726,12 @@ StatusWith<boost::optional<SSLPeerInfo>> SSLManagerWindows::parseAndValidatePeer
     UniqueCertificate certHolder(cert);
     SSLX509Name peerSubjectName;
 
+    auto* engine = remoteHost.empty() ? &_serverEngine : &_clientEngine;
+
     // Validate against the local machine store first since it is easier to manage programmatically.
     Status validateCertMachine = validatePeerCertificate(remoteHost,
                                                          certHolder.get(),
-                                                         _chainEngineMachine,
+                                                         engine->machine,
                                                          _allowInvalidCertificates,
                                                          _allowInvalidHostnames,
                                                          &peerSubjectName);
@@ -1714,7 +1740,7 @@ StatusWith<boost::optional<SSLPeerInfo>> SSLManagerWindows::parseAndValidatePeer
         // manage.
         Status validateCertUser = validatePeerCertificate(remoteHost,
                                                           certHolder.get(),
-                                                          _chainEngineUser,
+                                                          engine->user,
                                                           _allowInvalidCertificates,
                                                           _allowInvalidHostnames,
                                                           &peerSubjectName);

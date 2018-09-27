@@ -36,7 +36,6 @@
 #include "mongo/stdx/memory.h"
 #include "mongo/unittest/unittest.h"
 
-
 namespace mongo {
 namespace biggie {
 namespace {

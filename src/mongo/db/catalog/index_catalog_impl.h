@@ -269,12 +269,10 @@ public:
 
     /**
      * disk creation order
-     * 1) system.indexes entry
-     * 2) collection's NamespaceDetails
+     * 1) collection's NamespaceDetails
      *    a) info + head
      *    b) _indexBuildsInProgress++
-     * 3) indexes entry in .ns file
-     * 4) system.namespaces entry for index ns
+     * 2) indexes entry in .ns file
      */
     class IndexBuildBlock {
         MONGO_DISALLOW_COPYING(IndexBuildBlock);
@@ -351,15 +349,9 @@ public:
                        bool noWarn,
                        int64_t* keysDeletedOut) override;
 
-    // ------- temp internal -------
-
-    inline std::string getAccessMethodName(OperationContext* opCtx,
-                                           const BSONObj& keyPattern) override {
-        return _getAccessMethodName(opCtx, keyPattern);
+    inline std::string getAccessMethodName(const BSONObj& keyPattern) override {
+        return _getAccessMethodName(keyPattern);
     }
-
-    Status _upgradeDatabaseMinorVersionIfNeeded(OperationContext* opCtx,
-                                                const std::string& newPluginName) override;
 
     // public static helpers
 
@@ -376,14 +368,13 @@ public:
 private:
     static const BSONObj _idObj;  // { _id : 1 }
 
-    bool _shouldOverridePlugin(OperationContext* opCtx, const BSONObj& keyPattern) const;
-
     /**
-     * This differs from IndexNames::findPluginName in that returns the plugin name we *should*
-     * use, not the plugin name inside of the provided key pattern.  To understand when these
-     * differ, see shouldOverridePlugin.
+     * In addition to IndexNames::findPluginName, validates that it is a known index type.
+     * If all you need is to check for a certain type, just use IndexNames::findPluginName.
+     *
+     * Uasserts if the index type is unknown.
      */
-    std::string _getAccessMethodName(OperationContext* opCtx, const BSONObj& keyPattern) const;
+    std::string _getAccessMethodName(const BSONObj& keyPattern) const;
 
     void _checkMagic() const;
 

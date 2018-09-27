@@ -1,0 +1,66 @@
+# Copyright (C) 2018 MongoDB Inc.
+#
+# This program is free software: you can redistribute it and/or  modify
+# it under the terms of the GNU Affero General Public License, version 3,
+# as published by the Free Software Foundation.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+#
+global:
+    cpp_namespace: "mongo"
+
+imports:
+    - "mongo/idl/basic_types.idl"
+    - "mongo/s/sharding_types.idl"
+
+structs:
+    CommitParticipant:
+        description: "Describes a shard participant in a transaction commit"
+        fields:
+            shardId:
+                description: "The id of the shard"
+                type: shard_id
+
+commands:
+    prepareTransaction:
+        description: "Parser for the 'prepareTransaction' command."
+        strict: true
+        namespace: ignored
+        fields:
+            coordinatorId:
+                description: "The coordinator shard for this transaction."
+                type: shard_id
+
+    voteCommitTransaction:
+        description: "Parser for the 'voteCommitTransaction' command."
+        namespace: ignored
+        fields:
+            shardId:
+                description: "The shard name of the sender"
+                type: shard_id
+            prepareTimestamp:
+                description: "Timestamp at which the sender prepared the transaction"
+                type: timestamp
+
+    voteAbortTransaction:
+        description: "Parser for the 'voteAbortTransaction' command."
+        namespace: ignored
+        fields:
+            shardId:
+                description: "The shard name of the sender"
+                type: shard_id
+
+    coordinateCommitTransaction:
+        description: "Parser for the 'coordinateCommitTransaction' command."
+        strict: false
+        namespace: ignored
+        fields:
+            participants:
+                description: "An array of shard participants that must be included in the commit."
+                type: array<CommitParticipant>

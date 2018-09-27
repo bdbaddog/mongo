@@ -40,6 +40,12 @@ DBCollection.prototype.help = function() {
         ".count( query = {}, <optional params> ) - count the number of documents that matches the query, optional parameters are: limit, skip, hint, maxTimeMS");
     print(
         "\tdb." + shortName +
+        ".countDocuments( query = {}, <optional params> ) - count the number of documents that matches the query, optional parameters are: limit, skip, hint, maxTimeMS");
+    print(
+        "\tdb." + shortName +
+        ".estimatedDocumentCount( <optional params> ) - estimate the document count using collection metadata, optional parameters are: maxTimeMS");
+    print(
+        "\tdb." + shortName +
         ".copyTo(newColl) - duplicates collection by copying all documents to newColl; no indexes are copied.");
     print("\tdb." + shortName + ".convertToCapped(maxBytes) - calls {convertToCapped:'" +
           shortName + "', size:maxBytes}} command");
@@ -412,7 +418,7 @@ DBCollection.prototype.remove = function(t, justOne) {
                 result = ex;
             } else {
                 // Other exceptions thrown
-                throw Error(ex);
+                throw ex;
             }
         }
     } else {
@@ -528,7 +534,7 @@ DBCollection.prototype.update = function(query, obj, upsert, multi) {
                 result = ex;
             } else {
                 // Other exceptions thrown
-                throw Error(ex);
+                throw ex;
             }
         }
     } else {
@@ -635,27 +641,10 @@ DBCollection.prototype.createIndexes = function(keys, options) {
         indexSpecs[i] = this._indexSpec(keys[i], options);
     }
 
-    if (this.getMongo().writeMode() == "commands") {
-        for (var i = 0; i < indexSpecs.length; i++) {
-            delete (indexSpecs[i].ns);  // ns is passed to the first element in the command.
-        }
-        return this._db.runCommand({createIndexes: this.getName(), indexes: indexSpecs});
-    } else if (this.getMongo().writeMode() == "compatibility") {
-        // Use the downconversion machinery of the bulk api to do a safe write, report response as a
-        // command response
-        var result = this._db.getCollection("system.indexes").insert(indexSpecs, 0);
-
-        if (result.hasWriteErrors() || result.hasWriteConcernError()) {
-            // Return the first error
-            var error = result.hasWriteErrors() ? result.getWriteErrors()[0]
-                                                : result.getWriteConcernError();
-            return {ok: 0.0, code: error.code, errmsg: error.errmsg};
-        } else {
-            return {ok: 1.0};
-        }
-    } else {
-        this._db.getCollection("system.indexes").insert(indexSpecs, 0);
+    for (var i = 0; i < indexSpecs.length; i++) {
+        delete (indexSpecs[i].ns);  // ns is passed to the first element in the command.
     }
+    return this._db.runCommand({createIndexes: this.getName(), indexes: indexSpecs});
 };
 
 DBCollection.prototype.ensureIndex = function(keys, options) {
@@ -816,44 +805,19 @@ DBCollection.prototype.getShardVersion = function() {
     return this._db._adminCommand({getShardVersion: this._fullName});
 };
 
-DBCollection.prototype._getIndexesSystemIndexes = function(filter) {
-    var si = this.getDB().getCollection("system.indexes");
-    var query = {ns: this.getFullName()};
-    if (filter)
-        query = Object.extend(query, filter);
-    return si.find(query).toArray();
-};
-
-DBCollection.prototype._getIndexesCommand = function(filter) {
+DBCollection.prototype.getIndexes = function(filter) {
     var res = this.runCommand("listIndexes", filter);
 
     if (!res.ok) {
-        if (res.code == 59) {
-            // command doesn't exist, old mongod
-            return null;
-        }
-
-        if (res.code == 26) {
-            // NamespaceNotFound, for compatability, return []
+        if (res.code == ErrorCodes.NamespaceNotFound) {
+            // For compatibility, return []
             return [];
-        }
-
-        if (res.errmsg && res.errmsg.startsWith("no such cmd")) {
-            return null;
         }
 
         throw _getErrorWithCode(res, "listIndexes failed: " + tojson(res));
     }
 
     return new DBCommandCursor(this._db, res).toArray();
-};
-
-DBCollection.prototype.getIndexes = function(filter) {
-    var res = this._getIndexesCommand(filter);
-    if (res) {
-        return res;
-    }
-    return this._getIndexesSystemIndexes(filter);
 };
 
 DBCollection.prototype.getIndices = DBCollection.prototype.getIndexes;
@@ -875,16 +839,11 @@ DBCollection.prototype.hashAllDocs = function() {
 };
 
 /**
- * <p>Drop a specified index.</p>
+ * Drop a specified index.
  *
- * <p>
- * "index" is the name of the index in the system.indexes name field (run db.system.indexes.find()
- *to
- *  see example data), or an object holding the key(s) used to create the index.
- * For example:
- *  db.collectionName.dropIndex( "myIndexName" );
- *  db.collectionName.dropIndex( { "indexKey" : 1 } );
- * </p>
+ * "index" is the name or key pattern of the index. For example:
+ *    db.collectionName.dropIndex( "myIndexName" );
+ *    db.collectionName.dropIndex( { "indexKey" : 1 } );
  *
  * @param {String} name or key object of index to delete.
  * @return A result object.  result.ok will be true if successful.
@@ -1024,10 +983,6 @@ DBCollection.prototype.exists = function() {
         if (!cursor.hasNext())
             return null;
         return cursor.next();
-    }
-
-    if (res.errmsg && res.errmsg.startsWith("no such cmd")) {
-        return this._db.system.namespaces.findOne({name: this._fullName});
     }
 
     throw _getErrorWithCode(res, "listCollections failed: " + tojson(res));
@@ -1405,12 +1360,90 @@ DBCollection.prototype.unsetWriteConcern = function() {
 * @param {object} [options.collation=null] The collation that should be used for string comparisons
 * for this count op.
 * @return {number}
+*
 */
 DBCollection.prototype.count = function(query, options) {
     query = this.find(query);
 
     // Apply options and return the result of the find
     return QueryHelpers._applyCountOptions(query, options).count(true);
+};
+
+/**
+* Count number of matching documents in the db to a query using aggregation.
+*
+* @method
+* @param {object} query The query for the count.
+* @param {object} [options=null] Optional settings.
+* @param {number} [options.limit=null] The limit of documents to count.
+* @param {number} [options.skip=null] The number of documents to skip for the count.
+* @param {string|object} [options.hint=null] An index name hint or specification for the query.
+* @param {number} [options.maxTimeMS=null] The maximum amount of time to allow the query to run.
+* @param {object} [options.collation=null] The collation that should be used for string comparisons
+* for this count op.
+* @return {number}
+*/
+DBCollection.prototype.countDocuments = function(query, options) {
+    "use strict";
+    let pipeline = [{"$match": query}];
+    options = options || {};
+    assert.eq(typeof options, "object", "'options' argument must be an object");
+
+    if (options.skip) {
+        pipeline.push({"$skip": options.skip});
+    }
+    if (options.limit) {
+        pipeline.push({"$limit": options.limit});
+    }
+
+    // Construct an aggregation pipeline stage with sum to calculate the number of all documents.
+    pipeline.push({"$group": {"_id": null, "n": {"$sum": 1}}});
+
+    // countDocument options other than filter, skip, and limit, are added to the aggregate command.
+    let aggregateOptions = {};
+
+    if (options.hint) {
+        aggregateOptions.hint = options.hint;
+    }
+    if (options.maxTimeMS) {
+        aggregateOptions.maxTimeMS = options.maxTimeMS;
+    }
+    if (options.collation) {
+        aggregateOptions.collation = options.collation;
+    }
+
+    // Format cursor into an array.
+    const res = this.aggregate(pipeline, aggregateOptions).toArray();
+
+    return res[0].n;
+};
+
+/**
+* Estimates the count of documents in a collection using collection metadata.
+*
+* @method
+* @param {object} [options=null] Optional settings.
+* @param {number} [options.maxTimeMS=null] The maximum amount of time to allow the query to run.
+* @return {number}
+*/
+DBCollection.prototype.estimatedDocumentCount = function(options) {
+    "use strict";
+    let cmd = {count: this.getName()};
+    options = options || {};
+    assert.eq(typeof options, "object", "'options' argument must be an object");
+
+    if (options.maxTimeMS) {
+        cmd.maxTimeMS = options.maxTimeMS;
+    }
+
+    const res = this.runCommand(cmd);
+
+    if (!res.ok) {
+        throw _getErrorWithCode(res, "Error estimating document count: " + tojson(ret));
+    }
+
+    // Return the 'n' field, which should be the count of documents.
+    return res.n;
 };
 
 /**
@@ -1455,7 +1488,7 @@ DBCollection.prototype.distinct = function(keyString, query, options) {
     // Execute distinct command
     var res = this.runReadCommand(cmd);
     if (!res.ok) {
-        throw new Error("distinct failed: " + tojson(res));
+        throw _getErrorWithCode(res, "distinct failed: " + tojson(res));
     }
 
     return res.values;
@@ -1472,26 +1505,11 @@ DBCollection.prototype.latencyStats = function(options) {
 
 DBCollection.prototype.watch = function(pipeline, options) {
     pipeline = pipeline || [];
-    options = options || {};
     assert(pipeline instanceof Array, "'pipeline' argument must be an array");
-    assert(options instanceof Object, "'options' argument must be an object");
-
-    let changeStreamStage = {fullDocument: options.fullDocument || "default"};
-    delete options.fullDocument;
-
-    if (options.hasOwnProperty("resumeAfter")) {
-        changeStreamStage.resumeAfter = options.resumeAfter;
-        delete options.resumeAfter;
-    }
-
-    if (options.hasOwnProperty("startAtOperationTime")) {
-        changeStreamStage.startAtOperationTime = options.startAtOperationTime;
-        delete options.startAtOperationTime;
-    }
-
-    pipeline.unshift({$changeStream: changeStreamStage});
-    // Pass options "batchSize", "collation" and "maxAwaitTimeMS" down to aggregate().
-    return this.aggregate(pipeline, options);
+    let changeStreamStage;
+    [changeStreamStage, aggOptions] = this.getMongo()._extractChangeStreamOptions(options);
+    pipeline.unshift(changeStreamStage);
+    return this.aggregate(pipeline, aggOptions);
 };
 
 /**

@@ -67,6 +67,7 @@ protected:
      * Returns the service context.
      */
     ServiceContext* _context() override;
+    std::vector<std::unique_ptr<PeriodicRunner::PeriodicJobHandle>> _jobs;
 };
 
 }  // namespace mongo

@@ -50,22 +50,6 @@ struct QuerySolution;
 struct QuerySolutionNode;
 
 /**
- * When the CachedPlanStage runs a cached query, it can provide feedback to the cache.  This
- * feedback is available to anyone who retrieves that query in the future.
- */
-struct PlanCacheEntryFeedback {
-    // How well did the cached plan perform?
-    std::unique_ptr<PlanStageStats> stats;
-
-    // The "goodness" score produced by the plan ranker
-    // corresponding to 'stats'.
-    double score;
-};
-
-// TODO: Replace with opaque type.
-typedef std::string PlanID;
-
-/**
  * A PlanCacheIndexTree is the meaty component of the data
  * stored in SolutionCacheData. It is a tree structure with
  * index tags that indicates to the access planner which indices
@@ -93,7 +77,7 @@ struct PlanCacheIndexTree {
      * or satisfy the first field in the index.
      */
     struct OrPushdown {
-        std::string indexName;
+        IndexEntry::Identifier indexEntryId;
         size_t position;
         bool canCombineBounds;
         std::deque<size_t> route;
@@ -237,7 +221,9 @@ public:
      * Grabs any planner-specific data required from the solutions.
      * Takes ownership of the PlanRankingDecision that placed the plan in the cache.
      */
-    PlanCacheEntry(const std::vector<QuerySolution*>& solutions, PlanRankingDecision* why);
+    PlanCacheEntry(const std::vector<QuerySolution*>& solutions,
+                   PlanRankingDecision* why,
+                   uint32_t queryHash);
 
     ~PlanCacheEntry();
 
@@ -269,6 +255,10 @@ public:
     BSONObj collation;
     Date_t timeOfCreation;
 
+    // Hash of the PlanCacheKey. Intended as an identifier for the query shape in logs and other
+    // diagnostic output.
+    uint32_t queryHash;
+
     //
     // Performance stats
     //
@@ -277,9 +267,8 @@ public:
     // the other plans lost.
     std::unique_ptr<PlanRankingDecision> decision;
 
-    // Annotations from cached runs.  The CachedPlanStage provides these stats about its
-    // runs when they complete.
-    std::vector<PlanCacheEntryFeedback*> feedback;
+    // Scores from uses of this cache entry.
+    std::vector<double> feedback;
 
     // Whether or not the cache entry is active. Inactive cache entries should not be used for
     // planning.
@@ -390,7 +379,7 @@ public:
      * The return value will provide the "state" of the cache entry, as well as the CachedSolution
      * for the query (if there is one).
      */
-    GetResult get(const PlanCacheKey& query) const;
+    GetResult get(const PlanCacheKey& key) const;
 
     /**
      * If the cache entry exists and is active, return a CachedSolution. If the cache entry is
@@ -401,10 +390,9 @@ public:
 
     /**
      * When the CachedPlanStage runs a plan out of the cache, we want to record data about the
-     * plan's performance.  The CachedPlanStage calls feedback(...) after executing the cached
-     * plan for a trial period in order to do this.
-     *
-     * Cache takes ownership of 'feedback'.
+     * plan's performance. The CachedPlanStage calls feedback(...) after executing the cached
+     * plan for a trial period in order to do this. Currently, the only feedback metric recorded is
+     * the score associated with the cached plan trial period.
      *
      * If the entry corresponding to 'cq' isn't in the cache anymore, the feedback is ignored
      * and an error Status is returned.
@@ -412,7 +400,7 @@ public:
      * If the entry corresponding to 'cq' still exists, 'feedback' is added to the run
      * statistics about the plan.  Status::OK() is returned.
      */
-    Status feedback(const CanonicalQuery& cq, PlanCacheEntryFeedback* feedback);
+    Status feedback(const CanonicalQuery& cq, double score);
 
     /**
      * Remove the entry corresponding to 'ck' from the cache.  Returns Status::OK() if the plan
@@ -437,6 +425,12 @@ public:
     PlanCacheKey computeKey(const CanonicalQuery&) const;
 
     /**
+     * Returns a hash of the plan cache key. This hash may not be stable between different versions
+     * of the server.
+     */
+    static uint32_t computeQueryHash(const PlanCacheKey& key);
+
+    /**
      * Returns a copy of a cache entry.
      * Used by planCacheListPlans to display plan details.
      *
@@ -446,11 +440,9 @@ public:
 
     /**
      * Returns a vector of all cache entries.
-     * Caller owns the result vector and is responsible for cleaning up
-     * the cache entry copies.
      * Used by planCacheListQueryShapes and index_filter_commands_test.cpp.
      */
-    std::vector<PlanCacheEntry*> getAllEntries() const;
+    std::vector<std::unique_ptr<PlanCacheEntry>> getAllEntries() const;
 
     /**
      * Returns number of entries in cache. Includes inactive entries.
@@ -466,6 +458,14 @@ public:
      */
     void notifyOfIndexEntries(const std::vector<IndexEntry>& indexEntries);
 
+    /**
+     * Iterates over the plan cache. For each entry, serializes the PlanCacheEntry according to
+     * 'serializationFunc'. Returns a vector of all serialized entries which match 'filterFunc'.
+     */
+    std::vector<BSONObj> getMatchingStats(
+        const std::function<BSONObj(const PlanCacheEntry&)>& serializationFunc,
+        const std::function<bool(const BSONObj&)>& filterFunc) const;
+
 private:
     struct NewEntryState {
         bool shouldBeCreated = false;
@@ -473,6 +473,7 @@ private:
     };
 
     NewEntryState getNewEntryState(const CanonicalQuery& query,
+                                   uint32_t queryHash,
                                    PlanCacheEntry* oldEntry,
                                    size_t newWorks,
                                    double growthCoefficient);

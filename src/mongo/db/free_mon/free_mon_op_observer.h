@@ -46,7 +46,7 @@ public:
 
     void onCreateIndex(OperationContext* opCtx,
                        const NamespaceString& nss,
-                       OptionalCollectionUUID uuid,
+                       CollectionUUID uuid,
                        BSONObj indexDoc,
                        bool fromMigrate) final {}
 
@@ -133,7 +133,7 @@ public:
 
     void onTransactionCommit(OperationContext* opCtx, bool wasPrepared) final {}
 
-    void onTransactionPrepare(OperationContext* opCtx) final {}
+    void onTransactionPrepare(OperationContext* opCtx, const OplogSlot& prepareOpTime) final {}
 
     void onTransactionAbort(OperationContext* opCtx) final {}
 

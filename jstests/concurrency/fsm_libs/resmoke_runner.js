@@ -98,6 +98,13 @@
                 cleanup.push(workload);
             });
 
+            // Await replication after running the $config.setup() function when stepdowns are
+            // permitted to ensure its effects aren't rolled back.
+            if (cluster.isReplication() &&
+                typeof executionOptions.stepdownPermittedFile === 'string') {
+                cluster.awaitReplication();
+            }
+
             // After the $config.setup() function has been called, it is safe for the stepdown
             // thread to start running. The main thread won't attempt to interact with the cluster
             // until all of the spawned worker threads have finished.
@@ -247,7 +254,7 @@
             resmokeDbPathPrefix + '/concurrency_sharded_stepdown_stepping_down';
     }
 
-    if (Object.keys(sessionOptions).length > 0) {
+    if (Object.keys(sessionOptions).length > 0 || TestData.runningWithSessions) {
         executionOptions.sessionOptions = sessionOptions;
     }
 

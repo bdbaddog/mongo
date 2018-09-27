@@ -47,6 +47,7 @@
 #include "mongo/db/db_raii.h"
 #include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/jsobj.h"
+#include "mongo/db/op_observer.h"
 #include "mongo/db/storage/storage_options.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/log.h"
@@ -135,7 +136,7 @@ void generateSystemIndexForExistingCollection(OperationContext* opCtx,
 
             indexer.commit([opCtx, &ns, collection](const BSONObj& spec) {
                 opCtx->getServiceContext()->getOpObserver()->onCreateIndex(
-                    opCtx, ns, collection->uuid(), spec, false /* fromMigrate */);
+                    opCtx, ns, *(collection->uuid()), spec, false /* fromMigrate */);
             });
 
             wunit.commit();
@@ -234,7 +235,7 @@ void createSystemIndexes(OperationContext* opCtx, Collection* collection) {
     }
     if (!indexSpec.isEmpty()) {
         opCtx->getServiceContext()->getOpObserver()->onCreateIndex(
-            opCtx, ns, collection->uuid(), indexSpec, false /* fromMigrate */);
+            opCtx, ns, *(collection->uuid()), indexSpec, false /* fromMigrate */);
         // Note that the opObserver is called prior to creating the index.  This ensures the index
         // write gets the same storage timestamp as the oplog entry.
         fassert(40456,

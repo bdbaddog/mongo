@@ -30,6 +30,7 @@
 
 #include "mongo/db/operation_context.h"
 #include "mongo/db/service_context_test_fixture.h"
+#include "mongo/unittest/temp_dir.h"
 #include "mongo/unittest/unittest.h"
 
 namespace mongo {
@@ -39,19 +40,24 @@ namespace mongo {
  */
 class ServiceContextMongoDTest : public ServiceContextTest {
 protected:
+    enum class RepairAction { kNoRepair, kRepair };
+
     ServiceContextMongoDTest();
 
     /**
      * Build a ServiceContextMongoDTest, using the named storage engine.
      */
     explicit ServiceContextMongoDTest(std::string engine);
+    ServiceContextMongoDTest(std::string engine, RepairAction repair);
     virtual ~ServiceContextMongoDTest();
 
 private:
     struct {
         std::string engine;
         bool engineSetByUser;
+        bool repair;
     } _stashedStorageParams;
+    unittest::TempDir _tempDir;
 };
 
 }  // namespace mongo

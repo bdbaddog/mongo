@@ -80,7 +80,6 @@
 #include "mongo/db/query/internal_plans.h"
 #include "mongo/db/query/query_planner.h"
 #include "mongo/db/read_concern.h"
-#include "mongo/db/repair_database.h"
 #include "mongo/db/repl/optime.h"
 #include "mongo/db/repl/read_concern_args.h"
 #include "mongo/db/repl/repl_client_info.h"
@@ -348,7 +347,7 @@ public:
         DBDirectClient client(opCtx);
         Query q(query);
         q.sort(sort);
-        unique_ptr<DBClientCursor> c = client.query(ns, q);
+        unique_ptr<DBClientCursor> c = client.query(NamespaceString(ns), q);
         while (c->more()) {
             log() << c->nextSafe();
         }

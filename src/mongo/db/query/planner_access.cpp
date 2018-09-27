@@ -581,6 +581,7 @@ void QueryPlannerAccess::finishLeafNode(QuerySolutionNode* node, const IndexEntr
         return;
     }
 
+    IndexEntry* nodeIndex = nullptr;
     IndexBounds* bounds = NULL;
 
     if (STAGE_GEO_NEAR_2D == type) {
@@ -592,14 +593,45 @@ void QueryPlannerAccess::finishLeafNode(QuerySolutionNode* node, const IndexEntr
     } else {
         verify(type == STAGE_IXSCAN);
         IndexScanNode* scan = static_cast<IndexScanNode*>(node);
+        nodeIndex = &scan->index;
         bounds = &scan->bounds;
     }
+
+    // For $** indexes, the IndexEntry key pattern is {'path.to.field': ±1} but the actual keys in
+    // the index are of the form {'$_path': ±1, 'path.to.field': ±1}, where the value of the first
+    // field in each key is 'path.to.field'. We push a point-interval on 'path.to.field' into the
+    // bounds vector for the leading '$_path' bound here. We also push corresponding fields into the
+    // IndexScanNode's keyPattern and its multikeyPaths vector.
+    if (index.type == IndexType::INDEX_ALLPATHS) {
+        invariant(bounds->fields.size() == 1 && index.keyPattern.nFields() == 1);
+        invariant(!bounds->fields.front().name.empty());
+        invariant(nodeIndex);
+        bounds->fields.insert(bounds->fields.begin(), {"$_path"});
+        bounds->fields.front().intervals.push_back(
+            IndexBoundsBuilder::makePointInterval(nodeIndex->keyPattern.firstElementFieldName()));
+        // If the bounds are [MinKey, MaxKey] then we're querying for any values in the given
+        // path. Therefore we must add bounds that allow subpaths (specifically the bound
+        // ["path.","path/") on "$_path").
+        const auto& intervals = bounds->fields.back().intervals;
+        if (!intervals.empty() && intervals.front().isMinToMaxInclusive()) {
+            bounds->fields.front().intervals.push_back(IndexBoundsBuilder::makeRangeInterval(
+                bounds->fields.back().name + '.',
+                bounds->fields.back().name + static_cast<char>('.' + 1),
+                BoundInclusion::kIncludeStartKeyOnly));
+        }
+        nodeIndex->keyPattern = BSON("$_path" << nodeIndex->keyPattern.firstElement()
+                                              << nodeIndex->keyPattern.firstElement());
+        nodeIndex->multikeyPaths.insert(nodeIndex->multikeyPaths.begin(), std::set<std::size_t>{});
+    }
+
+    // If the QuerySolutionNode's IndexEntry is available, use its keyPattern.
+    const auto& keyPattern = (nodeIndex ? nodeIndex->keyPattern : index.keyPattern);
 
     // Find the first field in the scan's bounds that was not filled out.
     // TODO: could cache this.
     size_t firstEmptyField = 0;
     for (firstEmptyField = 0; firstEmptyField < bounds->fields.size(); ++firstEmptyField) {
-        if ("" == bounds->fields[firstEmptyField].name) {
+        if (bounds->fields[firstEmptyField].name.empty()) {
             verify(bounds->fields[firstEmptyField].intervals.empty());
             break;
         }
@@ -607,12 +639,12 @@ void QueryPlannerAccess::finishLeafNode(QuerySolutionNode* node, const IndexEntr
 
     // All fields are filled out with bounds, nothing to do.
     if (firstEmptyField == bounds->fields.size()) {
-        IndexBoundsBuilder::alignBounds(bounds, index.keyPattern);
+        IndexBoundsBuilder::alignBounds(bounds, keyPattern);
         return;
     }
 
     // Skip ahead to the firstEmptyField-th element, where we begin filling in bounds.
-    BSONObjIterator it(index.keyPattern);
+    BSONObjIterator it(keyPattern);
     for (size_t i = 0; i < firstEmptyField; ++i) {
         verify(it.more());
         it.next();
@@ -621,13 +653,10 @@ void QueryPlannerAccess::finishLeafNode(QuerySolutionNode* node, const IndexEntr
     // For each field in the key...
     while (it.more()) {
         BSONElement kpElt = it.next();
-        // There may be filled-in fields to the right of the firstEmptyField.
-        // Example:
-        // The index {loc:"2dsphere", x:1}
-        // With a predicate over x and a near search over loc.
-        if ("" == bounds->fields[firstEmptyField].name) {
+        // There may be filled-in fields to the right of the firstEmptyField; for instance, the
+        // index {loc:"2dsphere", x:1} with a predicate over x and a near search over loc.
+        if (bounds->fields[firstEmptyField].name.empty()) {
             verify(bounds->fields[firstEmptyField].intervals.empty());
-            // ...build the "all values" interval.
             IndexBoundsBuilder::allValuesForField(kpElt, &bounds->fields[firstEmptyField]);
         }
         ++firstEmptyField;
@@ -638,7 +667,7 @@ void QueryPlannerAccess::finishLeafNode(QuerySolutionNode* node, const IndexEntr
 
     // We create bounds assuming a forward direction but can easily reverse bounds to align
     // according to our desired direction.
-    IndexBoundsBuilder::alignBounds(bounds, index.keyPattern);
+    IndexBoundsBuilder::alignBounds(bounds, keyPattern);
 }
 
 void QueryPlannerAccess::findElemMatchChildren(const MatchExpression* node,
@@ -957,16 +986,12 @@ std::unique_ptr<QuerySolutionNode> QueryPlannerAccess::buildIndexedAnd(
     std::unique_ptr<MatchExpression> ownedRoot,
     const vector<IndexEntry>& indices,
     const QueryPlannerParams& params) {
-    // If we are not allowed to trim for ixisect, then clone the match expression before
-    // passing it to processIndexScans(), which may do the trimming. If we end up with
-    // an index intersection solution, then we use our copy of the match expression to be
-    // sure that the FETCH stage will recheck the entire predicate.
-    //
-    // XXX: This block is a hack to accommodate the storage layer concurrency model.
-    std::unique_ptr<MatchExpression> clonedRoot;
-    if (params.options & QueryPlannerParams::CANNOT_TRIM_IXISECT) {
-        clonedRoot = root->shallowClone();
-    }
+    // Clone the match expression before passing it to processIndexScans(), as it may trim
+    // predicates. If we end up with an index intersection solution, then we use our copy of the
+    // match expression to be sure that the FETCH stage will recheck the entire predicate. It is not
+    // correct to trim predicates for index intersection plans, as this can lead to spurious matches
+    // (see SERVER-16750).
+    auto clonedRoot = root->shallowClone();
 
     std::vector<std::unique_ptr<QuerySolutionNode>> ixscanNodes;
     const bool inArrayOperator = !ownedRoot;
@@ -990,6 +1015,16 @@ std::unique_ptr<QuerySolutionNode> QueryPlannerAccess::buildIndexedAnd(
     if (ixscanNodes.size() == 1) {
         andResult = std::move(ixscanNodes[0]);
     } else {
+        // $** indexes are prohibited from participating in either AND_SORTED or AND_HASH.
+        const bool allPathsIndexInvolvedInIntersection =
+            std::any_of(ixscanNodes.begin(), ixscanNodes.end(), [](const auto& ixScan) {
+                return ixScan->getType() == StageType::STAGE_IXSCAN &&
+                    static_cast<IndexScanNode*>(ixScan.get())->index.type == INDEX_ALLPATHS;
+            });
+        if (allPathsIndexInvolvedInIntersection) {
+            return nullptr;
+        }
+
         // Figure out if we want AndHashNode or AndSortedNode.
         bool allSortedByDiskLoc = true;
         for (size_t i = 0; i < ixscanNodes.size(); ++i) {
@@ -1034,12 +1069,13 @@ std::unique_ptr<QuerySolutionNode> QueryPlannerAccess::buildIndexedAnd(
         return andResult;
     }
 
-    // XXX: This block is a hack to accommodate the storage layer concurrency model.
-    if ((params.options & QueryPlannerParams::CANNOT_TRIM_IXISECT) &&
-        (andResult->getType() == STAGE_AND_HASH || andResult->getType() == STAGE_AND_SORTED)) {
-        // We got an index intersection solution, and we aren't allowed to answer predicates
-        // using the index. We add a fetch with the entire filter.
-        invariant(clonedRoot.get());
+    if (andResult->getType() == STAGE_AND_HASH || andResult->getType() == STAGE_AND_SORTED) {
+        // We got an index intersection solution, so we aren't allowed to answer predicates exactly
+        // using the index. This is because the index intersection stage finds documents that match
+        // each index's predicate, but the document isn't guaranteed to be in a state where it
+        // matches all indexed predicates simultaneously. Therefore, it is necessary to add a fetch
+        // stage which will explicitly evaluate the entire predicate (see SERVER-16750).
+        invariant(clonedRoot);
         auto fetch = stdx::make_unique<FetchNode>();
         fetch->filter = std::move(clonedRoot);
         // Takes ownership of 'andResult'.

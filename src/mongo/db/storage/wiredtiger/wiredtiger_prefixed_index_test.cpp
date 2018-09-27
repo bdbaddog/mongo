@@ -73,8 +73,12 @@ public:
 
         BSONObj spec = BSON("key" << BSON("a" << 1) << "name"
                                   << "testIndex"
+                                  << "v"
+                                  << static_cast<int>(IndexDescriptor::kLatestIndexVersion)
                                   << "ns"
-                                  << ns);
+                                  << ns
+                                  << "unique"
+                                  << unique);
 
         IndexDescriptor desc(NULL, "", spec);
 

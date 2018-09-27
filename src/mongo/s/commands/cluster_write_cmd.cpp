@@ -45,6 +45,7 @@
 #include "mongo/s/cluster_last_error_info.h"
 #include "mongo/s/commands/cluster_explain.h"
 #include "mongo/s/grid.h"
+#include "mongo/s/transaction/transaction_router.h"
 #include "mongo/s/write_ops/batched_command_request.h"
 #include "mongo/s/write_ops/batched_command_response.h"
 #include "mongo/s/write_ops/chunk_manager_targeter.h"
@@ -149,8 +150,7 @@ private:
                                   std::vector<Strategy::CommandResult>* results) {
         // Note that this implementation will not handle targeting retries and does not completely
         // emulate write behavior
-        TargeterStats stats;
-        ChunkManagerTargeter targeter(targetingBatchItem.getRequest()->getTargetingNS(), &stats);
+        ChunkManagerTargeter targeter(targetingBatchItem.getRequest()->getNS());
         Status status = targeter.init(opCtx);
         if (!status.isOK())
             return status;
@@ -245,6 +245,10 @@ private:
         auto db = batchedRequest.getNS().db();
         if (db != NamespaceString::kAdminDb && db != NamespaceString::kConfigDb) {
             batchedRequest.setAllowImplicitCreate(false);
+        }
+
+        if (auto txnRouter = TransactionRouter::get(opCtx)) {
+            txnRouter->setAtClusterTimeToLatestTime(opCtx);
         }
 
         BatchWriteExecStats stats;

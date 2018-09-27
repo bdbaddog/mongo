@@ -112,9 +112,7 @@ const char* DocumentSourceOplogMatch::getSourceName() const {
     return DocumentSourceChangeStream::kStageName.rawData();
 }
 
-DocumentSource::StageConstraints DocumentSourceOplogMatch::constraints(
-    Pipeline::SplitState pipeState) const {
-
+StageConstraints DocumentSourceOplogMatch::constraints(Pipeline::SplitState pipeState) const {
     StageConstraints constraints(StreamType::kStreaming,
                                  PositionRequirement::kFirst,
                                  HostTypeRequirement::kAnyShard,
@@ -386,7 +384,9 @@ list<intrusive_ptr<DocumentSource>> buildPipeline(const intrusive_ptr<Expression
             expCtx));
     }
 
-    stages.push_back(DocumentSourceChangeStreamTransform::create(expCtx, elem.embeddedObject()));
+    const auto fcv = serverGlobalParams.featureCompatibility.getVersion();
+    stages.push_back(
+        DocumentSourceChangeStreamTransform::create(expCtx, fcv, elem.embeddedObject()));
     stages.push_back(DocumentSourceCheckInvalidate::create(expCtx, ignoreFirstInvalidate));
 
     // The resume stage must come after the check invalidate stage to allow the check invalidate
@@ -442,8 +442,8 @@ list<intrusive_ptr<DocumentSource>> DocumentSourceChangeStream::createFromBson(
     return stages;
 }
 
-BSONObj DocumentSourceChangeStream::replaceResumeTokenInCommand(const BSONObj originalCmdObj,
-                                                                const BSONObj resumeToken) {
+BSONObj DocumentSourceChangeStream::replaceResumeTokenInCommand(BSONObj originalCmdObj,
+                                                                Document resumeToken) {
     Document originalCmd(originalCmdObj);
     auto pipeline = originalCmd[AggregationRequest::kPipelineName].getArray();
     // A $changeStream must be the first element of the pipeline in order to be able
@@ -454,12 +454,12 @@ BSONObj DocumentSourceChangeStream::replaceResumeTokenInCommand(const BSONObj or
         pipeline[0][DocumentSourceChangeStream::kStageName].getDocument());
     changeStreamStage[DocumentSourceChangeStreamSpec::kResumeAfterFieldName] = Value(resumeToken);
 
-    // If the command was initially specified with a startAtOperationTime, we need to remove it
-    // to use the new resume token.
+    // If the command was initially specified with a startAtOperationTime, we need to remove it to
+    // use the new resume token.
     changeStreamStage[DocumentSourceChangeStreamSpec::kStartAtOperationTimeFieldName] = Value();
     pipeline[0] =
         Value(Document{{DocumentSourceChangeStream::kStageName, changeStreamStage.freeze()}});
-    MutableDocument newCmd(originalCmd);
+    MutableDocument newCmd(std::move(originalCmd));
     newCmd[AggregationRequest::kPipelineName] = Value(pipeline);
     return newCmd.freeze().toBson();
 }

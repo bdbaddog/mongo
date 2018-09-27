@@ -227,7 +227,7 @@ protected:
             if (_blockingMode == Sync) {
                 std::error_code ec;
                 _sslSocket->handshake(asio::ssl::stream_base::client, ec);
-                return Future<void>::makeReady(errorCodeToStatus(ec));
+                return futurize(ec);
             } else {
                 return _sslSocket->async_handshake(asio::ssl::stream_base::client, UseFuture{});
             }
@@ -237,7 +237,7 @@ protected:
 
             auto sslManager = getSSLManager();
             auto swPeerInfo = uassertStatusOK(sslManager->parseAndValidatePeerCertificate(
-                _sslSocket->native_handle(), target.host()));
+                _sslSocket->native_handle(), target.host(), target));
 
             if (swPeerInfo) {
                 SSLPeerInfo::forSession(shared_from_this()) = std::move(*swPeerInfo);
@@ -616,7 +616,7 @@ private:
                 if (sslPeerInfo.subjectName.empty()) {
                     auto sslManager = getSSLManager();
                     auto swPeerInfo = sslManager->parseAndValidatePeerCertificate(
-                        _sslSocket->native_handle(), "");
+                        _sslSocket->native_handle(), "", _remote);
 
                     // The value of swPeerInfo is a bit complicated:
                     //

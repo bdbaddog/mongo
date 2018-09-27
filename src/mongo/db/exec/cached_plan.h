@@ -28,8 +28,8 @@
 
 #pragma once
 
-#include <list>
 #include <memory>
+#include <queue>
 
 #include "mongo/db/exec/plan_stage.h"
 #include "mongo/db/exec/working_set.h"
@@ -38,7 +38,6 @@
 #include "mongo/db/query/query_planner_params.h"
 #include "mongo/db/query/query_solution.h"
 #include "mongo/db/record_id.h"
-#include "mongo/db/storage/record_fetcher.h"
 
 namespace mongo {
 
@@ -64,8 +63,6 @@ public:
     bool isEOF() final;
 
     StageState doWork(WorkingSetID* out) final;
-
-    void doInvalidate(OperationContext* opCtx, const RecordId& dl, InvalidationType type) final;
 
     StageType stageType() const final {
         return STAGE_CACHED_PLAN;
@@ -136,13 +133,7 @@ private:
     std::unique_ptr<QuerySolution> _replannedQs;
 
     // Any results produced during trial period execution are kept here.
-    std::list<WorkingSetID> _results;
-
-    // When a stage requests a yield for document fetch, it gives us back a RecordFetcher*
-    // to use to pull the record into memory. We take ownership of the RecordFetcher here,
-    // deleting it after we've had a chance to do the fetch. For timing-based yields, we
-    // just pass a NULL fetcher.
-    std::unique_ptr<RecordFetcher> _fetcher;
+    std::queue<WorkingSetID> _results;
 
     // Stats
     CachedPlanStats _specificStats;

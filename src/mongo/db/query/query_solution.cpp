@@ -185,7 +185,7 @@ void TextNode::appendToString(mongoutils::str::stream* ss, int indent) const {
     addIndent(ss, indent);
     *ss << "TEXT\n";
     addIndent(ss, indent + 1);
-    *ss << "name = " << index.name << '\n';
+    *ss << "name = " << index.identifier.catalogName << '\n';
     addIndent(ss, indent + 1);
     *ss << "keyPattern = " << index.keyPattern.toString() << '\n';
     addIndent(ss, indent + 1);
@@ -521,7 +521,7 @@ void IndexScanNode::appendToString(mongoutils::str::stream* ss, int indent) cons
     addIndent(ss, indent);
     *ss << "IXSCAN\n";
     addIndent(ss, indent + 1);
-    *ss << "indexName = " << index.name << '\n';
+    *ss << "indexName = " << index.identifier.catalogName << '\n';
     *ss << "keyPattern = " << index.keyPattern << '\n';
     if (NULL != filter) {
         addIndent(ss, indent + 1);
@@ -558,6 +558,13 @@ bool IndexScanNode::hasField(const string& field) const {
 
     size_t keyPatternFieldIndex = 0;
     for (auto&& elt : index.keyPattern) {
+        // For $** indexes, the keyPattern is prefixed by a virtual field, '$_path'. We therefore
+        // skip the first keyPattern field when deciding whether we can provide the requested field.
+        if (index.type == IndexType::INDEX_ALLPATHS && !keyPatternFieldIndex) {
+            invariant(elt.fieldNameStringData() == "$_path"_sd);
+            ++keyPatternFieldIndex;
+            continue;
+        }
         // The index can provide this field if the requested path appears in the index key pattern,
         // and that path has no multikey components. We can't cover a field that has multikey
         // components because the index keys contain individual array elements, and we can't
@@ -981,7 +988,7 @@ void GeoNear2DNode::appendToString(mongoutils::str::stream* ss, int indent) cons
     addIndent(ss, indent);
     *ss << "GEO_NEAR_2D\n";
     addIndent(ss, indent + 1);
-    *ss << "name = " << index.name << '\n';
+    *ss << "name = " << index.identifier.catalogName << '\n';
     addIndent(ss, indent + 1);
     *ss << "keyPattern = " << index.keyPattern.toString() << '\n';
     addCommon(ss, indent);
@@ -1013,7 +1020,7 @@ void GeoNear2DSphereNode::appendToString(mongoutils::str::stream* ss, int indent
     addIndent(ss, indent);
     *ss << "GEO_NEAR_2DSPHERE\n";
     addIndent(ss, indent + 1);
-    *ss << "name = " << index.name << '\n';
+    *ss << "name = " << index.identifier.catalogName << '\n';
     addIndent(ss, indent + 1);
     *ss << "keyPattern = " << index.keyPattern.toString() << '\n';
     addCommon(ss, indent);
@@ -1066,35 +1073,6 @@ QuerySolutionNode* ShardingFilterNode::clone() const {
 }
 
 //
-// KeepMutationsNode
-//
-
-void KeepMutationsNode::appendToString(mongoutils::str::stream* ss, int indent) const {
-    addIndent(ss, indent);
-    *ss << "KEEP_MUTATIONS\n";
-    if (NULL != filter) {
-        addIndent(ss, indent + 1);
-        StringBuilder sb;
-        *ss << "filter:\n";
-        filter->debugString(sb, indent + 2);
-        *ss << sb.str();
-    }
-    addCommon(ss, indent);
-    addIndent(ss, indent + 1);
-    *ss << "Child:" << '\n';
-    children[0]->appendToString(ss, indent + 2);
-}
-
-QuerySolutionNode* KeepMutationsNode::clone() const {
-    KeepMutationsNode* copy = new KeepMutationsNode();
-    cloneBaseData(copy);
-
-    copy->sorts = this->sorts;
-
-    return copy;
-}
-
-//
 // DistinctNode
 //
 
@@ -1102,7 +1080,7 @@ void DistinctNode::appendToString(mongoutils::str::stream* ss, int indent) const
     addIndent(ss, indent);
     *ss << "DISTINCT\n";
     addIndent(ss, indent + 1);
-    *ss << "name = " << index.name << '\n';
+    *ss << "name = " << index.identifier.catalogName << '\n';
     addIndent(ss, indent + 1);
     *ss << "keyPattern = " << index.keyPattern << '\n';
     addIndent(ss, indent + 1);
@@ -1131,7 +1109,7 @@ void CountScanNode::appendToString(mongoutils::str::stream* ss, int indent) cons
     addIndent(ss, indent);
     *ss << "COUNT\n";
     addIndent(ss, indent + 1);
-    *ss << "name = " << index.name << '\n';
+    *ss << "name = " << index.identifier.catalogName << '\n';
     addIndent(ss, indent + 1);
     *ss << "keyPattern = " << index.keyPattern << '\n';
     addIndent(ss, indent + 1);

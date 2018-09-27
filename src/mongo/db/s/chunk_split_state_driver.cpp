@@ -36,15 +36,16 @@
 
 namespace mongo {
 
-boost::optional<ChunkSplitStateDriver> ChunkSplitStateDriver::tryInitiateSplit(
+std::shared_ptr<ChunkSplitStateDriver> ChunkSplitStateDriver::tryInitiateSplit(
     std::shared_ptr<ChunkWritesTracker> writesTracker) {
+    invariant(writesTracker);
     bool acquiredSplitLock = writesTracker->acquireSplitLock();
     return acquiredSplitLock
-        ? boost::optional<ChunkSplitStateDriver>(ChunkSplitStateDriver(writesTracker))
-        : boost::none;
+        ? std::shared_ptr<ChunkSplitStateDriver>(new ChunkSplitStateDriver(writesTracker))
+        : nullptr;
 }
 
-ChunkSplitStateDriver::ChunkSplitStateDriver(ChunkSplitStateDriver&& source) {
+ChunkSplitStateDriver::ChunkSplitStateDriver(ChunkSplitStateDriver&& source) noexcept {
     _writesTracker = source._writesTracker;
     source._writesTracker.reset();
 
@@ -73,6 +74,10 @@ void ChunkSplitStateDriver::prepareSplit() {
     uassert(50873, "Split interrupted due to chunk metadata change.", wt);
     // Clear bytes written and get the previous bytes written.
     _stashedBytesWritten = wt->clearBytesWritten();
+}
+
+void ChunkSplitStateDriver::abandonPrepare() {
+    _stashedBytesWritten = 0;
 }
 
 void ChunkSplitStateDriver::commitSplit() {

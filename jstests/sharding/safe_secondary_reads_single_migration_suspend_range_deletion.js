@@ -25,6 +25,7 @@
     "use strict";
 
     load('jstests/libs/profiler.js');
+    load('jstests/sharding/libs/last_stable_mongos_commands.js');
 
     let db = "test";
     let coll = "foo";
@@ -118,8 +119,6 @@
         connPoolSync: {skip: "does not return user data"},
         connectionStatus: {skip: "does not return user data"},
         convertToCapped: {skip: "primary only"},
-        copydb: {skip: "primary only"},
-        copydbsaslstart: {skip: "primary only"},
         count: {
             setUp: function(mongosConn) {
                 assert.writeOK(mongosConn.getCollection(nss).insert({x: 1}));
@@ -176,7 +175,6 @@
         emptycapped: {skip: "primary only"},
         enableSharding: {skip: "primary only"},
         endSessions: {skip: "does not return user data"},
-        eval: {skip: "must define test coverage for 4.0 backwards compatibility"},
         explain: {skip: "TODO SERVER-30068"},
         features: {skip: "does not return user data"},
         filemd5: {skip: "does not return user data"},
@@ -202,7 +200,6 @@
         forceerror: {skip: "does not return user data"},
         fsync: {skip: "does not return user data"},
         fsyncUnlock: {skip: "does not return user data"},
-        geoNear: {skip: "must define test coverage for 4.0 backwards compatibility"},
         geoSearch: {skip: "not supported in mongos"},
         getCmdLineOpts: {skip: "does not return user data"},
         getDiagnosticData: {skip: "does not return user data"},
@@ -218,7 +215,6 @@
         grantPrivilegesToRole: {skip: "primary only"},
         grantRolesToRole: {skip: "primary only"},
         grantRolesToUser: {skip: "primary only"},
-        group: {skip: "must define test coverage for 4.0 backwards compatibility"},
         handshake: {skip: "does not return user data"},
         hostInfo: {skip: "does not return user data"},
         insert: {skip: "primary only"},
@@ -279,7 +275,6 @@
         planCacheListQueryShapes: {skip: "does not return user data"},
         planCacheSetFilter: {skip: "does not return user data"},
         profile: {skip: "primary only"},
-        reIndex: {skip: "does not return user data"},
         reapLogicalSessionCacheNow: {skip: "does not return user data"},
         refreshLogicalSessionCacheNow: {skip: "does not return user data"},
         refreshSessions: {skip: "does not return user data"},
@@ -288,7 +283,6 @@
         removeShardFromZone: {skip: "primary only"},
         renameCollection: {skip: "primary only"},
         repairCursor: {skip: "does not return user data"},
-        repairDatabase: {skip: "does not return user data"},
         replSetAbortPrimaryCatchUp: {skip: "does not return user data"},
         replSetFreeze: {skip: "does not return user data"},
         replSetGetConfig: {skip: "does not return user data"},
@@ -339,8 +333,13 @@
         updateZoneKeyRange: {skip: "primary only"},
         usersInfo: {skip: "primary only"},
         validate: {skip: "does not return user data"},
+        waitForOngoingChunkSplits: {skip: "does not return user data"},
         whatsmyuri: {skip: "does not return user data"}
     };
+
+    commandsRemovedFromMongosIn42.forEach(function(cmd) {
+        testCases[cmd] = {skip: "must define test coverage for 4.0 backwards compatibility"};
+    });
 
     // Set the secondaries to priority 0 and votes 0 to prevent the primaries from stepping down.
     let rsOpts = {nodes: [{rsConfig: {votes: 1}}, {rsConfig: {priority: 0, votes: 0}}]};
@@ -392,6 +391,11 @@
 
         // Do any test-specific setup.
         test.setUp(staleMongos);
+
+        // Wait for replication as a safety net, in case the individual setup function for a test
+        // case did not specify writeConcern itself
+        st.rs0.awaitReplication();
+        st.rs1.awaitReplication();
 
         assert.commandWorked(recipientShardPrimary.getDB(db).setProfilingLevel(2));
         assert.commandWorked(donorShardSecondary.getDB(db).setProfilingLevel(2));

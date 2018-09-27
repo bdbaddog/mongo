@@ -164,9 +164,35 @@ public:
 
     virtual int64_t getIdentSize(OperationContext* opCtx, StringData ident) = 0;
 
+    /**
+     * Repair an ident. Returns Status::OK if repair did not modify data. Returns a non-fatal status
+     * of DataModifiedByRepair if a repair operation succeeded, but may have modified data.
+     */
     virtual Status repairIdent(OperationContext* opCtx, StringData ident) = 0;
 
     virtual Status dropIdent(OperationContext* opCtx, StringData ident) = 0;
+
+    /**
+     * Attempts to locate and recover a file that is "orphaned" from the storage engine's metadata,
+     * but may still exist on disk if this is a durable storage engine. Returns DataModifiedByRepair
+     * if a new record store was successfully created and Status::OK() if no data was modified.
+     *
+     * This may return an error if the storage engine attempted to recover the file and failed.
+     *
+     * This recovery process makes no guarantees about the integrity of data recovered or even that
+     * it still exists when recovered.
+     */
+    virtual Status recoverOrphanedIdent(OperationContext* opCtx,
+                                        StringData ns,
+                                        StringData ident,
+                                        const CollectionOptions& options) {
+        auto status = createRecordStore(opCtx, ns, ident, options);
+        if (status.isOK()) {
+            return {ErrorCodes::DataModifiedByRepair, "Orphan recovery created a new record store"};
+        }
+        return status;
+    }
+
 
     virtual void alterIdentMetadata(OperationContext* opCtx,
                                     StringData ident,
@@ -274,7 +300,8 @@ public:
     /**
      * See `StorageEngine::setStableTimestamp`
      */
-    virtual void setStableTimestamp(Timestamp stableTimestamp) {}
+    virtual void setStableTimestamp(Timestamp stableTimestamp,
+                                    boost::optional<Timestamp> maximumTruncationTimestamp) {}
 
     /**
      * See `StorageEngine::setInitialDataTimestamp`

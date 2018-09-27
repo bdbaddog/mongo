@@ -465,7 +465,8 @@ var DB;
     };
 
     /**
-      Clone database on another server to here.
+      Clone database on another server to here. This functionality was removed as of MongoDB 4.2.
+      The shell helper is kept to maintain compatibility with previous versions of MongoDB.
       <p>
       Generally, you should dropDatabase() first as otherwise the cloned information will MERGE
       into whatever data is already present in this database.  (That is however a valid way to use
@@ -481,7 +482,7 @@ var DB;
      */
     DB.prototype.cloneDatabase = function(from) {
         print(
-            "WARNING: db.cloneDatabase is deprecated. See http://dochub.mongodb.org/core/copydb-clone-deprecation");
+            "WARNING: db.cloneDatabase will only function with MongoDB 4.0 and below. See http://dochub.mongodb.org/core/4.2-copydb-clone");
         assert(isString(from) && from.length);
         return this._dbCommand({clone: from});
     };
@@ -512,7 +513,9 @@ var DB;
     };
 
     /**
-      Copy database from one server or name to another server or name.
+      Copy database from one server or name to another server or name. This functionality was
+      removed as of MongoDB 4.2. The shell helper is kept to maintain compatibility with previous
+      versions of MongoDB.
 
       Generally, you should dropDatabase() first as otherwise the copied information will MERGE
       into whatever data is already present in this database (and you will get duplicate objects
@@ -534,7 +537,7 @@ var DB;
     DB.prototype.copyDatabase = function(
         fromdb, todb, fromhost, username, password, mechanism, slaveOk) {
         print(
-            "WARNING: db.copyDatabase is deprecated. See http://dochub.mongodb.org/core/copydb-clone-deprecation");
+            "WARNING: db.copyDatabase will only function with MongoDB 4.0 and below. See http://dochub.mongodb.org/core/4.2-copydb-clone");
         assert(isString(fromdb) && fromdb.length);
         assert(isString(todb) && todb.length);
         fromhost = fromhost || "";
@@ -580,15 +583,6 @@ var DB;
         });
     };
 
-    /**
-      Repair database.
-
-     * @return Object returned has member ok set to true if operation succeeds, false otherwise.
-    */
-    DB.prototype.repairDatabase = function() {
-        return this._dbCommand({repairDatabase: 1});
-    };
-
     DB.prototype.help = function() {
         print("DB methods:");
         print(
@@ -596,9 +590,10 @@ var DB;
         print(
             "\tdb.aggregate([pipeline], {options}) - performs a collectionless aggregation on this database; returns a cursor");
         print("\tdb.auth(username, password)");
-        print("\tdb.cloneDatabase(fromhost) - deprecated");
+        print("\tdb.cloneDatabase(fromhost) - will only function with MongoDB 4.0 and below");
         print("\tdb.commandHelp(name) returns the help for the command");
-        print("\tdb.copyDatabase(fromdb, todb, fromhost) - deprecated");
+        print(
+            "\tdb.copyDatabase(fromdb, todb, fromhost) - will only function with MongoDB 4.0 and below");
         print("\tdb.createCollection(name, {size: ..., capped: ..., max: ...})");
         print("\tdb.createView(name, viewOn, [{$operator: {...}}, ...], {viewOptions})");
         print("\tdb.createUser(userDocument)");
@@ -636,7 +631,6 @@ var DB;
         print("\tdb.printShardingStatus()");
         print("\tdb.printSlaveReplicationInfo()");
         print("\tdb.dropUser(username)");
-        print("\tdb.repairDatabase()");
         print("\tdb.resetError()");
         print(
             "\tdb.runCommand(cmdObj) run a database command.  if cmdObj is a string, turns it into {cmdObj: 1}");
@@ -864,39 +858,6 @@ var DB;
         return this.runCommand({getpreverror: 1});
     };
 
-    DB.prototype._getCollectionInfosSystemNamespaces = function(filter) {
-        var all = [];
-
-        var dbNamePrefix = this._name + ".";
-
-        // Create a shallow copy of 'filter' in case we modify its 'name' property. Also defaults
-        // 'filter' to {} if the parameter was not specified.
-        filter = Object.extend({}, filter);
-        if (typeof filter.name === "string") {
-            // Queries on the 'name' field need to qualify the namespace with the database name for
-            // consistency with the command variant.
-            filter.name = dbNamePrefix + filter.name;
-        }
-
-        var c = this.getCollection("system.namespaces").find(filter);
-        while (c.hasNext()) {
-            var infoObj = c.next();
-
-            if (infoObj.name.indexOf("$") >= 0 && infoObj.name.indexOf(".oplog.$") < 0)
-                continue;
-
-            // Remove the database name prefix from the collection info object.
-            infoObj.name = infoObj.name.substring(dbNamePrefix.length);
-
-            all.push(infoObj);
-        }
-
-        // Return list of objects sorted by collection name.
-        return all.sort(function(coll1, coll2) {
-            return coll1.name.localeCompare(coll2.name);
-        });
-    };
-
     DB.prototype._getCollectionInfosCommand = function(
         filter, nameOnly = false, authorizedCollections = false) {
         filter = filter || {};
@@ -955,39 +916,28 @@ var DB;
      */
     DB.prototype.getCollectionInfos = function(
         filter, nameOnly = false, authorizedCollections = false) {
-        let oldException;
         try {
             return this._getCollectionInfosCommand(filter, nameOnly, authorizedCollections);
         } catch (ex) {
-            if (ex.code !== ErrorCodes.Unauthorized && ex.code !== ErrorCodes.CommandNotFound &&
-                !ex.message.startsWith("no such cmd")) {
+            if (ex.code !== ErrorCodes.Unauthorized) {
                 // We cannot recover from this error, propagate it.
                 throw ex;
             }
-            oldException = ex;
-        }
 
-        // We have failed to run listCollections. This may be due to the command not
-        // existing, or authorization failing. Try to query the system.namespaces collection.
-        try {
-            return this._getCollectionInfosSystemNamespaces(filter);
-        } catch (ex2) {
-            // Querying the system.namespaces collection has failed. We may be able to compute a
-            // set of *some* collections which exist and we have access to from our privileges.
-            // For this to work, the previous operations must have failed due to authorization,
-            // we must be attempting to recover the names of our own collections,
+            // We may be able to compute a set of *some* collections which exist and we have access
+            // to from our privileges. For this to work, the previous operation must have failed due
+            // to authorization, we must be attempting to recover the names of our own collections,
             // and no filter can have been provided.
 
             if (nameOnly && authorizedCollections &&
                 Object.getOwnPropertyNames(filter).length === 0 &&
-                oldException.code === ErrorCodes.Unauthorized &&
-                ex2.code == ErrorCodes.Unauthorized) {
+                ex.code === ErrorCodes.Unauthorized) {
                 print(
                     "Warning: unable to run listCollections, attempting to approximate collection names by parsing connectionStatus");
                 return this._getCollectionInfosFromPrivileges();
             }
 
-            throw oldException;
+            throw ex;
         }
     };
 
@@ -1593,6 +1543,12 @@ var DB;
                 if (!Array.isArray(mechs)) {
                     throw Error("Server replied with invalid saslSupportedMechs response");
                 }
+
+                if ((this._defaultAuthenticationMechanism != null) &&
+                    mechs.includes(this._defaultAuthenticationMechanism)) {
+                    return this._defaultAuthenticationMechanism;
+                }
+
                 // Never include PLAIN in auto-negotiation.
                 const priority = ["GSSAPI", "SCRAM-SHA-256", "SCRAM-SHA-1"];
                 for (var i = 0; i < priority.length; ++i) {
@@ -1891,25 +1847,12 @@ var DB;
 
     DB.prototype.watch = function(pipeline, options) {
         pipeline = pipeline || [];
-        options = options || {};
         assert(pipeline instanceof Array, "'pipeline' argument must be an array");
-        assert(options instanceof Object, "'options' argument must be an object");
 
-        let changeStreamStage = {fullDocument: options.fullDocument || "default"};
-        delete options.fullDocument;
-
-        if (options.hasOwnProperty("resumeAfter")) {
-            changeStreamStage.resumeAfter = options.resumeAfter;
-            delete options.resumeAfter;
-        }
-
-        if (options.hasOwnProperty("startAtOperationTime")) {
-            changeStreamStage.startAtOperationTime = options.startAtOperationTime;
-            delete options.startAtOperationTime;
-        }
-
-        pipeline.unshift({$changeStream: changeStreamStage});
-        return this._runAggregate({aggregate: 1, pipeline: pipeline}, options);
+        let changeStreamStage;
+        [changeStreamStage, aggOptions] = this.getMongo()._extractChangeStreamOptions(options);
+        pipeline.unshift(changeStreamStage);
+        return this._runAggregate({aggregate: 1, pipeline: pipeline}, aggOptions);
     };
 
     DB.prototype.getFreeMonitoringStatus = function() {

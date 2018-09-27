@@ -41,7 +41,7 @@ function testProperAuthorization(conn, t, testcase, privileges) {
 
     var command = t.command;
     if (typeof(command) === "function") {
-        command = t.command(state);
+        command = t.command(state, testcase.commandArgs);
     }
     var res = runOnDb.runCommand(command);
 
@@ -56,7 +56,7 @@ function testProperAuthorization(conn, t, testcase, privileges) {
     }
 
     firstDb.logout();
-    authCommandsLib.teardown(conn, t, runOnDb);
+    authCommandsLib.teardown(conn, t, runOnDb, res);
     return out;
 }
 
@@ -79,7 +79,7 @@ function testInsufficientPrivileges(conn, t, testcase, privileges) {
 
     var command = t.command;
     if (typeof(command) === "function") {
-        command = t.command(state);
+        command = t.command(state, testcase.commandArgs);
     }
     var res = runOnDb.runCommand(command);
 

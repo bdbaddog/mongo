@@ -50,16 +50,12 @@
 #include "mongo/util/log.h"
 #include "mongo/util/mongoutils/str.h"
 #include "mongo/util/net/http_client.h"
+#include "mongo/util/scopeguard.h"
 #include "mongo/util/text.h"
 #include "mongo/util/winutil.h"
 
 namespace mongo {
 namespace {
-
-const DWORD kResolveTimeout = 60 * 1000;
-const DWORD kConnectTimeout = 60 * 1000;
-const DWORD kSendTimeout = 120 * 1000;
-const DWORD kReceiveTimeout = 120 * 1000;
 
 const LPCWSTR kAcceptTypes[] = {
     L"application/octet-stream", nullptr,
@@ -151,14 +147,33 @@ public:
         _headers = toNativeString(header.c_str());
     }
 
-    std::vector<uint8_t> post(const std::string& urlString, ConstDataRange cdr) const final {
+    void setConnectTimeout(Seconds timeout) final {
+        _connectTimeout = timeout;
+    }
+
+    void setTimeout(Seconds timeout) final {
+        _timeout = timeout;
+    }
+
+    DataBuilder post(StringData url, ConstDataRange cdr) const final {
+        return doRequest(
+            L"POST", url, const_cast<void*>(static_cast<const void*>(cdr.data())), cdr.length());
+    }
+
+    DataBuilder get(StringData url) const final {
+        return doRequest(L"GET", url, nullptr, 0);
+    }
+
+private:
+    DataBuilder doRequest(LPCWSTR method, StringData urlSD, LPVOID data, DWORD data_len) const {
         const auto uassertWithErrno = [](StringData reason, bool ok) {
             const auto msg = errnoWithDescription(GetLastError());
             uassert(ErrorCodes::OperationFailed, str::stream() << reason << ": " << msg, ok);
         };
 
         // Break down URL for handling below.
-        auto url = uassertStatusOK(parseUrl(toNativeString(urlString.c_str())));
+        const auto urlString = toNativeString(urlSD.toString().c_str());
+        auto url = uassertStatusOK(parseUrl(urlString));
         uassert(
             ErrorCodes::BadValue, "URL endpoint must be https://", url.https || _allowInsecureHTTP);
 
@@ -195,16 +210,17 @@ public:
             "Failed setting HTTP session option",
             WinHttpSetOption(session, WINHTTP_OPTION_REDIRECT_POLICY, &setting, settingLength));
 
-        uassertWithErrno(
-            "Failed setting HTTP timeout",
-            WinHttpSetTimeouts(
-                session, kResolveTimeout, kConnectTimeout, kSendTimeout, kReceiveTimeout));
+        DWORD connectTimeout = durationCount<Milliseconds>(_connectTimeout);
+        DWORD totalTimeout = durationCount<Milliseconds>(_timeout);
+        uassertWithErrno("Failed setting HTTP timeout",
+                         WinHttpSetTimeouts(
+                             session, connectTimeout, connectTimeout, totalTimeout, totalTimeout));
 
         connect = WinHttpConnect(session, url.hostname.c_str(), url.port, 0);
         uassertWithErrno("Failed connecting to remote host", connect);
 
         request = WinHttpOpenRequest(connect,
-                                     L"POST",
+                                     method,
                                      (url.path + url.query).c_str(),
                                      nullptr,
                                      WINHTTP_NO_REFERER,
@@ -222,17 +238,22 @@ public:
             uassertWithErrno("Failed setting authentication credentials", result);
         }
 
-        uassertWithErrno("Failed sending HTTP request",
-                         WinHttpSendRequest(request,
-                                            _headers.c_str(),
-                                            -1L,
-                                            const_cast<void*>(static_cast<const void*>(cdr.data())),
-                                            cdr.length(),
-                                            cdr.length(),
-                                            0));
+        uassertWithErrno(
+            "Failed sending HTTP request",
+            WinHttpSendRequest(request, _headers.c_str(), -1L, data, data_len, data_len, 0));
 
-        uassertWithErrno("Failed receiving response from server",
-                         WinHttpReceiveResponse(request, nullptr));
+        if (!WinHttpReceiveResponse(request, nullptr)) {
+            // Carve out timeout which doesn't translate well.
+            const auto err = GetLastError();
+            if (err == ERROR_WINHTTP_TIMEOUT) {
+                uasserted(ErrorCodes::OperationFailed, "Timeout was reached");
+            }
+            const auto msg = errnoWithDescription(err);
+            uasserted(ErrorCodes::OperationFailed,
+                      str::stream() << "Failed receiving response from server"
+                                    << ": "
+                                    << msg);
+        }
 
         DWORD statusCode = 0;
         DWORD statusCodeLength = sizeof(statusCode);
@@ -249,9 +270,8 @@ public:
                 str::stream() << "Unexpected http status code from server: " << statusCode,
                 statusCode == 200);
 
-        // Marshal response into vector.
-        std::vector<uint8_t> ret;
-        auto sz = ret.size();
+        std::vector<char> buffer;
+        DataBuilder ret(4096);
         for (;;) {
             DWORD len = 0;
             uassertWithErrno("Failed receiving response data",
@@ -259,12 +279,14 @@ public:
             if (!len) {
                 break;
             }
-            ret.resize(sz + len);
+
+            buffer.resize(len);
             uassertWithErrno("Failed reading response data",
-                             WinHttpReadData(request, ret.data() + sz, len, &len));
-            sz += len;
+                             WinHttpReadData(request, buffer.data(), len, &len));
+
+            ConstDataRange cdr(buffer.data(), len);
+            ret.writeAndAdvance(cdr);
         }
-        ret.resize(sz);
 
         return ret;
     }
@@ -272,6 +294,8 @@ public:
 private:
     bool _allowInsecureHTTP = false;
     std::wstring _headers;
+    Seconds _connectTimeout = kConnectionTimeout;
+    Seconds _timeout = kTotalRequestTimeout;
 };
 
 }  // namespace

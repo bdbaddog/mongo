@@ -144,6 +144,7 @@ void ReplicationCoordinatorImpl::_handleHeartbeatResponse(
     }
 
     ReplSetHeartbeatResponse hbResponse;
+    OpTime lastOpCommitted;
     BSONObj resp;
     if (responseStatus.isOK()) {
         resp = cbData.response.data;
@@ -172,9 +173,11 @@ void ReplicationCoordinatorImpl::_handleHeartbeatResponse(
             replMetadata = responseStatus;
         }
         if (replMetadata.isOK()) {
+            lastOpCommitted = replMetadata.getValue().getLastOpCommitted();
+
             // Arbiters are the only nodes allowed to advance their commit point via heartbeats.
             if (_getMemberState_inlock().arbiter()) {
-                _advanceCommitPoint_inlock(replMetadata.getValue().getLastOpCommitted());
+                _advanceCommitPoint_inlock(lastOpCommitted);
             }
             // Asynchronous stepdown could happen, but it will wait for _mutex and execute
             // after this function, so we cannot and don't need to wait for it to finish.
@@ -204,8 +207,8 @@ void ReplicationCoordinatorImpl::_handleHeartbeatResponse(
         hbStatusResponse = StatusWith<ReplSetHeartbeatResponse>(responseStatus);
     }
 
-    HeartbeatResponseAction action =
-        _topCoord->processHeartbeatResponse(now, networkTime, target, hbStatusResponse);
+    HeartbeatResponseAction action = _topCoord->processHeartbeatResponse(
+        now, networkTime, target, hbStatusResponse, lastOpCommitted);
 
     if (action.getAction() == HeartbeatResponseAction::NoAction && hbStatusResponse.isOK() &&
         hbStatusResponse.getValue().hasState() &&
@@ -824,6 +827,7 @@ void ReplicationCoordinatorImpl::_startElectSelfIfEligibleV1(
                                     << "since we are not electable due to: " << status.reason();
                 break;
             case TopologyCoordinator::StartElectionReason::kStepUpRequest:
+            case TopologyCoordinator::StartElectionReason::kStepUpRequestSkipDryRun:
                 LOG_FOR_ELECTION(0) << "Not starting an election for a replSetStepUp request, "
                                     << "since we are not electable due to: " << status.reason();
                 break;
@@ -849,6 +853,7 @@ void ReplicationCoordinatorImpl::_startElectSelfIfEligibleV1(
             LOG_FOR_ELECTION(0) << "Starting an election for a priority takeover";
             break;
         case TopologyCoordinator::StartElectionReason::kStepUpRequest:
+        case TopologyCoordinator::StartElectionReason::kStepUpRequestSkipDryRun:
             LOG_FOR_ELECTION(0) << "Starting an election due to step up request";
             break;
         case TopologyCoordinator::StartElectionReason::kCatchupTakeover:

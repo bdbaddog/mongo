@@ -31,7 +31,6 @@
 #include "mongo/db/bson/dotted_path_support.h"
 #include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/service_context.h"
-#include "mongo/db/storage/record_fetcher.h"
 
 namespace mongo {
 
@@ -80,21 +79,6 @@ void WorkingSet::free(WorkingSetID i) {
     _freeList = i;
 }
 
-void WorkingSet::flagForReview(WorkingSetID i) {
-    WorkingSetMember* member = get(i);
-    verify(WorkingSetMember::OWNED_OBJ == member->_state);
-    _flagged.insert(i);
-}
-
-const stdx::unordered_set<WorkingSetID>& WorkingSet::getFlagged() const {
-    return _flagged;
-}
-
-bool WorkingSet::isFlagged(WorkingSetID id) const {
-    invariant(id < _data.size());
-    return _flagged.end() != _flagged.find(id);
-}
-
 void WorkingSet::clear() {
     for (size_t i = 0; i < _data.size(); i++) {
         delete _data[i].member;
@@ -105,7 +89,6 @@ void WorkingSet::clear() {
     // point to nothing.
     _freeList = INVALID_ID;
 
-    _flagged.clear();
     _yieldSensitiveIds.clear();
 }
 
@@ -173,7 +156,7 @@ bool WorkingSetMember::hasOwnedObj() const {
 }
 
 void WorkingSetMember::makeObjOwnedIfNeeded() {
-    if (supportsDocLocking() && _state == RID_AND_OBJ && !obj.value().isOwned()) {
+    if (_state == RID_AND_OBJ && !obj.value().isOwned()) {
         obj.setValue(obj.value().getOwned());
     }
 }
@@ -191,18 +174,6 @@ const WorkingSetComputedData* WorkingSetMember::getComputed(
 void WorkingSetMember::addComputed(WorkingSetComputedData* data) {
     verify(!hasComputed(data->type()));
     _computed[data->type()].reset(data);
-}
-
-void WorkingSetMember::setFetcher(RecordFetcher* fetcher) {
-    _fetcher.reset(fetcher);
-}
-
-RecordFetcher* WorkingSetMember::releaseFetcher() {
-    return _fetcher.release();
-}
-
-bool WorkingSetMember::hasFetcher() const {
-    return NULL != _fetcher.get();
 }
 
 bool WorkingSetMember::getFieldDotted(const string& field, BSONElement* out) const {

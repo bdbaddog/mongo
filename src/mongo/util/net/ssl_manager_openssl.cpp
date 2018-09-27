@@ -318,6 +318,14 @@ using UniqueSSLContext = std::unique_ptr<SSL_CTX, decltype(&free_ssl_context)>;
 static const int BUFFER_SIZE = 8 * 1024;
 static const int DATE_LEN = 128;
 
+struct UniqueX509Free {
+    void operator()(X509* ptr) const {
+        X509_free(ptr);
+    }
+};
+
+using UniqueX509 = std::unique_ptr<X509, UniqueX509Free>;
+
 class SSLManagerOpenSSL : public SSLManagerInterface {
 public:
     explicit SSLManagerOpenSSL(const SSLParams& params, bool isServer);
@@ -335,10 +343,11 @@ public:
     SSLConnectionInterface* accept(Socket* socket, const char* initialBytes, int len) final;
 
     SSLPeerInfo parseAndValidatePeerCertificateDeprecated(const SSLConnectionInterface* conn,
-                                                          const std::string& remoteHost) final;
+                                                          const std::string& remoteHost,
+                                                          const HostAndPort& hostForLogging) final;
 
     StatusWith<boost::optional<SSLPeerInfo>> parseAndValidatePeerCertificate(
-        SSL* conn, const std::string& remoteHost) final;
+        SSL* conn, const std::string& remoteHost, const HostAndPort& hostForLogging) final;
 
     const SSLConfiguration& getSSLConfiguration() const final {
         return _sslConfiguration;
@@ -356,6 +365,16 @@ private:
                                      mongodbRolesOID.longDescription.c_str());
     UniqueSSLContext _serverContext;  // SSL context for incoming connections
     UniqueSSLContext _clientContext;  // SSL context for outgoing connections
+
+// On OSX, it's not safe to copy the system CA certificates after a fork(), which we need to
+// do the deathtest unittests. So on __APPLE__ platforms, we copy the certificates into a vector
+// of OpenSSL X509 objects once at startup in _getSystemCerts() and then append them into
+// X509_STORE's when initializing SSL_CTX's.
+//
+// On other platforms it's safe to load the certificate each time we initialize an SSL_CTX.
+#if defined(__APPLE__)
+    std::vector<UniqueX509> _systemCACertificates;
+#endif
     bool _weakValidation;
     bool _allowInvalidCertificates;
     bool _allowInvalidHostnames;
@@ -418,6 +437,13 @@ private:
      * Set up an SSL context for certificate validation by loading the system's CA store
      */
     Status _setupSystemCA(SSL_CTX* context);
+
+#if defined(__APPLE__)
+    /*
+     * Loads the system-trusted CA certificates from a native source into a vector of X509 objects
+     */
+    std::vector<UniqueX509> _getSystemCerts();
+#endif
 
     /*
      * Import a certificate revocation list into an SSL context
@@ -576,6 +602,9 @@ SSLConnectionOpenSSL::~SSLConnectionOpenSSL() {
 SSLManagerOpenSSL::SSLManagerOpenSSL(const SSLParams& params, bool isServer)
     : _serverContext(nullptr, free_ssl_context),
       _clientContext(nullptr, free_ssl_context),
+#if defined(__APPLE__)
+      _systemCACertificates(_getSystemCerts()),
+#endif
       _weakValidation(params.sslWeakCertificateValidation),
       _allowInvalidCertificates(params.sslAllowInvalidCertificates),
       _allowInvalidHostnames(params.sslAllowInvalidHostnames),
@@ -718,23 +747,33 @@ Status SSLManagerOpenSSL::initSSLContext(SSL_CTX* context,
                                     << getSSLErrorMessage(ERR_get_error()));
     }
 
-    if (direction == ConnectionDirection::kOutgoing && !params.sslClusterFile.empty()) {
+    if (direction == ConnectionDirection::kOutgoing && params.tlsWithholdClientCertificate) {
+        // Do not send a client certificate if they have been suppressed.
+
+    } else if (direction == ConnectionDirection::kOutgoing && !params.sslClusterFile.empty()) {
+        // Use the configured clusterFile as our client certificate.
         ::EVP_set_pw_prompt("Enter cluster certificate passphrase");
         if (!_setupPEM(context, params.sslClusterFile, params.sslClusterPassword)) {
             return Status(ErrorCodes::InvalidSSLConfiguration, "Can not set up ssl clusterFile.");
         }
+
     } else if (!params.sslPEMKeyFile.empty()) {
-        // Use the pemfile for everything else
+        // Use the base pemKeyFile for any other outgoing connections,
+        // as well as all incoming connections.
         ::EVP_set_pw_prompt("Enter PEM passphrase");
         if (!_setupPEM(context, params.sslPEMKeyFile, params.sslPEMKeyPassword)) {
             return Status(ErrorCodes::InvalidSSLConfiguration, "Can not set up PEM key file.");
         }
     }
 
-    const auto status =
-        params.sslCAFile.empty() ? _setupSystemCA(context) : _setupCA(context, params.sslCAFile);
-    if (!status.isOK())
+    std::string cafile = params.sslCAFile;
+    if (direction == ConnectionDirection::kIncoming && !params.sslClusterCAFile.empty()) {
+        cafile = params.sslClusterCAFile;
+    }
+    const auto status = cafile.empty() ? _setupSystemCA(context) : _setupCA(context, cafile);
+    if (!status.isOK()) {
         return status;
+    }
 
     if (!params.sslCRLFile.empty()) {
         if (!_setupCRL(context, params.sslCRLFile)) {
@@ -1013,6 +1052,7 @@ Status importCertStoreToX509_STORE(const wchar_t* storeName,
 
     return Status::OK();
 }
+
 #elif defined(__APPLE__)
 
 template <typename T>
@@ -1039,48 +1079,41 @@ std::string OSStatusToString(OSStatus status) {
     return std::string{CFStringGetCStringPtr(errMsg, kCFStringEncodingUTF8)};
 }
 
-Status importKeychainToX509_STORE(X509_STORE* verifyStore) {
-    CFArrayRef result;
-    OSStatus status;
+std::vector<UniqueX509> SSLManagerOpenSSL::_getSystemCerts() {
+    // Copy the system CA certs into a CFArray for us to iterate and convert into X509*
+    auto anchorCerts = makeCFTypeRefHolder([] {
+        CFArrayRef ret;
+        auto status = SecTrustCopyAnchorCertificates(&ret);
+        uassert(50928,
+                str::stream() << "Error enumerating certificates: " << OSStatusToString(status),
+                status == ::errSecSuccess);
+        return ret;
+    }());
 
-    // This copies all the certificates trusted by the system (regardless of what keychain they're
-    // attached to) into a CFArray.
-    if ((status = SecTrustCopyAnchorCertificates(&result)) != 0) {
-        return {ErrorCodes::InvalidSSLConfiguration,
-                str::stream() << "Error enumerating certificates: " << OSStatusToString(status)};
-    }
-    const auto resultGuard = makeCFTypeRefHolder(result);
+    std::vector<UniqueX509> ret;
+    for (CFIndex i = 0; i < CFArrayGetCount(anchorCerts); i++) {
+        SecCertificateRef cert = static_cast<SecCertificateRef>(
+            const_cast<void*>(CFArrayGetValueAtIndex(anchorCerts, i)));
 
-    for (CFIndex i = 0; i < CFArrayGetCount(result); i++) {
-        SecCertificateRef cert =
-            static_cast<SecCertificateRef>(const_cast<void*>(CFArrayGetValueAtIndex(result, i)));
+        uassert(50929,
+                "Certificate array had something other than a certificate in it",
+                ::CFGetTypeID(cert) == ::SecCertificateGetTypeID());
 
+        // Get the raw X509 bytes out of the certificate
         auto rawData = makeCFTypeRefHolder(SecCertificateCopyData(cert));
-        if (!rawData) {
-            return {ErrorCodes::InvalidSSLConfiguration,
-                    str::stream() << "Error enumerating certificates: "
-                                  << OSStatusToString(status)};
-        }
+        uassert(50930, str::stream() << "Error converting certificate to raw bytes", rawData);
         const uint8_t* rawDataPtr = CFDataGetBytePtr(rawData);
 
         // Parse an openssl X509 object from each returned certificate
-        X509* x509Cert = d2i_X509(nullptr, &rawDataPtr, CFDataGetLength(rawData));
-        if (!x509Cert) {
-            return {ErrorCodes::InvalidSSLConfiguration,
-                    str::stream() << "Error parsing X509 certificate from system keychain: "
-                                  << ERR_reason_error_string(ERR_peek_last_error())};
-        }
-        const auto x509CertGuard = MakeGuard([&x509Cert]() { X509_free(x509Cert); });
-
-        // Add the parsed X509 object to the X509_STORE verification store
-        if (X509_STORE_add_cert(verifyStore, x509Cert) != 1) {
-            auto status = checkX509_STORE_error();
-            if (!status.isOK())
-                return status;
-        }
+        UniqueX509 x509Cert(d2i_X509(nullptr, &rawDataPtr, CFDataGetLength(rawData)));
+        uassert(50931,
+                str::stream() << "Error parsing X509 certificate from system keychain: "
+                              << ERR_reason_error_string(ERR_peek_last_error()),
+                x509Cert);
+        ret.push_back(std::move(x509Cert));
     }
 
-    return Status::OK();
+    return ret;
 }
 #endif
 
@@ -1098,7 +1131,6 @@ Status SSLManagerOpenSSL::_setupSystemCA(SSL_CTX* context) {
                               << X509_get_default_cert_dir()
                               << ")"};
     }
-    return Status::OK();
 #else
 
     X509_STORE* verifyStore = SSL_CTX_get_cert_store(context);
@@ -1112,9 +1144,13 @@ Status SSLManagerOpenSSL::_setupSystemCA(SSL_CTX* context) {
         return status;
     return importCertStoreToX509_STORE(L"CA", CERT_SYSTEM_STORE_CURRENT_USER, verifyStore);
 #elif defined(__APPLE__)
-    return importKeychainToX509_STORE(verifyStore);
+    for (const auto& cert : _systemCACertificates) {
+        X509_STORE_add_cert(verifyStore, cert.get());
+    }
 #endif
 #endif
+
+    return Status::OK();
 }
 
 bool SSLManagerOpenSSL::_setupCRL(SSL_CTX* context, const std::string& crlFile) {
@@ -1237,35 +1273,34 @@ SSLConnectionInterface* SSLManagerOpenSSL::accept(Socket* socket,
 }
 
 
-void recordTLSVersion(const SSL* conn) {
+StatusWith<TLSVersion> mapTLSVersion(SSL* conn) {
     int protocol = SSL_version(conn);
 
-    auto& counts = mongo::TLSVersionCounts::get(getGlobalServiceContext());
     switch (protocol) {
         case TLS1_VERSION:
-            counts.tls10.addAndFetch(1);
-            break;
+            return TLSVersion::kTLS10;
         case TLS1_1_VERSION:
-            counts.tls11.addAndFetch(1);
-            break;
+            return TLSVersion::kTLS11;
         case TLS1_2_VERSION:
-            counts.tls12.addAndFetch(1);
-            break;
+            return TLSVersion::kTLS12;
 #ifdef TLS1_3_VERSION
         case TLS1_3_VERSION:
-            counts.tls13.addAndFetch(1);
-            break;
+            return TLSVersion::kTLS13;
 #endif
         default:
-            // Do nothing
-            break;
+            return TLSVersion::kUnknown;
     }
 }
 
 StatusWith<boost::optional<SSLPeerInfo>> SSLManagerOpenSSL::parseAndValidatePeerCertificate(
-    SSL* conn, const std::string& remoteHost) {
+    SSL* conn, const std::string& remoteHost, const HostAndPort& hostForLogging) {
 
-    recordTLSVersion(conn);
+    auto tlsVersionStatus = mapTLSVersion(conn);
+    if (!tlsVersionStatus.isOK()) {
+        return tlsVersionStatus.getStatus();
+    }
+
+    recordTLSVersion(tlsVersionStatus.getValue(), hostForLogging);
 
     if (!_sslConfiguration.hasCA && isSSLServer)
         return {boost::none};
@@ -1379,10 +1414,12 @@ StatusWith<boost::optional<SSLPeerInfo>> SSLManagerOpenSSL::parseAndValidatePeer
 
 
 SSLPeerInfo SSLManagerOpenSSL::parseAndValidatePeerCertificateDeprecated(
-    const SSLConnectionInterface* connInterface, const std::string& remoteHost) {
+    const SSLConnectionInterface* connInterface,
+    const std::string& remoteHost,
+    const HostAndPort& hostForLogging) {
     const SSLConnectionOpenSSL* conn = checked_cast<const SSLConnectionOpenSSL*>(connInterface);
 
-    auto swPeerSubjectName = parseAndValidatePeerCertificate(conn->ssl, remoteHost);
+    auto swPeerSubjectName = parseAndValidatePeerCertificate(conn->ssl, remoteHost, hostForLogging);
     // We can't use uassertStatusOK here because we need to throw a NetworkException.
     if (!swPeerSubjectName.isOK()) {
         throwSocketError(SocketErrorKind::CONNECT_ERROR, swPeerSubjectName.getStatus().reason());

@@ -43,6 +43,7 @@
 #include "mongo/db/db_raii.h"
 #include "mongo/db/dbhelpers.h"
 #include "mongo/db/namespace_string.h"
+#include "mongo/db/op_observer.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/ops/delete.h"
 #include "mongo/db/ops/write_ops_exec.h"
@@ -51,6 +52,7 @@
 #include "mongo/db/s/collection_sharding_state.h"
 #include "mongo/db/s/migration_util.h"
 #include "mongo/db/s/move_timing_helper.h"
+#include "mongo/db/s/sharding_statistics.h"
 #include "mongo/db/s/start_chunk_clone_request.h"
 #include "mongo/db/service_context.h"
 #include "mongo/s/catalog/type_chunk.h"
@@ -288,6 +290,7 @@ void MigrationDestinationManager::report(BSONObjBuilder& b,
 
     b.append("ns", _nss.ns());
     b.append("from", _fromShardConnString.toString());
+    b.append("fromShardId", _fromShard.toString());
     b.append("min", _min);
     b.append("max", _max);
     b.append("shardKeyPattern", _shardKeyPattern);
@@ -364,6 +367,7 @@ Status MigrationDestinationManager::start(OperationContext* opCtx,
 
     _sessionMigration =
         stdx::make_unique<SessionCatalogMigrationDestination>(_fromShard, *_sessionId);
+    ShardingStatistics::get(opCtx).countRecipientMoveChunkStarted.addAndFetch(1);
 
     _migrateThreadHandle = stdx::thread([this]() { _migrateThread(); });
 
@@ -654,8 +658,11 @@ void MigrationDestinationManager::cloneCollectionIndexesAndOptions(OperationCont
 
             for (auto&& infoObj : indexInfoObjs.getValue()) {
                 // make sure to create index on secondaries as well
-                serviceContext->getOpObserver()->onCreateIndex(
-                    opCtx, collection->ns(), collection->uuid(), infoObj, true /* fromMigrate */);
+                serviceContext->getOpObserver()->onCreateIndex(opCtx,
+                                                               collection->ns(),
+                                                               *(collection->uuid()),
+                                                               infoObj,
+                                                               true /* fromMigrate */);
             }
 
             wunit.commit();
@@ -790,6 +797,8 @@ void MigrationDestinationManager::_migrateDriver(OperationContext* opCtx) {
             {
                 stdx::lock_guard<stdx::mutex> statsLock(_mutex);
                 _numCloned += batchNumCloned;
+                ShardingStatistics::get(opCtx).countDocsClonedOnRecipient.addAndFetch(
+                    batchNumCloned);
                 _clonedBytes += batchClonedBytes;
             }
             if (_writeConcern.shouldWaitForOtherNodes()) {

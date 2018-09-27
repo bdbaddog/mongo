@@ -32,16 +32,15 @@
 #include <memory>
 #include <vector>
 
+#include "mongo/base/data_builder.h"
 #include "mongo/base/data_range.h"
 #include "mongo/base/string_data.h"
-#include "mongo/executor/thread_pool_task_executor.h"
-#include "mongo/util/concurrency/thread_pool.h"
-#include "mongo/util/future.h"
+#include "mongo/util/duration.h"
 
 namespace mongo {
 
-constexpr uint64_t kConnectionTimeoutSeconds = 60L;
-constexpr uint64_t kTotalRequestTimeoutSeconds = 120L;
+constexpr Seconds kConnectionTimeout{60};
+constexpr Seconds kTotalRequestTimeout{120};
 
 /**
  * Interface used to upload and receive binary payloads to HTTP servers.
@@ -62,16 +61,26 @@ public:
     virtual void setHeaders(const std::vector<std::string>& headers) = 0;
 
     /**
-     * Perform a POST request to specified URL.
+     * Sets the maximum time to wait during the connection phase.
+     * `0` indicates no timeout.
      */
-    virtual std::vector<uint8_t> post(const std::string& url, ConstDataRange data) const = 0;
+    virtual void setConnectTimeout(Seconds timeout) = 0;
 
     /**
-     * Futurized helper for HttpClient::post().
+     * Sets the maximum time to wait for the total request.
+     * `0` indicates no timeout.
      */
-    Future<std::vector<uint8_t>> postAsync(executor::ThreadPoolTaskExecutor* executor,
-                                           StringData url,
-                                           std::shared_ptr<std::vector<std::uint8_t>> data) const;
+    virtual void setTimeout(Seconds timeout) = 0;
+
+    /**
+     * Perform a POST request to specified URL.
+     */
+    virtual DataBuilder post(StringData url, ConstDataRange data) const = 0;
+
+    /**
+     * Perform a GET request from the specified URL.
+     */
+    virtual DataBuilder get(StringData url) const = 0;
 
     /**
      * Factory method provided by client implementation.

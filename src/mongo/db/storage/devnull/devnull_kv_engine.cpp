@@ -126,8 +126,7 @@ public:
     virtual Status updateRecord(OperationContext* opCtx,
                                 const RecordId& oldLocation,
                                 const char* data,
-                                int len,
-                                UpdateNotifier* notifier) {
+                                int len) {
         return Status::OK();
     }
 
@@ -191,8 +190,8 @@ class DevNullSortedDataBuilderInterface : public SortedDataBuilderInterface {
 public:
     DevNullSortedDataBuilderInterface() {}
 
-    virtual Status addKey(const BSONObj& key, const RecordId& loc) {
-        return Status::OK();
+    virtual StatusWith<SpecialFormatInserted> addKey(const BSONObj& key, const RecordId& loc) {
+        return StatusWith<SpecialFormatInserted>(SpecialFormatInserted::NoSpecialFormatInserted);
     }
 };
 
@@ -204,11 +203,11 @@ public:
         return new DevNullSortedDataBuilderInterface();
     }
 
-    virtual Status insert(OperationContext* opCtx,
-                          const BSONObj& key,
-                          const RecordId& loc,
-                          bool dupsAllowed) {
-        return Status::OK();
+    virtual StatusWith<SpecialFormatInserted> insert(OperationContext* opCtx,
+                                                     const BSONObj& key,
+                                                     const RecordId& loc,
+                                                     bool dupsAllowed) {
+        return StatusWith<SpecialFormatInserted>(SpecialFormatInserted::NoSpecialFormatInserted);
     }
 
     virtual void unindex(OperationContext* opCtx,

@@ -66,6 +66,7 @@
 #include "mongo/db/operation_context.h"
 #include "mongo/db/ops/delete_request.h"
 #include "mongo/db/ops/parsed_update.h"
+#include "mongo/db/ops/update_lifecycle_impl.h"
 #include "mongo/db/ops/update_request.h"
 #include "mongo/db/query/get_executor.h"
 #include "mongo/db/query/internal_plans.h"
@@ -879,8 +880,10 @@ Status StorageInterfaceImpl::upsertById(OperationContext* opCtx,
         // We can create an UpdateRequest now that the collection's namespace has been resolved, in
         // the event it was specified as a UUID.
         UpdateRequest request(collection->ns());
+        UpdateLifecycleImpl lifeCycle(collection->ns());
         request.setQuery(query);
         request.setUpdates(update);
+        request.setLifecycle(&lifeCycle);
         request.setUpsert(true);
         invariant(!request.isMulti());  // This follows from using an exact _id query.
         invariant(!request.shouldReturnAnyDocs());
@@ -919,8 +922,10 @@ Status StorageInterfaceImpl::putSingleton(OperationContext* opCtx,
                                           const NamespaceString& nss,
                                           const TimestampedBSONObj& update) {
     UpdateRequest request(nss);
+    UpdateLifecycleImpl lifeCycle(nss);
     request.setQuery({});
     request.setUpdates(update.obj);
+    request.setLifecycle(&lifeCycle);
     request.setUpsert(true);
     return _updateWithQuery(opCtx, request, update.timestamp);
 }
@@ -930,8 +935,10 @@ Status StorageInterfaceImpl::updateSingleton(OperationContext* opCtx,
                                              const BSONObj& query,
                                              const TimestampedBSONObj& update) {
     UpdateRequest request(nss);
+    UpdateLifecycleImpl lifeCycle(nss);
     request.setQuery(query);
     request.setUpdates(update.obj);
+    request.setLifecycle(&lifeCycle);
     invariant(!request.isUpsert());
     return _updateWithQuery(opCtx, request, update.timestamp);
 }
@@ -1046,7 +1053,7 @@ Status StorageInterfaceImpl::upgradeNonReplicatedUniqueIndexes(OperationContext*
 }
 
 void StorageInterfaceImpl::setStableTimestamp(ServiceContext* serviceCtx, Timestamp snapshotName) {
-    serviceCtx->getStorageEngine()->setStableTimestamp(snapshotName);
+    serviceCtx->getStorageEngine()->setStableTimestamp(snapshotName, boost::none);
 }
 
 void StorageInterfaceImpl::setInitialDataTimestamp(ServiceContext* serviceCtx,
@@ -1125,16 +1132,18 @@ Status StorageInterfaceImpl::isAdminDbValid(OperationContext* opCtx) {
 }
 
 void StorageInterfaceImpl::waitForAllEarlierOplogWritesToBeVisible(OperationContext* opCtx) {
+    Lock::GlobalLock lk(opCtx, MODE_IS);
     Collection* oplog;
     {
         // We don't want to be holding the collection lock while blocking, to avoid deadlocks.
-        // It is safe to store and access the oplog's Collection object after dropping the lock
-        // because the oplog is special and cannot be deleted on a running process.
+        // It is safe to store and access the oplog's Collection object with just the global IS
+        // lock because of the special concurrency rules for the oplog.
         // TODO(spencer): It should be possible to get the pointer to the oplog Collection object
         // without ever having to take the collection lock.
         AutoGetCollection oplogLock(opCtx, NamespaceString::kRsOplogNamespace, MODE_IS);
         oplog = oplogLock.getCollection();
     }
+    uassert(ErrorCodes::NotYetInitialized, "The oplog does not exist", oplog);
     oplog->getRecordStore()->waitForAllEarlierOplogWritesToBeVisible(opCtx);
 }
 

@@ -61,6 +61,7 @@
 #include "mongo/s/query/establish_cursors.h"
 #include "mongo/s/query/store_possible_cursor.h"
 #include "mongo/s/stale_exception.h"
+#include "mongo/s/transaction/transaction_router.h"
 #include "mongo/stdx/memory.h"
 #include "mongo/util/fail_point_service.h"
 #include "mongo/util/log.h"
@@ -80,6 +81,8 @@ static const BSONObj kGeoNearDistanceMetaProjection = BSON("$meta"
 // for the field name's null terminator + 1 byte per digit in the array index. The index can be no
 // more than 8 decimal digits since the response is at most 16MB, and 16 * 1024 * 1024 < 1 * 10^8.
 static const int kPerDocumentOverheadBytesUpperBound = 10;
+
+const char kFindCmdName[] = "find";
 
 /**
  * Given the QueryRequest 'qr' being executed by mongos, returns a copy of the query which is
@@ -177,16 +180,9 @@ std::vector<std::pair<ShardId, BSONObj>> constructRequestsForShards(
     const CachedCollectionRoutingInfo& routingInfo,
     const std::set<ShardId>& shardIds,
     const CanonicalQuery& query,
-    bool appendGeoNearDistanceProjection,
-    boost::optional<LogicalTime> atClusterTime) {
+    bool appendGeoNearDistanceProjection) {
     const auto qrToForward = uassertStatusOK(
         transformQueryForShards(query.getQueryRequest(), appendGeoNearDistanceProjection));
-
-    if (atClusterTime) {
-        auto readConcernAtClusterTime =
-            appendAtClusterTimeToReadConcern(qrToForward->getReadConcern(), *atClusterTime);
-        qrToForward->setReadConcern(readConcernAtClusterTime);
-    }
 
     auto shardRegistry = Grid::get(opCtx)->shardRegistry();
     std::vector<std::pair<ShardId, BSONObj>> requests;
@@ -224,16 +220,15 @@ CursorId runQueryWithoutRetrying(OperationContext* opCtx,
                                               query.getQueryRequest().getFilter(),
                                               query.getQueryRequest().getCollation());
 
-    // Determine atClusterTime for snapshot reads. This will be a null time for requests with any
-    // other readConcern.
-    auto atClusterTime = computeAtClusterTime(opCtx,
-                                              false,
-                                              shardIds,
-                                              query.nss(),
-                                              query.getQueryRequest().getFilter(),
-                                              query.getQueryRequest().getCollation());
+    if (auto txnRouter = TransactionRouter::get(opCtx)) {
+        txnRouter->computeAtClusterTime(opCtx,
+                                        false,
+                                        shardIds,
+                                        query.nss(),
+                                        query.getQueryRequest().getFilter(),
+                                        query.getQueryRequest().getCollation());
+    }
 
-    invariant(!atClusterTime || *atClusterTime != LogicalTime::kUninitialized);
     // Construct the query and parameters.
 
     ClusterClientCursorParams params(query.nss(), readPref);
@@ -279,7 +274,7 @@ CursorId runQueryWithoutRetrying(OperationContext* opCtx,
     // attaching the shardVersion and txnNumber, if necessary.
 
     auto requests = constructRequestsForShards(
-        opCtx, routingInfo, shardIds, query, appendGeoNearDistanceProjection, atClusterTime);
+        opCtx, routingInfo, shardIds, query, appendGeoNearDistanceProjection);
 
     // Establish the cursors with a consistent shardVersion across shards.
 
@@ -445,11 +440,10 @@ CursorId ClusterFind::runQuery(OperationContext* opCtx,
                                             << " retries");
                 throw;
             } else if (!ErrorCodes::isStaleShardVersionError(ex.code()) &&
-                       !ErrorCodes::isSnapshotError(ex.code()) &&
                        ex.code() != ErrorCodes::ShardNotFound) {
-                // Errors other than stale metadata, snapshot unavailable, or from trying to reach a
-                // non existent shard are fatal to the operation. Network errors and replication
-                // retries happen at the level of the AsyncResultsMerger.
+                // Errors other than stale metadata or from trying to reach a non existent shard are
+                // fatal to the operation. Network errors and replication retries happen at the
+                // level of the AsyncResultsMerger.
                 ex.addContext("Encountered non-retryable error during query");
                 throw;
             }
@@ -457,12 +451,12 @@ CursorId ClusterFind::runQuery(OperationContext* opCtx,
             LOG(1) << "Received error status for query " << redact(query.toStringShort())
                    << " on attempt " << retries << " of " << kMaxRetries << ": " << redact(ex);
 
-            // Note: there is no need to refresh metadata on snapshot errors since the request
-            // failed because atClusterTime was too low, not because the wrong shards were targeted,
-            // and subsequent attempts will choose a later atClusterTime.
-            if (ErrorCodes::isStaleShardVersionError(ex.code()) ||
-                ex.code() == ErrorCodes::ShardNotFound) {
-                catalogCache->onStaleShardVersion(std::move(routingInfo));
+            catalogCache->onStaleShardVersion(std::move(routingInfo));
+
+            if (auto txnRouter = TransactionRouter::get(opCtx)) {
+                // A transaction can always continue on a stale version error during find because
+                // the operation must be idempotent.
+                txnRouter->onStaleShardOrDbError(kFindCmdName);
             }
         }
     }

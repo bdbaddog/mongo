@@ -38,6 +38,8 @@
 #include "mongo/base/string_data.h"
 #include "mongo/bson/simple_bsonelement_comparator.h"
 #include "mongo/db/bson/dotted_path_support.h"
+#include "mongo/db/index/all_paths_key_generator.h"
+#include "mongo/db/index_names.h"
 #include "mongo/db/matcher/expression_algo.h"
 #include "mongo/db/matcher/expression_geo.h"
 #include "mongo/db/matcher/expression_text.h"
@@ -111,17 +113,11 @@ string optionString(size_t options) {
             case QueryPlannerParams::INDEX_INTERSECTION:
                 ss << "INDEX_INTERSECTION ";
                 break;
-            case QueryPlannerParams::KEEP_MUTATIONS:
-                ss << "KEEP_MUTATIONS ";
-                break;
             case QueryPlannerParams::IS_COUNT:
                 ss << "IS_COUNT ";
                 break;
             case QueryPlannerParams::SPLIT_LIMITED_SORT:
                 ss << "SPLIT_LIMITED_SORT ";
-                break;
-            case QueryPlannerParams::CANNOT_TRIM_IXISECT:
-                ss << "CANNOT_TRIM_IXISECT ";
                 break;
             case QueryPlannerParams::NO_UNCOVERED_PROJECTIONS:
                 ss << "NO_UNCOVERED_PROJECTIONS ";
@@ -343,12 +339,11 @@ StatusWith<std::unique_ptr<PlanCacheIndexTree>> QueryPlanner::cacheDataFromTagge
         }
 
         for (const auto& dest : orPushdownTag->getDestinations()) {
-            PlanCacheIndexTree::OrPushdown orPushdown;
-            orPushdown.route = dest.route;
             IndexTag* indexTag = static_cast<IndexTag*>(dest.tagData.get());
-            orPushdown.indexName = relevantIndices[indexTag->index].name;
-            orPushdown.position = indexTag->pos;
-            orPushdown.canCombineBounds = indexTag->canCombineBounds;
+            PlanCacheIndexTree::OrPushdown orPushdown{relevantIndices[indexTag->index].identifier,
+                                                      indexTag->pos,
+                                                      indexTag->canCombineBounds,
+                                                      dest.route};
             indexTree->orPushdowns.push_back(std::move(orPushdown));
         }
     }
@@ -368,7 +363,7 @@ StatusWith<std::unique_ptr<PlanCacheIndexTree>> QueryPlanner::cacheDataFromTagge
 // static
 Status QueryPlanner::tagAccordingToCache(MatchExpression* filter,
                                          const PlanCacheIndexTree* const indexTree,
-                                         const map<StringData, size_t>& indexMap) {
+                                         const map<IndexEntry::Identifier, size_t>& indexMap) {
     if (NULL == filter) {
         return Status(ErrorCodes::BadValue, "Cannot tag tree: filter is NULL.");
     }
@@ -400,11 +395,10 @@ Status QueryPlanner::tagAccordingToCache(MatchExpression* filter,
         filter->setTag(new OrPushdownTag());
         OrPushdownTag* orPushdownTag = static_cast<OrPushdownTag*>(filter->getTag());
         for (const auto& orPushdown : indexTree->orPushdowns) {
-            auto index = indexMap.find(orPushdown.indexName);
+            auto index = indexMap.find(orPushdown.indexEntryId);
             if (index == indexMap.end()) {
                 return Status(ErrorCodes::BadValue,
-                              str::stream() << "Did not find index with name: "
-                                            << orPushdown.indexName);
+                              str::stream() << "Did not find index: " << orPushdown.indexEntryId);
             }
             OrPushdownTag::Destination dest;
             dest.route = orPushdown.route;
@@ -415,10 +409,10 @@ Status QueryPlanner::tagAccordingToCache(MatchExpression* filter,
     }
 
     if (indexTree->entry.get()) {
-        map<StringData, size_t>::const_iterator got = indexMap.find(indexTree->entry->name);
+        const auto got = indexMap.find(indexTree->entry->identifier);
         if (got == indexMap.end()) {
             mongoutils::str::stream ss;
-            ss << "Did not find index with name: " << indexTree->entry->name;
+            ss << "Did not find index with name: " << indexTree->entry->identifier.catalogName;
             return Status(ErrorCodes::BadValue, ss);
         }
         if (filter->getTag()) {
@@ -479,14 +473,19 @@ StatusWith<std::unique_ptr<QuerySolution>> QueryPlanner::planFromCache(
            << redact(clone->toString()) << "Cache data:" << endl
            << redact(winnerCacheData.toString());
 
+    stdx::unordered_set<string> fields;
+    QueryPlannerIXSelect::getFields(query.root(), &fields);
+    std::vector<IndexEntry> expandedIndexes =
+        QueryPlannerIXSelect::expandIndexes(fields, params.indices);
+
     // Map from index name to index number.
-    // TODO: can we assume that the index numbering has the same lifetime
-    // as the cache state?
-    map<StringData, size_t> indexMap;
-    for (size_t i = 0; i < params.indices.size(); ++i) {
-        const IndexEntry& ie = params.indices[i];
-        indexMap[ie.name] = i;
-        LOG(5) << "Index " << i << ": " << ie.name;
+    map<IndexEntry::Identifier, size_t> indexMap;
+    for (size_t i = 0; i < expandedIndexes.size(); ++i) {
+        const IndexEntry& ie = expandedIndexes[i];
+        const auto insertionRes = indexMap.insert(std::make_pair(ie.identifier, i));
+        // Be sure the key was not already in the map.
+        invariant(insertionRes.second);
+        LOG(5) << "Index " << i << ": " << ie.identifier;
     }
 
     Status s = tagAccordingToCache(clone.get(), winnerCacheData.tree.get(), indexMap);
@@ -501,7 +500,7 @@ StatusWith<std::unique_ptr<QuerySolution>> QueryPlanner::planFromCache(
 
     // Use the cached index assignments to build solnRoot.
     std::unique_ptr<QuerySolutionNode> solnRoot(QueryPlannerAccess::buildIndexedDataAccess(
-        query, std::move(clone), params.indices, params));
+        query, std::move(clone), expandedIndexes, params));
 
     if (!solnRoot) {
         return Status(ErrorCodes::BadValue,
@@ -576,71 +575,64 @@ StatusWith<std::vector<std::unique_ptr<QuerySolution>>> QueryPlanner::plan(
         }
     }
 
+    // Hints require us to only consider the hinted index. If index filters in the query settings
+    // were used to override the allowed indices for planning, we should not use the hinted index
+    // requested in the query.
+    BSONObj hintedIndex;
+    if (!params.indexFiltersApplied) {
+        hintedIndex = query.getQueryRequest().getHint();
+    }
+
+    // Either the list of indices passed in by the caller, or the list of indices filtered according
+    // to the hint. This list is later expanded in order to allow the planner to handle wildcard
+    // indexes.
+    std::vector<IndexEntry> fullIndexList;
+
+    if (hintedIndex.isEmpty()) {
+        fullIndexList = params.indices;
+    } else {
+        fullIndexList = QueryPlannerIXSelect::findIndexesByHint(hintedIndex, params.indices);
+
+        if (fullIndexList.empty()) {
+            return Status(ErrorCodes::BadValue,
+                          "hint provided does not correspond to an existing index");
+        }
+        if (fullIndexList.size() > 1) {
+            return Status(ErrorCodes::IndexNotFound,
+                          str::stream() << "Hint matched multiple indexes, "
+                                        << "must hint by index name. Matched: "
+                                        << fullIndexList[0].toString()
+                                        << " and "
+                                        << fullIndexList[1].toString());
+        }
+    }
+
     // Figure out what fields we care about.
     stdx::unordered_set<string> fields;
-    QueryPlannerIXSelect::getFields(query.root(), "", &fields);
-
+    QueryPlannerIXSelect::getFields(query.root(), &fields);
     for (stdx::unordered_set<string>::const_iterator it = fields.begin(); it != fields.end();
          ++it) {
         LOG(5) << "Predicate over field '" << *it << "'";
     }
 
-    // Filter our indices so we only look at indices that are over our predicates.
-    vector<IndexEntry> relevantIndices;
+    fullIndexList = QueryPlannerIXSelect::expandIndexes(fields, std::move(fullIndexList));
+    std::vector<IndexEntry> relevantIndices;
 
-    // Hints require us to only consider the hinted index.
-    // If index filters in the query settings were used to override
-    // the allowed indices for planning, we should not use the hinted index
-    // requested in the query.
-    BSONObj hintIndex;
-    if (!params.indexFiltersApplied) {
-        hintIndex = query.getQueryRequest().getHint();
-    }
-
-    boost::optional<size_t> hintIndexNumber;
-
-    if (hintIndex.isEmpty()) {
-        QueryPlannerIXSelect::findRelevantIndices(fields, params.indices, &relevantIndices);
+    if (hintedIndex.isEmpty()) {
+        relevantIndices = QueryPlannerIXSelect::findRelevantIndices(fields, fullIndexList);
     } else {
-        // Sigh.  If the hint is specified it might be using the index name.
-        BSONElement firstHintElt = hintIndex.firstElement();
-        if (str::equals("$hint", firstHintElt.fieldName()) && String == firstHintElt.type()) {
-            string hintName = firstHintElt.String();
-            for (size_t i = 0; i < params.indices.size(); ++i) {
-                if (params.indices[i].name == hintName) {
-                    LOG(5) << "Hint by name specified, restricting indices to "
-                           << params.indices[i].keyPattern.toString();
-                    relevantIndices.clear();
-                    relevantIndices.push_back(params.indices[i]);
-                    hintIndexNumber = i;
-                    hintIndex = params.indices[i].keyPattern;
-                    break;
-                }
-            }
-        } else {
-            for (size_t i = 0; i < params.indices.size(); ++i) {
-                if (0 == params.indices[i].keyPattern.woCompare(hintIndex)) {
-                    relevantIndices.clear();
-                    relevantIndices.push_back(params.indices[i]);
-                    LOG(5) << "Hint specified, restricting indices to " << hintIndex.toString();
-                    if (hintIndexNumber) {
-                        return Status(ErrorCodes::IndexNotFound,
-                                      str::stream() << "Hint matched multiple indexes, "
-                                                    << "must hint by index name. Matched: "
-                                                    << params.indices[i].toString()
-                                                    << " and "
-                                                    << params.indices[*hintIndexNumber].toString());
-                    }
-                    hintIndexNumber = i;
-                }
-            }
-        }
+        relevantIndices = fullIndexList;
 
-        if (!hintIndexNumber) {
-            return Status(ErrorCodes::BadValue, "bad hint");
+        // Relevant indices should only ever exceed a size of 1 when there is a hint in the case of
+        // $** index.
+        if (relevantIndices.size() > 1) {
+            for (auto&& entry : relevantIndices) {
+                invariant(entry.type == IndexType::INDEX_ALLPATHS);
+            }
         }
     }
 
+    // TODO SERVER-35335 Ensure min/max can generate bounds over $** index.
     // Deal with the .min() and .max() query options.  If either exist we can only use an index
     // that matches the object inside.
     if (!query.getQueryRequest().getMin().isEmpty() ||
@@ -655,63 +647,31 @@ StatusWith<std::vector<std::unique_ptr<QuerySolution>>> QueryPlanner::plan(
         BSONObj finishedMinObj;
         BSONObj finishedMaxObj;
 
-        // This is the index into params.indices[...] that we use.
+        // Index into the 'fulledIndexList' vector indicating the index that we will use to answer
+        // this min/max query.
         size_t idxNo = numeric_limits<size_t>::max();
 
-        // If there's an index hinted we need to be able to use it.
-        if (!hintIndex.isEmpty()) {
-            invariant(hintIndexNumber);
-            const auto& hintedIndexEntry = params.indices[*hintIndexNumber];
+        for (size_t i = 0; i < fullIndexList.size(); ++i) {
+            const auto& indexEntry = fullIndexList[i];
 
-            if (!minObj.isEmpty() &&
-                !indexCompatibleMaxMin(minObj, query.getCollator(), hintedIndexEntry)) {
-                LOG(5) << "Minobj doesn't work with hint";
-                return Status(ErrorCodes::BadValue, "hint provided does not work with min query");
-            }
+            const BSONObj toUse = minObj.isEmpty() ? maxObj : minObj;
+            if (indexCompatibleMaxMin(toUse, query.getCollator(), indexEntry)) {
+                // In order to be fully compatible, the min has to be less than the max
+                // according to the index key pattern ordering. The first step in verifying
+                // this is "finish" the min and max by replacing empty objects and stripping
+                // field names.
+                finishedMinObj = finishMinObj(indexEntry, minObj, maxObj);
+                finishedMaxObj = finishMaxObj(indexEntry, minObj, maxObj);
 
-            if (!maxObj.isEmpty() &&
-                !indexCompatibleMaxMin(maxObj, query.getCollator(), hintedIndexEntry)) {
-                LOG(5) << "Maxobj doesn't work with hint";
-                return Status(ErrorCodes::BadValue, "hint provided does not work with max query");
-            }
-
-            finishedMinObj = finishMinObj(hintedIndexEntry, minObj, maxObj);
-            finishedMaxObj = finishMaxObj(hintedIndexEntry, minObj, maxObj);
-
-            // The min must be less than the max for the hinted index ordering.
-            if (0 <= finishedMinObj.woCompare(finishedMaxObj, hintedIndexEntry.keyPattern, false)) {
-                LOG(5) << "Minobj/Maxobj don't work with hint";
-                return Status(ErrorCodes::BadValue,
-                              "hint provided does not work with min/max query");
-            }
-
-            idxNo = *hintIndexNumber;
-        } else {
-            // No hinted index, look for one that is compatible (has same field names and
-            // ordering thereof).
-            for (size_t i = 0; i < params.indices.size(); ++i) {
-                const auto& indexEntry = params.indices[i];
-
-                BSONObj toUse = minObj.isEmpty() ? maxObj : minObj;
-                if (indexCompatibleMaxMin(toUse, query.getCollator(), indexEntry)) {
-                    // In order to be fully compatible, the min has to be less than the max
-                    // according to the index key pattern ordering. The first step in verifying
-                    // this is "finish" the min and max by replacing empty objects and stripping
-                    // field names.
-                    finishedMinObj = finishMinObj(indexEntry, minObj, maxObj);
-                    finishedMaxObj = finishMaxObj(indexEntry, minObj, maxObj);
-
-                    // Now we have the final min and max. This index is only relevant for
-                    // the min/max query if min < max.
-                    if (0 >
-                        finishedMinObj.woCompare(finishedMaxObj, indexEntry.keyPattern, false)) {
-                        // Found a relevant index.
-                        idxNo = i;
-                        break;
-                    }
-
-                    // This index is not relevant; move on to the next.
+                // Now we have the final min and max. This index is only relevant for
+                // the min/max query if min < max.
+                if (0 > finishedMinObj.woCompare(finishedMaxObj, indexEntry.keyPattern, false)) {
+                    // Found a relevant index.
+                    idxNo = i;
+                    break;
                 }
+
+                // This index is not relevant; move on to the next.
             }
         }
 
@@ -721,11 +681,11 @@ StatusWith<std::vector<std::unique_ptr<QuerySolution>>> QueryPlanner::plan(
             return Status(ErrorCodes::BadValue, "unable to find relevant index for max/min query");
         }
 
-        LOG(5) << "Max/min query using index " << params.indices[idxNo].toString();
+        LOG(5) << "Max/min query using index " << fullIndexList[idxNo].toString();
 
         // Make our scan and output.
         std::unique_ptr<QuerySolutionNode> solnRoot(QueryPlannerAccess::makeIndexScan(
-            params.indices[idxNo], query, params, finishedMinObj, finishedMaxObj));
+            fullIndexList[idxNo], query, params, finishedMinObj, finishedMaxObj));
         invariant(solnRoot);
 
         auto soln = QueryPlannerAnalysis::analyzeDataAccess(query, params, std::move(solnRoot));
@@ -785,8 +745,8 @@ StatusWith<std::vector<std::unique_ptr<QuerySolution>>> QueryPlanner::plan(
         // the text stage can't be built if no text index exists or there is an ambiguity as to
         // which one to use.
         size_t textIndexCount = 0;
-        for (size_t i = 0; i < params.indices.size(); i++) {
-            if (INDEX_TEXT == params.indices[i].type) {
+        for (size_t i = 0; i < fullIndexList.size(); i++) {
+            if (INDEX_TEXT == fullIndexList[i].type) {
                 textIndexCount++;
             }
         }
@@ -884,15 +844,16 @@ StatusWith<std::vector<std::unique_ptr<QuerySolution>>> QueryPlanner::plan(
         }
     }
 
-    // An index was hinted.  If there are any solutions, they use the hinted index.  If not, we
+    // An index was hinted. If there are any solutions, they use the hinted index.  If not, we
     // scan the entire index to provide results and output that as our plan.  This is the
-    // desired behavior when an index is hinted that is not relevant to the query.
-    if (!hintIndex.isEmpty()) {
-        if (0 == out.size()) {
+    // desired behavior when an index is hinted that is not relevant to the query. In the case that
+    // $** index is hinted, we do not want this behavior.
+    if (!hintedIndex.isEmpty() && relevantIndices.size() == 1) {
+        if (0 == out.size() && relevantIndices.front().type != IndexType::INDEX_ALLPATHS) {
             // Push hinted index solution to output list if found. It is possible to end up without
             // a solution in the case where a filtering QueryPlannerParams argument, such as
             // NO_BLOCKING_SORT, leads to its exclusion.
-            auto soln = buildWholeIXSoln(params.indices[*hintIndexNumber], query, params);
+            auto soln = buildWholeIXSoln(relevantIndices.front(), query, params);
             if (soln) {
                 LOG(5) << "Planner: outputting soln that uses hinted index as scan.";
                 out.push_back(std::move(soln));
@@ -919,8 +880,8 @@ StatusWith<std::vector<std::unique_ptr<QuerySolution>>> QueryPlanner::plan(
         }
 
         if (!usingIndexToSort) {
-            for (size_t i = 0; i < params.indices.size(); ++i) {
-                const IndexEntry& index = params.indices[i];
+            for (size_t i = 0; i < fullIndexList.size(); ++i) {
+                const IndexEntry& index = fullIndexList[i];
                 // Only regular (non-plugin) indexes can be used to provide a sort, and only
                 // non-sparse indexes can be used to provide a sort.
                 //
@@ -957,10 +918,10 @@ StatusWith<std::vector<std::unique_ptr<QuerySolution>>> QueryPlanner::plan(
                 const BSONObj kp = QueryPlannerAnalysis::getSortPattern(index.keyPattern);
                 if (providesSort(query, kp)) {
                     LOG(5) << "Planner: outputting soln that uses index to provide sort.";
-                    auto soln = buildWholeIXSoln(params.indices[i], query, params);
+                    auto soln = buildWholeIXSoln(fullIndexList[i], query, params);
                     if (soln) {
                         PlanCacheIndexTree* indexTree = new PlanCacheIndexTree();
-                        indexTree->setIndexEntry(params.indices[i]);
+                        indexTree->setIndexEntry(fullIndexList[i]);
                         SolutionCacheData* scd = new SolutionCacheData();
                         scd->tree.reset(indexTree);
                         scd->solnType = SolutionCacheData::WHOLE_IXSCAN_SOLN;
@@ -974,10 +935,10 @@ StatusWith<std::vector<std::unique_ptr<QuerySolution>>> QueryPlanner::plan(
                 if (providesSort(query, QueryPlannerCommon::reverseSortObj(kp))) {
                     LOG(5) << "Planner: outputting soln that uses (reverse) index "
                            << "to provide sort.";
-                    auto soln = buildWholeIXSoln(params.indices[i], query, params, -1);
+                    auto soln = buildWholeIXSoln(fullIndexList[i], query, params, -1);
                     if (soln) {
                         PlanCacheIndexTree* indexTree = new PlanCacheIndexTree();
-                        indexTree->setIndexEntry(params.indices[i]);
+                        indexTree->setIndexEntry(fullIndexList[i]);
                         SolutionCacheData* scd = new SolutionCacheData();
                         scd->tree.reset(indexTree);
                         scd->solnType = SolutionCacheData::WHOLE_IXSCAN_SOLN;
@@ -998,7 +959,7 @@ StatusWith<std::vector<std::unique_ptr<QuerySolution>>> QueryPlanner::plan(
     if (params.options & QueryPlannerParams::GENERATE_COVERED_IXSCANS && out.size() == 0 &&
         query.getQueryObj().isEmpty() && projection && !projection->requiresDocument()) {
 
-        const auto* indicesToConsider = hintIndex.isEmpty() ? &params.indices : &relevantIndices;
+        const auto* indicesToConsider = hintedIndex.isEmpty() ? &fullIndexList : &relevantIndices;
         for (auto&& index : *indicesToConsider) {
             if (index.type != INDEX_BTREE || index.multikey || index.sparse || index.filterExpr ||
                 !CollatorInterface::collatorsMatch(index.collator, query.getCollator())) {
@@ -1030,7 +991,7 @@ StatusWith<std::vector<std::unique_ptr<QuerySolution>>> QueryPlanner::plan(
     // Also, if a hint is specified it indicates that we MUST use it.
     bool possibleToCollscan =
         !QueryPlannerCommon::hasNode(query.root(), MatchExpression::GEO_NEAR) &&
-        !QueryPlannerCommon::hasNode(query.root(), MatchExpression::TEXT) && hintIndex.isEmpty();
+        !QueryPlannerCommon::hasNode(query.root(), MatchExpression::TEXT) && hintedIndex.isEmpty();
 
     // The caller can explicitly ask for a collscan.
     bool collscanRequested = (params.options & QueryPlannerParams::INCLUDE_COLLSCAN);

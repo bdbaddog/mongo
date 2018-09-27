@@ -101,7 +101,7 @@ protected:
         }
 
         mongo_embedded_v1_init_params params;
-        params.log_flags = 0;
+        params.log_flags = MONGO_EMBEDDED_V1_LOG_STDOUT;
         params.log_callback = nullptr;
         params.log_user_data = nullptr;
 
@@ -263,6 +263,32 @@ TEST_F(MongodbCAPITest, CreateBackgroundIndex) {
             ]
         })raw_delimiter");
     auto inputOpMsg = mongo::OpMsgRequest::fromDBAndBody("background_index_db", inputObj);
+    auto output = performRpc(client, inputOpMsg);
+
+    ASSERT(output.hasField("ok"));
+    ASSERT(output.getField("ok").numberDouble() != 1.0);
+}
+
+TEST_F(MongodbCAPITest, CreateTTLIndex) {
+    // create the client object
+    auto client = createClient();
+
+    // craft the createIndexes message
+    mongo::BSONObj inputObj = mongo::fromjson(
+        R"raw_delimiter({
+            createIndexes: 'items',
+            indexes: 
+            [
+                {
+                    key: {
+                        task: 1
+                    },
+                    name: 'task_ttl',
+                    expireAfterSeconds: 36000
+                }
+            ]
+        })raw_delimiter");
+    auto inputOpMsg = mongo::OpMsgRequest::fromDBAndBody("ttl_index_db", inputObj);
     auto output = performRpc(client, inputOpMsg);
 
     ASSERT(output.hasField("ok"));
@@ -521,59 +547,68 @@ TEST_F(MongodbCAPITest, InsertAndUpdate) {
 TEST_F(MongodbCAPITest, RunListCommands) {
     auto client = createClient();
 
-    std::vector<std::string> whitelist = {"_hashBSONElement",
-                                          "aggregate",
-                                          "buildInfo",
-                                          "collMod",
-                                          "collStats",
-                                          "configureFailPoint",
-                                          "count",
-                                          "create",
-                                          "createIndexes",
-                                          "currentOp",
-                                          "dataSize",
-                                          "dbStats",
-                                          "delete",
-                                          "distinct",
-                                          "drop",
-                                          "dropDatabase",
-                                          "dropIndexes",
-                                          "echo",
-                                          "explain",
-                                          "find",
-                                          "findAndModify",
-                                          "getLastError",
-                                          "getMore",
-                                          "getParameter",
-                                          "getPrevError",
-                                          "insert",
-                                          "isMaster",
-                                          "killCursors",
-                                          "killOp",
-                                          "listCollections",
-                                          "listCommands",
-                                          "listDatabases",
-                                          "listIndexes",
-                                          "lockInfo",
-                                          "ping",
-                                          "planCacheClear",
-                                          "planCacheClearFilters",
-                                          "planCacheListFilters",
-                                          "planCacheListPlans",
-                                          "planCacheListQueryShapes",
-                                          "planCacheSetFilter",
-                                          "reIndex",
-                                          "renameCollection",
-                                          "repairCursor",
-                                          "repairDatabase",
-                                          "resetError",
-                                          "serverStatus",
-                                          "setBatteryLevel",
-                                          "setParameter",
-                                          "sleep",
-                                          "trimMemory",
-                                          "update",
-                                          "validate"};
+    std::vector<std::string> whitelist = {
+        "_hashBSONElement",
+        "aggregate",
+        "buildInfo",
+        "collMod",
+        "collStats",
+        "configureFailPoint",
+        "count",
+        "create",
+        "createIndexes",
+        "currentOp",
+        "dataSize",
+        "dbStats",
+        "delete",
+        "distinct",
+        "drop",
+        "dropDatabase",
+        "dropIndexes",
+        "echo",
+        "endSessions",
+        "explain",
+        "find",
+        "findAndModify",
+        "getLastError",
+        "getMore",
+        "getParameter",
+        "getPrevError",
+        "insert",
+        "isMaster",
+        "killCursors",
+        "killOp",
+        "killSessions",
+        "killAllSessions",
+        "killAllSessionsByPattern",
+        "listCollections",
+        "listCommands",
+        "listDatabases",
+        "listIndexes",
+        "lockInfo",
+        "ping",
+        "planCacheClear",
+        "planCacheClearFilters",
+        "planCacheListFilters",
+        "planCacheListPlans",
+        "planCacheListQueryShapes",
+        "planCacheSetFilter",
+        "reIndex",
+        "refreshLogicalSessionCacheNow",
+        "refreshSessions",
+        "renameCollection",
+        "repairCursor",
+        "repairDatabase",
+        "resetError",
+        "serverStatus",
+        "setBatteryLevel",
+        "setParameter",
+        "sleep",
+        "startSession",
+        "trimMemory",
+        "update",
+        "validate",
+    };
     std::sort(whitelist.begin(), whitelist.end());
 
     mongo::BSONObj listCommandsObj = mongo::fromjson("{ listCommands: 1 }");

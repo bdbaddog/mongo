@@ -172,7 +172,7 @@ Status ShardingCatalogManager::dropCollection(OperationContext* opCtx, const Nam
                     "dropCollection.start",
                     nss.ns(),
                     BSONObj(),
-                    ShardingCatalogClientImpl::kMajorityWriteConcern)
+                    ShardingCatalogClient::kMajorityWriteConcern)
         .ignore();
 
     auto shardsStatus =
@@ -353,7 +353,7 @@ Status ShardingCatalogManager::dropCollection(OperationContext* opCtx, const Nam
                     "dropCollection",
                     nss.ns(),
                     BSONObj(),
-                    ShardingCatalogClientImpl::kMajorityWriteConcern)
+                    ShardingCatalogClient::kMajorityWriteConcern)
         .ignore();
 
     return Status::OK();
@@ -400,8 +400,11 @@ void ShardingCatalogManager::shardCollection(OperationContext* opCtx,
                                               ->makeFromBSON(defaultCollation));
     }
 
-    const auto initialChunks = InitialSplitPolicy::writeFirstChunksToConfig(
-        opCtx, nss, fieldsAndOrder, dbPrimaryShardId, splitPoints, distributeInitialChunks);
+    std::vector<TagsType> tags;
+    const auto initialChunks = InitialSplitPolicy::createFirstChunks(
+        opCtx, nss, fieldsAndOrder, dbPrimaryShardId, splitPoints, tags, distributeInitialChunks);
+
+    InitialSplitPolicy::writeFirstChunksToConfig(opCtx, initialChunks);
 
     {
         CollectionType coll;

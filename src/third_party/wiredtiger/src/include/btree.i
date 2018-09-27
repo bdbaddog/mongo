@@ -1189,7 +1189,7 @@ __wt_page_las_active(WT_SESSION_IMPL *session, WT_REF *ref)
 
 	if ((page_las = ref->page_las) == NULL)
 		return (false);
-	if (page_las->invalid || !ref->page_las->skew_newest)
+	if (!page_las->skew_newest)
 		return (true);
 	if (__wt_txn_visible_all(session, page_las->max_txn,
 	    WT_TIMESTAMP_NULL(&page_las->max_timestamp)))
@@ -1216,9 +1216,8 @@ __wt_btree_can_evict_dirty(WT_SESSION_IMPL *session)
 	WT_BTREE *btree;
 
 	btree = S2BT(session);
-	return ((btree->checkpointing == WT_CKPT_OFF &&
-	    !F_ISSET(S2C(session), WT_CONN_CLOSING_TIMESTAMP)) ||
-	    WT_SESSION_IS_CHECKPOINT(session));
+	return ((!WT_BTREE_SYNCING(btree) || WT_SESSION_BTREE_SYNC(session)) &&
+	    !F_ISSET(S2C(session), WT_CONN_CLOSING_TIMESTAMP));
 }
 
 /*
@@ -1235,6 +1234,14 @@ __wt_leaf_page_can_split(WT_SESSION_IMPL *session, WT_PAGE *page)
 	int count;
 
 	btree = S2BT(session);
+
+	/*
+	 * Checkpoints can't do in-memory splits in the tree they are walking:
+	 * that can lead to corruption when the parent internal page is
+	 * updated.
+	 */
+	if (WT_SESSION_BTREE_SYNC(session))
+		return (false);
 
 	/*
 	 * Only split a page once, otherwise workloads that update in the middle
@@ -1504,7 +1511,7 @@ __wt_page_release(WT_SESSION_IMPL *session, WT_REF *ref, uint32_t flags)
 		if (!__wt_page_evict_clean(page) &&
 		    (LF_ISSET(WT_READ_NO_SPLIT) || (!inmem_split &&
 		    F_ISSET(session, WT_SESSION_NO_RECONCILE)))) {
-			if (!WT_SESSION_IS_CHECKPOINT(session))
+			if (!WT_SESSION_BTREE_SYNC(session))
 				WT_IGNORE_RET(
 				    __wt_page_evict_urgent(session, ref));
 		} else {
@@ -1668,7 +1675,7 @@ static inline int
 __wt_page_swap_func(
     WT_SESSION_IMPL *session, WT_REF *held, WT_REF *want, uint32_t flags
 #ifdef HAVE_DIAGNOSTIC
-    , const char *file, int line
+    , const char *func, int line
 #endif
     )
 {
@@ -1691,7 +1698,7 @@ __wt_page_swap_func(
 	/* Get the wanted page. */
 	ret = __wt_page_in_func(session, want, flags
 #ifdef HAVE_DIAGNOSTIC
-	    , file, line
+	    , func, line
 #endif
 	    );
 

@@ -4624,6 +4624,67 @@ TEST(NumericalBaseParsing, YAMLConfigFile) {
     ASSERT_EQUALS(unsignedVal, 0x10U);
 }
 
+TEST(YAMLConfigFile, OutputConfig) {
+    moe::OptionSection options;
+    options.addOptionChaining("cacheSize", "cacheSize", moe::Long, "");
+    options.addOptionChaining("command", "command", moe::StringVector, "");
+    options.addOptionChaining("config", "config", moe::String, "");
+    options.addOptionChaining("math.pi", "pi", moe::Double, "");
+    options.addOptionChaining("net.port", "port", moe::Int, "");
+    options.addOptionChaining("net.bindIp", "bind_ip", moe::String, "");
+    options.addOptionChaining("net.bindIpAll", "bind_ip_all", moe::Switch, "");
+    options.addOptionChaining("security.javascriptEnabled", "javascriptEnabled", moe::Bool, "");
+    options.addOptionChaining("setParameter", "setParameter", moe::StringMap, "");
+    options.addOptionChaining("systemLog.path", "logPath", moe::String, "");
+
+    OptionsParserTester parser;
+    parser.setConfig("config.yaml",
+                     "systemLog: { path: /tmp/mongod.log }\n"
+                     "command: [ mongo, mongod, mongos ]");
+
+    const std::vector<std::string> argv = {
+        "binaryname",
+        "--port",
+        "31337",
+        "--bind_ip",
+        "127.0.0.1,::1",
+        "--bind_ip_all",
+        "--setParameter",
+        "scramSHAIterationCount=12345",
+        "--javascriptEnabled",
+        "false",
+        "--cacheSize",
+        "12345",
+        "--pi",
+        "3.14159265",
+        "--config",
+        "config.yaml",
+    };
+
+    std::map<std::string, std::string> env_map;
+    moe::Environment env;
+    ASSERT_OK(parser.run(options, argv, env_map, &env));
+    ASSERT_EQ(env.toYAML(),
+              "cacheSize: 12345\n"
+              "command:\n"
+              "  - mongo\n"
+              "  - mongod\n"
+              "  - mongos\n"
+              "config: config.yaml\n"
+              "math:\n"
+              "  pi: 3.14159265\n"
+              "net:\n"
+              "  bindIp: 127.0.0.1,::1\n"
+              "  bindIpAll: true\n"
+              "  port: 31337\n"
+              "security:\n"
+              "  javascriptEnabled: false\n"
+              "setParameter:\n"
+              "  scramSHAIterationCount: 12345\n"
+              "systemLog:\n"
+              "  path: /tmp/mongod.log");
+}
+
 void TestFile(std::vector<unsigned char> contents, bool valid) {
     mongo::unittest::TempDir tempdir("options_testpath");
     boost::filesystem::path p(tempdir.path());
@@ -4658,6 +4719,32 @@ void TestFile(std::vector<unsigned char> contents, bool valid) {
     } else {
         ASSERT_NOT_OK(parser.run(testOpts, argv, env_map, &environment));
     }
+}
+
+TEST(YAMLConfigFile, canonicalize) {
+    moe::OptionSection opts;
+    opts.addOptionChaining("net.bindIpAll", "bind_ip_all", moe::Switch, "Bind all addresses")
+        .incompatibleWith("net.bindIp")
+        .canonicalize([](moe::Environment* env) {
+            auto status = env->remove("net.bindIpAll");
+            if (!status.isOK()) {
+                return status;
+            }
+            return env->set("net.bindIp", moe::Value("0.0.0.0"));
+        });
+    opts.addOptionChaining("net.bindIp", "bind_ip", moe::String, "Bind specific addresses")
+        .incompatibleWith("net.bindIpAll");
+
+    moe::OptionsParser parser;
+    moe::Environment env;
+    std::vector<std::string> argv = {
+        "binary", "--bind_ip_all",
+    };
+    std::map<std::string, std::string> env_map;
+    ASSERT_OK(parser.run(opts, argv, env_map, &env));
+    ASSERT_TRUE(env.count("net.bindIp"));
+    ASSERT_FALSE(env.count("net.bindIpAll"));
+    ASSERT_EQ(env["net.bindIp"].as<std::string>(), "0.0.0.0");
 }
 
 #if defined(_WIN32)

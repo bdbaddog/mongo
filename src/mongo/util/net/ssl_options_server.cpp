@@ -40,6 +40,7 @@
 #include "mongo/util/log.h"
 #include "mongo/util/options_parser/startup_option_init.h"
 #include "mongo/util/options_parser/startup_options.h"
+#include "mongo/util/text.h"
 
 #if MONGO_CONFIG_SSL_PROVIDER == MONGO_CONFIG_SSL_PROVIDER_OPENSSL
 #include <openssl/ssl.h>
@@ -116,6 +117,11 @@ Status addSSLServerOptions(moe::OptionSection* options) {
                                {"net.ssl.CAFile"},
                                {"sslCAFile"});
 
+    options->addOptionChaining("net.tls.clusterCAFile",
+                               "tlsClusterCAFile",
+                               moe::String,
+                               "CA used for verifying remotes during outbound connections");
+
     options->addOptionChaining("net.tls.CRLFile",
                                "tlsCRLFile",
                                moe::String,
@@ -139,6 +145,13 @@ Status addSSLServerOptions(moe::OptionSection* options) {
         "Comma separated list of TLS protocols to disable [TLS1_0,TLS1_1,TLS1_2]",
         {"net.ssl.disabledProtocols"},
         {"sslDisabledProtocols"});
+
+
+    options->addOptionChaining(
+        "net.tls.logVersions",
+        "tlsLogVersions",
+        moe::String,
+        "Comma separated list of TLS protocols to log on connect [TLS1_0,TLS1_1,TLS1_2]");
 
     options->addOptionChaining("net.tls.weakCertificateValidation",
                                "tlsWeakCertificateValidation",
@@ -201,6 +214,32 @@ Status addSSLServerOptions(moe::OptionSection* options) {
     return Status::OK();
 }
 
+Status storeTLSLogVersion(const std::string& loggedProtocols) {
+    // The tlsLogVersion field is composed of a comma separated list of protocols to
+    // log. First, tokenize the field.
+    const auto tokens = StringSplitter::split(loggedProtocols, ",");
+
+    // All universally accepted tokens, and their corresponding enum representation.
+    const std::map<std::string, SSLParams::Protocols> validConfigs{
+        {"TLS1_0", SSLParams::Protocols::TLS1_0},
+        {"TLS1_1", SSLParams::Protocols::TLS1_1},
+        {"TLS1_2", SSLParams::Protocols::TLS1_2},
+    };
+
+    // Map the tokens to their enum values, and push them onto the list of logged protocols.
+    for (const std::string& token : tokens) {
+        auto mappedToken = validConfigs.find(token);
+        if (mappedToken != validConfigs.end()) {
+            sslGlobalParams.tlsLogVersions.push_back(mappedToken->second);
+            continue;
+        }
+
+        return Status(ErrorCodes::BadValue, "Unrecognized tlsLogVersions '" + token + "'");
+    }
+
+    return Status::OK();
+}
+
 Status storeSSLServerOptions(const moe::Environment& params) {
     if (params.count("net.tls.mode")) {
         std::string sslModeParam = params["net.tls.mode"].as<string>();
@@ -255,6 +294,12 @@ Status storeSSLServerOptions(const moe::Environment& params) {
                 .generic_string();
     }
 
+    if (params.count("net.tls.clusterCAFile")) {
+        sslGlobalParams.sslClusterCAFile =
+            boost::filesystem::absolute(params["net.tls.clusterCAFile"].as<std::string>())
+                .generic_string();
+    }
+
     if (params.count("net.tls.CRLFile")) {
         sslGlobalParams.sslCRLFile =
             boost::filesystem::absolute(params["net.tls.CRLFile"].as<std::string>())
@@ -291,6 +336,13 @@ Status storeSSLServerOptions(const moe::Environment& params) {
                  "specify --sslDisabledProtocols 'none'";
         sslGlobalParams.sslDisabledProtocols.push_back(SSLParams::Protocols::TLS1_0);
 #endif
+    }
+
+    if (params.count("net.tls.logVersions")) {
+        const auto status = storeTLSLogVersion(params["net.tls.logVersions"].as<string>());
+        if (!status.isOK()) {
+            return status;
+        }
     }
 
     if (params.count("net.tls.weakCertificateValidation")) {
