@@ -1140,31 +1140,27 @@ class Node(object):
             binfo.bactsig = SCons.Util.MD5signature(executor.get_contents())
 
         if self._specific_sources:
-            sources = []
-            for s in self.sources:
-                if s not in ignore_set:
-                    sources.append(s)
+            sources = [s for s in self.sources if not s in ignore_set]
+
         else:
             sources = executor.get_unignored_sources(self, self.ignore)
-        seen = set()
-        bsources = []
-        bsourcesigs = []
-        for s in sources:
-            if not s in seen:
-                seen.add(s)
-                bsources.append(s)
-                bsourcesigs.append(s.get_ninfo())
-        binfo.bsources = bsources
-        binfo.bsourcesigs = bsourcesigs
 
-        # Fixes so length of bdepends and bdependsigs won't be different if one file matches
-        # any one in the ignore_set.
+
+        seen = set()
+        binfo.bsources = [s for s in sources if s not in seen and not seen.add(s)]
+        binfo.bsourcesigs = [s.get_ninfo() for s in binfo.bsources]
+
         binfo.bdepends = [d for d in self.depends if d not in ignore_set]
         binfo.bdependsigs = [d.get_ninfo() for d in self.depends]
 
-        binfo.bimplicit = [i for i in self.implicit or [] if i not in ignore_set]
-        binfo.bimplicitsigs = [i.get_ninfo() for i in binfo.bimplicit]
-
+        # Because self.implicit is initialized to None (and not empty list [])
+        # we have to handle this case
+        if not self.implicit:
+            binfo.bimplicit = []
+            binfo.bimplicitsigs = []
+        else:
+            binfo.bimplicit = [i for i in self.implicit if i not in ignore_set]
+            binfo.bimplicitsigs = [i.get_ninfo() for i in binfo.bimplicit]
 
         return binfo
 
