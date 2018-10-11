@@ -32,6 +32,7 @@
 
 #include "mongo/db/transaction_coordinator_commands_impl.h"
 
+#include "mongo/client/remote_command_targeter.h"
 #include "mongo/db/commands/txn_cmds_gen.h"
 #include "mongo/db/operation_context_session_mongod.h"
 #include "mongo/executor/task_executor_pool.h"
@@ -44,11 +45,104 @@ namespace mongo {
 
 namespace {
 
-std::vector<ShardId> sendCommit(OperationContext* opCtx,
-                                const std::set<ShardId>& nonAckedParticipants,
-                                Timestamp commitTimestamp) {
+/**
+ * Finds the host and port for a shard.
+ */
+StatusWith<HostAndPort> targetHost(OperationContext* opCtx,
+                                   const ShardId& shardId,
+                                   const ReadPreferenceSetting& readPref) {
+    auto shard = Grid::get(getGlobalServiceContext())->shardRegistry()->getShardNoReload(shardId);
+    if (!shard) {
+        return Status(ErrorCodes::ShardNotFound,
+                      str::stream() << "Could not find shard " << shardId);
+    }
+
+    auto targeter = shard->getTargeter();
+    return targeter->findHost(opCtx, readPref);
+}
+
+using CallbackFn = stdx::function<void(Status status, const ShardId& shardID)>;
+
+/**
+ * Sends the given command object to the given shard ID. If scheduling and running the command is
+ * successful, calls the callback with the status of the command response and the shard ID.
+ */
+void sendAsyncCommandToShard(OperationContext* opCtx,
+                             executor::TaskExecutor* executor,
+                             const ShardId& shardId,
+                             const BSONObj& commandObj,
+                             CallbackFn callbackOnCommandResponse) {
+    auto readPref = ReadPreferenceSetting(ReadPreference::PrimaryOnly);
+    auto swShardHostAndPort = targetHost(opCtx, shardId, readPref);
+    if (!swShardHostAndPort.isOK()) {
+        LOG(3) << "Coordinator shard failed to target primary host of participant shard for "
+               << commandObj << causedBy(swShardHostAndPort.getStatus());
+        return;
+    }
+
+    executor::RemoteCommandRequest request(
+        swShardHostAndPort.getValue(), "admin", commandObj, readPref.toContainingBSON(), nullptr);
+
+    auto swCallbackHandle = executor->scheduleRemoteCommand(
+        request,
+        [commandObj, shardId, callbackOnCommandResponse](
+            const executor::TaskExecutor::RemoteCommandCallbackArgs& args) {
+
+            auto status = (!args.response.isOK()) ? args.response.status
+                                                  : getStatusFromCommandResult(args.response.data);
+
+            LOG(3) << "Coordinator shard got response " << status << " for " << commandObj << " to "
+                   << shardId;
+
+            // Only call callback if command successfully executed and got a response.
+            if (args.response.isOK()) {
+                callbackOnCommandResponse(status, shardId);
+            }
+        });
+
+    if (!swCallbackHandle.isOK()) {
+        LOG(3) << "Coordinator shard failed to schedule the task to send " << commandObj
+               << " to shard " << shardId << causedBy(swCallbackHandle.getStatus());
+    }
+
+    // Do not wait for the callback to run.
+}
+
+/**
+ * Sends the given command object to all shards in the set of shard IDs. For each shard ID, if
+ * scheduling and running the command is successful, calls the callback with the status of the
+ * command response and the shard ID.
+ */
+void sendAsyncCommandToShards(OperationContext* opCtx,
+                              const std::set<ShardId>& shardIds,
+                              const BSONObj& commandObj,
+                              CallbackFn callbackOnCommandResponse) {
+    // TODO (SERVER-36638): Change to arbitrary task executor? Unit test only supports fixed
+    // executor.
+    auto exec = Grid::get(opCtx)->getExecutorPool()->getFixedExecutor();
+
     StringBuilder ss;
     ss << "[";
+    // For each non-acked participant, launch an async task to target its shard
+    // and then asynchronously send the command.
+    for (const auto& shardId : shardIds) {
+        sendAsyncCommandToShard(opCtx, exec, shardId, commandObj, callbackOnCommandResponse);
+        ss << shardId << " ";
+    }
+
+    ss << "]";
+    LOG(3) << "Coordinator shard sending " << commandObj << " to " << ss.str();
+}
+
+}  // namespace
+
+namespace txn {
+
+void sendCommit(OperationContext* opCtx,
+                std::shared_ptr<TransactionCoordinator> coordinator,
+                const std::set<ShardId>& nonAckedParticipants,
+                Timestamp commitTimestamp) {
+    invariant(coordinator);
 
     CommitTransaction commitTransaction;
     commitTransaction.setCommitTimestamp(commitTimestamp);
@@ -58,179 +152,28 @@ std::vector<ShardId> sendCommit(OperationContext* opCtx,
                << "autocommit"
                << false));
 
-    std::vector<AsyncRequestsSender::Request> requests;
-    for (const auto& shardId : nonAckedParticipants) {
-        requests.emplace_back(shardId, commitObj);
-        ss << shardId << " ";
-    }
-
-    // TODO (SERVER-36687): Remove log line or demote to lower log level once cross-shard
-    // transactions are stable.
-    ss << "]";
-    LOG(0) << "Coordinator shard sending " << commitObj << " to " << ss.str();
-
-    // TODO (SERVER-36638): Change to arbitrary task executor? Unit test only supports fixed
-    // executor.
-    AsyncRequestsSender ars(opCtx,
-                            Grid::get(opCtx)->getExecutorPool()->getFixedExecutor(),
-                            "admin",
-                            requests,
-                            ReadPreferenceSetting(ReadPreference::PrimaryOnly),
-                            Shard::RetryPolicy::kIdempotent);
-
-    std::vector<ShardId> ackedParticipants;
-    while (!ars.done()) {
-        auto response = ars.next();
-
-        if (response.swResponse.getStatus().isOK()) {
-            auto commandStatus = getStatusFromCommandResult(response.swResponse.getValue().data);
-
-            // TODO (SERVER-36642): Also interpret TransactionTooOld as acknowledgment.
-            if (commandStatus.isOK()) {
-                ackedParticipants.push_back(response.shardId);
-            }
-
-            // TODO (SERVER-36687): Remove log line or demote to lower log level once cross-shard
-            // transactions are stable.
-            LOG(0) << "Coordinator shard got response " << commandStatus
-                   << " for commitTransaction to " << response.shardId;
-        } else {
-            // TODO (SERVER-36687): Remove log line or demote to lower log level once cross-shard
-            // transactions are stable.
-            LOG(0) << "Coordinator shard got response " << response.swResponse.getStatus()
-                   << " for commitTransaction to " << response.shardId;
-        }
-    }
-    return ackedParticipants;
+    sendAsyncCommandToShards(opCtx,
+                             nonAckedParticipants,
+                             commitObj,
+                             [coordinator](Status commandResponseStatus, const ShardId& shardId) {
+                                 // TODO (SERVER-36642): Also interpret TransactionTooOld as
+                                 // acknowledgment.
+                                 if (commandResponseStatus.isOK()) {
+                                     coordinator->recvCommitAck(shardId);
+                                 }
+                             });
 }
 
-void sendAbort(OperationContext* opCtx, const std::set<ShardId>& nonAckedParticipants) {
-    StringBuilder ss;
-    ss << "[";
-
+void sendAbort(OperationContext* opCtx, const std::set<ShardId>& nonVotedAbortParticipants) {
+    // TODO (SERVER-36584) Use IDL to create command BSON.
     BSONObj abortObj = BSON(
         "abortTransaction" << 1 << "lsid" << opCtx->getLogicalSessionId()->toBSON() << "txnNumber"
                            << *opCtx->getTxnNumber()
                            << "autocommit"
                            << false);
 
-    std::vector<AsyncRequestsSender::Request> requests;
-    for (const auto& shardId : nonAckedParticipants) {
-        // TODO (SERVER-36584) Use IDL to create command BSON.
-        requests.emplace_back(shardId, abortObj);
-        ss << shardId << " ";
-    }
-
-    // TODO (SERVER-36687): Remove log line or demote to lower log level once cross-shard
-    // transactions are stable.
-    ss << "]";
-    LOG(0) << "Coordinator shard sending " << abortObj << " to " << ss.str();
-
-    // TODO (SERVER-36638): Change to arbitrary task executor? Unit test only supports fixed
-    // executor.
-    AsyncRequestsSender ars(opCtx,
-                            Grid::get(opCtx)->getExecutorPool()->getFixedExecutor(),
-                            "admin",
-                            requests,
-                            ReadPreferenceSetting(ReadPreference::PrimaryOnly),
-                            Shard::RetryPolicy::kIdempotent);
-
-    // TODO (SERVER-36638): The ARS does not currently support "fire-and-forget" messages; the ARS
-    // uses the caller's thread to send the messages over the network inside calls to next().
-    while (!ars.done()) {
-        auto response = ars.next();
-
-        if (response.swResponse.getStatus().isOK()) {
-            auto commandStatus = getStatusFromCommandResult(response.swResponse.getValue().data);
-
-            // TODO (SERVER-36687): Remove log line or demote to lower log level once cross-shard
-            // transactions are stable.
-            LOG(0) << "Coordinator shard got response " << commandStatus
-                   << " for abortTransaction to " << response.shardId;
-        } else {
-            // TODO (SERVER-36687): Remove log line or demote to lower log level once cross-shard
-            // transactions are stable.
-            LOG(0) << "Coordinator shard got response " << response.swResponse.getStatus()
-                   << " for abortTransaction to " << response.shardId;
-        }
-    }
-}
-
-void doAction(OperationContext* opCtx,
-              std::shared_ptr<TransactionCoordinator> coordinator,
-              TransactionCoordinator::StateMachine::Action action) {
-    switch (action) {
-        case TransactionCoordinator::StateMachine::Action::kSendCommit: {
-            const auto nonAckedParticipants = coordinator->getNonAckedCommitParticipants();
-            const auto commitTimestamp = coordinator->getCommitTimestamp();
-
-            // TODO (SERVER-36638): Spawn a separate thread to do this so that the client's thread
-            // does not block.
-            auto ackedParticipants = sendCommit(opCtx, nonAckedParticipants, commitTimestamp);
-            for (auto& participant : ackedParticipants) {
-                coordinator->recvCommitAck(participant);
-            }
-
-            return;
-        }
-        case TransactionCoordinator::StateMachine::Action::kSendAbort: {
-            sendAbort(opCtx, coordinator->getNonVotedAbortParticipants());
-            return;
-        }
-        case TransactionCoordinator::StateMachine::Action::kNone:
-            return;
-    }
-    MONGO_UNREACHABLE;
-}
-
-}  // namespace
-
-namespace txn {
-
-void recvCoordinateCommit(OperationContext* opCtx,
-                          std::shared_ptr<TransactionCoordinator> coordinator,
-                          const std::set<ShardId>& participantList) {
-    // TODO (SERVER-36687): Remove log line or demote to lower log level once cross-shard
-    // transactions are stable.
-    StringBuilder ss;
-    ss << "[";
-    for (const auto& shardId : participantList) {
-        ss << shardId << " ";
-    }
-    ss << "]";
-    LOG(0) << "Coordinator shard received participant list with shards " << ss.str();
-
-    TransactionCoordinator::StateMachine::Action action;
-    action = coordinator->recvCoordinateCommit(participantList);
-    doAction(opCtx, coordinator, action);
-
-    // TODO (SERVER-36640): Wait for decision to be made.
-}
-
-void recvVoteCommit(OperationContext* opCtx,
-                    std::shared_ptr<TransactionCoordinator> coordinator,
-                    const ShardId& shardId,
-                    Timestamp prepareTimestamp) {
-    // TODO (SERVER-36687): Remove log line or demote to lower log level once cross-shard
-    // transactions are stable.
-    LOG(0) << "Coordinator shard received voteCommit from " << shardId << " with prepare timestamp "
-           << prepareTimestamp;
-
-    TransactionCoordinator::StateMachine::Action action;
-    action = coordinator->recvVoteCommit(shardId, prepareTimestamp);
-    doAction(opCtx, coordinator, action);
-}
-
-void recvVoteAbort(OperationContext* opCtx,
-                   std::shared_ptr<TransactionCoordinator> coordinator,
-                   const ShardId& shardId) {
-    // TODO (SERVER-36687): Remove log line or demote to lower log level once cross-shard
-    // transactions are stable.
-    LOG(0) << "Coordinator shard received voteAbort from " << shardId;
-
-    TransactionCoordinator::StateMachine::Action action;
-    action = coordinator->recvVoteAbort(shardId);
-    doAction(opCtx, coordinator, action);
+    sendAsyncCommandToShards(
+        opCtx, nonVotedAbortParticipants, abortObj, [](Status, const ShardId&) {});
 }
 
 }  // namespace txn

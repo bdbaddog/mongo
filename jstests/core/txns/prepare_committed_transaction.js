@@ -1,7 +1,7 @@
 /**
  * Test error cases when calling prepare on a committed transaction.
  *
- * @tags: [uses_transactions]
+ * @tags: [uses_transactions, uses_prepare_transaction]
  */
 (function() {
     "use strict";
@@ -24,26 +24,32 @@
     session.startTransaction();
     assert.commandWorked(sessionColl.insert(doc));
     session.commitTransaction();
-    assert.commandFailedWithCode(
-        sessionDB.adminCommand(
-            {prepareTransaction: 1, txnNumber: NumberLong(0), autocommit: false}),
-        ErrorCodes.TransactionCommitted);
+    assert.commandFailedWithCode(sessionDB.adminCommand({
+        prepareTransaction: 1,
+        coordinatorId: "dummy",
+        txnNumber: NumberLong(0),
+        autocommit: false
+    }),
+                                 ErrorCodes.TransactionCommitted);
 
     jsTestLog("Test the error precedence when calling prepare on a committed transaction but not " +
               "providing txnNumber to prepareTransaction.");
-    assert.commandFailedWithCode(sessionDB.adminCommand({prepareTransaction: 1, autocommit: false}),
-                                 ErrorCodes.InvalidOptions);
+    assert.commandFailedWithCode(
+        sessionDB.adminCommand({prepareTransaction: 1, coordinatorId: "dummy", autocommit: false}),
+        ErrorCodes.InvalidOptions);
 
     jsTestLog("Test the error precedence when calling prepare on a committed transaction but not " +
               "providing autocommit to prepareTransaction.");
     assert.commandFailedWithCode(
-        sessionDB.adminCommand({prepareTransaction: 1, txnNumber: NumberLong(0)}),
+        sessionDB.adminCommand(
+            {prepareTransaction: 1, coordinatorId: "dummy", txnNumber: NumberLong(0)}),
         ErrorCodes.InvalidOptions);
 
     jsTestLog("Test the error precedence when calling prepare on a committed transaction and " +
               "providing startTransaction to prepareTransaction.");
     assert.commandFailedWithCode(sessionDB.adminCommand({
         prepareTransaction: 1,
+        coordinatorId: "dummy",
         txnNumber: NumberLong(0),
         autocommit: false,
         startTransaction: true

@@ -1,5 +1,5 @@
 // Test parsing of readConcern level 'snapshot' on mongos.
-// @tags: [requires_replication,requires_sharding, uses_transactions]
+// @tags: [requires_replication,requires_sharding, uses_transactions, uses_single_shard_transaction]
 (function() {
     "use strict";
 
@@ -55,13 +55,6 @@
     expectFailInTxnThenAbort(session, sessionDb, ErrorCodes.InvalidOptions, {
         find: collName,
         readConcern: {level: "snapshot", atClusterTime: clusterTime},
-    });
-
-    // readConcern 'snapshot' is not supported by non-CRUD commands.
-    expectFailInTxnThenAbort(session, sessionDb, ErrorCodes.InvalidOptions, {
-        createIndexes: collName,
-        indexes: [{key: {a: 1}, name: "a_1"}],
-        readConcern: {level: "snapshot"},
     });
 
     // Passthrough tests. There are parts not implemented on mongod and mongos, they are tracked by
@@ -127,14 +120,6 @@
         pipeline: [],
         cursor: {},
         readConcern: {level: "snapshot", afterClusterTime: clusterTime},
-    });
-
-    // Passthrough tests that are not implemented yet.
-
-    // TODO SERVER-33709: Add snapshot support for cluster count on mongos.
-    expectFailInTxnThenAbort(session, sessionDb, ErrorCodes.InvalidOptions, {
-        count: collName,
-        readConcern: {level: "snapshot"},
     });
 
     st.stop();

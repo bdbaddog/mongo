@@ -58,6 +58,11 @@ functions:
           rm -rf ./dsi
           mkdir -p ./src
           git clone git@github.com:10gen/dsi.git
+    # get the mongo source, note the s3.get calls put the
+    # exe files in their respective make locations.
+    - command: git.get_project
+      params:
+        directory: src
   "start server":
     - command: shell.exec
       params:
@@ -135,9 +140,43 @@ functions:
         script: |
           set -e
           set -v
-          virtualenv ./venv
-          source ./venv/bin/activate
-          pip install -r ../dsi/requirements/analysis.txt
+          ../dsi/run-dsi setup
+    - command: shell.exec
+      params:
+        working_dir: src
+        script: |
+          cat > bootstrap.yml <<EOF
+          infrastructure_provisioning: ${cluster}
+          platform: ${platform}
+          mongodb_setup: ${setup}
+          storageEngine: ${storageEngine}
+          test_control: ${test}
+          production: true
+          EOF
+
+          cat > runtime.yml <<EOF
+          # evergreen default expansions
+          is_patch: ${is_patch}
+          task_id: ${task_id}
+          EOF
+
+          cp ../dsi/configurations/analysis/analysis.common.yml  analysis.yml
+    - command: shell.exec
+      params:
+        working_dir: src
+        silent: true
+        script: |
+          cat > runtime_secret.yml <<EOF
+          dsi_analysis_atlas_user: "${dsi_analysis_atlas_user}"
+          dsi_analysis_atlas_pw: "${dsi_analysis_atlas_pw}"
+          EOF
+          chmod 400 runtime_secret.yml
+    - command: shell.exec
+      params:
+        working_dir: src
+        script: |
+          set -v
+          ../dsi/run-dsi detect-changes
     - command: json.get_history
       params:
         task: ${task_name}
@@ -354,6 +393,40 @@ tasks:
     - func: "analyze"
       vars:
         reports_analysis: true
+- name: wildcard-index-read
+  depends_on:
+  - variant: linux-wt-standalone
+    name: compile
+  commands:
+    - func: "start server"
+    - func: "run perf tests"
+      vars:
+        includeFilter1: "wildcard_read"
+        includeFilter2 : "core regression"
+        excludeFilter : "single_threaded"
+        threads : "1 2 4 8"
+        readCmd: false
+    - func: "download analysis scripts"
+    - func: "analyze"
+      vars:
+        reports_analysis: true
+- name: wildcard-index-write
+  depends_on:
+  - variant: linux-wt-standalone
+    name: compile
+  commands:
+    - func: "start server"
+    - func: "run perf tests"
+      vars:
+        includeFilter1: "wildcard_write"
+        includeFilter2 : "core regression"
+        excludeFilter : "single_threaded"
+        threads : "1 2 4 8"
+        readCmd: false
+    - func: "download analysis scripts"
+    - func: "analyze"
+      vars:
+        reports_analysis: true
 - name: geo
   depends_on:
   - variant: linux-wt-standalone
@@ -453,8 +526,6 @@ buildvariants:
     compile_flags: --ssl MONGO_DISTMOD=rhel62 -j$(grep -c ^processor /proc/cpuinfo) --release --variables-files=etc/scons/mongodbtoolchain_gcc.vars
     mongod_exec_wrapper: &exec_wrapper "numactl --physcpubind=4,5,6,7 -i 1"
     perf_exec_wrapper: &perf_wrapper "numactl --physcpubind=1,2,3 -i 0"
-    # TODO SERVER-36198: Remove the `--setParameter internalQueryAllowAllPathsIndexes=true` line
-    # when all paths indexes are enabled by default.
     mongod_flags: >-
       --auth
       --fork
@@ -464,7 +535,6 @@ buildvariants:
       --networkMessageCompressors noop
       --setParameter diagnosticDataCollectionEnabled=false
       --setParameter enableTestCommands=1
-      --setParameter internalQueryAllowAllPathsIndexes=true
       --setParameter ttlMonitorEnabled=false
       --storageEngine inMemory
       --syncdelay 0
@@ -484,6 +554,8 @@ buildvariants:
   - name: where
   - name: update
   - name: insert
+  - name: wildcard-index-read
+  - name: wildcard-index-write
   - name: geo
   - name: misc
   - name: singleThreaded
@@ -494,8 +566,6 @@ buildvariants:
   expansions:
     mongod_exec_wrapper: *exec_wrapper
     perf_exec_wrapper: *perf_wrapper
-    # TODO SERVER-36198: Remove the `--setParameter internalQueryAllowAllPathsIndexes=true` line
-    # when all paths indexes are enabled by default.
     mongod_flags: >-
       --auth
       --fork
@@ -507,7 +577,6 @@ buildvariants:
       --replSet test
       --setParameter diagnosticDataCollectionEnabled=false
       --setParameter enableTestCommands=1
-      --setParameter internalQueryAllowAllPathsIndexes=true
       --setParameter ttlMonitorEnabled=false
       --storageEngine inMemory
       --syncdelay 0
@@ -519,3 +588,4 @@ buildvariants:
   - name: insert
   - name: misc
   - name: singleThreaded
+  - name: wildcard-index-write

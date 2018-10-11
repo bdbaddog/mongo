@@ -68,21 +68,15 @@ public:
         // TODO: Remove test command enabling/disabling in SERVER-36198
         _prevEnabled = getTestCommandsEnabled();
         setTestCommandsEnabled(true);
-
-        // TODO: Remove knob enabling/disabling in SERVER-36198.
-        _prevKnobEnabled = internalQueryAllowAllPathsIndexes.load();
-        internalQueryAllowAllPathsIndexes.store(true);
     }
 
     ~TestCommandFcvGuard() {
         serverGlobalParams.featureCompatibility.setVersion(_prevVersion);
         setTestCommandsEnabled(_prevEnabled);
-        internalQueryAllowAllPathsIndexes.store(_prevKnobEnabled);
     }
 
 private:
     bool _prevEnabled;
-    bool _prevKnobEnabled;
     ServerGlobalParams::FeatureCompatibility::Version _prevVersion;
 };
 
@@ -838,79 +832,79 @@ TEST(IndexSpecPartialFilterTest, AcceptsValidPartialFilterExpression) {
     ASSERT_OK(result.getStatus());
 }
 
-TEST(IndexSpecAllPaths, SucceedsWithInclusion) {
+TEST(IndexSpecWildcard, SucceedsWithInclusion) {
     TestCommandFcvGuard guard;
     auto result = validateIndexSpec(kDefaultOpCtx,
                                     BSON("key" << BSON("$**" << 1) << "name"
                                                << "indexName"
-                                               << "starPathsTempName"
+                                               << "wildcardProjection"
                                                << BSON("a" << 1 << "b" << 1)),
                                     kTestNamespace,
                                     serverGlobalParams.featureCompatibility);
     ASSERT_OK(result.getStatus());
 }
 
-TEST(IndexSpecAllPaths, SucceedsWithExclusion) {
+TEST(IndexSpecWildcard, SucceedsWithExclusion) {
     TestCommandFcvGuard guard;
     auto result = validateIndexSpec(kDefaultOpCtx,
                                     BSON("key" << BSON("$**" << 1) << "name"
                                                << "indexName"
-                                               << "starPathsTempName"
+                                               << "wildcardProjection"
                                                << BSON("a" << 0 << "b" << 0)),
                                     kTestNamespace,
                                     serverGlobalParams.featureCompatibility);
     ASSERT_OK(result.getStatus());
 }
 
-TEST(IndexSpecAllPaths, SucceedsWithExclusionIncludingId) {
+TEST(IndexSpecWildcard, SucceedsWithExclusionIncludingId) {
     TestCommandFcvGuard guard;
     auto result = validateIndexSpec(kDefaultOpCtx,
                                     BSON("key" << BSON("$**" << 1) << "name"
                                                << "indexName"
-                                               << "starPathsTempName"
+                                               << "wildcardProjection"
                                                << BSON("_id" << 1 << "a" << 0 << "b" << 0)),
                                     kTestNamespace,
                                     serverGlobalParams.featureCompatibility);
     ASSERT_OK(result.getStatus());
 }
 
-TEST(IndexSpecAllPaths, SucceedsWithInclusionExcludingId) {
+TEST(IndexSpecWildcard, SucceedsWithInclusionExcludingId) {
     TestCommandFcvGuard guard;
     auto result = validateIndexSpec(kDefaultOpCtx,
                                     BSON("key" << BSON("$**" << 1) << "name"
                                                << "indexName"
-                                               << "starPathsTempName"
+                                               << "wildcardProjection"
                                                << BSON("_id" << 0 << "a" << 1 << "b" << 1)),
                                     kTestNamespace,
                                     serverGlobalParams.featureCompatibility);
     ASSERT_OK(result.getStatus());
 }
 
-TEST(IndexSpecAllPaths, FailsWithInclusionExcludingIdSubfield) {
+TEST(IndexSpecWildcard, FailsWithInclusionExcludingIdSubfield) {
     TestCommandFcvGuard guard;
     auto result = validateIndexSpec(kDefaultOpCtx,
                                     BSON("key" << BSON("$**" << 1) << "name"
                                                << "indexName"
-                                               << "starPathsTempName"
+                                               << "wildcardProjection"
                                                << BSON("_id.field" << 0 << "a" << 1 << "b" << 1)),
                                     kTestNamespace,
                                     serverGlobalParams.featureCompatibility);
     ASSERT_EQ(result.getStatus().code(), 40179);
 }
 
-TEST(IndexSpecAllPaths, FailsWithExclusionIncludingIdSubfield) {
+TEST(IndexSpecWildcard, FailsWithExclusionIncludingIdSubfield) {
     TestCommandFcvGuard guard;
     auto result = validateIndexSpec(kDefaultOpCtx,
                                     BSON("key" << BSON("$**" << 1) << "name"
                                                << "indexName"
-                                               << "starPathsTempName"
+                                               << "wildcardProjection"
                                                << BSON("_id.field" << 1 << "a" << 0 << "b" << 0)),
                                     kTestNamespace,
                                     serverGlobalParams.featureCompatibility);
     ASSERT_EQ(result.getStatus().code(), 40178);
 }
 
-TEST(IndexSpecAllPaths, FailsWithImproperFeatureCompatabilityVersion) {
+TEST(IndexSpecWildcard, FailsWithImproperFeatureCompatabilityVersion) {
     TestCommandFcvGuard guard;
     serverGlobalParams.featureCompatibility.setVersion(
         ServerGlobalParams::FeatureCompatibility::Version::kUpgradingTo42);
@@ -922,24 +916,24 @@ TEST(IndexSpecAllPaths, FailsWithImproperFeatureCompatabilityVersion) {
     ASSERT_EQ(result.getStatus().code(), ErrorCodes::CannotCreateIndex);
 }
 
-TEST(IndexSpecAllPaths, FailsWithMixedProjection) {
+TEST(IndexSpecWildcard, FailsWithMixedProjection) {
     TestCommandFcvGuard guard;
     auto result = validateIndexSpec(kDefaultOpCtx,
                                     BSON("key" << BSON("$**" << 1) << "name"
                                                << "indexName"
-                                               << "starPathsTempName"
+                                               << "wildcardProjection"
                                                << BSON("a" << 1 << "b" << 0)),
                                     kTestNamespace,
                                     serverGlobalParams.featureCompatibility);
     ASSERT_EQ(result.getStatus().code(), 40178);
 }
 
-TEST(IndexSpecAllPaths, FailsWithComputedFieldsInProjection) {
+TEST(IndexSpecWildcard, FailsWithComputedFieldsInProjection) {
     TestCommandFcvGuard guard;
     auto result = validateIndexSpec(kDefaultOpCtx,
                                     BSON("key" << BSON("$**" << 1) << "name"
                                                << "indexName"
-                                               << "starPathsTempName"
+                                               << "wildcardProjection"
                                                << BSON("a" << 1 << "b"
                                                            << "string")),
                                     kTestNamespace,
@@ -947,60 +941,60 @@ TEST(IndexSpecAllPaths, FailsWithComputedFieldsInProjection) {
     ASSERT_EQ(result.getStatus().code(), ErrorCodes::FailedToParse);
 }
 
-TEST(IndexSpecAllPaths, FailsWhenProjectionPluginNotAllPaths) {
+TEST(IndexSpecWildcard, FailsWhenProjectionPluginNotWildcard) {
     TestCommandFcvGuard guard;
     auto result = validateIndexSpec(kDefaultOpCtx,
                                     BSON("key" << BSON("a" << 1) << "name"
                                                << "indexName"
-                                               << "starPathsTempName"
+                                               << "wildcardProjection"
                                                << BSON("a" << 1)),
                                     kTestNamespace,
                                     serverGlobalParams.featureCompatibility);
     ASSERT_EQ(result.getStatus().code(), ErrorCodes::BadValue);
 }
 
-TEST(IndexSpecAllPaths, FailsWhenProjectionIsNotAnObject) {
+TEST(IndexSpecWildcard, FailsWhenProjectionIsNotAnObject) {
     TestCommandFcvGuard guard;
     auto result = validateIndexSpec(kDefaultOpCtx,
                                     BSON("key" << BSON("$**" << 1) << "name"
                                                << "indexName"
-                                               << "starPathsTempName"
+                                               << "wildcardProjection"
                                                << 4),
                                     kTestNamespace,
                                     serverGlobalParams.featureCompatibility);
     ASSERT_EQ(result.getStatus().code(), ErrorCodes::TypeMismatch);
 }
 
-TEST(IndexSpecAllPaths, FailsWithEmptyProjection) {
+TEST(IndexSpecWildcard, FailsWithEmptyProjection) {
     TestCommandFcvGuard guard;
     auto result = validateIndexSpec(kDefaultOpCtx,
                                     BSON("key" << BSON("$**" << 1) << "name"
                                                << "indexName"
-                                               << "starPathsTempName"
+                                               << "wildcardProjection"
                                                << BSONObj()),
                                     kTestNamespace,
                                     serverGlobalParams.featureCompatibility);
     ASSERT_EQ(result.getStatus().code(), ErrorCodes::FailedToParse);
 }
 
-TEST(IndexSpecAllPaths, FailsWhenInclusionWithSubpath) {
+TEST(IndexSpecWildcard, FailsWhenInclusionWithSubpath) {
     TestCommandFcvGuard guard;
     auto result = validateIndexSpec(kDefaultOpCtx,
                                     BSON("key" << BSON("a.$**" << 1) << "name"
                                                << "indexName"
-                                               << "starPathsTempName"
+                                               << "wildcardProjection"
                                                << BSON("a" << 1)),
                                     kTestNamespace,
                                     serverGlobalParams.featureCompatibility);
     ASSERT_EQ(result.getStatus().code(), ErrorCodes::FailedToParse);
 }
 
-TEST(IndexSpecAllPaths, FailsWhenExclusionWithSubpath) {
+TEST(IndexSpecWildcard, FailsWhenExclusionWithSubpath) {
     TestCommandFcvGuard guard;
     auto result = validateIndexSpec(kDefaultOpCtx,
                                     BSON("key" << BSON("a.$**" << 1) << "name"
                                                << "indexName"
-                                               << "starPathsTempName"
+                                               << "wildcardProjection"
                                                << BSON("b" << 0)),
                                     kTestNamespace,
                                     serverGlobalParams.featureCompatibility);

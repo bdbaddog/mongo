@@ -63,6 +63,7 @@
 #include "mongo/db/service_context.h"
 #include "mongo/db/service_context_d_test_fixture.h"
 #include "mongo/db/session_catalog.h"
+#include "mongo/db/session_txn_record_gen.h"
 #include "mongo/stdx/mutex.h"
 #include "mongo/unittest/death_test.h"
 #include "mongo/unittest/unittest.h"
@@ -232,9 +233,8 @@ auto parseFromOplogEntryArray(const BSONObj& obj, int elem) {
 TEST_F(SyncTailTest, SyncApplyNoNamespaceBadOp) {
     const BSONObj op = BSON("op"
                             << "x");
-    ASSERT_THROWS(
-        SyncTail::syncApply(_opCtx.get(), op, OplogApplication::Mode::kInitialSync).ignore(),
-        ExceptionFor<ErrorCodes::BadValue>);
+    ASSERT_THROWS(SyncTail::syncApply(_opCtx.get(), op, OplogApplication::Mode::kInitialSync),
+                  ExceptionFor<ErrorCodes::BadValue>);
 }
 
 TEST_F(SyncTailTest, SyncApplyNoNamespaceNoOp) {
@@ -249,16 +249,15 @@ TEST_F(SyncTailTest, SyncApplyBadOp) {
                             << "x"
                             << "ns"
                             << "test.t");
-    ASSERT_THROWS(
-        SyncTail::syncApply(_opCtx.get(), op, OplogApplication::Mode::kInitialSync).ignore(),
-        ExceptionFor<ErrorCodes::BadValue>);
+    ASSERT_THROWS(SyncTail::syncApply(_opCtx.get(), op, OplogApplication::Mode::kInitialSync),
+                  ExceptionFor<ErrorCodes::BadValue>);
 }
 
 TEST_F(SyncTailTest, SyncApplyInsertDocumentDatabaseMissing) {
     NamespaceString nss("test.t");
     auto op = makeOplogEntry(OpTypeEnum::kInsert, nss, {});
     ASSERT_THROWS(
-        SyncTail::syncApply(_opCtx.get(), op.toBSON(), OplogApplication::Mode::kSecondary).ignore(),
+        SyncTail::syncApply(_opCtx.get(), op.toBSON(), OplogApplication::Mode::kSecondary),
         ExceptionFor<ErrorCodes::NamespaceNotFound>);
 }
 
@@ -274,7 +273,7 @@ TEST_F(SyncTailTest, SyncApplyInsertDocumentCollectionLookupByUUIDFails) {
     NamespaceString otherNss(nss.getSisterNS("othername"));
     auto op = makeOplogEntry(OpTypeEnum::kInsert, otherNss, kUuid);
     ASSERT_THROWS(
-        SyncTail::syncApply(_opCtx.get(), op.toBSON(), OplogApplication::Mode::kSecondary).ignore(),
+        SyncTail::syncApply(_opCtx.get(), op.toBSON(), OplogApplication::Mode::kSecondary),
         ExceptionFor<ErrorCodes::NamespaceNotFound>);
 }
 
@@ -294,7 +293,7 @@ TEST_F(SyncTailTest, SyncApplyInsertDocumentCollectionMissing) {
     // implicitly create the collection and lock the database in MODE_X.
     auto op = makeOplogEntry(OpTypeEnum::kInsert, nss, {});
     ASSERT_THROWS(
-        SyncTail::syncApply(_opCtx.get(), op.toBSON(), OplogApplication::Mode::kSecondary).ignore(),
+        SyncTail::syncApply(_opCtx.get(), op.toBSON(), OplogApplication::Mode::kSecondary),
         ExceptionFor<ErrorCodes::NamespaceNotFound>);
     ASSERT_FALSE(collectionExists(_opCtx.get(), nss));
 }
@@ -382,9 +381,8 @@ TEST_F(SyncTailTest, SyncApplyCommandThrowsException) {
                             << BSON("create"
                                     << "t"));
     // This test relies on the namespace type check in applyCommand_inlock().
-    ASSERT_THROWS(
-        SyncTail::syncApply(_opCtx.get(), op, OplogApplication::Mode::kInitialSync).ignore(),
-        ExceptionFor<ErrorCodes::InvalidNamespace>);
+    ASSERT_THROWS(SyncTail::syncApply(_opCtx.get(), op, OplogApplication::Mode::kInitialSync),
+                  ExceptionFor<ErrorCodes::InvalidNamespace>);
 }
 
 DEATH_TEST_F(SyncTailTest, MultiApplyAbortsWhenNoOperationsAreGiven, "!ops.empty()") {

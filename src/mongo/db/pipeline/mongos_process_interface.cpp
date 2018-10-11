@@ -32,13 +32,15 @@
 
 #include "mongo/db/catalog/uuid_catalog.h"
 #include "mongo/db/curop.h"
+#include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/pipeline/document_source.h"
 #include "mongo/db/query/collation/collation_spec.h"
+#include "mongo/db/query/collation/collator_factory_interface.h"
 #include "mongo/db/repl/read_concern_args.h"
 #include "mongo/db/s/scoped_collection_metadata.h"
 #include "mongo/executor/task_executor_pool.h"
 #include "mongo/s/catalog_cache.h"
-#include "mongo/s/commands/cluster_commands_helpers.h"
+#include "mongo/s/cluster_commands_helpers.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/query/cluster_cursor_manager.h"
 #include "mongo/s/query/establish_cursors.h"
@@ -88,6 +90,23 @@ StatusWith<CachedCollectionRoutingInfo> getCollectionRoutingInfo(
         }
     }
     return swRoutingInfo;
+}
+
+bool supportsUniqueKey(const boost::intrusive_ptr<ExpressionContext>& expCtx,
+                       const BSONObj& index,
+                       const std::set<FieldPath>& uniqueKeyPaths) {
+    // Retrieve the collation from the index, or default to the simple collation.
+    const auto collation = uassertStatusOK(
+        CollatorFactoryInterface::get(expCtx->opCtx->getServiceContext())
+            ->makeFromBSON(index.hasField(IndexDescriptor::kCollationFieldName)
+                               ? index.getObjectField(IndexDescriptor::kCollationFieldName)
+                               : CollationSpec::kSimpleSpec));
+
+    return index.getBoolField(IndexDescriptor::kUniqueFieldName) &&
+        !index.hasField(IndexDescriptor::kPartialFilterExprFieldName) &&
+        MongoProcessCommon::keyPatternNamesExactPaths(
+               index.getObjectField(IndexDescriptor::kKeyPatternFieldName), uniqueKeyPaths) &&
+        CollatorInterface::collatorsMatch(collation.get(), expCtx->getCollator());
 }
 
 }  // namespace
@@ -233,12 +252,41 @@ std::vector<GenericCursor> MongoSInterface::getIdleCursors(
     invariant(hasGlobalServiceContext());
     auto cursorManager = Grid::get(expCtx->opCtx->getServiceContext())->getCursorManager();
     invariant(cursorManager);
-    return cursorManager->getIdleCursors();
+    return cursorManager->getIdleCursors(expCtx->opCtx, userMode);
 }
 
 bool MongoSInterface::isSharded(OperationContext* opCtx, const NamespaceString& nss) {
     auto routingInfo = Grid::get(opCtx)->catalogCache()->getCollectionRoutingInfo(opCtx, nss);
     return routingInfo.isOK() && routingInfo.getValue().cm();
+}
+
+bool MongoSInterface::uniqueKeyIsSupportedByIndex(
+    const boost::intrusive_ptr<ExpressionContext>& expCtx,
+    const NamespaceString& nss,
+    const std::set<FieldPath>& uniqueKeyPaths) const {
+    const auto opCtx = expCtx->opCtx;
+    const auto routingInfo =
+        uassertStatusOK(Grid::get(opCtx)->catalogCache()->getCollectionRoutingInfo(opCtx, nss));
+
+    // Run an exhaustive listIndexes against the primary shard only.
+    auto response = routingInfo.db().primary()->runExhaustiveCursorCommand(
+        opCtx,
+        ReadPreferenceSetting::get(opCtx),
+        nss.db().toString(),
+        BSON("listIndexes" << nss.coll()),
+        opCtx->hasDeadline() ? opCtx->getRemainingMaxTimeMillis() : Milliseconds(-1));
+
+    // If the namespace does not exist, then the unique key *must* be _id only.
+    if (response.getStatus() == ErrorCodes::NamespaceNotFound) {
+        return uniqueKeyPaths == std::set<FieldPath>{"_id"};
+    }
+    uassertStatusOK(response);
+
+    const auto& indexes = response.getValue().docs;
+    return std::any_of(
+        indexes.begin(), indexes.end(), [&expCtx, &uniqueKeyPaths](const auto& index) {
+            return supportsUniqueKey(expCtx, index, uniqueKeyPaths);
+        });
 }
 
 }  // namespace mongo

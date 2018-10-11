@@ -34,13 +34,14 @@
 
 #include "mongo/client/remote_command_retry_scheduler.h"
 #include "mongo/client/remote_command_targeter.h"
+#include "mongo/db/cursor_id.h"
 #include "mongo/db/query/cursor_response.h"
 #include "mongo/db/query/getmore_request.h"
 #include "mongo/db/query/killcursors_request.h"
 #include "mongo/executor/remote_command_request.h"
 #include "mongo/executor/remote_command_response.h"
-#include "mongo/s/async_requests_sender.h"
 #include "mongo/s/grid.h"
+#include "mongo/s/multi_statement_transaction_requests_sender.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/log.h"
 #include "mongo/util/scopeguard.h"
@@ -60,12 +61,12 @@ std::vector<RemoteCursor> establishCursors(OperationContext* opCtx,
     }
 
     // Send the requests
-    AsyncRequestsSender ars(opCtx,
-                            executor,
-                            nss.db().toString(),
-                            std::move(requests),
-                            readPref,
-                            Shard::RetryPolicy::kIdempotent);
+    MultiStatementTransactionRequestsSender ars(opCtx,
+                                                executor,
+                                                nss.db().toString(),
+                                                std::move(requests),
+                                                readPref,
+                                                Shard::RetryPolicy::kIdempotent);
 
     std::vector<RemoteCursor> remoteCursors;
     try {
@@ -137,27 +138,35 @@ std::vector<RemoteCursor> establishCursors(OperationContext* opCtx,
             }
 
             // Schedule killCursors against all cursors that were established.
-            for (const auto& remoteCursor : remoteCursors) {
-                BSONObj cmdObj =
-                    KillCursorsRequest(nss, {remoteCursor.getCursorResponse().getCursorId()})
-                        .toBSON();
-                executor::RemoteCommandRequest request(
-                    remoteCursor.getHostAndPort(), nss.db().toString(), cmdObj, opCtx);
-
-                // We do not process the response to the killCursors request (we make a good-faith
-                // attempt at cleaning up the cursors, but ignore any returned errors).
-                executor
-                    ->scheduleRemoteCommand(
-                        request,
-                        [](const executor::TaskExecutor::RemoteCommandCallbackArgs& cbData) {})
-                    .status_with_transitional_ignore();
-            }
+            killRemoteCursors(opCtx, executor, std::move(remoteCursors), nss);
         } catch (const DBException&) {
             // Ignore the new error and rethrow the original one.
         }
 
         throw;
     }
+}
+
+void killRemoteCursors(OperationContext* opCtx,
+                       executor::TaskExecutor* executor,
+                       std::vector<RemoteCursor>&& remoteCursors,
+                       const NamespaceString& nss) {
+    for (auto&& remoteCursor : remoteCursors) {
+        killRemoteCursor(opCtx, executor, std::move(remoteCursor), nss);
+    }
+}
+
+void killRemoteCursor(OperationContext* opCtx,
+                      executor::TaskExecutor* executor,
+                      RemoteCursor&& cursor,
+                      const NamespaceString& nss) {
+    BSONObj cmdObj = KillCursorsRequest(nss, {cursor.getCursorResponse().getCursorId()}).toBSON();
+    executor::RemoteCommandRequest request(
+        cursor.getHostAndPort(), nss.db().toString(), cmdObj, opCtx);
+
+    // We do not process the response to the killCursors request (we make a good-faith
+    // attempt at cleaning up the cursors, but ignore any returned errors).
+    executor->scheduleRemoteCommand(request, [](auto const&) {}).getStatus().ignore();
 }
 
 }  // namespace mongo

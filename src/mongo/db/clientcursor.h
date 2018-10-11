@@ -168,23 +168,60 @@ public:
     /**
      * Returns the total number of query results returned by the cursor so far.
      */
-    long long pos() const {
-        return _pos;
+    std::uint64_t nReturnedSoFar() const {
+        return _nReturnedSoFar;
     }
 
     /**
      * Increments the cursor's tracked number of query results returned so far by 'n'.
      */
-    void incPos(long long n) {
-        _pos += n;
+    void incNReturnedSoFar(std::uint64_t n) {
+        _nReturnedSoFar += n;
     }
 
     /**
      * Sets the cursor's tracked number of query results returned so far to 'n'.
      */
-    void setPos(long long n) {
-        _pos = n;
+    void setNReturnedSoFar(std::uint64_t n) {
+        invariant(n >= _nReturnedSoFar);
+        _nReturnedSoFar = n;
     }
+
+    /**
+     * Returns the number of batches returned by this cursor so far.
+     */
+    std::uint64_t getNBatches() const {
+        return _nBatchesReturned;
+    }
+
+    /**
+     * Increments the number of batches returned so far by one.
+     */
+    void incNBatches() {
+        ++_nBatchesReturned;
+    }
+
+    Date_t getLastUseDate() const {
+        return _lastUseDate;
+    }
+
+    Date_t getCreatedDate() const {
+        return _createdDate;
+    }
+
+    void setPlanSummary(std::string ps) {
+        _planSummary = std::move(ps);
+    }
+
+    StringData getPlanSummary() const {
+        return StringData(_planSummary);
+    }
+
+    /**
+     * Returns a generic cursor containing diagnostics about this cursor.
+     * The caller must either have this cursor pinned or hold a mutex from the cursor manager.
+     */
+    GenericCursor toGenericCursor() const;
 
     //
     // Timing.
@@ -298,7 +335,10 @@ private:
     bool _disposed = false;
 
     // Tracks the number of results returned by this cursor so far.
-    long long _pos = 0;
+    std::uint64_t _nReturnedSoFar = 0;
+
+    // Tracks the number of batches returned by this cursor so far.
+    std::uint64_t _nBatchesReturned = 0;
 
     // Holds an owned copy of the command specification received from the client.
     const BSONObj _originatingCommand;
@@ -341,6 +381,10 @@ private:
     OperationContext* _operationUsingCursor;
 
     Date_t _lastUseDate;
+    Date_t _createdDate;
+
+    // A string with the plan summary of the cursor's query.
+    std::string _planSummary;
 };
 
 /**

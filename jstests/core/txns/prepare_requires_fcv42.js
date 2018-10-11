@@ -1,7 +1,7 @@
 /**
  * Tests that 'prepareTransaction' only succeeds in FCV 4.2.
  *
- * @tags: [uses_transactions]
+ * @tags: [uses_transactions, uses_prepare_transaction]
  */
 (function() {
     "use strict";
@@ -35,8 +35,9 @@
         jsTestLog("Transaction fails to prepare in last stable FCV.");
         session.startTransaction();
         assert.commandWorked(sessionDB[collName].insert({_id: "b"}));
-        assert.commandFailedWithCode(sessionDB.adminCommand({prepareTransaction: 1}),
-                                     ErrorCodes.CommandNotSupported);
+        assert.commandFailedWithCode(
+            sessionDB.adminCommand({prepareTransaction: 1, coordinatorId: "dummy"}),
+            ErrorCodes.CommandNotSupported);
         // Abort the transaction in the shell.
         session.abortTransaction();
 

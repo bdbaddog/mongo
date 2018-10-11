@@ -37,6 +37,7 @@
 #include "mongo/db/operation_context.h"
 #include "mongo/db/pipeline/expression_context.h"
 #include "mongo/db/service_context.h"
+#include "mongo/util/net/socket_utils.h"
 
 namespace mongo {
 
@@ -78,10 +79,34 @@ std::vector<BSONObj> MongoProcessCommon::getCurrentOps(
     if (cursorMode == CurrentOpCursorMode::kIncludeCursors) {
 
         for (auto&& cursor : getIdleCursors(expCtx, userMode)) {
-            ops.push_back(BSON("type"
-                               << "idleCursor"
-                               << "cursor"
-                               << cursor.toBSON()));
+            BSONObjBuilder cursorObj;
+            auto ns = cursor.getNs();
+            auto lsid = cursor.getLsid();
+            cursorObj.append("type", "idleCursor");
+            cursorObj.append("host", getHostNameCached());
+            cursorObj.append("ns", ns->toString());
+            // If in legacy read mode, lsid is not present.
+            if (lsid) {
+                cursorObj.append("lsid", lsid->toBSON());
+            }
+            cursor.setNs(boost::none);
+            cursor.setLsid(boost::none);
+            // On mongos, planSummary is not present.
+            auto planSummaryData = cursor.getPlanSummary();
+            if (planSummaryData) {
+                auto planSummaryText = planSummaryData->toString();
+                // Plan summary has to appear in the top level object, not the cursor object.
+                // We remove it, create the op, then put it back.
+                cursor.setPlanSummary(boost::none);
+                cursorObj.append("planSummary", planSummaryText);
+                cursorObj.append("cursor", cursor.toBSON());
+                cursor.setPlanSummary(StringData(planSummaryText));
+            } else {
+                cursorObj.append("cursor", cursor.toBSON());
+            }
+            ops.emplace_back(cursorObj.obj());
+            cursor.setNs(ns);
+            cursor.setLsid(lsid);
         }
     }
 
@@ -91,6 +116,21 @@ std::vector<BSONObj> MongoProcessCommon::getCurrentOps(
     }
 
     return ops;
+}
+
+bool MongoProcessCommon::keyPatternNamesExactPaths(const BSONObj& keyPattern,
+                                                   const std::set<FieldPath>& uniqueKeyPaths) {
+    size_t nFieldsMatched = 0;
+    for (auto&& elem : keyPattern) {
+        if (!elem.isNumber()) {
+            return false;
+        }
+        if (uniqueKeyPaths.find(elem.fieldNameStringData()) == uniqueKeyPaths.end()) {
+            return false;
+        }
+        ++nFieldsMatched;
+    }
+    return nFieldsMatched == uniqueKeyPaths.size();
 }
 
 }  // namespace mongo

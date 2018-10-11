@@ -131,11 +131,14 @@ public:
                        const NamespaceString& collectionName,
                        OptionalCollectionUUID uuid) final {}
 
-    void onTransactionCommit(OperationContext* opCtx, bool wasPrepared) final {}
+    void onTransactionCommit(OperationContext* opCtx,
+                             boost::optional<OplogSlot> commitOplogEntryOpTime,
+                             boost::optional<Timestamp> commitTimestamp) final {}
 
     void onTransactionPrepare(OperationContext* opCtx, const OplogSlot& prepareOpTime) final {}
 
-    void onTransactionAbort(OperationContext* opCtx) final {}
+    void onTransactionAbort(OperationContext* opCtx,
+                            boost::optional<OplogSlot> abortOplogEntryOpTime) final {}
 
     void onReplicationRollback(OperationContext* opCtx, const RollbackObserverInfo& rbInfo);
 };

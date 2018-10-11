@@ -196,7 +196,8 @@ var BackupRestoreTest = function(options) {
                         };
                         var result = db.getSiblingDB('test').fsm_teardown.insert({a: 1}, wc);
                         assert.writeOK(result, 'teardown insert failed: ' + tojson(result));
-                        result = db.getSiblingDB('test').fsm_teardown.drop();
+                        result = db.getSiblingDB('test').fsm_teardown.drop(
+                            {writeConcern: {w: "majority"}});
                         assert(result, 'teardown drop failed');
                     });
                 } catch (e) {
@@ -360,51 +361,14 @@ var BackupRestoreTest = function(options) {
             assert.gt(copiedFiles.length, 0, testName + ' no files copied');
             rst.start(secondary.nodeId, {}, true);
         } else if (options.backup == 'backupCursor') {
-            resetDbpath(hiddenDbpath);
-            mkdir(hiddenDbpath + '/journal');
-            jsTestLog("Copying start: " + tojson({
-                          source: dbpathSecondary,
-                          destination: hiddenDbpath,
-                          sourceFiles: ls(dbpathSecondary),
-                          journalFiles: ls(dbpathSecondary + '/journal')
-                      }));
+            load("jstests/libs/backup_utils.js");
 
-            let backupCursor = secondary.getDB('admin').aggregate([{$backupCursor: {}}]);
-            assert(backupCursor.hasNext());
-            let doc = backupCursor.next();
-            assert(doc.hasOwnProperty('metadata'));
-            jsTestLog("Metadata doc: " + tojson({doc: doc}));
-
-            // Grab the dbpath, ensure it ends with a slash. Note that while the `dbpath` inputs
-            // may be in windows or unix format, the FS helpers for listing a directory and
-            // copying files (etc..)  treat them equally.
-            let dbpath = doc['metadata']['dbpath'];
-            if (dbpath.lastIndexOf('/') + 1 != dbpath.length &&
-                dbpath.lastIndexOf('\\') + 1 != dbpath.length) {
-                dbpath += '/';
-            }
-
-            while (backupCursor.hasNext()) {
-                doc = backupCursor.next();
-
-                let fileToCopy = doc['filename'];
-                // Ensure that the full path starts with the returned dbpath.
-                assert.eq(0, fileToCopy.search(dbpath));
-
-                // Grab the file path relative to the dbpath. Maintain that relation when copying
-                // to the `hiddenDbpath`.
-                let relativePath = fileToCopy.substr(dbpath.length);
-                jsTestLog("File copy: " +
-                          tojson({fileToCopy: fileToCopy, relativePath: relativePath}));
-                copyFile(fileToCopy, hiddenDbpath + '/' + relativePath);
-            }
-
+            backupData(secondary, hiddenDbpath);
             copiedFiles = ls(hiddenDbpath);
             jsTestLog("Copying End: " + tojson({
                           destinationFiles: copiedFiles,
                           destinationJournal: ls(hiddenDbpath + '/journal')
                       }));
-            backupCursor.close();
             assert.gt(copiedFiles.length, 0, testName + ' no files copied');
         }
 
@@ -450,6 +414,8 @@ var BackupRestoreTest = function(options) {
         // Wait up to 5 minutes until the new hidden node is in state RECOVERING.
         rst.waitForState(hiddenNode, [ReplSetTest.State.RECOVERING, ReplSetTest.State.SECONDARY]);
 
+        jsTestLog('Stopping CRUD and FSM clients');
+
         // Stop CRUD client and FSM client.
         var crudStatus = checkProgram(crudPid);
         assert(crudStatus.alive,
@@ -462,6 +428,14 @@ var BackupRestoreTest = function(options) {
                testName + ' FSM client was not running at end of test and exited with code: ' +
                    fsmStatus.exitCode);
         stopMongoProgramByPid(fsmPid);
+
+        // Make sure the test database is not in a drop-pending state. This can happen if we
+        // killed the FSM client while it was in the middle of dropping it.
+        assert.soonNoExcept(function() {
+            let result = primary.getDB("test").afterClientKills.insert(
+                {"a": 1}, {writeConcern: {w: "majority"}});
+            return (result.nInserted === 1);
+        }, "failed to insert to test collection", 10 * 60 * 1000);
 
         // Wait up to 5 minutes until the new hidden node is in state SECONDARY.
         jsTestLog('CRUD and FSM clients stopped. Waiting for hidden node ' + hiddenHost +

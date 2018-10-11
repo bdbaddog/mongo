@@ -26,10 +26,11 @@
  *    it in the license file.
  */
 
+#include "mongo/platform/basic.h"
+
 #include "mongo/db/operation_context_session_mongod.h"
 
-#include "mongo/db/transaction_coordinator.h"
-#include "mongo/db/transaction_coordinator_service.h"
+#include "mongo/db/transaction_coordinator_factory.h"
 #include "mongo/db/transaction_participant.h"
 
 namespace mongo {
@@ -41,28 +42,19 @@ OperationContextSessionMongod::OperationContextSessionMongod(OperationContext* o
                                                              boost::optional<bool> coordinator)
     : _operationContextSession(opCtx, shouldCheckOutSession) {
     if (shouldCheckOutSession && !opCtx->getClient()->isInDirectClient()) {
-        auto session = OperationContextSession::get(opCtx);
-        invariant(session);
+        const auto txnParticipant = TransactionParticipant::get(opCtx);
+        txnParticipant->refreshFromStorageIfNeeded(opCtx);
 
-        auto clientTxnNumber = *opCtx->getTxnNumber();
-        session->refreshFromStorageIfNeeded(opCtx);
-        session->beginOrContinueTxn(opCtx, clientTxnNumber);
+        const auto clientTxnNumber = *opCtx->getTxnNumber();
 
         if (startTransaction && *startTransaction) {
-            auto clientLsid = opCtx->getLogicalSessionId().get();
-            auto clockSource = opCtx->getServiceContext()->getFastClockSource();
-
             // If this shard has been selected as the coordinator, set up the coordinator state
             // to be ready to receive votes.
             if (coordinator && *coordinator) {
-                TransactionCoordinatorService::get(opCtx)->createCoordinator(
-                    clientLsid,
-                    clientTxnNumber,
-                    clockSource->now() + Seconds(transactionLifetimeLimitSeconds.load()));
+                createTransactionCoordinator(opCtx, clientTxnNumber);
             }
         }
 
-        auto txnParticipant = TransactionParticipant::get(opCtx);
         txnParticipant->beginOrContinue(clientTxnNumber, autocommit, startTransaction);
     }
 }
@@ -71,17 +63,10 @@ OperationContextSessionMongodWithoutRefresh::OperationContextSessionMongodWithou
     OperationContext* opCtx)
     : _operationContextSession(opCtx, true /* checkout */) {
     invariant(!opCtx->getClient()->isInDirectClient());
-    auto session = OperationContextSession::get(opCtx);
-    invariant(session);
+    const auto clientTxnNumber = *opCtx->getTxnNumber();
 
-    auto clientTxnNumber = *opCtx->getTxnNumber();
-    // Session is refreshed, but the transaction participant isn't.
-    session->refreshFromStorageIfNeeded(opCtx);
-    session->beginOrContinueTxn(opCtx, clientTxnNumber);
-
-    auto txnParticipant = TransactionParticipant::get(opCtx);
-    invariant(txnParticipant);
-    txnParticipant->beginTransactionUnconditionally(clientTxnNumber);
+    const auto txnParticipant = TransactionParticipant::get(opCtx);
+    txnParticipant->beginOrContinueTransactionUnconditionally(clientTxnNumber);
 }
 
 }  // namespace mongo

@@ -2,7 +2,7 @@
  * Verify the states that a multi-statement transaction can be restarted on at the active
  * transaction number for servers in a sharded cluster.
  *
- * @tags: [requires_sharding, uses_transactions]
+ * @tags: [requires_sharding, uses_transactions, uses_prepare_transaction]
  */
 (function() {
     "use strict";
@@ -108,8 +108,12 @@
             autocommit: false,
             startTransaction: true
         }));
-        assert.commandWorked(directDB.adminCommand(
-            {prepareTransaction: 1, txnNumber: NumberLong(txnNumber), autocommit: false}));
+        assert.commandWorked(directDB.adminCommand({
+            prepareTransaction: 1,
+            coordinatorId: "dummy",
+            txnNumber: NumberLong(txnNumber),
+            autocommit: false
+        }));
 
         assert.commandFailedWithCode(directDB.runCommand({
             find: collName,

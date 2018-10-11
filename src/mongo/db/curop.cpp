@@ -230,6 +230,8 @@ void CurOp::reportCurrentOpForClient(OperationContext* opCtx,
     invariant(client);
     OperationContext* clientOpCtx = client->getOperationContext();
 
+    infoBuilder->append("type", "op");
+
     const std::string hostName = getHostNameCachedAndPort();
     infoBuilder->append("host", hostName);
 
@@ -290,6 +292,10 @@ void CurOp::reportCurrentOpForClient(OperationContext* opCtx,
 
         CurOp::get(clientOpCtx)->reportState(infoBuilder, truncateOps);
     }
+}
+
+void CurOp::setGenericCursor_inlock(GenericCursor gc) {
+    _genericCursor = std::move(gc);
 }
 
 CurOp::CurOp(OperationContext* opCtx) : CurOp(opCtx, &_curopStack(opCtx)) {
@@ -483,12 +489,28 @@ void CurOp::reportState(BSONObjBuilder* builder, bool truncateOps) {
 
     appendAsObjOrString("command", _opDescription, maxQuerySize, builder);
 
-    if (!_originatingCommand.isEmpty()) {
-        appendAsObjOrString("originatingCommand", _originatingCommand, maxQuerySize, builder);
-    }
-
     if (!_planSummary.empty()) {
         builder->append("planSummary", _planSummary);
+    }
+
+    if (_genericCursor) {
+        // This creates a new builder to truncate the object that will go into the curOp output. In
+        // order to make sure the object is not too large but not truncate the comment, we only
+        // truncate the originatingCommand and not the entire cursor.
+        BSONObjBuilder tempObj;
+        appendAsObjOrString(
+            "truncatedObj", _genericCursor->getOriginatingCommand().get(), maxQuerySize, &tempObj);
+        auto originatingCommand = tempObj.done().getObjectField("truncatedObj");
+        _genericCursor->setOriginatingCommand(originatingCommand.getOwned());
+        // lsid and ns exist in the top level curop object, so they need to be temporarily
+        // removed from the cursor object to avoid duplicating information.
+        auto lsid = _genericCursor->getLsid();
+        auto ns = _genericCursor->getNs();
+        _genericCursor->setLsid(boost::none);
+        _genericCursor->setNs(boost::none);
+        builder->append("cursor", _genericCursor->toBSON());
+        _genericCursor->setLsid(lsid);
+        _genericCursor->setNs(ns);
     }
 
     if (!_message.empty()) {

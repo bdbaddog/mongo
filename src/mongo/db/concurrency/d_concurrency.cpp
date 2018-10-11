@@ -216,8 +216,10 @@ Lock::DBLock::DBLock(OperationContext* opCtx, StringData db, LockMode mode, Date
           opCtx, isSharedLockMode(_mode) ? MODE_IS : MODE_IX, deadline, InterruptBehavior::kThrow) {
     massert(28539, "need a valid database name", !db.empty() && nsIsDbOnly(db));
 
-    if (!_globalLock.isLocked())
+    if (!_globalLock.isLocked()) {
+        invariant(deadline != Date_t::max() || _opCtx->lockState()->hasMaxLockTimeout());
         return;
+    }
 
     // The check for the admin db is to ensure direct writes to auth collections
     // are serialized (see SERVER-16092).
@@ -226,7 +228,7 @@ Lock::DBLock::DBLock(OperationContext* opCtx, StringData db, LockMode mode, Date
     }
 
     _result = _opCtx->lockState()->lock(_opCtx, _id, _mode, deadline);
-    invariant(_result == LOCK_OK || deadline != Date_t::max());
+    invariant(_result == LOCK_OK || _result == LOCK_TIMEOUT);
 }
 
 Lock::DBLock::DBLock(DBLock&& otherLock)
@@ -274,7 +276,7 @@ Lock::CollectionLock::CollectionLock(Locker* lockState,
     }
 
     _result = _lockState->lock(_id, actualLockMode, deadline);
-    invariant(_result == LOCK_OK || deadline != Date_t::max());
+    invariant(_result == LOCK_OK || _result == LOCK_TIMEOUT);
 }
 
 Lock::CollectionLock::CollectionLock(CollectionLock&& otherLock)

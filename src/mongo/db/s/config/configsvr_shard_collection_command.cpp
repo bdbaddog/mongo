@@ -54,7 +54,7 @@
 #include "mongo/s/catalog/type_shard.h"
 #include "mongo/s/catalog_cache.h"
 #include "mongo/s/client/shard_registry.h"
-#include "mongo/s/commands/cluster_commands_helpers.h"
+#include "mongo/s/cluster_commands_helpers.h"
 #include "mongo/s/config_server_client.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/request_types/shard_collection_gen.h"
@@ -767,13 +767,17 @@ public:
         shardsvrShardCollectionRequest.setGetUUIDfromPrimaryShard(
             request.getGetUUIDfromPrimaryShard());
 
-        auto cmdResponse = uassertStatusOK(primaryShard->runCommandWithFixedRetryAttempts(
-            opCtx,
-            ReadPreferenceSetting(ReadPreference::PrimaryOnly),
-            "admin",
-            CommandHelpers::appendMajorityWriteConcern(CommandHelpers::appendPassthroughFields(
-                cmdObj, shardsvrShardCollectionRequest.toBSON())),
-            Shard::RetryPolicy::kIdempotent));
+        // TODO(SERVER-37354): Remove the 'runWithoutInterruption' block.
+        auto cmdResponse = opCtx->runWithoutInterruption([&] {
+            return uassertStatusOK(primaryShard->runCommandWithFixedRetryAttempts(
+                opCtx,
+                ReadPreferenceSetting(ReadPreference::PrimaryOnly),
+                "admin",
+                CommandHelpers::appendMajorityWriteConcern(CommandHelpers::appendPassthroughFields(
+                    cmdObj, shardsvrShardCollectionRequest.toBSON())),
+                Shard::RetryPolicy::kIdempotent));
+        });
+
 
         if (cmdResponse.commandStatus != ErrorCodes::CommandNotFound) {
             uassertStatusOK(cmdResponse.commandStatus);

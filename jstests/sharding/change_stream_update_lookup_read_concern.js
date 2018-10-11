@@ -1,6 +1,7 @@
 // Tests that a change stream's update lookup will use the appropriate read concern. In particular,
 // tests that the update lookup will return a version of the document at least as recent as the
 // change that we're doing the lookup for, and that change will be majority-committed.
+// @tags: [uses_change_streams]
 (function() {
     "use strict";
 
@@ -130,18 +131,23 @@
                        newClosestSecondary,
                        {ok: true, secondary: true, tags: {tag: "closestSecondary"}},
                        rst);
+    awaitRSClientHosts(st.s,
+                       originalClosestSecondaryDB.getMongo(),
+                       {ok: true, secondary: true, tags: {tag: "fartherSecondary"}},
+                       rst);
     assert.commandWorked(newClosestSecondaryDB.setProfilingLevel(2));
 
     // Make sure new queries with read preference tag "closestSecondary" go to the new secondary.
-    assert.eq(newClosestSecondaryDB.system.profile.count(), 0);
+    profilerHasZeroMatchingEntriesOrThrow({profileDB: newClosestSecondaryDB, filter: {}});
     assert.eq(mongosColl.find()
                   .readPref("nearest", [{tag: "closestSecondary"}])
                   .comment("testing targeting")
                   .itcount(),
               1);
-    assert.gt(newClosestSecondaryDB.system.profile.count(
-                  {ns: mongosColl.getFullName(), "command.comment": "testing targeting"}),
-              0);
+    profilerHasSingleMatchingEntryOrThrow({
+        profileDB: newClosestSecondaryDB,
+        filter: {ns: mongosColl.getFullName(), "command.comment": "testing targeting"}
+    });
 
     // Test that the change stream continues on the original host, but the update lookup now targets
     // the new, lagged secondary. Even though it's lagged, the lookup should use 'afterClusterTime'

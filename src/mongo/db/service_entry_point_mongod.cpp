@@ -37,12 +37,24 @@
 #include "mongo/db/curop.h"
 #include "mongo/db/read_concern.h"
 #include "mongo/db/repl/repl_client_info.h"
+#include "mongo/db/s/implicit_create_collection.h"
+#include "mongo/db/s/scoped_operation_completion_sharding_actions.h"
+#include "mongo/db/s/shard_filtering_metadata_refresh.h"
+#include "mongo/db/s/sharding_config_optime_gossip.h"
+#include "mongo/db/s/sharding_state.h"
 #include "mongo/db/service_entry_point_common.h"
 #include "mongo/logger/redaction.h"
 #include "mongo/rpc/get_status_from_command_result.h"
+#include "mongo/rpc/metadata/config_server_metadata.h"
+#include "mongo/rpc/metadata/sharding_metadata.h"
+#include "mongo/s/cannot_implicitly_create_collection_info.h"
+#include "mongo/s/grid.h"
+#include "mongo/s/stale_exception.h"
 #include "mongo/util/log.h"
 
 namespace mongo {
+
+constexpr auto kLastCommittedOpTimeFieldName = "lastCommittedOpTime"_sd;
 
 class ServiceEntryPointMongod::Hooks final : public ServiceEntryPointCommon::Hooks {
 public:
@@ -116,6 +128,87 @@ public:
 
     void attachCurOpErrInfo(OperationContext* opCtx, const BSONObj& replyObj) const override {
         CurOp::get(opCtx)->debug().errInfo = getStatusFromCommandResult(replyObj);
+    }
+
+    void handleException(const DBException& e, OperationContext* opCtx) const override {
+        // If we got a stale config, wait in case the operation is stuck in a critical section
+        if (auto sce = e.extraInfo<StaleConfigInfo>()) {
+            if (!opCtx->getClient()->isInDirectClient()) {
+                // We already have the StaleConfig exception, so just swallow any errors due to
+                // refresh
+                onShardVersionMismatchNoExcept(opCtx, sce->getNss(), sce->getVersionReceived())
+                    .ignore();
+            }
+        } else if (auto sce = e.extraInfo<StaleDbRoutingVersion>()) {
+            if (!opCtx->getClient()->isInDirectClient()) {
+                onDbVersionMismatchNoExcept(
+                    opCtx, sce->getDb(), sce->getVersionReceived(), sce->getVersionWanted())
+                    .ignore();
+            }
+        } else if (auto cannotImplicitCreateCollInfo =
+                       e.extraInfo<CannotImplicitlyCreateCollectionInfo>()) {
+            if (ShardingState::get(opCtx)->enabled()) {
+                onCannotImplicitlyCreateCollection(opCtx, cannotImplicitCreateCollInfo->getNss())
+                    .ignore();
+            }
+        }
+    }
+
+    // Called from the error contexts where request may not be available.
+    void appendReplyMetadataOnError(OperationContext* opCtx,
+                                    BSONObjBuilder* metadataBob) const override {
+        const bool isConfig = serverGlobalParams.clusterRole == ClusterRole::ConfigServer;
+        if (ShardingState::get(opCtx)->enabled() || isConfig) {
+            auto lastCommittedOpTime =
+                repl::ReplicationCoordinator::get(opCtx)->getLastCommittedOpTime();
+            metadataBob->append(kLastCommittedOpTimeFieldName, lastCommittedOpTime.getTimestamp());
+        }
+    }
+
+    void appendReplyMetadata(OperationContext* opCtx,
+                             const OpMsgRequest& request,
+                             BSONObjBuilder* metadataBob) const override {
+        const bool isShardingAware = ShardingState::get(opCtx)->enabled();
+        const bool isConfig = serverGlobalParams.clusterRole == ClusterRole::ConfigServer;
+        auto const replCoord = repl::ReplicationCoordinator::get(opCtx);
+        const bool isReplSet =
+            replCoord->getReplicationMode() == repl::ReplicationCoordinator::modeReplSet;
+
+        if (isReplSet) {
+            // Attach our own last opTime.
+            repl::OpTime lastOpTimeFromClient =
+                repl::ReplClientInfo::forClient(opCtx->getClient()).getLastOp();
+            replCoord->prepareReplMetadata(request.body, lastOpTimeFromClient, metadataBob);
+            // For commands from mongos, append some info to help getLastError(w) work.
+            // TODO: refactor out of here as part of SERVER-18236
+            if (isShardingAware || isConfig) {
+                rpc::ShardingMetadata(lastOpTimeFromClient, replCoord->getElectionId())
+                    .writeToMetadata(metadataBob)
+                    .transitional_ignore();
+            }
+
+            if (isShardingAware || isConfig) {
+                auto lastCommittedOpTime = replCoord->getLastCommittedOpTime();
+                metadataBob->append(kLastCommittedOpTimeFieldName,
+                                    lastCommittedOpTime.getTimestamp());
+            }
+        }
+
+        // If we're a shard other than the config shard, attach the last configOpTime we know about.
+        if (isShardingAware && !isConfig) {
+            auto opTime = Grid::get(opCtx)->configOpTime();
+            rpc::ConfigServerMetadata(opTime).writeToMetadata(metadataBob);
+        }
+    }
+
+    void advanceConfigOptimeFromRequestMetadata(OperationContext* opCtx) const override {
+        // Handle config optime information that may have been sent along with the command.
+        rpc::advanceConfigOptimeFromRequestMetadata(opCtx);
+    }
+
+    std::unique_ptr<PolymorphicScoped> scopedOperationCompletionShardingActions(
+        OperationContext* opCtx) const override {
+        return std::make_unique<ScopedOperationCompletionShardingActions>(opCtx);
     }
 };
 

@@ -36,10 +36,10 @@
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/pipeline/aggregation_request.h"
 #include "mongo/db/pipeline/document_source.h"
-#include "mongo/db/pipeline/document_source_merge_cursors.h"
 #include "mongo/s/async_requests_sender.h"
 #include "mongo/s/commands/strategy.h"
 #include "mongo/s/query/cluster_client_cursor_params.h"
+#include "mongo/s/query/document_source_merge_cursors.h"
 
 namespace mongo {
 
@@ -52,6 +52,11 @@ class ShardId;
  */
 class ClusterAggregate {
 public:
+    /**
+     * Max number of retries to resolve the underlying namespace of a view.
+     */
+    static constexpr unsigned kMaxViewRetries = 10;
+
     /**
      * 'requestedNss' is the namespace aggregation will register cursors under. This is the
      * namespace which we will return in responses to aggregate / getMore commands, and it is the
@@ -79,6 +84,19 @@ public:
                                const AggregationRequest& request,
                                BSONObj cmdObj,
                                BSONObjBuilder* result);
+
+    /**
+     * Retries a command that was previously run on a view by resolving the view as an aggregation
+     * against the underlying collection.
+     *
+     * On success, populates 'result' with the command response.
+     */
+    static Status retryOnViewError(OperationContext* opCtx,
+                                   const AggregationRequest& request,
+                                   const ResolvedView& resolvedView,
+                                   const NamespaceString& requestedNss,
+                                   BSONObjBuilder* result,
+                                   unsigned numberRetries = 0);
 
 private:
     static void uassertAllShardsSupportExplain(

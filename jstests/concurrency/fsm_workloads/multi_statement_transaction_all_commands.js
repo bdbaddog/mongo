@@ -80,7 +80,7 @@ var $config = (function() {
     const states = {
 
         init: function init(db, collName) {
-            this.session = db.getMongo().startSession({causalConsistency: false});
+            this.session = db.getMongo().startSession({causalConsistency: true});
             this.txnNumber = -1;
             this.sessionDb = this.session.getDatabase(db.getName());
             this.iteration = 1;
@@ -155,8 +155,13 @@ var $config = (function() {
     // Wrap each state in a cleanupOnLastIteration() invocation.
     for (let stateName of Object.keys(states)) {
         const stateFn = states[stateName];
+        const abortErrorCodes = [
+            ErrorCodes.NoSuchTransaction,
+            ErrorCodes.TransactionCommitted,
+            ErrorCodes.TransactionTooOld
+        ];
         states[stateName] = function(db, collName) {
-            cleanupOnLastIteration(this, () => stateFn.apply(this, arguments));
+            cleanupOnLastIteration(this, () => stateFn.apply(this, arguments), abortErrorCodes);
         };
     }
 

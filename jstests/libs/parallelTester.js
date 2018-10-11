@@ -215,7 +215,8 @@ if (typeof _threadInject != "undefined") {
                 "views/views_aggregation.js",
                 "views/views_change.js",
                 "views/views_drop.js",
-                "views/views_find.js"
+                "views/views_find.js",
+                "wildcard_index_collation.js"
             ];
             Object.assign(skipTests, makeKeys(requires_find_command));
         }
@@ -282,6 +283,13 @@ if (typeof _threadInject != "undefined") {
             // TODO: Remove this restriction as part of SERVER-33942.
             parallelFilesDir + "/compact_keeps_indexes.js",
             parallelFilesDir + "/awaitdata_getmore_cmd.js",
+
+            // These tests rely on a deterministically refreshable logical session cache. If they
+            // run in parallel, they could interfere with the cache and cause failures.
+            parallelFilesDir + "/list_all_local_sessions.js",
+            parallelFilesDir + "/list_all_sessions.js",
+            parallelFilesDir + "/list_local_sessions.js",
+            parallelFilesDir + "/list_sessions.js",
         ];
         var serialTests = makeKeys(serialTestsArr);
 

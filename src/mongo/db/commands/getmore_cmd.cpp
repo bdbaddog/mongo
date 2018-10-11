@@ -88,7 +88,6 @@ void validateLSID(OperationContext* opCtx, const GetMoreRequest& request, Client
                           << ", without an lsid",
             opCtx->getLogicalSessionId() || !cursor->getSessionId());
 
-    // TODO: SERVER-35323 - compare logicalSessionId that include userId.
     uassert(50738,
             str::stream() << "Cannot run getMore on cursor " << request.cursorid
                           << ", which was created in session "
@@ -96,7 +95,7 @@ void validateLSID(OperationContext* opCtx, const GetMoreRequest& request, Client
                           << ", in session "
                           << *opCtx->getLogicalSessionId(),
             !opCtx->getLogicalSessionId() || !cursor->getSessionId() ||
-                (opCtx->getLogicalSessionId()->getId() == cursor->getSessionId()->getId()));
+                (opCtx->getLogicalSessionId() == cursor->getSessionId()));
 }
 
 /**
@@ -187,7 +186,7 @@ public:
                              const GetMoreRequest& request,
                              CursorResponseBuilder* nextBatch,
                              PlanExecutor::ExecState* state,
-                             long long* numResults) {
+                             std::uint64_t* numResults) {
             PlanExecutor* exec = cursor->getExecutor();
 
             // If an awaitData getMore is killed during this process due to our max time expiring at
@@ -424,6 +423,9 @@ public:
                 if (!originatingCommand.isEmpty()) {
                     curOp->setOriginatingCommand_inlock(originatingCommand);
                 }
+
+                // Update the genericCursor stored in curOp with the new cursor stats.
+                curOp->setGenericCursor_inlock(cursor->toGenericCursor());
             }
 
             CursorId respondWithId = 0;
@@ -431,7 +433,7 @@ public:
             CursorResponseBuilder nextBatch(reply, CursorResponseBuilder::Options());
             BSONObj obj;
             PlanExecutor::ExecState state = PlanExecutor::ADVANCED;
-            long long numResults = 0;
+            std::uint64_t numResults = 0;
 
             // We report keysExamined and docsExamined to OpDebug for a given getMore operation. To
             // obtain these values we need to take a diff of the pre-execution and post-execution
@@ -492,7 +494,8 @@ public:
                 exec->detachFromOperationContext();
 
                 cursor->setLeftoverMaxTimeMicros(opCtx->getRemainingMaxTimeMicros());
-                cursor->incPos(numResults);
+                cursor->incNReturnedSoFar(numResults);
+                cursor->incNBatches();
             } else {
                 curOp->debug().cursorExhausted = true;
             }

@@ -39,7 +39,7 @@
 
 namespace mongo {
 
-class ServiceEntryPointEmbedded::Hooks : public ServiceEntryPointCommon::Hooks {
+class ServiceEntryPointEmbedded::Hooks final : public ServiceEntryPointCommon::Hooks {
 public:
     bool lockedForWriting() const override {
         return false;
@@ -78,6 +78,22 @@ public:
     }
 
     void attachCurOpErrInfo(OperationContext*, const BSONObj&) const override {}
+
+    void handleException(const DBException& e, OperationContext* opCtx) const override {}
+
+    void advanceConfigOptimeFromRequestMetadata(OperationContext* opCtx) const override {}
+
+    std::unique_ptr<PolymorphicScoped> scopedOperationCompletionShardingActions(
+        OperationContext* opCtx) const override {
+        return nullptr;
+    }
+
+    void appendReplyMetadataOnError(OperationContext* opCtx,
+                                    BSONObjBuilder* metadataBob) const override {}
+
+    void appendReplyMetadata(OperationContext* opCtx,
+                             const OpMsgRequest& request,
+                             BSONObjBuilder* metadataBob) const override {}
 };
 
 DbResponse ServiceEntryPointEmbedded::handleRequest(OperationContext* opCtx, const Message& m) {

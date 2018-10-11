@@ -38,7 +38,7 @@
 #include "mongo/base/string_data.h"
 #include "mongo/bson/simple_bsonelement_comparator.h"
 #include "mongo/db/bson/dotted_path_support.h"
-#include "mongo/db/index/all_paths_key_generator.h"
+#include "mongo/db/index/wildcard_key_generator.h"
 #include "mongo/db/index_names.h"
 #include "mongo/db/matcher/expression_algo.h"
 #include "mongo/db/matcher/expression_geo.h"
@@ -131,6 +131,9 @@ string optionString(size_t options) {
             case QueryPlannerParams::OPLOG_SCAN_WAIT_FOR_VISIBLE:
                 ss << "OPLOG_SCAN_WAIT_FOR_VISIBLE ";
                 break;
+            case QueryPlannerParams::STRICT_DISTINCT_ONLY:
+                ss << "STRICT_DISTINCT_ONLY ";
+                break;
             case QueryPlannerParams::DEFAULT:
                 MONGO_UNREACHABLE;
                 break;
@@ -147,6 +150,10 @@ static BSONObj getKeyFromQuery(const BSONObj& keyPattern, const BSONObj& query) 
 static bool indexCompatibleMaxMin(const BSONObj& obj,
                                   const CollatorInterface* queryCollator,
                                   const IndexEntry& indexEntry) {
+    if (indexEntry.type == IndexType::INDEX_WILDCARD) {
+        return false;
+    }
+
     BSONObjIterator kpIt(indexEntry.keyPattern);
     BSONObjIterator objIt(obj);
 
@@ -627,7 +634,7 @@ StatusWith<std::vector<std::unique_ptr<QuerySolution>>> QueryPlanner::plan(
         // $** index.
         if (relevantIndices.size() > 1) {
             for (auto&& entry : relevantIndices) {
-                invariant(entry.type == IndexType::INDEX_ALLPATHS);
+                invariant(entry.type == IndexType::INDEX_WILDCARD);
             }
         }
     }
@@ -849,7 +856,7 @@ StatusWith<std::vector<std::unique_ptr<QuerySolution>>> QueryPlanner::plan(
     // desired behavior when an index is hinted that is not relevant to the query. In the case that
     // $** index is hinted, we do not want this behavior.
     if (!hintedIndex.isEmpty() && relevantIndices.size() == 1) {
-        if (0 == out.size() && relevantIndices.front().type != IndexType::INDEX_ALLPATHS) {
+        if (0 == out.size() && relevantIndices.front().type != IndexType::INDEX_WILDCARD) {
             // Push hinted index solution to output list if found. It is possible to end up without
             // a solution in the case where a filtering QueryPlannerParams argument, such as
             // NO_BLOCKING_SORT, leads to its exclusion.

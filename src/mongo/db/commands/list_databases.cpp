@@ -35,6 +35,7 @@
 #include "mongo/db/catalog_raii.h"
 #include "mongo/db/client.h"
 #include "mongo/db/commands.h"
+#include "mongo/db/commands/list_databases_gen.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/matcher/expression.h"
 #include "mongo/db/operation_context.h"
@@ -87,27 +88,43 @@ public:
 
     bool run(OperationContext* opCtx,
              const string& dbname,
-             const BSONObj& jsobj,
+             const BSONObj& cmdObj,
              BSONObjBuilder& result) final {
-        // Parse the filter.
-        std::unique_ptr<MatchExpression> filter;
-        if (auto filterElt = jsobj[kFilterField]) {
-            if (filterElt.type() != BSONType::Object) {
-                uasserted(ErrorCodes::TypeMismatch,
-                          str::stream() << "Field '" << kFilterField
-                                        << "' must be of type Object in: "
-                                        << jsobj);
+        IDLParserErrorContext ctx("listDatabases");
+        auto cmd = ListDatabasesCommand::parse(ctx, cmdObj);
+        auto* as = AuthorizationSession::get(opCtx->getClient());
+
+        // {nameOnly: bool} - default false.
+        const bool nameOnly = cmd.getNameOnly();
+
+        // {authorizedDatabases: bool} - Dynamic default based on permissions.
+        const bool authorizedDatabases = ([as](const boost::optional<bool>& authDB) {
+            const bool mayListAllDatabases = as->isAuthorizedForActionsOnResource(
+                ResourcePattern::forClusterResource(), ActionType::listDatabases);
+
+            if (authDB) {
+                uassert(ErrorCodes::Unauthorized,
+                        "Insufficient permissions to list all databases",
+                        authDB.get() || mayListAllDatabases);
+                return authDB.get();
             }
+
+            // By default, list all databases if we can, otherwise
+            // only those we're allowed to find on.
+            return !mayListAllDatabases;
+        })(cmd.getAuthorizedDatabases());
+
+        // {filter: matchExpression}.
+        std::unique_ptr<MatchExpression> filter;
+        if (auto filterObj = cmd.getFilter()) {
             // The collator is null because database metadata objects are compared using simple
             // binary comparison.
             const CollatorInterface* collator = nullptr;
             boost::intrusive_ptr<ExpressionContext> expCtx(new ExpressionContext(opCtx, collator));
-            auto statusWithMatcher =
-                MatchExpressionParser::parse(filterElt.Obj(), std::move(expCtx));
-            uassertStatusOK(statusWithMatcher.getStatus());
-            filter = std::move(statusWithMatcher.getValue());
+            auto matcher =
+                uassertStatusOK(MatchExpressionParser::parse(filterObj.get(), std::move(expCtx)));
+            filter = std::move(matcher);
         }
-        bool nameOnly = jsobj[kNameOnlyField].trueValue();
 
         vector<string> dbNames;
         StorageEngine* storageEngine = getGlobalServiceContext()->getStorageEngine();
@@ -118,20 +135,12 @@ public:
 
         vector<BSONObj> dbInfos;
 
-        // If we have ActionType::listDatabases,
-        // then we don't need to test each record in the output.
-        // Otherwise, we'll test the database names as we enumerate them.
-        const auto as = AuthorizationSession::get(opCtx->getClient());
-        const bool checkAuth = as &&
-            !as->isAuthorizedForActionsOnResource(ResourcePattern::forClusterResource(),
-                                                  ActionType::listDatabases);
-
         const bool filterNameOnly = filter &&
             filter->getCategory() == MatchExpression::MatchCategory::kLeaf &&
             filter->path() == kNameField;
         intmax_t totalSize = 0;
         for (const auto& dbname : dbNames) {
-            if (checkAuth && as &&
+            if (authorizedDatabases &&
                 !as->isAuthorizedForActionsOnResource(ResourcePattern::forDatabaseName(dbname),
                                                       ActionType::find)) {
                 // We don't have listDatabases on the cluser or find on this database.

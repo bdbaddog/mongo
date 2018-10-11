@@ -99,7 +99,7 @@ ShardingTestFixture::ShardingTestFixture() {
     // Configure the service context
     service->setFastClockSource(stdx::make_unique<ClockSourceMock>());
     service->setPreciseClockSource(stdx::make_unique<ClockSourceMock>());
-    service->setTickSource(stdx::make_unique<TickSourceMock>());
+    service->setTickSource(stdx::make_unique<TickSourceMock<>>());
 
     CollatorFactoryInterface::set(service, stdx::make_unique<CollatorFactoryMock>());
     _transportSession = transport::MockSession::create(nullptr);
@@ -354,7 +354,7 @@ void ShardingTestFixture::expectConfigCollectionCreate(const HostAndPort& config
                           << BSON("w"
                                   << "majority"
                                   << "wtimeout"
-                                  << 15000)
+                                  << 60000)
                           << "maxTimeMS"
                           << 30000);
         ASSERT_BSONOBJ_EQ(expectedCreateCmd, request.cmdObj);

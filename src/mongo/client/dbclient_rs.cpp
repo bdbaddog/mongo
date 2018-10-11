@@ -400,7 +400,7 @@ DBClientConnection& DBClientReplicaSet::slaveConn() {
 bool DBClientReplicaSet::connect() {
     // Returns true if there are any up hosts.
     const ReadPreferenceSetting anyUpHost(ReadPreference::Nearest, TagSet());
-    return _getMonitor()->getHostOrRefresh(anyUpHost).isOK();
+    return _getMonitor()->getHostOrRefresh(anyUpHost).getNoThrow().isOK();
 }
 
 static bool isAuthenticationException(const DBException& ex) {
@@ -459,7 +459,7 @@ void DBClientReplicaSet::_auth(const BSONObj& params) {
     if (lastNodeStatus.isOK()) {
         StringBuilder assertMsgB;
         assertMsgB << "Failed to authenticate, no good nodes in " << _getMonitor()->getName();
-        uasserted(ErrorCodes::NodeNotFound, assertMsgB.str());
+        uasserted(ErrorCodes::HostNotFound, assertMsgB.str());
     } else {
         uassertStatusOK(lastNodeStatus);
     }
@@ -671,7 +671,7 @@ DBClientConnection* DBClientReplicaSet::selectNodeUsingTags(
 
     ReplicaSetMonitorPtr monitor = _getMonitor();
 
-    auto selectedNodeStatus = monitor->getHostOrRefresh(*readPref);
+    auto selectedNodeStatus = monitor->getHostOrRefresh(*readPref).getNoThrow();
     if (!selectedNodeStatus.isOK()) {
         LOG(3) << "dbclient_rs no compatible node found"
                << causedBy(redact(selectedNodeStatus.getStatus()));
@@ -937,7 +937,7 @@ std::pair<rpc::UniqueReply, DBClientBase*> DBClientReplicaSet::runCommandWithTar
         }
     }
 
-    uasserted(ErrorCodes::NodeNotFound,
+    uasserted(ErrorCodes::HostNotFound,
               str::stream() << "Could not satisfy $readPreference of '" << readPref.toString()
                             << "' while attempting to run command "
                             << request.getCommandName());
