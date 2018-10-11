@@ -39,7 +39,7 @@
 #include "mongo/db/views/resolved_view.h"
 #include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/s/catalog_cache.h"
-#include "mongo/s/commands/cluster_commands_helpers.h"
+#include "mongo/s/cluster_commands_helpers.h"
 #include "mongo/s/commands/cluster_explain.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/query/cluster_aggregate.h"
@@ -167,15 +167,8 @@ public:
                 auto aggRequestOnView = uassertStatusOK(
                     AggregationRequest::parseFromBSON(ns(), aggCmdOnView, verbosity));
 
-                auto resolvedAggRequest = ex->asExpandedViewAggregation(aggRequestOnView);
-                auto resolvedAggCmd = resolvedAggRequest.serializeToCommandObj().toBson();
-
-                ClusterAggregate::Namespaces nsStruct;
-                nsStruct.requestedNss = ns();
-                nsStruct.executionNss = std::move(ex->getNamespace());
-
-                uassertStatusOK(ClusterAggregate::runAggregate(
-                    opCtx, nsStruct, resolvedAggRequest, resolvedAggCmd, &bodyBuilder));
+                uassertStatusOK(ClusterAggregate::retryOnViewError(
+                    opCtx, aggRequestOnView, *ex.extraInfo<ResolvedView>(), ns(), &bodyBuilder));
             }
         }
 
@@ -218,20 +211,9 @@ public:
                 auto aggRequestOnView =
                     uassertStatusOK(AggregationRequest::parseFromBSON(ns(), aggCmdOnView));
 
-                auto resolvedAggRequest = ex->asExpandedViewAggregation(aggRequestOnView);
-                auto resolvedAggCmd = resolvedAggRequest.serializeToCommandObj().toBson();
-
-                // We pass both the underlying collection namespace and the view namespace here. The
-                // underlying collection namespace is used to execute the aggregation on mongoD. Any
-                // cursor returned will be registered under the view namespace so that subsequent
-                // getMore and killCursors calls against the view have access.
-                ClusterAggregate::Namespaces nsStruct;
-                nsStruct.requestedNss = ns();
-                nsStruct.executionNss = std::move(ex->getNamespace());
-
                 auto bodyBuilder = result->getBodyBuilder();
-                uassertStatusOK(ClusterAggregate::runAggregate(
-                    opCtx, nsStruct, resolvedAggRequest, resolvedAggCmd, &bodyBuilder));
+                uassertStatusOK(ClusterAggregate::retryOnViewError(
+                    opCtx, aggRequestOnView, *ex.extraInfo<ResolvedView>(), ns(), &bodyBuilder));
             }
         }
 

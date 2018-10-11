@@ -73,7 +73,9 @@ def _make_parser():  # pylint: disable=too-many-statements
     parser.add_option("--excludeWithAnyTags", action="append", dest="exclude_with_any_tags",
                       metavar="TAG1,TAG2",
                       help=("Comma separated list of tags. Any jstest that contains any of the"
-                            " specified tags will be excluded from any suites that are run."))
+                            " specified tags will be excluded from any suites that are run."
+                            " The tag '{}' is implicitly part of this list.".format(
+                                _config.EXCLUDED_TAG)))
 
     parser.add_option("-f", "--findSuites", action="store_true", dest="find_suites",
                       help="Lists the names of the suites that will execute the specified tests.")
@@ -196,6 +198,11 @@ def _make_parser():  # pylint: disable=too-many-statements
                       help=("Enables or disables the stagger of launching resmoke jobs."
                             " Defaults to %default."))
 
+    parser.add_option("--majorityReadConcern", type="choice", action="store",
+                      dest="majority_read_concern", choices=("on", "off"), metavar="ON|OFF",
+                      help=("Enable or disable majority read concern support."
+                            " Defaults to %default."))
+
     parser.add_option("--storageEngine", dest="storage_engine", metavar="ENGINE",
                       help="The storage engine used by dbtests and jstests.")
 
@@ -310,7 +317,7 @@ def _make_parser():  # pylint: disable=too-many-statements
 
     parser.set_defaults(benchrun_device="Desktop", dry_run="off", find_suites=False,
                         list_suites=False, logger_file="console", shuffle="auto",
-                        stagger_jobs="off", suite_files="with_server")
+                        stagger_jobs="off", suite_files="with_server", majority_read_concern="on")
     return parser
 
 
@@ -382,10 +389,14 @@ def _update_config_vars(values):  # pylint: disable=too-many-statements
     _config.DBPATH_PREFIX = _expand_user(config.pop("dbpath_prefix"))
     _config.DBTEST_EXECUTABLE = _expand_user(config.pop("dbtest_executable"))
     _config.DRY_RUN = config.pop("dry_run")
-    _config.EXCLUDE_WITH_ANY_TAGS = _tags_from_list(config.pop("exclude_with_any_tags"))
+    # EXCLUDE_WITH_ANY_TAGS will always contain the implicitly defined EXCLUDED_TAG.
+    _config.EXCLUDE_WITH_ANY_TAGS = [_config.EXCLUDED_TAG]
+    _config.EXCLUDE_WITH_ANY_TAGS.extend(
+        utils.default_if_none(_tags_from_list(config.pop("exclude_with_any_tags")), []))
     _config.FAIL_FAST = not config.pop("continue_on_failure")
     _config.INCLUDE_WITH_ANY_TAGS = _tags_from_list(config.pop("include_with_any_tags"))
     _config.JOBS = config.pop("jobs")
+    _config.MAJORITY_READ_CONCERN = config.pop("majority_read_concern") == "on"
     _config.MONGO_EXECUTABLE = _expand_user(config.pop("mongo_executable"))
     _config.MONGOD_EXECUTABLE = _expand_user(config.pop("mongod_executable"))
     _config.MONGOD_SET_PARAMETERS = config.pop("mongod_set_parameters")

@@ -365,6 +365,20 @@ variables:
   - compile_dbtest
   - dbtest
 
+- &aggregation_multiversion_fuzzer_burn_in
+  name: aggregation_multiversion_fuzzer_burn_in
+  execution_tasks:
+  - aggregation_multiversion_fuzzer_0
+  - aggregation_multiversion_fuzzer_1
+  - aggregation_multiversion_fuzzer_2
+  - aggregation_multiversion_fuzzer_3
+  - aggregation_multiversion_fuzzer_4
+  - aggregation_multiversion_fuzzer_5
+  - aggregation_multiversion_fuzzer_6
+  - aggregation_multiversion_fuzzer_7
+  - aggregation_multiversion_fuzzer_8
+  - aggregation_multiversion_fuzzer_9
+
 - &compile_task_group_template
   name: compile_task_group_template
   max_hosts: 1
@@ -455,6 +469,7 @@ variables:
     # spawning a large number of linker processes.
     num_scons_link_jobs_available: $(( $(grep -c ^processor /proc/cpuinfo) / 4 ))
     python: python
+    python3: '/cygdrive/c/python/python36/python.exe'
     num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
     ext: zip
     use_scons_cache: true
@@ -496,6 +511,18 @@ variables:
   - name: jstestfuzz_concurrent_sharded
   - name: jstestfuzz_replication
   - name: jstestfuzz_sharded
+  - name: logical_session_cache_replication_100ms_refresh_jscore_passthrough
+  - name: logical_session_cache_replication_1sec_refresh_jscore_passthrough
+  - name: logical_session_cache_replication_10sec_refresh_jscore_passthrough
+  - name: logical_session_cache_replication_default_refresh_jscore_passthrough
+  - name: logical_session_cache_sharding_100ms_refresh_jscore_passthrough
+  - name: logical_session_cache_sharding_1sec_refresh_jscore_passthrough
+  - name: logical_session_cache_sharding_10sec_refresh_jscore_passthrough
+  - name: logical_session_cache_sharding_default_refresh_jscore_passthrough
+  - name: logical_session_cache_standalone_100ms_refresh_jscore_passthrough
+  - name: logical_session_cache_standalone_1sec_refresh_jscore_passthrough
+  - name: logical_session_cache_standalone_10sec_refresh_jscore_passthrough
+  - name: logical_session_cache_standalone_default_refresh_jscore_passthrough
   - name: replica_sets_auth_0
   - name: replica_sets_auth_1
   - name: replica_sets_auth_2
@@ -1103,7 +1130,10 @@ functions:
 
         for dir in $dirs; do
           echo "Pruning /efs/$dir/scons-cache"
-          distro=$(cat /efs/$dir/info/distro_name)
+
+          if [ -e /efs/$dir/info/distro_name ]; then
+            distro=$(cat /efs/$dir/info/distro_name)
+          fi
 
           # Set cache sizes by distro
           case $distro in
@@ -1291,22 +1321,38 @@ functions:
     command: shell.exec
     type: test
     params:
+        shell: bash
         script: |
           # exit immediately if virtualenv is not found
           set -o errexit
           set -o verbose
 
-          python_loc=$(which ${python|/opt/mongodbtoolchain/v2/bin/python2})
-          python3_loc=$(which ${python|/opt/mongodbtoolchain/v2/bin/python3})
           virtualenv_loc=$(which ${virtualenv|virtualenv})
-          if [ "Windows_NT" = "$OS" ]; then
-            python_loc=$(cygpath -w $python_loc)
-            python3_loc=$(cygpath -w c:/python/Python36/python.exe)
+
+          python2_loc=$(which ${python|/opt/mongodbtoolchain/v2/bin/python2})
+          python3_loc=$(which ${python3|/opt/mongodbtoolchain/v2/bin/python3})
+          venv2_dir="${workdir}/venv"
+          venv3_dir="${workdir}/venv_3"
+          if command -V cygpath; then
+            # Sad note: We have to use the Windows path instead of the posix path here.
+            # Otherwise, virtualenv may mistakenly resolve paths relative to c:\cygdrive.
+            python2_loc=$(cygpath -w $python2_loc)
+            python3_loc=$(cygpath -w $python3_loc)
+            venv2_dir="$(cygpath -w "$venv2_dir")"
+            venv3_dir="$(cygpath -w "$venv3_dir")"
           fi
-          # Set up virtualenv in ${workdir}
-          "$virtualenv_loc" --python "$python_loc" --system-site-packages "${workdir}/venv"
-          # Add virtualenv for python3 in ${workdir}
-          "$virtualenv_loc" --python "$python3_loc" --system-site-packages "${workdir}/venv_3"
+
+          # Set up virtualenvs in ${workdir}
+          "$virtualenv_loc" --python "$python2_loc" --system-site-packages "$venv2_dir"
+          "$virtualenv_loc" --python "$python3_loc" --system-site-packages "$venv3_dir"
+
+          # Link python2/python3 in the primary virtualenv bin dir
+          export VIRTUAL_ENV_DISABLE_PROMPT=yes
+          venv2_bin="$(dirname "$(cd "$venv2_dir"; . ./*/activate; which python)")"
+          py2_exe="$(cd "$venv2_dir"; . ./*/activate; which python)"
+          py3_exe="$(cd "$venv3_dir"; . ./*/activate; which python)"
+          if [[ ! -f $venv2_bin/python2 ]]; then ln -sfv "$py2_exe" "$venv2_bin/python2"; fi
+          if [[ ! -f $venv2_bin/python3 ]]; then ln -sfv "$py3_exe" "$venv2_bin/python3"; fi
 
   "run tests" :
     - *determine_task_timeout
@@ -1335,8 +1381,7 @@ functions:
 
           # activate the virtualenv if it has been set up
           ${activate_virtualenv}
-          pip install boto3==1.5.27
-          pip install mock==2.0.0
+          python2 -m pip install -r etc/pip/evgtest-requirements.txt
 
           # Set the TMPDIR environment variable to be a directory in the task's working
           # directory so that temporary files created by processes spawned by resmoke.py get
@@ -1500,6 +1545,7 @@ functions:
     type: test
     params:
       working_dir: src
+      shell: bash
       script: |
         set -o errexit
         set -o verbose
@@ -1516,12 +1562,15 @@ functions:
         fi
 
         ${activate_virtualenv}
-        set +o errexit
-        ${compile_env|} $python ./buildscripts/scons.py ${compile_flags|} ${task_compile_flags|} ${task_compile_flags_extra|} ${scons_cache_args|} $extra_args ${targets} ${additional_targets|} MONGO_VERSION=${version}
-        exit_status=$?
+
+        python2 -m pip install -r ./etc/pip/compile-requirements.txt
+        ${compile_env|} $python ./buildscripts/scons.py                                     \
+            ${compile_flags|} ${task_compile_flags|} ${task_compile_flags_extra|}           \
+            ${scons_cache_args|} $extra_args                                                \
+            ${targets} ${additional_targets|} MONGO_VERSION=${version} || exit_status=$?
         # If compile fails we do not run any tests
-        if [ $exit_status -ne 0 ]; then
-          if [ ${dump_scons_config_on_failure} = 'true' ]; then
+        if [[ $exit_status -ne 0 ]]; then
+          if [[ "${dump_scons_config_on_failure}" == true ]]; then
             echo "Dumping build/scons/config.log"
             cat build/scons/config.log
           fi
@@ -1925,7 +1974,7 @@ functions:
 
         ${activate_virtualenv}
         # The Windows build variants are running python 2.7.3 and require TLS 1.2 from pyOpenSSL
-        pip install 'pyOpenSSL ; sys_platform == "win32" or sys_platform == "cygwin"'
+        python2 -m pip install 'pyOpenSSL ; sys_platform == "win32" or sys_platform == "cygwin"'
 
         rm -rf /data/install /data/multiversion
         $python buildscripts/setup_multiversion_mongodb.py   \
@@ -2128,8 +2177,7 @@ functions:
 
           set -o errexit
           ${activate_virtualenv}
-          pip install -r buildscripts/requirements.txt
-          pip install -r pytests/requirements.txt
+          python2 -m pip install -r etc/pip/powercycle-requirements.txt
 
           if [ ! -z "${subnet_id}" ]; then
             subnet_id="-n ${subnet_id}"
@@ -2257,7 +2305,7 @@ functions:
         script: |
           set -o errexit
           # Copy buildscripts, pytests and mongoDB executables to the remote host.
-          file_param="--file buildscripts --file pytests"
+          file_param="--file etc --file buildscripts --file pytests"
           mongo_executables="mongo mongod mongos"
           for executable in $mongo_executables
           do
@@ -2287,7 +2335,7 @@ functions:
           cmds="$cmds; virtualenv --python \$python_loc --system-site-packages ${virtualenv_dir|venv}"
           cmds="$cmds; activate=\$(find ${virtualenv_dir|venv} -name 'activate')"
           cmds="$cmds; . \$activate"
-          cmds="$cmds; pip install -r \$remote_dir/pytests/requirements.txt"
+          cmds="$cmds; pip2 install -r \$remote_dir/etc/pip/powercycle-requirements.txt"
           ssh_connection_options="${ssh_identity} ${ssh_connection_options}"
           ${activate_virtualenv}
           $python buildscripts/remote_operations.py          \
@@ -2763,7 +2811,7 @@ functions:
             python=python
           else
             if [ "Windows_NT" = "$OS" ]; then
-              python=/cygdrive/c/python/Python36/python
+              python=/cygdrive/c/python/python36/python
             else
               python=${python3|/opt/mongodbtoolchain/v2/bin/python3}
             fi
@@ -3407,6 +3455,7 @@ tasks:
             cat build/integration_tests.txt | xargs ${strip_command|/usr/bin/strip}
             ${strip_command|/usr/bin/strip} dbtest
             ${strip_command|/usr/bin/strip} mongobridge
+            ${strip_command|/usr/bin/strip} wt
           fi
 
 
@@ -3435,10 +3484,11 @@ tasks:
           $python ../buildscripts/make_archive.py -o mongodb-shell.${ext|tgz} $(find mongodb-* -type f)
           cd ..
 
-    - func: "fetch test_lifecycle.yml"
-      vars:
-        # Do not fail the task if we fail to fetch the test_lifecycle.yml file
-        fail_task_on_error: false
+  # Test lifecycle is temporarily disabled to reduce load on Evergreen API.
+  # - func: "fetch test_lifecycle.yml"
+  #   vars:
+  #     # Do not fail the task if we fail to fetch the test_lifecycle.yml file
+  #     fail_task_on_error: false
 
     - command: archive.targz_pack
       params:
@@ -3457,11 +3507,14 @@ tasks:
           - "./mongobridge*"
           - "./mongoebench*"
           - "./mongoed*"
+          - "./wt*"
           - "buildscripts/**"
           - "*Example"
           - "*Test"
           - "./**.pdb"
           - "./**.msi"
+          - "./etc/pip/**"
+          - "./etc/scons/**"
           - "./etc/*san.suppressions"
           - "./etc/repo_config.yaml"
           - "./etc/test_lifecycle.yml"
@@ -3617,12 +3670,9 @@ tasks:
           VERSION=${version}
           WORKDIR=${workdir}
 
-          CDRIVER_VERSION=1.12.0
-          rm -rf mongo-c-driver-$CDRIVER_VERSION
           rm -rf mongo-c-driver
-          curl -LO https://github.com/mongodb/mongo-c-driver/releases/download/$CDRIVER_VERSION/mongo-c-driver-$CDRIVER_VERSION.tar.gz
-          tar xzf mongo-c-driver-$CDRIVER_VERSION.tar.gz
-          mv mongo-c-driver-$CDRIVER_VERSION mongo-c-driver
+
+          git clone --branch r1.13 --depth 1 https://github.com/mongodb/mongo-c-driver.git
           cd mongo-c-driver
 
           trap "cat CMakeFiles/CMakeOutput.log" EXIT
@@ -3721,6 +3771,7 @@ tasks:
 
           if [ ${enable_embedded_tests|false} = "ios_tvos_simulator" -a $(command -v xcrun) ]; then
             find ./lib -type f -name "*.dylib" -print0 | xargs -0 -L 1 xcrun codesign -s -
+            find ./Frameworks -type f -name "*" '!' -name "*.*" -print0 | xargs -0 -L 1 xcrun codesign -s -
           fi
 
     - command: shell.exec
@@ -3733,17 +3784,17 @@ tasks:
 
           ${activate_virtualenv}
           if [ ${enable_embedded_tests|false} = "ios_tvos_simulator" ]; then
-              ${compile_env|} buildscripts/runiossim.sh ${ios_sim_device} ${ios_sim_runtime} "build/mongo-embedded-sdk-${version}/bin/mongo_embedded_capi_test" --tempPath /data
-              ${compile_env|} buildscripts/runiossim.sh ${ios_sim_device} ${ios_sim_runtime} "build/mongo-embedded-sdk-${version}/bin/mongo_embedded_mongoc_client_test" --tempPath /data
+              ${compile_env|} buildscripts/runiossim.sh ${ios_sim_device} ${ios_sim_runtime} "build/mongo-embedded-sdk-${version}/bin/mongo_embedded_test" --tempPath /data
+              ${compile_env|} buildscripts/runiossim.sh ${ios_sim_device} ${ios_sim_runtime} "build/mongo-embedded-sdk-${version}/bin/mongoc_embedded_test" --tempPath /data
           elif [ ${enable_embedded_tests|false} = "android_emulator" ]; then
               # strip because the binaries with debug symbols are too big for the default storage on the emulator
               find build/mongo-embedded-sdk-${version}/bin -type f | xargs $(dirname $(pwd))/android_toolchain-${android_toolchain_target_arch}-${android_toolchain_api_version}/bin/*-linux-android*-strip
               find build/mongo-embedded-sdk-${version}/lib -type f -name "*.so" | xargs $(dirname $(pwd))/android_toolchain-${android_toolchain_target_arch}-${android_toolchain_api_version}/bin/*-linux-android*-strip
-              ${compile_env|} buildscripts/runandroidsim.sh $(dirname $(pwd))/android_sdk ${android_toolchain_system_image_arch} ${android_system_image_version} "build/mongo-embedded-sdk-${version}" "bin/mongo_embedded_capi_test" --tempPath /data
-              ${compile_env|} buildscripts/runandroidsim.sh $(dirname $(pwd))/android_sdk ${android_toolchain_system_image_arch} ${android_system_image_version} "build/mongo-embedded-sdk-${version}" "bin/mongo_embedded_mongoc_client_test" --tempPath /data
+              ${compile_env|} buildscripts/runandroidsim.sh $(dirname $(pwd))/android_sdk ${android_toolchain_system_image_arch} ${android_system_image_version} "build/mongo-embedded-sdk-${version}" "bin/mongo_embedded_test" --tempPath /data
+              ${compile_env|} buildscripts/runandroidsim.sh $(dirname $(pwd))/android_sdk ${android_toolchain_system_image_arch} ${android_system_image_version} "build/mongo-embedded-sdk-${version}" "bin/mongoc_embedded_test" --tempPath /data
           elif [ ${enable_embedded_tests|false} = "native" ]; then
-            "build/mongo-embedded-sdk-${version}/bin/mongo_embedded_capi_test"
-            "build/mongo-embedded-sdk-${version}/bin/mongo_embedded_mongoc_client_test"
+            "build/mongo-embedded-sdk-${version}/bin/mongo_embedded_test"
+            "build/mongo-embedded-sdk-${version}/bin/mongoc_embedded_test"
           fi
 
     # If this is a patch build, blow away the file so our subsequent and optional s3.put
@@ -3837,21 +3888,21 @@ tasks:
           if [ "${setup_android_toolchain|}" = "true" ]; then
             export ANDROID_HOME=$(pwd)/android_sdk
 
-            cd src/src/mongo/embedded/java
+            cd src/src/mongo/embedded/mongo_embedded/java
 
             chmod +x gradlew
 
             for arch in arm64-v8a armeabi-v7a x86_64 ; do
-                tar zxvf ../../../../../embedded-sdk-android-$arch.tgz
+                tar zxvf ../../../../../../embedded-sdk-android-$arch.tgz
                 mkdir -p jniLibs/$arch
-                cp ./mongo-embedded-sdk-${version}/lib/*.so jniLibs/$arch
+                cp ./mongo-embedded-sdk-${version}/lib/libmongo_embedded.so jniLibs/$arch
                 rm -rf ./mongo-embedded-sdk-${version}
             done
 
             ./gradlew clean :aar:build :aar:publishMavenAarPublicationToLocalRepository
 
-            mkdir -p ../../../../build/mongo-embedded-sdk-${version}/android
-            cp -r aar/build/repo/* ../../../../build/mongo-embedded-sdk-${version}/android
+            mkdir -p ../../../../../build/mongo-embedded-sdk-${version}/android
+            cp -r aar/build/repo/* ../../../../../build/mongo-embedded-sdk-${version}/android
           fi
     - command: shell.exec
       params:
@@ -3936,24 +3987,24 @@ tasks:
           if [ "${setup_android_toolchain|}" = "true" ]; then
             export ANDROID_HOME=$(pwd)/android_sdk
 
-            cd src/src/mongo/embedded/java
+            cd src/src/mongo/embedded/mongo_embedded/java
 
             chmod +x gradlew
 
-            tar zxvf ../../../../../embedded-sdk-java-linux-x86-64.tgz
+            tar zxvf ../../../../../../embedded-sdk-java-linux-x86-64.tgz
             mkdir -p jniLibs/linux-x86-64
-            cp ./mongo-embedded-sdk-${version}/lib/*.so jniLibs/linux-x86-64
+            cp ./mongo-embedded-sdk-${version}/lib/libmongo_embedded.so jniLibs/linux-x86-64
             rm -rf ./mongo-embedded-sdk-${version}
 
-            tar zxvf ../../../../../embedded-sdk-java-darwin.tgz
+            tar zxvf ../../../../../../embedded-sdk-java-darwin.tgz
             mkdir -p jniLibs/darwin
-            cp ./mongo-embedded-sdk-${version}/lib/*.dylib jniLibs/darwin
+            cp ./mongo-embedded-sdk-${version}/lib/libmongo_embedded.dylib jniLibs/darwin
             rm -rf ./mongo-embedded-sdk-${version}
 
             ./gradlew clean :jar:build :jar:publishMavenPublicationToLocalRepository
 
-            mkdir -p ../../../../build/mongo-embedded-sdk-${version}/java
-            cp -r jar/build/repo/* ../../../../build/mongo-embedded-sdk-${version}/java
+            mkdir -p ../../../../../build/mongo-embedded-sdk-${version}/java
+            cp -r jar/build/repo/* ../../../../../build/mongo-embedded-sdk-${version}/java
           fi
     - command: shell.exec
       params:
@@ -3995,6 +4046,137 @@ tasks:
         aws_key: ${aws_key}
         aws_secret: ${aws_secret}
         local_file: "src/build/mongo-embedded-sdk-${version}.tgz"
+        remote_file: ${project}/embedded-sdk/${build_variant}-latest.tgz
+        bucket: mciuploads
+        permissions: public-read
+        content_type: application/tar
+
+
+- name: embedded_sdk_multiarch_apple_package
+  depends_on:
+    - name: embedded_sdk_s3_put
+      variant: embedded-sdk-iphoneos-10.2
+    - name: embedded_sdk_s3_put
+      variant: embedded-sdk-iphonesimulator-10.2
+    - name: embedded_sdk_s3_put
+      variant: embedded-sdk-appletvos-10.2
+    - name: embedded_sdk_s3_put
+      variant: embedded-sdk-appletvsimulator-10.2
+    - name: embedded_sdk_s3_put
+      variant: embedded-sdk-watchos-4.2
+    - name: embedded_sdk_s3_put
+      variant: embedded-sdk-watchsimulator-4.2
+
+  commands:
+    - command: manifest.load
+    - func: "git get project"
+    - func: "get buildnumber"
+    - func: "set up credentials"
+    - func: "generate compile expansions"
+    - func: "apply compile expansions"
+
+    - command: s3.get
+      params:
+        aws_key: ${aws_key}
+        aws_secret: ${aws_secret}
+        remote_file: ${project}/embedded-sdk/embedded-sdk-iphoneos-10.2/${revision}/${version}.tgz
+        bucket: mciuploads
+        local_file: "iPhoneOS/embedded-sdk.tgz"
+
+    - command: s3.get
+      params:
+        aws_key: ${aws_key}
+        aws_secret: ${aws_secret}
+        remote_file: ${project}/embedded-sdk/embedded-sdk-iphonesimulator-10.2/${revision}/${version}.tgz
+        bucket: mciuploads
+        local_file: "iPhoneSimulator/embedded-sdk.tgz"
+
+    - command: s3.get
+      params:
+        aws_key: ${aws_key}
+        aws_secret: ${aws_secret}
+        remote_file: ${project}/embedded-sdk/embedded-sdk-appletvos-10.2/${revision}/${version}.tgz
+        bucket: mciuploads
+        local_file: "AppleTVOS/embedded-sdk.tgz"
+
+    - command: s3.get
+      params:
+        aws_key: ${aws_key}
+        aws_secret: ${aws_secret}
+        remote_file: ${project}/embedded-sdk/embedded-sdk-appletvsimulator-10.2/${revision}/${version}.tgz
+        bucket: mciuploads
+        local_file: "AppleTVSimulator/embedded-sdk.tgz"
+
+    - command: s3.get
+      params:
+        aws_key: ${aws_key}
+        aws_secret: ${aws_secret}
+        remote_file: ${project}/embedded-sdk/embedded-sdk-watchos-4.2/${revision}/${version}.tgz
+        bucket: mciuploads
+        local_file: "WatchOS/embedded-sdk.tgz"
+
+    - command: s3.get
+      params:
+        aws_key: ${aws_key}
+        aws_secret: ${aws_secret}
+        remote_file: ${project}/embedded-sdk/embedded-sdk-watchsimulator-4.2/${revision}/${version}.tgz
+        bucket: mciuploads
+        local_file: "WatchSimulator/embedded-sdk.tgz"
+
+    - command: shell.exec
+      params:
+        script: |
+          set -o errexit
+          set -o verbose
+
+          for directory in *OS *Simulator; do
+              pushd $directory
+              tar --include "*/Frameworks*" --include "*/LICENSE*" --strip-components=1 -xf ./embedded-sdk.tgz
+              popd
+          done
+
+          for platform in iPhone AppleTV Watch; do
+              for framework in bson mongoc mongo_embedded mongoc_embedded; do
+                  _OSFile=$(printf ./%sOS/Frameworks/%s.framework/%s $platform $framework $framework)
+                  _SimulatorFile=$(printf ./%sSimulator/Frameworks/%s.framework/%s $platform $framework $framework)
+                  ${compile_env|} xcrun lipo $_OSFile $_SimulatorFile -create -output $_OSFile
+              done
+          done
+
+          tar --exclude "*/*.tgz" -zcvf mongo-embedded-sdk-${version}.tgz ./*OS
+
+    - command: s3.put
+      params:
+        aws_key: ${aws_key}
+        aws_secret: ${aws_secret}
+        local_file: "mongo-embedded-sdk-${version}.tgz"
+        remote_file: "${project}/embedded-sdk/embedded-sdk-apple-multiarch/${revision}/${version}.tgz"
+        bucket: mciuploads
+        permissions: public-read
+        content_type: application/tar
+        display_name: "Embedded SDK Tar Archive"
+
+    # If this is a patch build, blow away the file so our subsequent and optional s3.put
+    # doesn't run. That way, we won't overwrite the latest part in our patches.
+    - command: shell.exec
+      params:
+        script: |
+          set -o errexit
+          set -o verbose
+
+          if [ "${is_patch}" = "true" ]; then
+            rm -f mongo-embedded-sdk-${version}.tgz
+          fi
+
+    # A second put, this time to -latest, to give devs a reasonable
+    # way to get the most recent build.
+    - command: s3.put
+      params:
+        visibility: none
+        optional: true
+        aws_key: ${aws_key}
+        aws_secret: ${aws_secret}
+        local_file: "mongo-embedded-sdk-${version}.tgz"
         remote_file: ${project}/embedded-sdk/${build_variant}-latest.tgz
         bucket: mciuploads
         permissions: public-read
@@ -4049,19 +4231,58 @@ tasks:
           set -o errexit
           set -o verbose
 
-          ### TODO: Remove python3 when mypy 0.580 is installed in the toolchain.
-          # Since mypy requires python3, we need to activate the venv_3
-          ${activate_virtualenv_3}
-          pip install -r buildscripts/requirements.txt
-          updated_mypy=$(PATH=$PATH:/opt/mongodbtoolchain/v2/bin which mypy)
-          deactivate
-          ###
           ${activate_virtualenv}
-          # TODO: Remove once the linters have been updated on the variants.
-          pip install -r buildscripts/requirements.txt
-          # The linters require the modules be installed.
-          pip install -r pytests/requirements.txt
-          MYPY=$updated_mypy ${compile_env|} $python ./buildscripts/scons.py ${compile_flags|} --stack-size=1024 lint
+          python3 -m pip install -r etc/pip/lint-requirements.txt
+          python2 -m pip install -r etc/pip/lint-requirements.txt
+          export MYPY="$(
+            PATH+=':/opt/mongodbtoolchain/v2/bin'
+            if command -V cygpath 2>/dev/null; then
+                PATH+=":$(cypath "${workdir}")/venv_3/Scripts"
+            else
+                PATH+=":${workdir}/venv_3/bin"
+            fi
+            which mypy
+          )"
+          ${compile_env|} python2 ./buildscripts/scons.py ${compile_flags|} --stack-size=1024 lint
+
+- name: verify_pip
+  depends_on: []
+  commands:
+  - command: manifest.load
+  - func: "git get project"
+  - command: shell.exec
+    type: test
+    params:
+      working_dir: src
+      script: |
+        set -o errexit
+        set -o verbose
+
+        # Note: One pleasant side effect of this task is that it should pre warm pip's cache.
+        # For every pypa project that is part of our current toolchain, this will do nothing.
+        # For every pypa project that we are missing, the .whl file will be added to the pip cache.
+        # (See https://pip.pypa.io/en/latest/reference/pip_install/#caching)
+
+        ${activate_virtualenv}
+        # This installs the explicit project versions which would be installed in the toolchain
+        # from this patch
+        python2 -m pip install -r etc/pip/constraints.txt
+        python3 -m pip install -r etc/pip/constraints.txt
+
+        python2 -m pip freeze >requirements.txt.python2.old
+        python3 -m pip freeze >requirements.txt.python3.old
+
+        # This installs any requirements which are unsatisfied by the constraints.txt above
+        python2 -m pip install -r etc/pip/toolchain-requirements.txt
+        python3 -m pip install -r etc/pip/toolchain-requirements.txt
+
+        python2 -m pip freeze >requirements.txt.python2.new
+        python3 -m pip freeze >requirements.txt.python3.new
+
+        # Compare the old freezes to the new freezes.
+        # They should be the same if our constraints satisfy our toolchain requirements
+        diff -w requirements.txt.python2.old requirements.txt.python2.new
+        diff -w requirements.txt.python3.old requirements.txt.python3.new
 
 - <<: *task_template
   name: burn_in_tests
@@ -4326,20 +4547,52 @@ tasks:
       jepsen_write_concern: --write-concern w1
 
 ## Standalone generational fuzzer for aggregation pipelines ##
-- <<: *jstestfuzz_template
+- &aggregation_multiversion_fuzzer_template
+  <<: *jstestfuzz_template 
   name: aggregation_multiversion_fuzzer
   commands:
   - func: "do setup"
   - func: "do multiversion setup"
   - func: "run jstestfuzz"
     vars:
-      jstestfuzz_vars: --numGeneratedFiles 50
+      jstestfuzz_vars: --numGeneratedFiles 5
       npm_command: agg-fuzzer
   - <<: *run_jstestfuzz_tests
     vars:
       <<: *jstestfuzz_config_vars
       task_path_suffix: /data/multiversion
       resmoke_args: --suites=generational_fuzzer
+
+# Define multiple fuzzer tasks so they can be run in parallel.
+- <<: *aggregation_multiversion_fuzzer_template
+  name: aggregation_multiversion_fuzzer_0
+
+- <<: *aggregation_multiversion_fuzzer_template
+  name: aggregation_multiversion_fuzzer_1
+
+- <<: *aggregation_multiversion_fuzzer_template
+  name: aggregation_multiversion_fuzzer_2
+
+- <<: *aggregation_multiversion_fuzzer_template
+  name: aggregation_multiversion_fuzzer_3
+
+- <<: *aggregation_multiversion_fuzzer_template
+  name: aggregation_multiversion_fuzzer_4
+
+- <<: *aggregation_multiversion_fuzzer_template
+  name: aggregation_multiversion_fuzzer_5
+
+- <<: *aggregation_multiversion_fuzzer_template
+  name: aggregation_multiversion_fuzzer_6
+
+- <<: *aggregation_multiversion_fuzzer_template
+  name: aggregation_multiversion_fuzzer_7
+
+- <<: *aggregation_multiversion_fuzzer_template
+  name: aggregation_multiversion_fuzzer_8
+
+- <<: *aggregation_multiversion_fuzzer_template
+  name: aggregation_multiversion_fuzzer_9
 
 ## Standalone generational fuzzer for aggregation expressions ##
 - <<: *jstestfuzz_template
@@ -4928,16 +5181,6 @@ tasks:
   name: ese
   commands:
   - func: "do setup"
-  - command: shell.exec
-    type: test
-    params:
-      working_dir: src
-      script: |
-        set -o errexit
-        set -o verbose
-
-        ${activate_virtualenv}
-        python -m pip install -r src/mongo/db/modules/enterprise/jstests/encryptdb/libs/requirements.txt
   - func: "run tests"
     vars:
       resmoke_args: --suites=ese --storageEngine=wiredTiger
@@ -6819,6 +7062,20 @@ tasks:
   name: ssl
   commands:
   - func: "do setup"
+  - command: shell.exec
+    type: test
+    params:
+      working_dir: src
+      script: |
+        set -o errexit
+        set -o verbose
+
+        ${activate_virtualenv}
+        if [ "Windows_NT" = "$OS" ]; then
+          /cygdrive/c/python/python36/python.exe -m pip install -r etc/pip/evgtest-requirements.txt
+        else
+          python3 -m pip install -r etc/pip/evgtest-requirements.txt
+        fi
   - func: "run tests"
     vars:
       resmoke_args: --suites=ssl --storageEngine=wiredTiger
@@ -6925,6 +7182,138 @@ tasks:
       run_multiple_jobs: true
 
 - <<: *task_template
+  name: logical_session_cache_replication_default_refresh_jscore_passthrough
+  depends_on:
+  - name: jsCore
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=logical_session_cache_replication_default_refresh_jscore_passthrough --storageEngine=wiredTiger
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: logical_session_cache_replication_100ms_refresh_jscore_passthrough
+  depends_on:
+  - name: jsCore
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=logical_session_cache_replication_100ms_refresh_jscore_passthrough --storageEngine=wiredTiger
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: logical_session_cache_replication_1sec_refresh_jscore_passthrough
+  depends_on:
+  - name: jsCore
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=logical_session_cache_replication_1sec_refresh_jscore_passthrough --storageEngine=wiredTiger
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: logical_session_cache_replication_10sec_refresh_jscore_passthrough
+  depends_on:
+  - name: jsCore
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=logical_session_cache_replication_10sec_refresh_jscore_passthrough --storageEngine=wiredTiger
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: logical_session_cache_sharding_default_refresh_jscore_passthrough
+  depends_on:
+  - name: jsCore
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=logical_session_cache_sharding_default_refresh_jscore_passthrough --storageEngine=wiredTiger
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: logical_session_cache_sharding_100ms_refresh_jscore_passthrough
+  depends_on:
+  - name: jsCore
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=logical_session_cache_sharding_100ms_refresh_jscore_passthrough --storageEngine=wiredTiger
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: logical_session_cache_sharding_1sec_refresh_jscore_passthrough
+  depends_on:
+  - name: jsCore
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=logical_session_cache_sharding_1sec_refresh_jscore_passthrough --storageEngine=wiredTiger
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: logical_session_cache_sharding_10sec_refresh_jscore_passthrough
+  depends_on:
+  - name: jsCore
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=logical_session_cache_sharding_10sec_refresh_jscore_passthrough --storageEngine=wiredTiger
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: logical_session_cache_standalone_default_refresh_jscore_passthrough
+  depends_on:
+  - name: jsCore
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=logical_session_cache_standalone_default_refresh_jscore_passthrough --storageEngine=wiredTiger
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: logical_session_cache_standalone_100ms_refresh_jscore_passthrough
+  depends_on:
+  - name: jsCore
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=logical_session_cache_standalone_100ms_refresh_jscore_passthrough --storageEngine=wiredTiger
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: logical_session_cache_standalone_1sec_refresh_jscore_passthrough
+  depends_on:
+  - name: jsCore
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=logical_session_cache_standalone_1sec_refresh_jscore_passthrough --storageEngine=wiredTiger
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: logical_session_cache_standalone_10sec_refresh_jscore_passthrough
+  depends_on:
+  - name: jsCore
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=logical_session_cache_standalone_10sec_refresh_jscore_passthrough --storageEngine=wiredTiger
+      run_multiple_jobs: true
+
+- <<: *task_template
   name: retryable_writes_jscore_stepdown_passthrough
   depends_on:
   - name: jsCore
@@ -6958,8 +7347,13 @@ tasks:
         set -o verbose
 
         ${activate_virtualenv}
-        if [ "Windows_NT" = "$OS" ]; then
-          /cygdrive/c/python/python36/python.exe -m pip install -r buildscripts/requirements.txt
+        # Since the free monitoring tests use python 3 via C exec,
+        # they deliberately hit python3.6 on Windows and toolchain python otherwise.
+        # We happen to pre-seed the core requirements in the toolchain,
+        # but we have no way of doing so to Windows python3.6 installed via Chocolatey.
+        if command -V cygpath; then
+            echo "Installing core requirements into Python at '${python3}'"
+            "$(cygpath "${python3}")" -mpip install -r etc/pip/core-requirements.txt
         fi
   - func: "run tests"
     vars:
@@ -7676,8 +8070,7 @@ tasks:
         set -o verbose
 
         ${activate_virtualenv}
-        # Install Python modules to support OAuth with pip until it is available in the toolchain.
-        pip install cryptography==1.7.2 pyjwt==1.5.3
+        python2 -m pip install -r etc/pip/jira-requirements.txt
 
         # We use a small batch size to avoid hitting the load balancer timeout if the Evergreen
         # API query is not fast enough.
@@ -7794,6 +8187,7 @@ buildvariants:
   display_tasks:
   - *dbtest
   - *unittests
+  - *aggregation_multiversion_fuzzer_burn_in
   tasks:
   - name: compile_all_run_unittests_TG
     distros:
@@ -7837,12 +8231,21 @@ buildvariants:
   - name: jsCore_decimal
   - name: jsCore_txns
   - name: causally_consistent_jscore_txns_passthrough
-  - name: aggregation_multiversion_fuzzer
   - name: jstestfuzz
   - name: jstestfuzz_concurrent
   - name: jstestfuzz_concurrent_replication
   - name: jstestfuzz_concurrent_sharded
   - name: jstestfuzz_replication
+  - name: aggregation_multiversion_fuzzer_0
+  - name: aggregation_multiversion_fuzzer_1
+  - name: aggregation_multiversion_fuzzer_2
+  - name: aggregation_multiversion_fuzzer_3
+  - name: aggregation_multiversion_fuzzer_4
+  - name: aggregation_multiversion_fuzzer_5
+  - name: aggregation_multiversion_fuzzer_6
+  - name: aggregation_multiversion_fuzzer_7
+  - name: aggregation_multiversion_fuzzer_8
+  - name: aggregation_multiversion_fuzzer_9
   - name: jstestfuzz_sharded
   - name: mongosTest
   - name: multiversion_auth
@@ -7862,6 +8265,9 @@ buildvariants:
   - name: concurrency_sharded_replication_with_balancer
   - name: concurrency_simultaneous
   - name: concurrency_simultaneous_replication
+  - name: logical_session_cache_replication_1sec_refresh_jscore_passthrough
+  - name: logical_session_cache_sharding_1sec_refresh_jscore_passthrough
+  - name: logical_session_cache_standalone_1sec_refresh_jscore_passthrough
   - name: read_concern_linearizable_passthrough
   - name: read_concern_majority_passthrough
   - name: read_only
@@ -7910,6 +8316,18 @@ buildvariants:
   - name: integration_tests_sharded
   - name: jsCore
   - name: jsCore_txns
+  - name: logical_session_cache_replication_100ms_refresh_jscore_passthrough
+  - name: logical_session_cache_replication_1sec_refresh_jscore_passthrough
+  - name: logical_session_cache_replication_10sec_refresh_jscore_passthrough
+  - name: logical_session_cache_replication_default_refresh_jscore_passthrough
+  - name: logical_session_cache_sharding_100ms_refresh_jscore_passthrough
+  - name: logical_session_cache_sharding_1sec_refresh_jscore_passthrough
+  - name: logical_session_cache_sharding_10sec_refresh_jscore_passthrough
+  - name: logical_session_cache_sharding_default_refresh_jscore_passthrough
+  - name: logical_session_cache_standalone_100ms_refresh_jscore_passthrough
+  - name: logical_session_cache_standalone_1sec_refresh_jscore_passthrough
+  - name: logical_session_cache_standalone_10sec_refresh_jscore_passthrough
+  - name: logical_session_cache_standalone_default_refresh_jscore_passthrough
   - name: parallel
   - name: concurrency
   - name: concurrency_replication
@@ -8003,6 +8421,18 @@ buildvariants:
   - name: jsCore_txns
   - name: causally_consistent_jscore_txns_passthrough
   - name: jsonSchema
+  - name: logical_session_cache_replication_100ms_refresh_jscore_passthrough
+  - name: logical_session_cache_replication_1sec_refresh_jscore_passthrough
+  - name: logical_session_cache_replication_10sec_refresh_jscore_passthrough
+  - name: logical_session_cache_sharding_100ms_refresh_jscore_passthrough
+  - name: logical_session_cache_sharding_1sec_refresh_jscore_passthrough
+  - name: logical_session_cache_sharding_10sec_refresh_jscore_passthrough
+  - name: logical_session_cache_sharding_default_refresh_jscore_passthrough
+  - name: logical_session_cache_replication_default_refresh_jscore_passthrough
+  - name: logical_session_cache_standalone_100ms_refresh_jscore_passthrough
+  - name: logical_session_cache_standalone_1sec_refresh_jscore_passthrough
+  - name: logical_session_cache_standalone_10sec_refresh_jscore_passthrough
+  - name: logical_session_cache_standalone_default_refresh_jscore_passthrough
   - name: mongosTest
   - name: noPassthrough
   - name: noPassthroughWithMongod
@@ -8244,6 +8674,9 @@ buildvariants:
   - name: concurrency_sharded_replication
   - name: concurrency_sharded_replication_with_balancer
   - name: concurrency_simultaneous
+  - name: logical_session_cache_replication_1sec_refresh_jscore_passthrough
+  - name: logical_session_cache_sharding_1sec_refresh_jscore_passthrough
+  - name: logical_session_cache_standalone_1sec_refresh_jscore_passthrough
   - name: replica_sets
   - name: replica_sets_auth
   - name: replica_sets_jscore_passthrough
@@ -8341,6 +8774,9 @@ buildvariants:
   - name: concurrency_sharded_replication_with_balancer
   - name: concurrency_simultaneous
   - name: concurrency_simultaneous_replication
+  - name: logical_session_cache_replication_1sec_refresh_jscore_passthrough
+  - name: logical_session_cache_sharding_1sec_refresh_jscore_passthrough
+  - name: logical_session_cache_standalone_1sec_refresh_jscore_passthrough
   - name: replica_sets
   - name: replica_sets_auth
   - name: replica_sets_jscore_passthrough
@@ -8403,6 +8839,9 @@ buildvariants:
   - name: jstestfuzz_concurrent_sharded
   - name: jstestfuzz_replication
   - name: jstestfuzz_sharded
+  - name: logical_session_cache_replication_1sec_refresh_jscore_passthrough
+  - name: logical_session_cache_sharding_1sec_refresh_jscore_passthrough
+  - name: logical_session_cache_standalone_1sec_refresh_jscore_passthrough
   - name: replica_sets_auth
   - name: replica_sets_jscore_passthrough
   - name: sasl
@@ -8596,6 +9035,9 @@ buildvariants:
   - name: concurrency_sharded_replication_with_balancer
   - name: concurrency_simultaneous
   - name: concurrency_simultaneous_replication
+  - name: logical_session_cache_replication_1sec_refresh_jscore_passthrough
+  - name: logical_session_cache_sharding_1sec_refresh_jscore_passthrough
+  - name: logical_session_cache_standalone_1sec_refresh_jscore_passthrough
   - name: replica_sets
   - name: replica_sets_auth
   - name: replica_sets_jscore_passthrough
@@ -8681,6 +9123,9 @@ buildvariants:
   - name: concurrency_sharded_replication_with_balancer
   - name: concurrency_simultaneous
   - name: concurrency_simultaneous_replication
+  - name: logical_session_cache_replication_1sec_refresh_jscore_passthrough
+  - name: logical_session_cache_sharding_1sec_refresh_jscore_passthrough
+  - name: logical_session_cache_standalone_1sec_refresh_jscore_passthrough
   - name: replica_sets
   - name: replica_sets_auth
   - name: replica_sets_jscore_passthrough
@@ -8801,6 +9246,9 @@ buildvariants:
   - name: concurrency_sharded_replication_with_balancer
   - name: concurrency_simultaneous
   - name: concurrency_simultaneous_replication
+  - name: logical_session_cache_replication_1sec_refresh_jscore_passthrough
+  - name: logical_session_cache_sharding_1sec_refresh_jscore_passthrough
+  - name: logical_session_cache_standalone_1sec_refresh_jscore_passthrough
   - name: replica_sets
   - name: replica_sets_auth
   - name: replica_sets_jscore_passthrough
@@ -8890,6 +9338,9 @@ buildvariants:
   - name: jstestfuzz_concurrent_sharded
   - name: jstestfuzz_replication
   - name: jstestfuzz_sharded
+  - name: logical_session_cache_replication_1sec_refresh_jscore_passthrough
+  - name: logical_session_cache_sharding_1sec_refresh_jscore_passthrough
+  - name: logical_session_cache_standalone_1sec_refresh_jscore_passthrough
   - name: mongosTest
   - name: noPassthroughWithMongod
   - name: noPassthrough
@@ -8977,6 +9428,9 @@ buildvariants:
   - name: jstestfuzz_concurrent_sharded
   - name: jstestfuzz_replication
   - name: jstestfuzz_sharded
+  - name: logical_session_cache_replication_1sec_refresh_jscore_passthrough
+  - name: logical_session_cache_sharding_1sec_refresh_jscore_passthrough
+  - name: logical_session_cache_standalone_1sec_refresh_jscore_passthrough
   - name: noPassthrough
   - name: noPassthroughWithMongod
   - name: bulk_gle_passthrough
@@ -9077,6 +9531,9 @@ buildvariants:
   - name: concurrency_sharded_replication_with_balancer
   - name: concurrency_simultaneous
   - name: concurrency_simultaneous_replication
+  - name: logical_session_cache_replication_1sec_refresh_jscore_passthrough
+  - name: logical_session_cache_sharding_1sec_refresh_jscore_passthrough
+  - name: logical_session_cache_standalone_1sec_refresh_jscore_passthrough
   - name: replica_sets
   - name: replica_sets_auth
   - name: replica_sets_jscore_passthrough
@@ -9153,6 +9610,9 @@ buildvariants:
   - name: jstestfuzz_concurrent_sharded
   - name: jstestfuzz_replication
   - name: jstestfuzz_sharded
+  - name: logical_session_cache_replication_1sec_refresh_jscore_passthrough
+  - name: logical_session_cache_sharding_1sec_refresh_jscore_passthrough
+  - name: logical_session_cache_standalone_1sec_refresh_jscore_passthrough
   - name: noPassthrough
   - name: noPassthroughWithMongod
   - name: bulk_gle_passthrough
@@ -9256,6 +9716,9 @@ buildvariants:
   - name: concurrency_sharded_replication_with_balancer
   - name: concurrency_simultaneous
   - name: concurrency_simultaneous_replication
+  - name: logical_session_cache_replication_1sec_refresh_jscore_passthrough
+  - name: logical_session_cache_sharding_1sec_refresh_jscore_passthrough
+  - name: logical_session_cache_standalone_1sec_refresh_jscore_passthrough
   - name: replica_sets
   - name: replica_sets_auth
   - name: replica_sets_jscore_passthrough
@@ -9295,6 +9758,7 @@ buildvariants:
     # spawning a large number of linker processes.
     num_scons_link_jobs_available: $(( $(grep -c ^processor /proc/cpuinfo) / 4 ))
     python: python
+    python3: '/cygdrive/c/python/python36/python.exe'
     ext: zip
     use_scons_cache: true
     multiversion_platform: windows
@@ -9343,6 +9807,9 @@ buildvariants:
   - name: jsCore_txns
   - name: causally_consistent_jscore_txns_passthrough
   - name: jsonSchema
+  - name: logical_session_cache_replication_1sec_refresh_jscore_passthrough
+  - name: logical_session_cache_sharding_1sec_refresh_jscore_passthrough
+  - name: logical_session_cache_standalone_1sec_refresh_jscore_passthrough
   - name: mongosTest
   - name: noPassthrough
   - name: noPassthroughWithMongod
@@ -9457,6 +9924,7 @@ buildvariants:
     # spawning a large number of linker processes.
     num_scons_link_jobs_available: $(( $(grep -c ^processor /proc/cpuinfo) / 4 ))
     python: python
+    python3: '/cygdrive/c/python/python36/python.exe'
     num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
     ext: zip
     use_scons_cache: true
@@ -9477,12 +9945,14 @@ buildvariants:
   - name: compile_TG
     requires:
     - name: burn_in_tests
+    - name: verify_pip
     distros:
     - windows-64-vs2015-large
   - name: compile_benchmarks
     distros:
     - windows-64-vs2015-large
   - name: burn_in_tests
+  - name: verify_pip
   - name: audit
   - name: auth_audit
   - name: benchmarks_orphaned
@@ -9778,6 +10248,7 @@ buildvariants:
     # spawning a large number of linker processes.
     num_scons_link_jobs_available: $(( $(grep -c ^processor /proc/cpuinfo) / 4 ))
     python: python
+    python3: '/cygdrive/c/python/python36/python.exe'
     num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
     ext: zip
     use_scons_cache: true
@@ -9810,6 +10281,7 @@ buildvariants:
     # spawning a large number of linker processes.
     num_scons_link_jobs_available: $(( $(grep -c ^processor /proc/cpuinfo) / 4 ))
     python: python
+    python3: '/cygdrive/c/python/python36/python.exe'
     num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
     test_flags: --storageEngine=inMemory --excludeWithAnyTags=requires_persistence,requires_journaling,uses_transactions
     ext: zip
@@ -9849,6 +10321,9 @@ buildvariants:
   - name: jstestfuzz_concurrent_sharded
   - name: jstestfuzz_replication
   - name: jstestfuzz_sharded
+  - name: logical_session_cache_replication_1sec_refresh_jscore_passthrough
+  - name: logical_session_cache_sharding_1sec_refresh_jscore_passthrough
+  - name: logical_session_cache_standalone_1sec_refresh_jscore_passthrough
   - name: read_concern_linearizable_passthrough
   - name: replica_sets_auth
   - name: replica_sets_jscore_passthrough
@@ -9884,6 +10359,7 @@ buildvariants:
     # spawning a large number of linker processes.
     num_scons_link_jobs_available: $(( $(grep -c ^processor /proc/cpuinfo) / 4 ))
     python: python
+    python3: '/cygdrive/c/python/python36/python.exe'
     num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
     ext: zip
     use_scons_cache: true
@@ -9943,6 +10419,9 @@ buildvariants:
   - name: jstestfuzz_sharded_causal_consistency
   - name: jstestfuzz_sharded_continuous_stepdown
   - name: jstestfuzz_sharded_session
+  - name: logical_session_cache_replication_1sec_refresh_jscore_passthrough
+  - name: logical_session_cache_sharding_1sec_refresh_jscore_passthrough
+  - name: logical_session_cache_standalone_1sec_refresh_jscore_passthrough
   - name: mongosTest
   - name: multiversion
   - name: multiversion_auth
@@ -10000,6 +10479,7 @@ buildvariants:
     # spawning a large number of linker processes.
     num_scons_link_jobs_available: $(( $(grep -c ^processor /proc/cpuinfo) / 4 ))
     python: python
+    python3: '/cygdrive/c/python/python36/python.exe'
     num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
     ext: zip
     use_scons_cache: true
@@ -10100,6 +10580,9 @@ buildvariants:
   - name: jstestfuzz_sharded
   - name: jstestfuzz_sharded_causal_consistency
   - name: jstestfuzz_sharded_session
+  - name: logical_session_cache_replication_1sec_refresh_jscore_passthrough
+  - name: logical_session_cache_sharding_1sec_refresh_jscore_passthrough
+  - name: logical_session_cache_standalone_1sec_refresh_jscore_passthrough
   - name: mongosTest
   - name: noPassthroughWithMongod
   - name: noPassthrough
@@ -10197,6 +10680,9 @@ buildvariants:
   - name: jstestfuzz_concurrent_sharded
   - name: jstestfuzz_replication
   - name: jstestfuzz_sharded
+  - name: logical_session_cache_replication_1sec_refresh_jscore_passthrough
+  - name: logical_session_cache_sharding_1sec_refresh_jscore_passthrough
+  - name: logical_session_cache_standalone_1sec_refresh_jscore_passthrough
   - name: replica_sets_auth
   - name: replica_sets_jscore_passthrough
   - name: sasl
@@ -10268,21 +10754,17 @@ buildvariants:
     compile_flags: >-
       -j$(sysctl -n hw.logicalcpu)
       --variables-files=etc/scons/xcode_macosx.vars
-      LIBPATH="\$BUILD_ROOT/mongo-embedded-sdk-\$MONGO_VERSION/lib"
+      FRAMEWORKPATH='$BUILD_ROOT/mongo-embedded-sdk-$MONGO_VERSION/Frameworks'
       --lto
     cdriver_cmake_flags: >-
         -DCMAKE_BUILD_TYPE=RelWithDebInfo
         -DTHREADS_PTHREAD_ARG=2
-        -DCMAKE_SYSTEM_NAME=Darwin
+        -DCMAKE_OSX_SYSROOT="$(xcrun --sdk macosx --show-sdk-path)"
+        -DENABLE_APPLE_FRAMEWORK=ON
+        -DCMAKE_INSTALL_BINDIR=Frameworks
         -DCMAKE_SYSTEM_PROCESSOR=x86_64
-        -DCMAKE_FIND_ROOT_PATH="$(xcrun --sdk macosx --show-sdk-path);$WORKDIR/src/build/mongo-embedded-sdk-$VERSION-tmp"
-        -DCMAKE_FIND_ROOT_PATH_MODE_LIBRARY=ONLY
-        -DCMAKE_FIND_ROOT_PATH_MODE_PACKAGE=ONLY
-        -DCMAKE_FIND_ROOT_PATH_MODE_PROGRAM=NEVER
-        -DCMAKE_FIND_ROOT_PATH_MODE_INCLUDE=ONLY
-        -DCMAKE_C_FLAGS="-arch x86_64 -isysroot $(xcrun --sdk macosx --show-sdk-path) -mmacosx-version-min=10.10 -flto"
-        -DCMAKE_SHARED_LINKER_FLAGS="-arch x86_64 -isysroot $(xcrun --sdk macosx --show-sdk-path) -mmacosx-version-min=10.10 -flto"
-        -DCMAKE_INSTALL_NAME_DIR=@rpath
+        -DCMAKE_C_FLAGS="-arch x86_64 -mmacosx-version-min=10.10 -flto"
+        -DCMAKE_SHARED_LINKER_FLAGS="-arch x86_64 -mmacosx-version-min=10.10 -flto"
     disable_unit_tests: true
     enable_embedded_tests: native
     dump_scons_config_on_failure: true
@@ -10301,20 +10783,16 @@ buildvariants:
     compile_flags: >-
       -j$(sysctl -n hw.logicalcpu)
       --variables-files=etc/scons/xcode_ios.vars
-      LIBPATH="\$BUILD_ROOT/mongo-embedded-sdk-\$MONGO_VERSION/lib"
+      FRAMEWORKPATH='$BUILD_ROOT/mongo-embedded-sdk-$MONGO_VERSION/Frameworks'
       --lto
     cdriver_cmake_flags: >-
         -DCMAKE_BUILD_TYPE=RelWithDebInfo
         -DTHREADS_PTHREAD_ARG=2
-        -DCMAKE_SYSTEM_NAME=Darwin
-        -DCMAKE_FIND_ROOT_PATH="$(xcrun --sdk iphoneos --show-sdk-path);$WORKDIR/src/build/mongo-embedded-sdk-$VERSION-tmp"
-        -DCMAKE_FIND_ROOT_PATH_MODE_LIBRARY=ONLY
-        -DCMAKE_FIND_ROOT_PATH_MODE_PACKAGE=ONLY
-        -DCMAKE_FIND_ROOT_PATH_MODE_PROGRAM=NEVER
-        -DCMAKE_FIND_ROOT_PATH_MODE_INCLUDE=ONLY
-        -DCMAKE_C_FLAGS="-arch arm64 -fembed-bitcode -isysroot $(xcrun --sdk iphoneos --show-sdk-path) -miphoneos-version-min=10.2 -flto"
-        -DCMAKE_SHARED_LINKER_FLAGS="-arch arm64 -fembed-bitcode -isysroot $(xcrun --sdk iphoneos --show-sdk-path) -miphoneos-version-min=10.2 -flto"
-        -DCMAKE_INSTALL_NAME_DIR=@rpath
+        -DCMAKE_OSX_SYSROOT="$(xcrun --sdk iphoneos --show-sdk-path)"
+        -DENABLE_APPLE_FRAMEWORK=ON
+        -DCMAKE_INSTALL_BINDIR=Frameworks
+        -DCMAKE_C_FLAGS="-arch arm64 -fembed-bitcode -miphoneos-version-min=10.2 -flto"
+        -DCMAKE_SHARED_LINKER_FLAGS="-arch arm64 -fembed-bitcode -miphoneos-version-min=10.2 -flto"
     disable_unit_tests: true
     dump_scons_config_on_failure: true
   tasks:
@@ -10332,20 +10810,16 @@ buildvariants:
     compile_flags: >-
       -j$(sysctl -n hw.logicalcpu)
       --variables-files=etc/scons/xcode_ios_sim.vars
-      LIBPATH="\$BUILD_ROOT/mongo-embedded-sdk-\$MONGO_VERSION/lib"
+      FRAMEWORKPATH='$BUILD_ROOT/mongo-embedded-sdk-$MONGO_VERSION/Frameworks'
       --lto
     cdriver_cmake_flags: >-
         -DCMAKE_BUILD_TYPE=RelWithDebInfo
         -DTHREADS_PTHREAD_ARG=2
-        -DCMAKE_SYSTEM_NAME=Darwin
-        -DCMAKE_FIND_ROOT_PATH="$(xcrun --sdk iphonesimulator --show-sdk-path);$WORKDIR/src/build/mongo-embedded-sdk-$VERSION-tmp"
-        -DCMAKE_FIND_ROOT_PATH_MODE_LIBRARY=ONLY
-        -DCMAKE_FIND_ROOT_PATH_MODE_PACKAGE=ONLY
-        -DCMAKE_FIND_ROOT_PATH_MODE_PROGRAM=NEVER
-        -DCMAKE_FIND_ROOT_PATH_MODE_INCLUDE=ONLY
-        -DCMAKE_C_FLAGS="-arch x86_64 -fembed-bitcode -isysroot $(xcrun --sdk iphonesimulator --show-sdk-path) -miphoneos-version-min=10.2 -flto"
-        -DCMAKE_SHARED_LINKER_FLAGS="-arch x86_64 -fembed-bitcode -isysroot $(xcrun --sdk iphonesimulator --show-sdk-path) -miphoneos-version-min=10.2 -flto"
-        -DCMAKE_INSTALL_NAME_DIR=@rpath
+        -DCMAKE_OSX_SYSROOT="$(xcrun --sdk iphonesimulator --show-sdk-path)"
+        -DENABLE_APPLE_FRAMEWORK=ON
+        -DCMAKE_INSTALL_BINDIR=Frameworks
+        -DCMAKE_C_FLAGS="-arch x86_64 -fembed-bitcode -miphoneos-version-min=10.2 -flto"
+        -DCMAKE_SHARED_LINKER_FLAGS="-arch x86_64 -fembed-bitcode -miphoneos-version-min=10.2 -flto"
     disable_unit_tests: true
     enable_embedded_tests: ios_tvos_simulator
     ios_sim_device: iPhone-7
@@ -10366,20 +10840,16 @@ buildvariants:
     compile_flags: >-
       -j$(sysctl -n hw.logicalcpu)
       --variables-files=etc/scons/xcode_tvos.vars
-      LIBPATH="\$BUILD_ROOT/mongo-embedded-sdk-\$MONGO_VERSION/lib"
+      FRAMEWORKPATH='$BUILD_ROOT/mongo-embedded-sdk-$MONGO_VERSION/Frameworks'
       --lto
     cdriver_cmake_flags: >-
         -DCMAKE_BUILD_TYPE=RelWithDebInfo
         -DTHREADS_PTHREAD_ARG=2
-        -DCMAKE_SYSTEM_NAME=Darwin
-        -DCMAKE_FIND_ROOT_PATH="$(xcrun --sdk appletvos --show-sdk-path);$WORKDIR/src/build/mongo-embedded-sdk-$VERSION-tmp"
-        -DCMAKE_FIND_ROOT_PATH_MODE_LIBRARY=ONLY
-        -DCMAKE_FIND_ROOT_PATH_MODE_PACKAGE=ONLY
-        -DCMAKE_FIND_ROOT_PATH_MODE_PROGRAM=NEVER
-        -DCMAKE_FIND_ROOT_PATH_MODE_INCLUDE=ONLY
-        -DCMAKE_C_FLAGS="-arch arm64 -fembed-bitcode -isysroot $(xcrun --sdk appletvos --show-sdk-path) -mtvos-version-min=10.2 -flto"
-        -DCMAKE_SHARED_LINKER_FLAGS="-arch arm64 -fembed-bitcode -isysroot $(xcrun --sdk appletvos --show-sdk-path) -mtvos-version-min=10.2 -flto"
-        -DCMAKE_INSTALL_NAME_DIR=@rpath
+        -DCMAKE_OSX_SYSROOT="$(xcrun --sdk appletvos --show-sdk-path)"
+        -DENABLE_APPLE_FRAMEWORK=ON
+        -DCMAKE_INSTALL_BINDIR=Frameworks
+        -DCMAKE_C_FLAGS="-arch arm64 -fembed-bitcode -mtvos-version-min=10.2 -flto"
+        -DCMAKE_SHARED_LINKER_FLAGS="-arch arm64 -fembed-bitcode -mtvos-version-min=10.2 -flto"
     disable_unit_tests: true
     dump_scons_config_on_failure: true
   tasks:
@@ -10397,20 +10867,16 @@ buildvariants:
     compile_flags: >-
       -j$(sysctl -n hw.logicalcpu)
       --variables-files=etc/scons/xcode_tvos_sim.vars
-      LIBPATH="\$BUILD_ROOT/mongo-embedded-sdk-\$MONGO_VERSION/lib"
+      FRAMEWORKPATH='$BUILD_ROOT/mongo-embedded-sdk-$MONGO_VERSION/Frameworks'
       --lto
     cdriver_cmake_flags: >-
         -DCMAKE_BUILD_TYPE=RelWithDebInfo
         -DTHREADS_PTHREAD_ARG=2
-        -DCMAKE_SYSTEM_NAME=Darwin
-        -DCMAKE_FIND_ROOT_PATH="$(xcrun --sdk appletvsimulator --show-sdk-path);$WORKDIR/src/build/mongo-embedded-sdk-$VERSION-tmp"
-        -DCMAKE_FIND_ROOT_PATH_MODE_LIBRARY=ONLY
-        -DCMAKE_FIND_ROOT_PATH_MODE_PACKAGE=ONLY
-        -DCMAKE_FIND_ROOT_PATH_MODE_PROGRAM=NEVER
-        -DCMAKE_FIND_ROOT_PATH_MODE_INCLUDE=ONLY
-        -DCMAKE_C_FLAGS="-arch x86_64 -fembed-bitcode -isysroot $(xcrun --sdk appletvsimulator --show-sdk-path) -mtvos-version-min=10.2 -flto"
-        -DCMAKE_SHARED_LINKER_FLAGS="-arch x86_64 -fembed-bitcode -isysroot $(xcrun --sdk appletvsimulator --show-sdk-path) -mtvos-version-min=10.2 -flto"
-        -DCMAKE_INSTALL_NAME_DIR=@rpath
+        -DCMAKE_OSX_SYSROOT="$(xcrun --sdk appletvsimulator --show-sdk-path)"
+        -DENABLE_APPLE_FRAMEWORK=ON
+        -DCMAKE_INSTALL_BINDIR=Frameworks
+        -DCMAKE_C_FLAGS="-arch x86_64 -fembed-bitcode -mtvos-version-min=10.2 -flto"
+        -DCMAKE_SHARED_LINKER_FLAGS="-arch x86_64 -fembed-bitcode -mtvos-version-min=10.2 -flto"
     disable_unit_tests: true
     enable_embedded_tests: ios_tvos_simulator
     ios_sim_device: Apple-TV-1080p
@@ -10431,20 +10897,16 @@ buildvariants:
     compile_flags: >-
       -j$(sysctl -n hw.logicalcpu)
       --variables-files=etc/scons/xcode_watchos.vars
-      LIBPATH="\$BUILD_ROOT/mongo-embedded-sdk-\$MONGO_VERSION/lib"
+      FRAMEWORKPATH='$BUILD_ROOT/mongo-embedded-sdk-$MONGO_VERSION/Frameworks'
       --lto
     cdriver_cmake_flags: >-
         -DCMAKE_BUILD_TYPE=RelWithDebInfo
         -DTHREADS_PTHREAD_ARG=2
-        -DCMAKE_SYSTEM_NAME=Darwin
-        -DCMAKE_FIND_ROOT_PATH="$(xcrun --sdk watchos --show-sdk-path);$WORKDIR/src/build/mongo-embedded-sdk-$VERSION-tmp"
-        -DCMAKE_FIND_ROOT_PATH_MODE_LIBRARY=ONLY
-        -DCMAKE_FIND_ROOT_PATH_MODE_PACKAGE=ONLY
-        -DCMAKE_FIND_ROOT_PATH_MODE_PROGRAM=NEVER
-        -DCMAKE_FIND_ROOT_PATH_MODE_INCLUDE=ONLY
-        -DCMAKE_C_FLAGS="-arch armv7k -fembed-bitcode -isysroot $(xcrun --sdk watchos --show-sdk-path) -mwatchos-version-min=4.2 -flto"
-        -DCMAKE_SHARED_LINKER_FLAGS="-arch armv7k -fembed-bitcode -isysroot $(xcrun --sdk watchos --show-sdk-path) -mwatchos-version-min=4.2 -flto"
-        -DCMAKE_INSTALL_NAME_DIR=@rpath
+        -DCMAKE_OSX_SYSROOT="$(xcrun --sdk watchos --show-sdk-path)"
+        -DENABLE_APPLE_FRAMEWORK=ON
+        -DCMAKE_INSTALL_BINDIR=Frameworks
+        -DCMAKE_C_FLAGS="-arch armv7k -fembed-bitcode -mwatchos-version-min=4.2 -flto"
+        -DCMAKE_SHARED_LINKER_FLAGS="-arch armv7k -fembed-bitcode -mwatchos-version-min=4.2 -flto"
     disable_unit_tests: true
     dump_scons_config_on_failure: true
   tasks:
@@ -10462,20 +10924,16 @@ buildvariants:
     compile_flags: >-
       -j$(sysctl -n hw.logicalcpu)
       --variables-files=etc/scons/xcode_watchos_sim.vars
-      LIBPATH="\$BUILD_ROOT/mongo-embedded-sdk-\$MONGO_VERSION/lib"
+      FRAMEWORKPATH='$BUILD_ROOT/mongo-embedded-sdk-$MONGO_VERSION/Frameworks'
       --lto
     cdriver_cmake_flags: >-
         -DCMAKE_BUILD_TYPE=RelWithDebInfo
         -DTHREADS_PTHREAD_ARG=2
-        -DCMAKE_SYSTEM_NAME=Darwin
-        -DCMAKE_FIND_ROOT_PATH="$(xcrun --sdk watchsimulator --show-sdk-path);$WORKDIR/src/build/mongo-embedded-sdk-$VERSION-tmp"
-        -DCMAKE_FIND_ROOT_PATH_MODE_LIBRARY=ONLY
-        -DCMAKE_FIND_ROOT_PATH_MODE_PACKAGE=ONLY
-        -DCMAKE_FIND_ROOT_PATH_MODE_PROGRAM=NEVER
-        -DCMAKE_FIND_ROOT_PATH_MODE_INCLUDE=ONLY
-        -DCMAKE_C_FLAGS="-arch i386 -fembed-bitcode -isysroot $(xcrun --sdk watchsimulator --show-sdk-path) -mwatchos-version-min=4.2 -flto"
-        -DCMAKE_SHARED_LINKER_FLAGS="-arch i386 -fembed-bitcode -isysroot $(xcrun --sdk watchsimulator --show-sdk-path) -mwatchos-version-min=4.2 -flto"
-        -DCMAKE_INSTALL_NAME_DIR=@rpath
+        -DCMAKE_OSX_SYSROOT="$(xcrun --sdk watchsimulator --show-sdk-path)"
+        -DENABLE_APPLE_FRAMEWORK=ON
+        -DCMAKE_INSTALL_BINDIR=Frameworks
+        -DCMAKE_C_FLAGS="-arch i386 -fembed-bitcode -mwatchos-version-min=4.2 -flto"
+        -DCMAKE_SHARED_LINKER_FLAGS="-arch i386 -fembed-bitcode -mwatchos-version-min=4.2 -flto"
     disable_unit_tests: true
     enable_embedded_tests: ios_tvos_simulator
     ios_sim_device: Apple-Watch-Series-3-42mm
@@ -10483,6 +10941,16 @@ buildvariants:
     dump_scons_config_on_failure: true
   tasks:
   - name: embedded_sdk_build_and_test
+
+- name: embedded-sdk-apple-multiarch
+  display_name: "Embedded SDK - Apple Multiarch"
+  run_on:
+  - macos-1012
+  batchtime: 1440 # 1 day
+  expansions:
+    compile_env: DEVELOPER_DIR=/Applications/XCode9.2.app
+  tasks:
+  - name: embedded_sdk_multiarch_apple_package
 
 - name: embedded-sdk-ubuntu-1604-x86_64
   display_name: "Embedded SDK - Ubuntu 16.04 x86_64"
@@ -10543,7 +11011,7 @@ buildvariants:
     enable_embedded_tests: android_emulator
     setup_android_toolchain: true
     android_toolchain_system_image_arch: "armeabi-v7a"
-    android_system_image_version: "24"
+    android_system_image_version: "21"
     android_toolchain_target_arch: "arm"
     android_toolchain_api_version: "21"
     dump_scons_config_on_failure: true
@@ -10626,7 +11094,7 @@ buildvariants:
     enable_embedded_tests: android_emulator
     setup_android_toolchain: true
     android_toolchain_system_image_arch: "x86_64"
-    android_system_image_version: "24"
+    android_system_image_version: "21"
     android_toolchain_target_arch: "x86_64"
     android_toolchain_api_version: "21"
     dump_scons_config_on_failure: true
@@ -10707,6 +11175,7 @@ buildvariants:
   - name: compile_all_run_unittests_TG
     requires:
     - name: burn_in_tests
+    - name: verify_pip
     - name: lint
     distros:
     - rhel62-large
@@ -10717,6 +11186,7 @@ buildvariants:
   - name: burn_in_tests
     distros:
     - rhel62-large
+  - name: verify_pip
   - name: rollback_fuzzer
   - name: rollback_fuzzer_clean_shutdowns
   - name: rollback_fuzzer_unclean_shutdowns
@@ -10811,6 +11281,18 @@ buildvariants:
   - name: jstestfuzz_sharded_causal_consistency
   - name: jstestfuzz_sharded_continuous_stepdown
   - name: jstestfuzz_sharded_session
+  - name: logical_session_cache_replication_100ms_refresh_jscore_passthrough
+  - name: logical_session_cache_replication_1sec_refresh_jscore_passthrough
+  - name: logical_session_cache_replication_10sec_refresh_jscore_passthrough
+  - name: logical_session_cache_replication_default_refresh_jscore_passthrough
+  - name: logical_session_cache_sharding_100ms_refresh_jscore_passthrough
+  - name: logical_session_cache_sharding_1sec_refresh_jscore_passthrough
+  - name: logical_session_cache_sharding_10sec_refresh_jscore_passthrough
+  - name: logical_session_cache_sharding_default_refresh_jscore_passthrough
+  - name: logical_session_cache_standalone_100ms_refresh_jscore_passthrough
+  - name: logical_session_cache_standalone_1sec_refresh_jscore_passthrough
+  - name: logical_session_cache_standalone_10sec_refresh_jscore_passthrough
+  - name: logical_session_cache_standalone_default_refresh_jscore_passthrough
   - name: mongosTest
   - name: multiversion_auth
   - name: multiversion
@@ -11250,6 +11732,563 @@ buildvariants:
     - ubuntu1604-packer
   - name: push
 
+- name: enterprise-rhel-62-64-bit-majority-read-concern-off
+  display_name: "Enterprise RHEL 6.2 (majority read concern off)"
+  modules:
+  - enterprise
+  run_on:
+  - rhel62-small
+  expansions: &enterprise-rhel-62-64-bit-majority-read-concern-off-expansions
+    test_flags: >-
+      --majorityReadConcern=off
+      --excludeWithAnyTags=requires_majority_read_concern,uses_change_streams,uses_prepare_transaction,uses_multi_shard_transaction,uses_single_shard_transaction
+    compile_flags: >-
+      -j$(grep -c ^processor /proc/cpuinfo)
+      --ssl
+      --release
+      --variables-files=etc/scons/mongodbtoolchain_gcc.vars
+      MONGO_DISTMOD=rhel62
+    multiversion_platform: rhel62
+    multiversion_edition: enterprise
+    num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
+    repo_edition: enterprise
+    scons_cache_scope: shared
+    gorootvars: 'PATH="/opt/golang/go1.10/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/golang/go1.10'
+    tooltags: "-tags 'ssl sasl'"
+    build_mongoreplay: true
+  display_tasks:
+  - *dbtest
+  - *replica_sets_auth
+  - *replica_sets_ese
+  - *sharding
+  - *sharding_auth
+  - *sharding_auth_audit
+  - *sharding_ese
+  - *sharding_last_stable_mongos_and_mixed_shards
+  - *sharding_op_query
+  - *unittests
+  tasks:
+  - name: compile_all_run_unittests_TG
+    distros:
+    - rhel62-large
+  - name: rollback_fuzzer
+  - name: rollback_fuzzer_clean_shutdowns
+  - name: rollback_fuzzer_unclean_shutdowns
+  - name: aggregation
+  - name: aggregation_ese
+  - name: aggregation_auth
+  - name: aggregation_facet_unwind_passthrough
+  - name: aggregation_mongos_passthrough
+  - name: aggregation_one_shard_sharded_collections
+  - name: aggregation_sharded_collections_passthrough
+  - name: audit
+  - name: auth
+  - name: auth_audit
+  - name: buildscripts_test
+  - name: bulk_gle_passthrough
+  - name: causally_consistent_jscore_passthrough
+  - name: causally_consistent_jscore_passthrough_auth
+  - name: sharded_causally_consistent_jscore_passthrough
+  - name: concurrency
+  - name: concurrency_replication
+  - name: concurrency_replication_causal_consistency
+    distros:
+    - rhel62-large
+  - name: concurrency_replication_multi_stmt_txn
+  - name: concurrency_sharded_replication
+  - name: concurrency_sharded_replication_with_balancer
+  - name: concurrency_sharded_causal_consistency
+  - name: concurrency_sharded_causal_consistency_and_balancer
+  - name: concurrency_simultaneous
+  - name: concurrency_simultaneous_replication
+  - name: disk_wiredtiger
+  - name: ese
+  - name: failpoints
+  - name: failpoints_auth
+  - name: gle_auth
+  - name: gle_auth_basics_passthrough
+  - name: gle_auth_basics_passthrough_write_cmd
+  - name: gle_auth_write_cmd
+  - name: integration_tests_replset
+  - name: integration_tests_sharded
+  - name: integration_tests_standalone
+  - name: integration_tests_standalone_audit
+  - name: jsCore
+  - name: jsCore_ese
+  - name: jsCore_auth
+  - name: jsCore_compatibility
+  - name: jsCore_decimal
+  - name: jsCore_minimum_batch_size
+  - name: jsCore_op_query
+  - name: jsCore_txns
+  - name: causally_consistent_jscore_txns_passthrough
+  - name: jsonSchema
+  - name: aggregation_multiversion_fuzzer
+  - name: aggregation_expression_multiversion_fuzzer
+  - name: jstestfuzz
+  - name: jstestfuzz_concurrent
+  - name: jstestfuzz_concurrent_replication
+  - name: jstestfuzz_concurrent_replication_session
+  - name: jstestfuzz_concurrent_sharded
+  - name: jstestfuzz_concurrent_sharded_causal_consistency
+  - name: jstestfuzz_concurrent_sharded_continuous_stepdown
+  - name: jstestfuzz_concurrent_sharded_session
+  - name: jstestfuzz_interrupt
+  - name: jstestfuzz_interrupt_replication
+  - name: jstestfuzz_replication
+  - name: jstestfuzz_replication_initsync
+  - name: jstestfuzz_replication_session
+  - name: jstestfuzz_sharded
+  - name: jstestfuzz_sharded_causal_consistency
+  - name: jstestfuzz_sharded_continuous_stepdown
+  - name: jstestfuzz_sharded_session
+  - name: logical_session_cache_replication_100ms_refresh_jscore_passthrough
+  - name: logical_session_cache_replication_1sec_refresh_jscore_passthrough
+  - name: logical_session_cache_replication_10sec_refresh_jscore_passthrough
+  - name: logical_session_cache_replication_default_refresh_jscore_passthrough
+  - name: multiversion
+  - name: noPassthroughWithMongod
+  - name: noPassthrough
+  - name: parallel
+  - name: parallel_compatibility
+  - name: read_concern_linearizable_passthrough
+    distros:
+    - rhel62-large
+  - name: read_only
+  - name: read_only_sharded
+  - name: replica_sets
+    distros:
+    - rhel62-large
+  - name: replica_sets_auth_0
+    distros:
+    - rhel62-large
+  - name: replica_sets_auth_1
+    distros:
+    - rhel62-large
+  - name: replica_sets_auth_2
+    distros:
+    - rhel62-large
+  - name: replica_sets_auth_3
+    distros:
+    - rhel62-large
+  - name: replica_sets_auth_4
+    distros:
+    - rhel62-large
+  - name: replica_sets_auth_5
+    distros:
+    - rhel62-large
+  - name: replica_sets_auth_6
+    distros:
+    - rhel62-large
+  - name: replica_sets_auth_misc
+    distros:
+    - rhel62-large
+  - name: replica_sets_ese_0
+    distros:
+    - rhel62-large
+  - name: replica_sets_ese_1
+    distros:
+    - rhel62-large
+  - name: replica_sets_ese_2
+    distros:
+    - rhel62-large
+  - name: replica_sets_ese_3
+    distros:
+    - rhel62-large
+  - name: replica_sets_ese_4
+    distros:
+    - rhel62-large
+  - name: replica_sets_ese_5
+    distros:
+    - rhel62-large
+  - name: replica_sets_ese_6
+    distros:
+    - rhel62-large
+  - name: replica_sets_ese_misc
+    distros:
+    - rhel62-large
+  - name: replica_sets_jscore_passthrough
+    distros:
+    - rhel62-large
+  - name: replica_sets_initsync_jscore_passthrough
+    distros:
+    - rhel62-large
+  - name: replica_sets_initsync_static_jscore_passthrough
+    distros:
+    - rhel62-large
+  - name: replica_sets_multi_stmt_txn_jscore_passthrough
+    distros:
+    - rhel62-large
+  - name: replica_sets_kill_secondaries_jscore_passthrough
+    distros:
+    - rhel62-large
+  - name: retryable_writes_jscore_passthrough
+    distros:
+    - rhel62-large
+  - name: sasl
+  - name: session_jscore_passthrough
+  - name: sharded_collections_jscore_passthrough
+  - name: sharding_0
+    distros:
+    - rhel62-large
+  - name: sharding_1
+    distros:
+    - rhel62-large
+  - name: sharding_2
+    distros:
+    - rhel62-large
+  - name: sharding_3
+    distros:
+    - rhel62-large
+  - name: sharding_4
+    distros:
+    - rhel62-large
+  - name: sharding_5
+    distros:
+    - rhel62-large
+  - name: sharding_6
+    distros:
+    - rhel62-large
+  - name: sharding_7
+    distros:
+    - rhel62-large
+  - name: sharding_8
+    distros:
+    - rhel62-large
+  - name: sharding_9
+    distros:
+    - rhel62-large
+  - name: sharding_10
+    distros:
+    - rhel62-large
+  - name: sharding_11
+    distros:
+    - rhel62-large
+  - name: sharding_12
+    distros:
+    - rhel62-large
+  - name: sharding_13
+    distros:
+    - rhel62-large
+  - name: sharding_14
+    distros:
+    - rhel62-large
+  - name: sharding_misc
+    distros:
+    - rhel62-large
+  - name: sharding_auth_0
+    distros:
+    - rhel62-large
+  - name: sharding_auth_1
+    distros:
+    - rhel62-large
+  - name: sharding_auth_2
+    distros:
+    - rhel62-large
+  - name: sharding_auth_3
+    distros:
+    - rhel62-large
+  - name: sharding_auth_4
+    distros:
+    - rhel62-large
+  - name: sharding_auth_5
+    distros:
+    - rhel62-large
+  - name: sharding_auth_6
+    distros:
+    - rhel62-large
+  - name: sharding_auth_7
+    distros:
+    - rhel62-large
+  - name: sharding_auth_8
+    distros:
+    - rhel62-large
+  - name: sharding_auth_9
+    distros:
+    - rhel62-large
+  - name: sharding_auth_10
+    distros:
+    - rhel62-large
+  - name: sharding_auth_11
+    distros:
+    - rhel62-large
+  - name: sharding_auth_12
+    distros:
+    - rhel62-large
+  - name: sharding_auth_13
+    distros:
+    - rhel62-large
+  - name: sharding_auth_14
+    distros:
+    - rhel62-large
+  - name: sharding_auth_15
+    distros:
+    - rhel62-large
+  - name: sharding_auth_16
+    distros:
+    - rhel62-large
+  - name: sharding_auth_17
+    distros:
+    - rhel62-large
+  - name: sharding_auth_18
+    distros:
+    - rhel62-large
+  - name: sharding_auth_19
+    distros:
+    - rhel62-large
+  - name: sharding_auth_misc
+    distros:
+    - rhel62-large
+  - name: sharding_auth_audit_0
+    distros:
+    - rhel62-large
+  - name: sharding_auth_audit_1
+    distros:
+    - rhel62-large
+  - name: sharding_auth_audit_2
+    distros:
+    - rhel62-large
+  - name: sharding_auth_audit_3
+    distros:
+    - rhel62-large
+  - name: sharding_auth_audit_4
+    distros:
+    - rhel62-large
+  - name: sharding_auth_audit_5
+    distros:
+    - rhel62-large
+  - name: sharding_auth_audit_6
+    distros:
+    - rhel62-large
+  - name: sharding_auth_audit_7
+    distros:
+    - rhel62-large
+  - name: sharding_auth_audit_8
+    distros:
+    - rhel62-large
+  - name: sharding_auth_audit_9
+    distros:
+    - rhel62-large
+  - name: sharding_auth_audit_10
+    distros:
+    - rhel62-large
+  - name: sharding_auth_audit_11
+    distros:
+    - rhel62-large
+  - name: sharding_auth_audit_12
+    distros:
+    - rhel62-large
+  - name: sharding_auth_audit_13
+    distros:
+    - rhel62-large
+  - name: sharding_auth_audit_14
+    distros:
+    - rhel62-large
+  - name: sharding_auth_audit_15
+    distros:
+    - rhel62-large
+  - name: sharding_auth_audit_16
+    distros:
+    - rhel62-large
+  - name: sharding_auth_audit_17
+    distros:
+    - rhel62-large
+  - name: sharding_auth_audit_18
+    distros:
+    - rhel62-large
+  - name: sharding_auth_audit_misc
+    distros:
+    - rhel62-large
+  - name: sharding_ese_0
+    distros:
+    - rhel62-large
+  - name: sharding_ese_1
+    distros:
+    - rhel62-large
+  - name: sharding_ese_2
+    distros:
+    - rhel62-large
+  - name: sharding_ese_3
+    distros:
+    - rhel62-large
+  - name: sharding_ese_4
+    distros:
+    - rhel62-large
+  - name: sharding_ese_5
+    distros:
+    - rhel62-large
+  - name: sharding_ese_6
+    distros:
+    - rhel62-large
+  - name: sharding_ese_7
+    distros:
+    - rhel62-large
+  - name: sharding_ese_8
+    distros:
+    - rhel62-large
+  - name: sharding_ese_9
+    distros:
+    - rhel62-large
+  - name: sharding_ese_10
+    distros:
+    - rhel62-large
+  - name: sharding_ese_11
+    distros:
+    - rhel62-large
+  - name: sharding_ese_12
+    distros:
+    - rhel62-large
+  - name: sharding_ese_13
+    distros:
+    - rhel62-large
+  - name: sharding_ese_14
+    distros:
+    - rhel62-large
+  - name: sharding_ese_15
+    distros:
+    - rhel62-large
+  - name: sharding_ese_16
+    distros:
+    - rhel62-large
+  - name: sharding_ese_17
+    distros:
+    - rhel62-large
+  - name: sharding_ese_18
+    distros:
+    - rhel62-large
+  - name: sharding_ese_19
+    distros:
+    - rhel62-large
+  - name: sharding_ese_20
+    distros:
+    - rhel62-large
+  - name: sharding_ese_misc
+    distros:
+    - rhel62-large
+  - name: sharding_gle_auth_basics_passthrough
+  - name: sharding_gle_auth_basics_passthrough_write_cmd
+  - name: sharding_jscore_passthrough
+  - name: sharding_jscore_op_query_passthrough
+  - name: sharding_jscore_passthrough_wire_ops
+  - name: sharding_last_stable_mongos_and_mixed_shards_0
+    distros:
+    - rhel62-large
+  - name: sharding_last_stable_mongos_and_mixed_shards_1
+    distros:
+    - rhel62-large
+  - name: sharding_last_stable_mongos_and_mixed_shards_2
+    distros:
+    - rhel62-large
+  - name: sharding_last_stable_mongos_and_mixed_shards_3
+    distros:
+    - rhel62-large
+  - name: sharding_last_stable_mongos_and_mixed_shards_4
+    distros:
+    - rhel62-large
+  - name: sharding_last_stable_mongos_and_mixed_shards_5
+    distros:
+    - rhel62-large
+  - name: sharding_last_stable_mongos_and_mixed_shards_6
+    distros:
+    - rhel62-large
+  - name: sharding_last_stable_mongos_and_mixed_shards_7
+    distros:
+    - rhel62-large
+  - name: sharding_last_stable_mongos_and_mixed_shards_8
+    distros:
+    - rhel62-large
+  - name: sharding_last_stable_mongos_and_mixed_shards_9
+    distros:
+    - rhel62-large
+  - name: sharding_last_stable_mongos_and_mixed_shards_10
+    distros:
+    - rhel62-large
+  - name: sharding_last_stable_mongos_and_mixed_shards_11
+    distros:
+    - rhel62-large
+  - name: sharding_last_stable_mongos_and_mixed_shards_misc
+    distros:
+    - rhel62-large
+  - name: sharding_csrs_continuous_config_stepdown
+    distros:
+    - rhel62-large
+  - name: sharding_op_query_0
+    distros:
+    - rhel62-large
+  - name: sharding_op_query_1
+    distros:
+    - rhel62-large
+  - name: sharding_op_query_2
+    distros:
+    - rhel62-large
+  - name: sharding_op_query_3
+    distros:
+    - rhel62-large
+  - name: sharding_op_query_4
+    distros:
+    - rhel62-large
+  - name: sharding_op_query_5
+    distros:
+    - rhel62-large
+  - name: sharding_op_query_6
+    distros:
+    - rhel62-large
+  - name: sharding_op_query_7
+    distros:
+    - rhel62-large
+  - name: sharding_op_query_8
+    distros:
+    - rhel62-large
+  - name: sharding_op_query_9
+    distros:
+    - rhel62-large
+  - name: sharding_op_query_10
+    distros:
+    - rhel62-large
+  - name: sharding_op_query_11
+    distros:
+    - rhel62-large
+  - name: sharding_op_query_misc
+    distros:
+    - rhel62-large
+  - name: slow1
+  - name: serial_run
+  - name: snmp
+  - name: ssl
+  - name: sslSpecial
+  - name: tool
+  - name: update_fuzzer
+  - name: update_fuzzer_replication
+  - name: write_concern_majority_passthrough
+    distros:
+    - rhel62-large
+  - name: secondary_reads_passthrough
+    distros:
+    - rhel62-large
+
+- name: enterprise-rhel-62-64-bit-required-majority-read-concern-off
+  display_name: "! Enterprise RHEL 6.2 (majority read concern off)"
+  modules:
+  - enterprise
+  run_on:
+  - rhel62-small
+  expansions:
+    <<: *enterprise-rhel-62-64-bit-majority-read-concern-off-expansions
+    burn_in_tests_build_variant: enterprise-rhel-62-64-bit-majority-read-concern-off
+  tasks:
+  # This build variants exists specifically to test that newly added or modified JavaScript tests
+  # are correctly tagged with "requires_majority_read_concern", "uses_change_streams",
+  # "uses_prepare_transaction", "uses_multi_shard_transaction", and "uses_single_shard_transaction"
+  # prior to the changes being pushed. It uses the task list from the
+  # enterprise-rhel-62-64-bit-majority-read-concern-off build variant to determine the resmoke.py
+  # YAML suite configurations to run the tests under. Do not add more tasks to this list.
+  - name: compile_TG
+    requires:
+    - name: burn_in_tests
+    distros:
+    - rhel62-large
+  - name: burn_in_tests
+
 - name: enterprise-rhel-62-64-bit-coverage
   display_name: "~ Enterprise RHEL 6.2 DEBUG Code Coverage"
   modules:
@@ -11339,6 +12378,9 @@ buildvariants:
   - name: jsCore_op_query
   - name: jsCore_txns
   - name: causally_consistent_jscore_txns_passthrough
+  - name: logical_session_cache_replication_1sec_refresh_jscore_passthrough
+  - name: logical_session_cache_sharding_1sec_refresh_jscore_passthrough
+  - name: logical_session_cache_standalone_1sec_refresh_jscore_passthrough
   - name: mongosTest
   - name: multiversion_auth
   - name: multiversion
@@ -11438,6 +12480,9 @@ buildvariants:
   - name: jstestfuzz_concurrent_sharded
   - name: jstestfuzz_replication
   - name: jstestfuzz_sharded
+  - name: logical_session_cache_replication_1sec_refresh_jscore_passthrough
+  - name: logical_session_cache_sharding_1sec_refresh_jscore_passthrough
+  - name: logical_session_cache_standalone_1sec_refresh_jscore_passthrough
   - name: external_auth
   - name: replica_sets_auth
   - name: replica_sets_jscore_passthrough
@@ -11549,6 +12594,18 @@ buildvariants:
   - name: jstestfuzz_concurrent_sharded
   - name: jstestfuzz_replication
   - name: jstestfuzz_sharded
+  - name: logical_session_cache_replication_100ms_refresh_jscore_passthrough
+  - name: logical_session_cache_replication_1sec_refresh_jscore_passthrough
+  - name: logical_session_cache_replication_10sec_refresh_jscore_passthrough
+  - name: logical_session_cache_replication_default_refresh_jscore_passthrough
+  - name: logical_session_cache_sharding_100ms_refresh_jscore_passthrough
+  - name: logical_session_cache_sharding_1sec_refresh_jscore_passthrough
+  - name: logical_session_cache_sharding_10sec_refresh_jscore_passthrough
+  - name: logical_session_cache_sharding_default_refresh_jscore_passthrough
+  - name: logical_session_cache_standalone_100ms_refresh_jscore_passthrough
+  - name: logical_session_cache_standalone_1sec_refresh_jscore_passthrough
+  - name: logical_session_cache_standalone_10sec_refresh_jscore_passthrough
+  - name: logical_session_cache_standalone_default_refresh_jscore_passthrough
   - name: mongosTest
   - name: multiversion
   - name: noPassthrough
@@ -11566,6 +12623,9 @@ buildvariants:
   - name: concurrency_sharded_replication_with_balancer
   - name: concurrency_simultaneous
   - name: concurrency_simultaneous_replication
+  - name: logical_session_cache_replication_1sec_refresh_jscore_passthrough
+  - name: logical_session_cache_sharding_1sec_refresh_jscore_passthrough
+  - name: logical_session_cache_standalone_1sec_refresh_jscore_passthrough
   - name: replica_sets
   - name: replica_sets_auth
   - name: replica_sets_jscore_passthrough
@@ -11639,6 +12699,9 @@ buildvariants:
   - name: jstestfuzz_concurrent_sharded
   - name: jstestfuzz_replication
   - name: jstestfuzz_sharded
+  - name: logical_session_cache_replication_1sec_refresh_jscore_passthrough
+  - name: logical_session_cache_sharding_1sec_refresh_jscore_passthrough
+  - name: logical_session_cache_standalone_1sec_refresh_jscore_passthrough
   - name: mongosTest
   - name: multiversion
   - name: noPassthrough
@@ -11763,6 +12826,9 @@ buildvariants:
   - name: jstestfuzz_concurrent_sharded
   - name: jstestfuzz_replication
   - name: jstestfuzz_sharded
+  - name: logical_session_cache_replication_1sec_refresh_jscore_passthrough
+  - name: logical_session_cache_sharding_1sec_refresh_jscore_passthrough
+  - name: logical_session_cache_standalone_1sec_refresh_jscore_passthrough
   - name: mongosTest
   - name: noPassthroughWithMongod
   - name: noPassthrough
@@ -11873,6 +12939,9 @@ buildvariants:
   - name: jstestfuzz_concurrent_sharded
   - name: jstestfuzz_replication
   - name: jstestfuzz_sharded
+  - name: logical_session_cache_replication_1sec_refresh_jscore_passthrough
+  - name: logical_session_cache_sharding_1sec_refresh_jscore_passthrough
+  - name: logical_session_cache_standalone_1sec_refresh_jscore_passthrough
   - name: mongosTest
   - name: noPassthroughWithMongod
   - name: noPassthrough
@@ -11976,6 +13045,9 @@ buildvariants:
   - name: jsCore_op_query
   - name: jsCore_txns
   - name: causally_consistent_jscore_txns_passthrough
+  - name: logical_session_cache_replication_1sec_refresh_jscore_passthrough
+  - name: logical_session_cache_sharding_1sec_refresh_jscore_passthrough
+  - name: logical_session_cache_standalone_1sec_refresh_jscore_passthrough
   - name: mongosTest
   - name: noPassthroughWithMongod
   - name: noPassthrough
@@ -12095,6 +13167,9 @@ buildvariants:
   - name: jstestfuzz_concurrent_sharded
   - name: jstestfuzz_replication
   - name: jstestfuzz_sharded
+  - name: logical_session_cache_replication_1sec_refresh_jscore_passthrough
+  - name: logical_session_cache_sharding_1sec_refresh_jscore_passthrough
+  - name: logical_session_cache_standalone_1sec_refresh_jscore_passthrough
   - name: replica_sets_auth
   - name: replica_sets_jscore_passthrough
   - name: sasl
@@ -12167,6 +13242,9 @@ buildvariants:
   - name: jstestfuzz_concurrent_sharded
   - name: jstestfuzz_replication
   - name: jstestfuzz_sharded
+  - name: logical_session_cache_replication_1sec_refresh_jscore_passthrough
+  - name: logical_session_cache_sharding_1sec_refresh_jscore_passthrough
+  - name: logical_session_cache_standalone_1sec_refresh_jscore_passthrough
   - name: replica_sets_auth
   - name: replica_sets_jscore_passthrough
   - name: sasl
@@ -12270,6 +13348,9 @@ buildvariants:
   - name: jstestfuzz_concurrent_sharded
   - name: jstestfuzz_replication
   - name: jstestfuzz_sharded
+  - name: logical_session_cache_replication_1sec_refresh_jscore_passthrough
+  - name: logical_session_cache_sharding_1sec_refresh_jscore_passthrough
+  - name: logical_session_cache_standalone_1sec_refresh_jscore_passthrough
   - name: replica_sets_auth
   - name: replica_sets_jscore_passthrough
   - name: sasl
@@ -12356,6 +13437,9 @@ buildvariants:
   - name: jstestfuzz_concurrent_sharded
   - name: jstestfuzz_replication
   - name: jstestfuzz_sharded
+  - name: logical_session_cache_replication_1sec_refresh_jscore_passthrough
+  - name: logical_session_cache_sharding_1sec_refresh_jscore_passthrough
+  - name: logical_session_cache_standalone_1sec_refresh_jscore_passthrough
   - name: mongosTest
   - name: noPassthroughWithMongod
   - name: noPassthrough
@@ -12466,6 +13550,9 @@ buildvariants:
   - name: concurrency_sharded_replication_with_balancer
   - name: concurrency_simultaneous
   - name: concurrency_simultaneous_replication
+  - name: logical_session_cache_replication_1sec_refresh_jscore_passthrough
+  - name: logical_session_cache_sharding_1sec_refresh_jscore_passthrough
+  - name: logical_session_cache_standalone_1sec_refresh_jscore_passthrough
   - name: replica_sets
   - name: replica_sets_auth
   - name: replica_sets_jscore_passthrough
@@ -12531,6 +13618,9 @@ buildvariants:
   - name: jstestfuzz_concurrent_sharded
   - name: jstestfuzz_replication
   - name: jstestfuzz_sharded
+  - name: logical_session_cache_replication_1sec_refresh_jscore_passthrough
+  - name: logical_session_cache_sharding_1sec_refresh_jscore_passthrough
+  - name: logical_session_cache_standalone_1sec_refresh_jscore_passthrough
   - name: replica_sets_auth
   - name: replica_sets_jscore_passthrough
   - name: sasl
@@ -12615,6 +13705,9 @@ buildvariants:
   - name: concurrency_sharded_replication_with_balancer
   - name: concurrency_simultaneous
   - name: concurrency_simultaneous_replication
+  - name: logical_session_cache_replication_1sec_refresh_jscore_passthrough
+  - name: logical_session_cache_sharding_1sec_refresh_jscore_passthrough
+  - name: logical_session_cache_standalone_1sec_refresh_jscore_passthrough
   - name: replica_sets
   - name: replica_sets_auth
   - name: replica_sets_jscore_passthrough
@@ -12681,6 +13774,9 @@ buildvariants:
   - name: jstestfuzz_concurrent_sharded
   - name: jstestfuzz_replication
   - name: jstestfuzz_sharded
+  - name: logical_session_cache_replication_1sec_refresh_jscore_passthrough
+  - name: logical_session_cache_sharding_1sec_refresh_jscore_passthrough
+  - name: logical_session_cache_standalone_1sec_refresh_jscore_passthrough
   - name: replica_sets_auth
   - name: replica_sets_jscore_passthrough
   - name: sasl
@@ -12768,6 +13864,9 @@ buildvariants:
   - name: concurrency_sharded_replication_with_balancer
   - name: concurrency_simultaneous
   - name: concurrency_simultaneous_replication
+  - name: logical_session_cache_replication_1sec_refresh_jscore_passthrough
+  - name: logical_session_cache_sharding_1sec_refresh_jscore_passthrough
+  - name: logical_session_cache_standalone_1sec_refresh_jscore_passthrough
   - name: replica_sets
   - name: replica_sets_auth
   - name: replica_sets_jscore_passthrough
@@ -12889,6 +13988,18 @@ buildvariants:
   - name: jstestfuzz_sharded
   - name: jstestfuzz_sharded_session
   - name: jstestfuzz_sharded_causal_consistency
+  - name: logical_session_cache_replication_100ms_refresh_jscore_passthrough
+  - name: logical_session_cache_replication_1sec_refresh_jscore_passthrough
+  - name: logical_session_cache_replication_10sec_refresh_jscore_passthrough
+  - name: logical_session_cache_replication_default_refresh_jscore_passthrough
+  - name: logical_session_cache_sharding_100ms_refresh_jscore_passthrough
+  - name: logical_session_cache_sharding_1sec_refresh_jscore_passthrough
+  - name: logical_session_cache_sharding_10sec_refresh_jscore_passthrough
+  - name: logical_session_cache_sharding_default_refresh_jscore_passthrough
+  - name: logical_session_cache_standalone_100ms_refresh_jscore_passthrough
+  - name: logical_session_cache_standalone_1sec_refresh_jscore_passthrough
+  - name: logical_session_cache_standalone_10sec_refresh_jscore_passthrough
+  - name: logical_session_cache_standalone_default_refresh_jscore_passthrough
   - name: mongosTest
   - name: noPassthrough
   - name: noPassthroughWithMongod
@@ -13222,6 +14333,9 @@ buildvariants:
   - name: jstestfuzz_concurrent_sharded
   - name: jstestfuzz_replication
   - name: jstestfuzz_sharded
+  - name: logical_session_cache_replication_1sec_refresh_jscore_passthrough
+  - name: logical_session_cache_sharding_1sec_refresh_jscore_passthrough
+  - name: logical_session_cache_standalone_1sec_refresh_jscore_passthrough
   - name: mongosTest
   - name: noPassthrough
   - name: noPassthroughWithMongod
@@ -13302,6 +14416,9 @@ buildvariants:
   - name: jsCore_op_query
   - name: jsCore_txns
   - name: causally_consistent_jscore_txns_passthrough
+  - name: logical_session_cache_replication_1sec_refresh_jscore_passthrough
+  - name: logical_session_cache_sharding_1sec_refresh_jscore_passthrough
+  - name: logical_session_cache_standalone_1sec_refresh_jscore_passthrough
   - name: mongosTest
   - name: noPassthrough
   - name: noPassthroughWithMongod
@@ -13401,6 +14518,9 @@ buildvariants:
   - name: jsCore_op_query
   - name: jsCore_txns
   - name: causally_consistent_jscore_txns_passthrough
+  - name: logical_session_cache_replication_1sec_refresh_jscore_passthrough
+  - name: logical_session_cache_sharding_1sec_refresh_jscore_passthrough
+  - name: logical_session_cache_standalone_1sec_refresh_jscore_passthrough
   - name: mongosTest
   - name: noPassthrough
   - name: noPassthroughWithMongod
@@ -13528,6 +14648,18 @@ buildvariants:
   - name: jsCore_txns
   - name: causally_consistent_jscore_txns_passthrough
   - name: jsonSchema
+  - name: logical_session_cache_replication_100ms_refresh_jscore_passthrough
+  - name: logical_session_cache_replication_1sec_refresh_jscore_passthrough
+  - name: logical_session_cache_replication_10sec_refresh_jscore_passthrough
+  - name: logical_session_cache_replication_default_refresh_jscore_passthrough
+  - name: logical_session_cache_sharding_100ms_refresh_jscore_passthrough
+  - name: logical_session_cache_sharding_1sec_refresh_jscore_passthrough
+  - name: logical_session_cache_sharding_10sec_refresh_jscore_passthrough
+  - name: logical_session_cache_sharding_default_refresh_jscore_passthrough
+  - name: logical_session_cache_standalone_100ms_refresh_jscore_passthrough
+  - name: logical_session_cache_standalone_1sec_refresh_jscore_passthrough
+  - name: logical_session_cache_standalone_10sec_refresh_jscore_passthrough
+  - name: logical_session_cache_standalone_default_refresh_jscore_passthrough
   - name: mongosTest
   - name: multiversion_auth
   - name: multiversion
@@ -13711,6 +14843,9 @@ buildvariants:
   - name: jsCore_txns
   - name: causally_consistent_jscore_txns_passthrough
   - name: jsonSchema
+  - name: logical_session_cache_replication_1sec_refresh_jscore_passthrough
+  - name: logical_session_cache_sharding_1sec_refresh_jscore_passthrough
+  - name: logical_session_cache_standalone_1sec_refresh_jscore_passthrough
   - name: mongosTest
   - name: multiversion_auth
   - name: multiversion
@@ -13787,6 +14922,9 @@ buildvariants:
   - name: jsCore
   - name: jsCore_txns
   - name: causally_consistent_jscore_txns_passthrough
+  - name: logical_session_cache_replication_1sec_refresh_jscore_passthrough
+  - name: logical_session_cache_sharding_1sec_refresh_jscore_passthrough
+  - name: logical_session_cache_standalone_1sec_refresh_jscore_passthrough
   - name: watchdog_wiredtiger
 
 - name: ubuntu1604-debug-aubsan-async
@@ -13856,6 +14994,9 @@ buildvariants:
   - name: jsCore_op_query
   - name: jsCore_txns
   - name: causally_consistent_jscore_txns_passthrough
+  - name: logical_session_cache_replication_1sec_refresh_jscore_passthrough
+  - name: logical_session_cache_sharding_1sec_refresh_jscore_passthrough
+  - name: logical_session_cache_standalone_1sec_refresh_jscore_passthrough
   - name: mongosTest
   - name: multiversion_auth
   - name: multiversion
@@ -13926,7 +15067,8 @@ buildvariants:
   batchtime: 1440 # 1 day
   stepback: false
   tasks:
-  - name: update_test_lifecycle
+# Test lifecycle is temporarily disabled to reduce load on Evergreen API.
+# - name: update_test_lifecycle
   - name: fetch_test_lifecycle
     distros:
     - rhel62-small

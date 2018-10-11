@@ -1,7 +1,7 @@
 /**
  * Test that we can't call prepareTransaction if there isn't an active transaction on the session.
  *
- * @tags: [uses_transactions]
+ * @tags: [uses_transactions, uses_prepare_transaction]
  */
 
 (function() {
@@ -24,8 +24,9 @@
               "the session");
     assert.commandFailedWithCode(sessionDB.adminCommand({
         prepareTransaction: 1,
+        coordinatorId: "dummy",
         txnNumber: NumberLong(0),
-        stmtid: NumberInt(1),
+        stmtId: NumberInt(1),
         autocommit: false
     }),
                                  ErrorCodes.NoSuchTransaction);
@@ -38,8 +39,9 @@
 
     assert.commandFailedWithCode(sessionDB.adminCommand({
         prepareTransaction: 1,
+        coordinatorId: "dummy",
         txnNumber: NumberLong(0),
-        stmtid: NumberInt(1),
+        stmtId: NumberInt(1),
         autocommit: false
     }),
                                  ErrorCodes.NoSuchTransaction);
@@ -52,8 +54,9 @@
 
     assert.commandFailedWithCode(sessionDB.adminCommand({
         prepareTransaction: 1,
+        coordinatorId: "dummy",
         txnNumber: NumberLong(1),
-        stmtid: NumberInt(1),
+        stmtId: NumberInt(1),
         autocommit: false
     }),
                                  ErrorCodes.TransactionCommitted);

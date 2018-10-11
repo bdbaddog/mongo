@@ -72,6 +72,7 @@
 #include "mongo/db/storage/storage_file_util.h"
 #include "mongo/db/storage/storage_options.h"
 #include "mongo/db/storage/storage_repair_observer.h"
+#include "mongo/db/storage/wiredtiger/wiredtiger_cursor.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_customization_hooks.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_extensions.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_global_options.h"
@@ -267,14 +268,21 @@ public:
                 // First, initialDataTimestamp is Timestamp(0, 1) -> Take full checkpoint. This is
                 // when there is no consistent view of the data (i.e: during initial sync).
                 //
-                // Second, stableTimestamp < initialDataTimestamp: Skip checkpoints. The data on
-                // disk is prone to being rolled back. Hold off on checkpoints.  Hope that the
-                // stable timestamp surpasses the data on disk, allowing storage to persist newer
-                // copies to disk.
+                // Second, enableMajorityReadConcern is false. In this case, we are not tracking a
+                // stable timestamp. Take a full checkpoint.
                 //
-                // Third, stableTimestamp >= initialDataTimestamp: Take stable checkpoint. Steady
+                // Third, stableTimestamp < initialDataTimestamp: Skip checkpoints. The data on disk
+                // is prone to being rolled back. Hold off on checkpoints.  Hope that the stable
+                // timestamp surpasses the data on disk, allowing storage to persist newer copies to
+                // disk.
+                //
+                // Fourth, stableTimestamp >= initialDataTimestamp: Take stable checkpoint. Steady
                 // state case.
                 if (initialDataTimestamp.asULL() <= 1) {
+                    UniqueWiredTigerSession session = _sessionCache->getSession();
+                    WT_SESSION* s = session->getSession();
+                    invariantWTOK(s->checkpoint(s, "use_timestamp=false"));
+                } else if (!serverGlobalParams.enableMajorityReadConcern) {
                     UniqueWiredTigerSession session = _sessionCache->getSession();
                     WT_SESSION* s = session->getSession();
                     invariantWTOK(s->checkpoint(s, "use_timestamp=false"));
@@ -295,9 +303,8 @@ public:
                     WT_SESSION* s = session->getSession();
                     invariantWTOK(s->checkpoint(s, "use_timestamp=true"));
 
-                    // Now that the checkpoint is durable, publish the previously recorded stable
-                    // timestamp and oplog needed to recover from it.
-                    _lastStableCheckpointTimestamp.store(stableTimestamp.asULL());
+                    // Now that the checkpoint is durable, publish the oplog needed to recover
+                    // from it.
                     _oplogNeededForCrashRecovery.store(oplogNeededForRollback.asULL());
                 }
             } catch (const WriteConflictException&) {
@@ -340,10 +347,6 @@ public:
         }
     }
 
-    std::uint64_t getLastStableCheckpointTimestamp() const {
-        return _lastStableCheckpointTimestamp.load();
-    }
-
     std::uint64_t getOplogNeededForCrashRecovery() const {
         return _oplogNeededForCrashRecovery.load();
     }
@@ -372,10 +375,6 @@ private:
 
     bool _hasTriggeredFirstStableCheckpoint = false;
 
-    // The earliest stable timestamp at which the last checkpoint could have been taken. The
-    // checkpoint might have used a newer stable timestamp if stable was updated concurrently with
-    // checkpointing.
-    AtomicWord<std::uint64_t> _lastStableCheckpointTimestamp;
     AtomicWord<std::uint64_t> _oplogNeededForCrashRecovery;
 };
 
@@ -448,7 +447,8 @@ WiredTigerKVEngine::WiredTigerKVEngine(const std::string& canonicalName,
       _durable(durable),
       _ephemeral(ephemeral),
       _inRepairMode(repair),
-      _readOnly(readOnly) {
+      _readOnly(readOnly),
+      _keepDataHistory(serverGlobalParams.enableMajorityReadConcern) {
     boost::filesystem::path journalPath = path;
     journalPath /= "journal";
     if (_durable) {
@@ -708,6 +708,10 @@ void WiredTigerKVEngine::cleanShutdown() {
         log() << "Downgrading WiredTiger datafiles.";
         LOG(1) << "Downgrade compatibility configuration: " << _fileVersion.getDowngradeString();
         invariantWTOK(_conn->reconfigure(_conn, _fileVersion.getDowngradeString().c_str()));
+    }
+
+    if (!serverGlobalParams.enableMajorityReadConcern) {
+        closeConfig += "use_timestamp=false,";
     }
 
     invariantWTOK(_conn->close(_conn, closeConfig.c_str()));
@@ -1361,6 +1365,10 @@ MONGO_FAIL_POINT_DEFINE(WTPreserveSnapshotHistoryIndefinitely);
 
 void WiredTigerKVEngine::setStableTimestamp(Timestamp stableTimestamp,
                                             boost::optional<Timestamp> maximumTruncationTimestamp) {
+    if (!_keepDataHistory) {
+        return;
+    }
+
     if (stableTimestamp.isNull()) {
         return;
     }
@@ -1448,16 +1456,23 @@ void WiredTigerKVEngine::setOldestTimestampFromStable() {
         newOldestTimestamp = oplogReadTimestamp;
     }
 
-    _setOldestTimestamp(newOldestTimestamp, false);
+    setOldestTimestamp(newOldestTimestamp, false);
 }
 
-void WiredTigerKVEngine::setOldestTimestamp(Timestamp newOldestTimestamp) {
-    _setOldestTimestamp(newOldestTimestamp, true);
-}
-
-void WiredTigerKVEngine::_setOldestTimestamp(Timestamp newOldestTimestamp, bool force) {
+void WiredTigerKVEngine::setOldestTimestamp(Timestamp newOldestTimestamp, bool force) {
     if (MONGO_FAIL_POINT(WTPreserveSnapshotHistoryIndefinitely)) {
         return;
+    }
+    const auto localSnapshotTimestamp = _sessionCache->snapshotManager().getLocalSnapshot();
+    if (!force && localSnapshotTimestamp && newOldestTimestamp > *localSnapshotTimestamp) {
+        // When force is not set, lag the `oldest timestamp` to the local snapshot timestamp.
+        // Secondary reads are performed at the local snapshot timestamp, so advancing the oldest
+        // timestamp beyond the local snapshot timestamp could cause secondary reads to fail. This
+        // is not a problem when majority read concern is enabled, since the replication system will
+        // not set the stable timestamp ahead of the local snapshot timestamp. However, when
+        // majority read concern is disabled and the oldest timestamp is set by the oplog manager,
+        // the oplog manager can set the oldest timestamp ahead of the local snapshot timestamp.
+        newOldestTimestamp = *localSnapshotTimestamp;
     }
 
     char oldestTSConfigString["force=true,oldest_timestamp=,commit_timestamp="_sd.size() +
@@ -1529,6 +1544,13 @@ void WiredTigerKVEngine::setInitialDataTimestamp(Timestamp initialDataTimestamp)
 }
 
 bool WiredTigerKVEngine::supportsRecoverToStableTimestamp() const {
+    if (!_keepDataHistory) {
+        return false;
+    }
+    return true;
+}
+
+bool WiredTigerKVEngine::supportsRecoveryTimestamp() const {
     return true;
 }
 
@@ -1601,8 +1623,8 @@ Timestamp WiredTigerKVEngine::getAllCommittedTimestamp() const {
 }
 
 boost::optional<Timestamp> WiredTigerKVEngine::getRecoveryTimestamp() const {
-    if (!supportsRecoverToStableTimestamp()) {
-        severe() << "WiredTiger is configured to not support recover to a stable timestamp";
+    if (!supportsRecoveryTimestamp()) {
+        severe() << "WiredTiger is configured to not support providing a recovery timestamp";
         fassertFailed(50745);
     }
 
@@ -1628,7 +1650,7 @@ boost::optional<Timestamp> WiredTigerKVEngine::getLastStableRecoveryTimestamp() 
         return stable;
     }
 
-    const auto ret = _checkpointThread->getLastStableCheckpointTimestamp();
+    const auto ret = _getCheckpointTimestamp();
     if (ret) {
         return Timestamp(ret);
     }
@@ -1641,10 +1663,6 @@ boost::optional<Timestamp> WiredTigerKVEngine::getLastStableRecoveryTimestamp() 
 }
 
 Timestamp WiredTigerKVEngine::getOplogNeededForRollback() const {
-    // TODO: SERVER-36982 intends to allow holding onto minimum history (in front of the stable
-    // timestamp). If that results in never calling `StorageEngine::setStableTimestamp`, oplog
-    // will never be truncated. This method will need to be updated to accomodate that case, most
-    // simply by having this return `Timestamp::max()`.
     return Timestamp(_oplogNeededForRollback.load());
 }
 
@@ -1657,6 +1675,10 @@ boost::optional<Timestamp> WiredTigerKVEngine::getOplogNeededForCrashRecovery() 
 }
 
 Timestamp WiredTigerKVEngine::getPinnedOplog() const {
+    if (!_keepDataHistory) {
+        // We use rollbackViaRefetch and take full checkpoints, so there is no need to pin oplog.
+        return Timestamp::max();
+    }
     return getOplogNeededForCrashRecovery().value_or(getOplogNeededForRollback());
 }
 
@@ -1664,12 +1686,16 @@ bool WiredTigerKVEngine::supportsReadConcernSnapshot() const {
     return true;
 }
 
+bool WiredTigerKVEngine::supportsReadConcernMajority() const {
+    return _keepDataHistory;
+}
+
 void WiredTigerKVEngine::startOplogManager(OperationContext* opCtx,
                                            const std::string& uri,
                                            WiredTigerRecordStore* oplogRecordStore) {
     stdx::lock_guard<stdx::mutex> lock(_oplogManagerMutex);
     if (_oplogManagerCount == 0)
-        _oplogManager->start(opCtx, uri, oplogRecordStore);
+        _oplogManager->start(opCtx, uri, oplogRecordStore, !_keepDataHistory);
     _oplogManagerCount++;
 }
 
@@ -1706,6 +1732,15 @@ Timestamp WiredTigerKVEngine::getOldestTimestamp() const {
 
 Timestamp WiredTigerKVEngine::getInitialDataTimestamp() const {
     return Timestamp(_initialDataTimestamp.load());
+}
+
+std::uint64_t WiredTigerKVEngine::_getCheckpointTimestamp() const {
+    char buf[(2 * 8 /*bytes in hex*/) + 1 /*nul terminator*/];
+    invariantWTOK(_conn->query_timestamp(_conn, buf, "get=last_checkpoint"));
+
+    std::uint64_t tmp;
+    fassert(50963, parseNumberFromStringWithBase(buf, 16, &tmp));
+    return tmp;
 }
 
 }  // namespace mongo

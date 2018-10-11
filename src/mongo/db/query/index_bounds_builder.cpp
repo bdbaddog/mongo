@@ -46,6 +46,7 @@
 #include "mongo/db/query/expression_index_knobs.h"
 #include "mongo/db/query/indexability.h"
 #include "mongo/db/query/planner_ixselect.h"
+#include "mongo/db/query/planner_wildcard_helpers.h"
 #include "mongo/db/query/query_knobs.h"
 #include "mongo/util/log.h"
 #include "mongo/util/mongoutils/str.h"
@@ -55,6 +56,8 @@
 namespace mongo {
 
 namespace {
+
+namespace wcp = ::mongo::wildcard_planning;
 
 // Helper for checking that an OIL "appears" to be ascending given one interval.
 void assertOILIsAscendingLocally(const vector<Interval>& intervals, size_t idx) {
@@ -335,6 +338,22 @@ void IndexBoundsBuilder::translate(const MatchExpression* expr,
                                    const IndexEntry& index,
                                    OrderedIntervalList* oilOut,
                                    BoundsTightness* tightnessOut) {
+    // Fill out the bounds and tightness appropriate for the given predicate.
+    _translatePredicate(expr, elt, index, oilOut, tightnessOut);
+
+    // Under certain circumstances, queries on a $** index require that the bounds' tightness be
+    // adjusted regardless of the predicate. Having filled out the initial bounds, we apply any
+    // necessary changes to the tightness here.
+    if (index.type == IndexType::INDEX_WILDCARD) {
+        *tightnessOut = wcp::translateWildcardIndexBoundsAndTightness(index, *tightnessOut, oilOut);
+    }
+}
+
+void IndexBoundsBuilder::_translatePredicate(const MatchExpression* expr,
+                                             const BSONElement& elt,
+                                             const IndexEntry& index,
+                                             OrderedIntervalList* oilOut,
+                                             BoundsTightness* tightnessOut) {
     // We expect that the OIL we are constructing starts out empty.
     invariant(oilOut->intervals.empty());
 
@@ -352,12 +371,12 @@ void IndexBoundsBuilder::translate(const MatchExpression* expr,
 
     if (MatchExpression::ELEM_MATCH_VALUE == expr->matchType()) {
         OrderedIntervalList acc;
-        translate(expr->getChild(0), elt, index, &acc, tightnessOut);
+        _translatePredicate(expr->getChild(0), elt, index, &acc, tightnessOut);
 
         for (size_t i = 1; i < expr->numChildren(); ++i) {
             OrderedIntervalList next;
             BoundsTightness tightness;
-            translate(expr->getChild(i), elt, index, &next, &tightness);
+            _translatePredicate(expr->getChild(i), elt, index, &next, &tightness);
             intersectize(next, &acc);
         }
 
@@ -395,7 +414,7 @@ void IndexBoundsBuilder::translate(const MatchExpression* expr,
             return;
         }
 
-        translate(child, elt, index, oilOut, tightnessOut);
+        _translatePredicate(child, elt, index, oilOut, tightnessOut);
         oilOut->complement();
 
         // Until the index distinguishes between missing values and literal null values, we cannot
@@ -403,9 +422,6 @@ void IndexBoundsBuilder::translate(const MatchExpression* expr,
         // build exact bounds for the inverse, for example the query {a: {$ne: null}}.
         if (MatchExpression::EQ == child->matchType() &&
             static_cast<ComparisonMatchExpression*>(child)->getData().type() == BSONType::jstNULL) {
-            // We don't expect to try to use a sparse index for $ne: null. While this should be
-            // correct, it is not currently supported.
-            invariant(!index.sparse);
             *tightnessOut = IndexBoundsBuilder::EXACT;
         }
 

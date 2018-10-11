@@ -11,10 +11,10 @@
 
 var $config = (function() {
     var data = {
-        nIndexes: 3 + 1,  // 3 created and 1 for _id
+        nIndexes: 4 + 1,  // 4 created and 1 for _id.
         nDocumentsToInsert: 1000,
-        maxInteger: 100,   // Used for document values. Must be a factor of nDocumentsToInsert
-        prefix: 'reindex'  // Use filename for prefix because filename is assumed unique
+        maxInteger: 100,   // Used for document values. Must be a factor of nDocumentsToInsert.
+        prefix: 'reindex'  // Use filename for prefix because filename is assumed unique.
     };
 
     var states = (function() {
@@ -34,15 +34,12 @@ var $config = (function() {
         }
 
         function createIndexes(db, collName) {
-            // The number of indexes created here is also stored in data.nIndexes
-            var textResult = db[this.threadCollName].ensureIndex({text: 'text'});
-            assertAlways.commandWorked(textResult);
-
-            var geoResult = db[this.threadCollName].ensureIndex({geo: '2dsphere'});
-            assertAlways.commandWorked(geoResult);
-
-            var integerResult = db[this.threadCollName].ensureIndex({integer: 1});
-            assertAlways.commandWorked(integerResult);
+            // The number of indexes created here is also stored in data.nIndexes.
+            const coll = db[this.threadCollName];
+            assertAlways.commandWorked(coll.createIndex({text: 'text'}));
+            assertAlways.commandWorked(coll.createIndex({geo: '2dsphere'}));
+            assertAlways.commandWorked(coll.createIndex({integer: 1}));
+            assertAlways.commandWorked(coll.createIndex({"$**": 1}));
         }
 
         function init(db, collName) {

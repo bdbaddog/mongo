@@ -39,6 +39,7 @@
 #include "mongo/db/clientcursor.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/curop.h"
+#include "mongo/db/curop_failpoint_helpers.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/exec/filter.h"
 #include "mongo/db/exec/working_set_common.h"
@@ -72,6 +73,9 @@ using stdx::make_unique;
 
 // Failpoint for checking whether we've received a getmore.
 MONGO_FAIL_POINT_DEFINE(failReceivedGetmore);
+
+// Failpoint to keep a cursor pinned.
+MONGO_FAIL_POINT_DEFINE(legacyGetMoreWaitWithCursor)
 
 bool shouldSaveCursor(OperationContext* opCtx,
                       const Collection* collection,
@@ -170,7 +174,7 @@ namespace {
 void generateBatch(int ntoreturn,
                    ClientCursor* cursor,
                    BufBuilder* bb,
-                   int* numResults,
+                   std::uint64_t* numResults,
                    PlanExecutor::ExecState* state) {
     PlanExecutor* exec = cursor->getExecutor();
 
@@ -308,7 +312,7 @@ Message getMore(OperationContext* opCtx,
     // These are set in the QueryResult msg we return.
     int resultFlags = ResultFlag_AwaitCapable;
 
-    int numResults = 0;
+    std::uint64_t numResults = 0;
     int startingResult = 0;
 
     const int InitialBufSize =
@@ -373,7 +377,7 @@ Message getMore(OperationContext* opCtx,
         opCtx->checkForInterrupt();  // May trigger maxTimeAlwaysTimeOut fail point.
 
         // What number result are we starting at?  Used to fill out the reply.
-        startingResult = cc->pos();
+        startingResult = cc->nReturnedSoFar();
 
         uint64_t notifierVersion = 0;
         std::shared_ptr<CappedInsertNotifier> notifier;
@@ -404,6 +408,8 @@ Message getMore(OperationContext* opCtx,
             // command or upconverted legacy query in the originatingCommand field.
             curOp.setOpDescription_inlock(upconvertGetMoreEntry(nss, cursorid, ntoreturn));
             curOp.setOriginatingCommand_inlock(cc->getOriginatingCommandObj());
+            // Update the generic cursor in curOp.
+            curOp.setGenericCursor_inlock(cc->toGenericCursor());
         }
 
         PlanExecutor::ExecState state;
@@ -413,6 +419,10 @@ Message getMore(OperationContext* opCtx,
         // metrics, as they accumulate over the course of a cursor's lifetime.
         PlanSummaryStats preExecutionStats;
         Explain::getSummaryStats(*exec, &preExecutionStats);
+        if (MONGO_FAIL_POINT(legacyGetMoreWaitWithCursor)) {
+            CurOpFailpointHelpers::waitWhileFailPointEnabled(
+                &legacyGetMoreWaitWithCursor, opCtx, "legacyGetMoreWaitWithCursor", nullptr);
+        }
 
         generateBatch(ntoreturn, cc, &bb, &numResults, &state);
 
@@ -476,7 +486,8 @@ Message getMore(OperationContext* opCtx,
                    << PlanExecutor::statestr(state);
         } else {
             // Continue caching the ClientCursor.
-            cc->incPos(numResults);
+            cc->incNReturnedSoFar(numResults);
+            cc->incNBatches();
             exec->saveState();
             exec->detachFromOperationContext();
             LOG(5) << "getMore saving client cursor ended with state "
@@ -675,7 +686,8 @@ std::string runQuery(OperationContext* opCtx,
             curOp.debug().exhaust = true;
         }
 
-        pinnedCursor.getCursor()->setPos(numResults);
+        pinnedCursor.getCursor()->setNReturnedSoFar(numResults);
+        pinnedCursor.getCursor()->incNBatches();
 
         // We assume that cursors created through a DBDirectClient are always used from their
         // original OperationContext, so we do not need to move time to and from the cursor.

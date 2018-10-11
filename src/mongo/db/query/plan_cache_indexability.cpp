@@ -32,7 +32,7 @@
 
 #include "mongo/base/init.h"
 #include "mongo/base/owned_pointer_vector.h"
-#include "mongo/db/index/all_paths_key_generator.h"
+#include "mongo/db/index/wildcard_key_generator.h"
 #include "mongo/db/matcher/expression.h"
 #include "mongo/db/matcher/expression_algo.h"
 #include "mongo/db/matcher/expression_internal_expr_eq.h"
@@ -40,55 +40,13 @@
 #include "mongo/db/query/collation/collation_index_key.h"
 #include "mongo/db/query/collation/collator_interface.h"
 #include "mongo/db/query/index_entry.h"
+#include "mongo/db/query/planner_ixselect.h"
 #include "mongo/stdx/memory.h"
 #include <memory>
 
 namespace mongo {
 
 namespace {
-
-bool canUseAllPathsIndex(BSONElement elt, MatchExpression::MatchType matchType) {
-    if (elt.type() == BSONType::Object) {
-        return false;
-    }
-
-    if (elt.type() == BSONType::Array) {
-        // We only support equality to empty array.
-        return elt.embeddedObject().isEmpty() && matchType == MatchExpression::EQ;
-    }
-
-    return true;
-}
-
-bool supportedByAllPathsIndex(const MatchExpression* queryExpr) {
-    if (ComparisonMatchExpression::isComparisonMatchExpression(queryExpr)) {
-        const ComparisonMatchExpression* cmpExpr =
-            static_cast<const ComparisonMatchExpression*>(queryExpr);
-
-        return canUseAllPathsIndex(cmpExpr->getData(), cmpExpr->matchType());
-    } else if (queryExpr->matchType() == MatchExpression::MATCH_IN) {
-        const auto* queryExprIn = static_cast<const InMatchExpression*>(queryExpr);
-
-        return std::all_of(
-            queryExprIn->getEqualities().begin(),
-            queryExprIn->getEqualities().end(),
-            [](const BSONElement& elt) { return canUseAllPathsIndex(elt, MatchExpression::EQ); });
-    }
-
-    return true;
-};
-
-bool supportedBySparseIndex(const MatchExpression* queryExpr) {
-    if (queryExpr->matchType() == MatchExpression::EQ) {
-        const auto* queryExprEquality = static_cast<const EqualityMatchExpression*>(queryExpr);
-        return !queryExprEquality->getData().isNull();
-    } else if (queryExpr->matchType() == MatchExpression::MATCH_IN) {
-        const auto* queryExprIn = static_cast<const InMatchExpression*>(queryExpr);
-        return !queryExprIn->hasNull();
-    } else {
-        return true;
-    }
-};
 
 IndexabilityDiscriminator getPartialIndexDiscriminator(const MatchExpression* filterExpr) {
     return [filterExpr](const MatchExpression* queryExpr) {
@@ -124,13 +82,21 @@ IndexabilityDiscriminator getCollatedIndexDiscriminator(const CollatorInterface*
         return true;
     };
 }
+
+bool nodeIsConservativelySupportedBySparseIndex(const MatchExpression* me) {
+    // When an expression is in an $elemMatch, a sparse index may be able to support an equality to
+    // null. We don't track whether or not a match expression is in an $elemMatch when generating
+    // the plan cache key, so we make the conservative assumption that it is not.
+    const bool inElemMatch = false;
+    return QueryPlannerIXSelect::nodeIsSupportedBySparseIndex(me, inElemMatch);
+}
 }
 
 void PlanCacheIndexabilityState::processSparseIndex(const std::string& indexName,
                                                     const BSONObj& keyPattern) {
     for (BSONElement elem : keyPattern) {
         _pathDiscriminatorsMap[elem.fieldNameStringData()][indexName].addDiscriminator(
-            supportedBySparseIndex);
+            nodeIsConservativelySupportedBySparseIndex);
     }
 }
 
@@ -146,12 +112,12 @@ void PlanCacheIndexabilityState::processPartialIndex(const std::string& indexNam
     }
 }
 
-void PlanCacheIndexabilityState::processAllPathsIndex(const IndexEntry& ie) {
-    invariant(ie.type == IndexType::INDEX_ALLPATHS);
+void PlanCacheIndexabilityState::processWildcardIndex(const IndexEntry& ie) {
+    invariant(ie.type == IndexType::INDEX_WILDCARD);
 
-    _allPathsIndexDiscriminators.emplace_back(
-        AllPathsKeyGenerator::createProjectionExec(ie.keyPattern,
-                                                   ie.infoObj.getObjectField("starPathsTempName")),
+    _wildcardIndexDiscriminators.emplace_back(
+        WildcardKeyGenerator::createProjectionExec(ie.keyPattern,
+                                                   ie.infoObj.getObjectField("wildcardProjection")),
         ie.identifier.catalogName,
         ie.filterExpr,
         ie.collator);
@@ -179,20 +145,23 @@ const IndexToDiscriminatorMap& PlanCacheIndexabilityState::getDiscriminators(
     return it->second;
 }
 
-IndexToDiscriminatorMap PlanCacheIndexabilityState::buildAllPathsDiscriminators(
+IndexToDiscriminatorMap PlanCacheIndexabilityState::buildWildcardDiscriminators(
     StringData path) const {
 
     IndexToDiscriminatorMap ret;
-    for (auto&& allPathsDiscriminator : _allPathsIndexDiscriminators) {
-        if (allPathsDiscriminator.projectionExec->applyProjectionToOneField(path)) {
-            CompositeIndexabilityDiscriminator& cid = ret[allPathsDiscriminator.catalogName];
+    for (auto&& wildcardDiscriminator : _wildcardIndexDiscriminators) {
+        if (wildcardDiscriminator.projectionExec->applyProjectionToOneField(path)) {
+            CompositeIndexabilityDiscriminator& cid = ret[wildcardDiscriminator.catalogName];
 
-            cid.addDiscriminator(supportedByAllPathsIndex);
-            cid.addDiscriminator(supportedBySparseIndex);
-            cid.addDiscriminator(getCollatedIndexDiscriminator(allPathsDiscriminator.collator));
-            if (allPathsDiscriminator.filterExpr) {
+            // We can use these 'shallow' functions because the code building the plan cache key
+            // will descend the match expression for us, and check the discriminator's return value
+            // at each node.
+            cid.addDiscriminator(QueryPlannerIXSelect::nodeIsSupportedByWildcardIndex);
+            cid.addDiscriminator(nodeIsConservativelySupportedBySparseIndex);
+            cid.addDiscriminator(getCollatedIndexDiscriminator(wildcardDiscriminator.collator));
+            if (wildcardDiscriminator.filterExpr) {
                 cid.addDiscriminator(
-                    getPartialIndexDiscriminator(allPathsDiscriminator.filterExpr));
+                    getPartialIndexDiscriminator(wildcardDiscriminator.filterExpr));
             }
         }
     }
@@ -203,8 +172,8 @@ void PlanCacheIndexabilityState::updateDiscriminators(const std::vector<IndexEnt
     _pathDiscriminatorsMap = PathDiscriminatorsMap();
 
     for (const IndexEntry& idx : indexEntries) {
-        if (idx.type == IndexType::INDEX_ALLPATHS) {
-            processAllPathsIndex(idx);
+        if (idx.type == IndexType::INDEX_WILDCARD) {
+            processWildcardIndex(idx);
             continue;
         }
 

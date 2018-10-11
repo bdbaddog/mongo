@@ -37,6 +37,7 @@ if wiredtiger:
         target='storage_wiredtiger_core',
         source= [
             'wiredtiger_begin_transaction_block.cpp',
+            'wiredtiger_cursor.cpp',
             'wiredtiger_global_options.cpp',
             'wiredtiger_index.cpp',
             'wiredtiger_kv_engine.cpp',
@@ -149,6 +150,7 @@ if wiredtiger:
         ],
         LIBDEPS_PRIVATE=[
             '$BUILD_DIR/mongo/db/auth/authmocks',
+            '$BUILD_DIR/mongo/db/index/index_access_methods',
             '$BUILD_DIR/mongo/db/repl/repl_coordinator_interface',
             '$BUILD_DIR/mongo/db/repl/replmocks',
         ],

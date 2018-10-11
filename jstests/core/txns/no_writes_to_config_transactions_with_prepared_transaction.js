@@ -2,7 +2,7 @@
  * Tests that other than insertions, it is illegal to modify config.transactions while the session
  * has a prepared transaction.
  *
- * @tags: [uses_transactions]
+ * @tags: [uses_transactions, uses_prepare_transaction]
  */
 
 (function() {
@@ -45,8 +45,9 @@
     }));
     assert.commandWorked(sessionDB.adminCommand({
         prepareTransaction: 1,
+        coordinatorId: "dummy",
         txnNumber: NumberLong(0),
-        stmtid: NumberInt(1),
+        stmtId: NumberInt(1),
         autocommit: false
     }));
 

@@ -5,18 +5,6 @@ Import("get_option")
 
 env = env.Clone()
 
-env.Library(
-    target='cluster_commands_helpers',
-    source=[
-        'cluster_commands_helpers.cpp',
-    ],
-    LIBDEPS=[
-        '$BUILD_DIR/mongo/db/curop',
-        '$BUILD_DIR/mongo/s/async_requests_sender',
-        '$BUILD_DIR/mongo/s/transaction/router_session',
-    ],
-)
-
 # These commands are linked both in MongoS and MongoD
 env.Library(
     target='shared_cluster_commands',
@@ -103,6 +91,7 @@ env.Library(
         env.Idlc('cluster_multicast.idl')[0],
     ],
     LIBDEPS_PRIVATE=[
+        '$BUILD_DIR/mongo/db/audit',
         '$BUILD_DIR/mongo/db/auth/auth',
         '$BUILD_DIR/mongo/db/auth/role_graph',
         '$BUILD_DIR/mongo/db/auth/saslauth',
@@ -110,12 +99,13 @@ env.Library(
         '$BUILD_DIR/mongo/db/commands/current_op_common',
         '$BUILD_DIR/mongo/db/commands/feature_compatibility_parsers',
         '$BUILD_DIR/mongo/db/commands/kill_common',
+        '$BUILD_DIR/mongo/db/commands/list_databases_command',
         '$BUILD_DIR/mongo/db/commands/profile_common',
         '$BUILD_DIR/mongo/db/commands/servers',
         '$BUILD_DIR/mongo/db/commands/test_commands_enabled',
         '$BUILD_DIR/mongo/db/commands/write_commands_common',
         '$BUILD_DIR/mongo/db/ftdc/ftdc_server',
-        '$BUILD_DIR/mongo/db/handle_request_response',
+        '$BUILD_DIR/mongo/db/shared_request_handling',
         '$BUILD_DIR/mongo/db/logical_session_cache_impl',
         '$BUILD_DIR/mongo/db/pipeline/aggregation',
         '$BUILD_DIR/mongo/db/stats/counters',
@@ -126,7 +116,7 @@ env.Library(
         '$BUILD_DIR/mongo/s/query/cluster_client_cursor',
         '$BUILD_DIR/mongo/s/sharding_api',
         '$BUILD_DIR/mongo/s/sharding_legacy_api',
-        '$BUILD_DIR/mongo/s/transaction/router_session',
+        '$BUILD_DIR/mongo/s/sharding_router_api',
         '$BUILD_DIR/mongo/s/write_ops/cluster_write_op_conversion',
         '$BUILD_DIR/mongo/transport/message_compressor',
         '$BUILD_DIR/mongo/transport/transport_layer_common',

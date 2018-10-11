@@ -34,6 +34,7 @@
 #include "mongo/bson/ordering.h"
 #include "mongo/db/pipeline/document_source.h"
 #include "mongo/db/pipeline/exchange_spec_gen.h"
+#include "mongo/db/pipeline/field_path.h"
 #include "mongo/stdx/condition_variable.h"
 #include "mongo/stdx/mutex.h"
 
@@ -49,7 +50,7 @@ class Exchange : public RefCountable {
      * format (KeyString).
      */
     static std::vector<std::string> extractBoundaries(
-        const boost::optional<std::vector<BSONObj>>& obj);
+        const boost::optional<std::vector<BSONObj>>& obj, Ordering ordering);
 
     /**
      * Validate consumer ids coming off the wire. If the ids pass the validation then return them.
@@ -61,7 +62,12 @@ class Exchange : public RefCountable {
     /**
      * Extract the order description from the key.
      */
-    static Ordering extractOrdering(const BSONObj& obj);
+    static Ordering extractOrdering(const BSONObj& keyPattern);
+
+    /**
+     * Extract dotted paths from the key.
+     */
+    static std::vector<FieldPath> extractKeyPaths(const BSONObj& keyPattern);
 
 public:
     Exchange(ExchangeSpec spec, std::unique_ptr<Pipeline, PipelineDeleter> pipeline);
@@ -75,7 +81,7 @@ public:
         return _spec;
     }
 
-    void dispose(OperationContext* opCtx);
+    void dispose(OperationContext* opCtx, size_t consumerId);
 
 private:
     size_t loadNextBatch();
@@ -102,6 +108,8 @@ private:
     const BSONObj _keyPattern;
 
     const Ordering _ordering;
+
+    const std::vector<FieldPath> _keyPaths;
 
     // Range boundaries. The boundaries are ordered and must cover the whole domain, e.g.
     // [Min, -200, 0, 200, Max] partitions the domain into 4 ranges (i.e. 1 less than number of
@@ -134,6 +142,10 @@ private:
 
     // A thread that is currently loading the exchange buffers.
     size_t _loadingThreadId{kInvalidThreadId};
+
+    // A status indicating that the exception was thrown during loadNextBatch(). Once in the failed
+    // state all other producing threads will fail too.
+    Status _errorInLoadNextBatch{Status::OK()};
 
     size_t _roundRobinCounter{0};
 
@@ -184,7 +196,7 @@ public:
     }
 
     void doDispose() final {
-        _exchange->dispose(pExpCtx->opCtx);
+        _exchange->dispose(pExpCtx->opCtx, _consumerId);
     }
 
     auto getConsumerId() const {

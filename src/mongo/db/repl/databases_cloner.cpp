@@ -26,7 +26,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kReplication
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kReplicationInitialSync
 
 #include "mongo/platform/basic.h"
 
@@ -344,8 +344,8 @@ void DatabasesCloner::_onListDatabaseFinish(
             if (status.isOK()) {
                 LOG(1) << "collection clone finished: " << srcNss;
             } else {
-                warning() << "collection clone for '" << srcNss << "' failed due to "
-                          << status.toString();
+                error() << "collection clone for '" << srcNss << "' failed due to "
+                        << status.toString();
             }
         };
         const auto onDbFinish = [this, dbName](const Status& status) {

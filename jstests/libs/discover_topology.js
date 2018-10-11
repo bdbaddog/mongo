@@ -126,6 +126,6 @@ var DiscoverTopology = (function() {
             }
 
             return findConnectedNodesViaMongos(conn, options);
-        },
+        }
     };
 })();

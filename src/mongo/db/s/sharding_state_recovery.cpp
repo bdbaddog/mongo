@@ -65,7 +65,7 @@ const char kShardName[] = "shardName";                            // TODO SERVER
 
 const WriteConcernOptions kMajorityWriteConcern(WriteConcernOptions::kMajority,
                                                 WriteConcernOptions::SyncMode::UNSET,
-                                                Seconds(15));
+                                                WriteConcernOptions::kWriteConcernTimeoutSharding);
 
 const WriteConcernOptions kLocalWriteConcern(1,
                                              WriteConcernOptions::SyncMode::UNSET,
@@ -218,9 +218,9 @@ void ShardingStateRecovery::endMetadataOp(OperationContext* opCtx) {
 }
 
 Status ShardingStateRecovery::recover(OperationContext* opCtx) {
-    if (serverGlobalParams.clusterRole != ClusterRole::ShardServer) {
-        return Status::OK();
-    }
+    Grid* const grid = Grid::get(opCtx);
+    ShardingState* const shardingState = ShardingState::get(opCtx);
+    invariant(shardingState->enabled());
 
     BSONObj recoveryDocBSON;
 
@@ -242,10 +242,6 @@ Status ShardingStateRecovery::recover(OperationContext* opCtx) {
 
     log() << "Sharding state recovery process found document " << redact(recoveryDoc.toBSON());
 
-    Grid* const grid = Grid::get(opCtx);
-    ShardingState* const shardingState = ShardingState::get(opCtx);
-    invariant(shardingState->enabled());
-
     if (!recoveryDoc.getMinOpTimeUpdaters()) {
         // Treat the minOpTime as up-to-date
         grid->advanceConfigOpTime(recoveryDoc.getMinOpTime());
@@ -259,11 +255,11 @@ Status ShardingStateRecovery::recover(OperationContext* opCtx) {
 
     // Need to fetch the latest uptime from the config server, so do a logging write
     Status status =
-        grid->catalogClient()->logChange(opCtx,
-                                         "Sharding minOpTime recovery",
-                                         NamespaceString::kServerConfigurationNamespace.ns(),
-                                         recoveryDocBSON,
-                                         ShardingCatalogClient::kMajorityWriteConcern);
+        grid->catalogClient()->logChangeChecked(opCtx,
+                                                "Sharding minOpTime recovery",
+                                                NamespaceString::kServerConfigurationNamespace.ns(),
+                                                recoveryDocBSON,
+                                                ShardingCatalogClient::kMajorityWriteConcern);
     if (!status.isOK())
         return status;
 

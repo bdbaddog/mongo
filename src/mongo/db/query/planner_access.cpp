@@ -45,6 +45,7 @@
 #include "mongo/db/query/index_bounds_builder.h"
 #include "mongo/db/query/index_tag.h"
 #include "mongo/db/query/indexability.h"
+#include "mongo/db/query/planner_wildcard_helpers.h"
 #include "mongo/db/query/query_knobs.h"
 #include "mongo/db/query/query_planner.h"
 #include "mongo/db/query/query_planner_common.h"
@@ -56,6 +57,7 @@ namespace {
 
 using namespace mongo;
 
+namespace wcp = ::mongo::wildcard_planning;
 namespace dps = ::mongo::dotted_path_support;
 
 /**
@@ -577,19 +579,20 @@ void QueryPlannerAccess::finishLeafNode(QuerySolutionNode* node, const IndexEntr
     const StageType type = node->getType();
 
     if (STAGE_TEXT == type) {
-        finishTextNode(node, index);
-        return;
+        return finishTextNode(node, index);
     }
 
     IndexEntry* nodeIndex = nullptr;
-    IndexBounds* bounds = NULL;
+    IndexBounds* bounds = nullptr;
 
     if (STAGE_GEO_NEAR_2D == type) {
         GeoNear2DNode* gnode = static_cast<GeoNear2DNode*>(node);
         bounds = &gnode->baseBounds;
+        nodeIndex = &gnode->index;
     } else if (STAGE_GEO_NEAR_2DSPHERE == type) {
         GeoNear2DSphereNode* gnode = static_cast<GeoNear2DSphereNode*>(node);
         bounds = &gnode->baseBounds;
+        nodeIndex = &gnode->index;
     } else {
         verify(type == STAGE_IXSCAN);
         IndexScanNode* scan = static_cast<IndexScanNode*>(node);
@@ -597,35 +600,10 @@ void QueryPlannerAccess::finishLeafNode(QuerySolutionNode* node, const IndexEntr
         bounds = &scan->bounds;
     }
 
-    // For $** indexes, the IndexEntry key pattern is {'path.to.field': ±1} but the actual keys in
-    // the index are of the form {'$_path': ±1, 'path.to.field': ±1}, where the value of the first
-    // field in each key is 'path.to.field'. We push a point-interval on 'path.to.field' into the
-    // bounds vector for the leading '$_path' bound here. We also push corresponding fields into the
-    // IndexScanNode's keyPattern and its multikeyPaths vector.
-    if (index.type == IndexType::INDEX_ALLPATHS) {
-        invariant(bounds->fields.size() == 1 && index.keyPattern.nFields() == 1);
-        invariant(!bounds->fields.front().name.empty());
-        invariant(nodeIndex);
-        bounds->fields.insert(bounds->fields.begin(), {"$_path"});
-        bounds->fields.front().intervals.push_back(
-            IndexBoundsBuilder::makePointInterval(nodeIndex->keyPattern.firstElementFieldName()));
-        // If the bounds are [MinKey, MaxKey] then we're querying for any values in the given
-        // path. Therefore we must add bounds that allow subpaths (specifically the bound
-        // ["path.","path/") on "$_path").
-        const auto& intervals = bounds->fields.back().intervals;
-        if (!intervals.empty() && intervals.front().isMinToMaxInclusive()) {
-            bounds->fields.front().intervals.push_back(IndexBoundsBuilder::makeRangeInterval(
-                bounds->fields.back().name + '.',
-                bounds->fields.back().name + static_cast<char>('.' + 1),
-                BoundInclusion::kIncludeStartKeyOnly));
-        }
-        nodeIndex->keyPattern = BSON("$_path" << nodeIndex->keyPattern.firstElement()
-                                              << nodeIndex->keyPattern.firstElement());
-        nodeIndex->multikeyPaths.insert(nodeIndex->multikeyPaths.begin(), std::set<std::size_t>{});
+    // If this is a $** index, update and populate the keyPattern, bounds, and multikeyPaths.
+    if (index.type == IndexType::INDEX_WILDCARD) {
+        wcp::finalizeWildcardIndexScanConfiguration(nodeIndex, bounds);
     }
-
-    // If the QuerySolutionNode's IndexEntry is available, use its keyPattern.
-    const auto& keyPattern = (nodeIndex ? nodeIndex->keyPattern : index.keyPattern);
 
     // Find the first field in the scan's bounds that was not filled out.
     // TODO: could cache this.
@@ -639,12 +617,11 @@ void QueryPlannerAccess::finishLeafNode(QuerySolutionNode* node, const IndexEntr
 
     // All fields are filled out with bounds, nothing to do.
     if (firstEmptyField == bounds->fields.size()) {
-        IndexBoundsBuilder::alignBounds(bounds, keyPattern);
-        return;
+        return IndexBoundsBuilder::alignBounds(bounds, nodeIndex->keyPattern);
     }
 
     // Skip ahead to the firstEmptyField-th element, where we begin filling in bounds.
-    BSONObjIterator it(keyPattern);
+    BSONObjIterator it(nodeIndex->keyPattern);
     for (size_t i = 0; i < firstEmptyField; ++i) {
         verify(it.more());
         it.next();
@@ -667,7 +644,7 @@ void QueryPlannerAccess::finishLeafNode(QuerySolutionNode* node, const IndexEntr
 
     // We create bounds assuming a forward direction but can easily reverse bounds to align
     // according to our desired direction.
-    IndexBoundsBuilder::alignBounds(bounds, keyPattern);
+    IndexBoundsBuilder::alignBounds(bounds, nodeIndex->keyPattern);
 }
 
 void QueryPlannerAccess::findElemMatchChildren(const MatchExpression* node,
@@ -1016,12 +993,12 @@ std::unique_ptr<QuerySolutionNode> QueryPlannerAccess::buildIndexedAnd(
         andResult = std::move(ixscanNodes[0]);
     } else {
         // $** indexes are prohibited from participating in either AND_SORTED or AND_HASH.
-        const bool allPathsIndexInvolvedInIntersection =
+        const bool wildcardIndexInvolvedInIntersection =
             std::any_of(ixscanNodes.begin(), ixscanNodes.end(), [](const auto& ixScan) {
                 return ixScan->getType() == StageType::STAGE_IXSCAN &&
-                    static_cast<IndexScanNode*>(ixScan.get())->index.type == INDEX_ALLPATHS;
+                    static_cast<IndexScanNode*>(ixScan.get())->index.type == INDEX_WILDCARD;
             });
-        if (allPathsIndexInvolvedInIntersection) {
+        if (wildcardIndexInvolvedInIntersection) {
             return nullptr;
         }
 

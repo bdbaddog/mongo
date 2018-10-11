@@ -120,7 +120,9 @@ Status addSSLServerOptions(moe::OptionSection* options) {
     options->addOptionChaining("net.tls.clusterCAFile",
                                "tlsClusterCAFile",
                                moe::String,
-                               "CA used for verifying remotes during outbound connections");
+                               "CA used for verifying remotes during outbound connections",
+                               {"net.ssl.clusterCAFile"},
+                               {"sslClusterCAFile"});
 
     options->addOptionChaining("net.tls.CRLFile",
                                "tlsCRLFile",
@@ -224,6 +226,7 @@ Status storeTLSLogVersion(const std::string& loggedProtocols) {
         {"TLS1_0", SSLParams::Protocols::TLS1_0},
         {"TLS1_1", SSLParams::Protocols::TLS1_1},
         {"TLS1_2", SSLParams::Protocols::TLS1_2},
+        {"TLS1_3", SSLParams::Protocols::TLS1_3},
     };
 
     // Map the tokens to their enum values, and push them onto the list of logged protocols.

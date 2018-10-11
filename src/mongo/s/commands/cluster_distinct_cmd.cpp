@@ -37,10 +37,11 @@
 #include "mongo/db/query/view_response_formatter.h"
 #include "mongo/db/views/resolved_view.h"
 #include "mongo/rpc/get_status_from_command_result.h"
-#include "mongo/s/commands/cluster_commands_helpers.h"
+#include "mongo/s/cluster_commands_helpers.h"
 #include "mongo/s/commands/cluster_explain.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/query/cluster_aggregate.h"
+#include "mongo/s/transaction_router.h"
 
 namespace mongo {
 namespace {
@@ -131,16 +132,12 @@ public:
                 return aggRequestOnView.getStatus();
             }
 
-            auto resolvedAggRequest = ex->asExpandedViewAggregation(aggRequestOnView.getValue());
-            auto resolvedAggCmd = resolvedAggRequest.serializeToCommandObj().toBson();
-
-            ClusterAggregate::Namespaces nsStruct;
-            nsStruct.requestedNss = nss;
-            nsStruct.executionNss = resolvedAggRequest.getNamespaceString();
-
             auto bodyBuilder = result->getBodyBuilder();
-            return ClusterAggregate::runAggregate(
-                opCtx, nsStruct, resolvedAggRequest, resolvedAggCmd, &bodyBuilder);
+            return ClusterAggregate::retryOnViewError(opCtx,
+                                                      aggRequestOnView.getValue(),
+                                                      *ex.extraInfo<ResolvedView>(),
+                                                      nss,
+                                                      &bodyBuilder);
         }
 
         long long millisElapsed = timer.millis();
@@ -201,6 +198,10 @@ public:
 
             auto resolvedAggRequest = ex->asExpandedViewAggregation(aggRequestOnView.getValue());
             auto resolvedAggCmd = resolvedAggRequest.serializeToCommandObj().toBson();
+
+            if (auto txnRouter = TransactionRouter::get(opCtx)) {
+                txnRouter->onViewResolutionError();
+            }
 
             BSONObj aggResult = CommandHelpers::runCommandDirectly(
                 opCtx, OpMsgRequest::fromDBAndBody(dbName, std::move(resolvedAggCmd)));

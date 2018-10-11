@@ -26,10 +26,11 @@
  *    then also delete it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kTransaction
 
 #include "mongo/platform/basic.h"
 
+#include "mongo/client/remote_command_targeter.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/commands/txn_two_phase_commit_cmds_gen.h"
 #include "mongo/db/operation_context_session_mongod.h"
@@ -37,79 +38,196 @@
 #include "mongo/db/s/sharding_state.h"
 #include "mongo/db/transaction_coordinator_service.h"
 #include "mongo/db/transaction_participant.h"
+#include "mongo/executor/task_executor.h"
+#include "mongo/executor/task_executor_pool.h"
+#include "mongo/s/grid.h"
+#include "mongo/util/log.h"
 
 namespace mongo {
 namespace {
 
-class CmdPrepareTxn : public BasicCommand {
-public:
-    CmdPrepareTxn() : BasicCommand("prepareTransaction") {}
+MONGO_FAIL_POINT_DEFINE(skipShardingPartsOfPrepareTransaction);
 
-    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
-        return AllowedOnSecondary::kNever;
-    }
+class PrepareTransactionCmd : public TypedCommand<PrepareTransactionCmd> {
+public:
+    class PrepareTimestamp {
+    public:
+        PrepareTimestamp(Timestamp timestamp) : _timestamp(std::move(timestamp)) {}
+        void serialize(BSONObjBuilder* bob) const {
+            bob->append("prepareTimestamp", _timestamp);
+        }
+
+    private:
+        Timestamp _timestamp;
+    };
+
+    using Request = PrepareTransaction;
+    using Response = PrepareTimestamp;
+
+    class Invocation final : public InvocationBase {
+    public:
+        using InvocationBase::InvocationBase;
+
+        Response typedRun(OperationContext* opCtx) {
+            LOG(3)
+                << "Participant shard received prepareTransaction for transaction with txnNumber "
+                << opCtx->getTxnNumber() << " on session "
+                << opCtx->getLogicalSessionId()->toBSON();
+
+            // In production, only config servers or initialized shard servers can participate in a
+            // sharded transaction. However, many test suites test the replication and storage parts
+            // of prepareTransaction against a standalone replica set, so allow skipping the check.
+            if (!MONGO_FAIL_POINT(skipShardingPartsOfPrepareTransaction)) {
+                if (serverGlobalParams.clusterRole != ClusterRole::ConfigServer) {
+                    uassertStatusOK(ShardingState::get(opCtx)->canAcceptShardedCommands());
+                }
+            }
+
+            auto txnParticipant = TransactionParticipant::get(opCtx);
+            uassert(ErrorCodes::CommandFailed,
+                    "prepareTransaction must be run within a transaction",
+                    txnParticipant);
+
+            uassert(ErrorCodes::CommandNotSupported,
+                    "'prepareTransaction' is only supported in feature compatibility version 4.2",
+                    (serverGlobalParams.featureCompatibility.getVersion() ==
+                     ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo42));
+
+            uassert(ErrorCodes::NoSuchTransaction,
+                    "Transaction isn't in progress",
+                    txnParticipant->inMultiDocumentTransaction());
+
+            const auto& cmd = request();
+
+            if (txnParticipant->transactionIsPrepared()) {
+                auto& replClient = repl::ReplClientInfo::forClient(opCtx->getClient());
+                auto prepareOpTime = txnParticipant->getPrepareOpTime();
+                // Set the client optime to be prepareOpTime if it's not already later than
+                // prepareOpTime. his ensures that we wait for writeConcern and that prepareOpTime
+                // will be committed.
+                if (prepareOpTime > replClient.getLastOp()) {
+                    replClient.setLastOp(prepareOpTime);
+                }
+
+                invariant(opCtx->recoveryUnit()->getPrepareTimestamp() ==
+                              prepareOpTime.getTimestamp(),
+                          str::stream() << "recovery unit prepareTimestamp: "
+                                        << opCtx->recoveryUnit()->getPrepareTimestamp().toString()
+                                        << " participant prepareOpTime: "
+                                        << prepareOpTime.toString());
+
+                // A participant should re-send its vote if it re-received prepare.
+                _sendVoteCommit(opCtx, prepareOpTime.getTimestamp(), cmd.getCoordinatorId());
+
+                return PrepareTimestamp(prepareOpTime.getTimestamp());
+            }
+
+            // TODO (SERVER-36839): Pass coordinatorId into prepareTransaction() so that the
+            // coordinatorId can be included in the write to config.transactions.
+            const auto prepareTimestamp = txnParticipant->prepareTransaction(opCtx, {});
+            _sendVoteCommit(opCtx, prepareTimestamp, cmd.getCoordinatorId());
+
+            return PrepareTimestamp(prepareTimestamp);
+        }
+
+    private:
+        void _sendVoteCommit(OperationContext* opCtx,
+                             Timestamp prepareTimestamp,
+                             ShardId coordinatorId) {
+            // In a production cluster, a participant should always send its vote to the coordinator
+            // as part of prepareTransaction. However, many test suites test the replication and
+            // storage parts of prepareTransaction against a standalone replica set, so allow
+            // skipping sending a vote.
+            if (MONGO_FAIL_POINT(skipShardingPartsOfPrepareTransaction)) {
+                return;
+            }
+
+            VoteCommitTransaction voteCommit;
+            voteCommit.setDbName("admin");
+            voteCommit.setShardId(ShardingState::get(opCtx)->shardId());
+            voteCommit.setPrepareTimestamp(prepareTimestamp);
+            BSONObj voteCommitObj = voteCommit.toBSON(
+                BSON("lsid" << opCtx->getLogicalSessionId()->toBSON() << "txnNumber"
+                            << *opCtx->getTxnNumber()
+                            << "autocommit"
+                            << false));
+            _sendVote(opCtx, voteCommitObj, coordinatorId);
+        }
+
+        void _sendVoteAbort(OperationContext* opCtx, ShardId coordinatorId) {
+            // In a production cluster, a participant should always send its vote to the coordinator
+            // as part of prepareTransaction. However, many test suites test the replication and
+            // storage parts of prepareTransaction against a standalone replica set, so allow
+            // skipping sending a vote.
+            if (MONGO_FAIL_POINT(skipShardingPartsOfPrepareTransaction)) {
+                return;
+            }
+
+            VoteAbortTransaction voteAbort;
+            voteAbort.setDbName("admin");
+            voteAbort.setShardId(ShardingState::get(opCtx)->shardId());
+            BSONObj voteAbortObj = voteAbort.toBSON(
+                BSON("lsid" << opCtx->getLogicalSessionId()->toBSON() << "txnNumber"
+                            << *opCtx->getTxnNumber()
+                            << "autocommit"
+                            << false));
+            _sendVote(opCtx, voteAbortObj, coordinatorId);
+        }
+
+        void _sendVote(OperationContext* opCtx, const BSONObj& voteObj, ShardId coordinatorId) {
+            try {
+                // TODO (SERVER-37328): Participant should wait for writeConcern before sending its
+                // vote.
+
+                LOG(3) << "Participant shard sending " << voteObj << " to " << coordinatorId;
+
+                const auto coordinatorPrimaryHost = [&] {
+                    auto coordinatorShard = uassertStatusOK(
+                        Grid::get(opCtx)->shardRegistry()->getShard(opCtx, coordinatorId));
+                    return uassertStatusOK(coordinatorShard->getTargeter()->findHostNoWait(
+                        ReadPreferenceSetting{ReadPreference::PrimaryOnly}));
+                }();
+
+                const executor::RemoteCommandRequest request(
+                    coordinatorPrimaryHost,
+                    NamespaceString::kAdminDb.toString(),
+                    voteObj,
+                    ReadPreferenceSetting{ReadPreference::PrimaryOnly}.toContainingBSON(),
+                    opCtx,
+                    executor::RemoteCommandRequest::kNoTimeout);
+
+                auto noOp = [](const executor::TaskExecutor::RemoteCommandCallbackArgs&) {};
+                uassertStatusOK(
+                    Grid::get(opCtx)->getExecutorPool()->getFixedExecutor()->scheduleRemoteCommand(
+                        request, noOp));
+            } catch (const DBException& ex) {
+                LOG(3) << "Participant shard failed to send " << voteObj << " to " << coordinatorId
+                       << causedBy(ex.toStatus());
+            }
+        }
+
+        bool supportsWriteConcern() const override {
+            return true;
+        }
+
+        NamespaceString ns() const override {
+            return NamespaceString(request().getDbName(), "");
+        }
+
+        void doCheckAuthorization(OperationContext* opCtx) const override {}
+    };
 
     virtual bool adminOnly() const {
         return true;
     }
 
-    bool supportsWriteConcern(const BSONObj& cmd) const override {
-        return true;
-    }
-
     std::string help() const override {
-        return "Prepares a transaction. This is only expected to be called by mongos.";
+        return "Prepares a transaction on this shard; sent by a router or re-sent by the "
+               "transaction commit coordinator for a cross-shard transaction";
     }
 
-    Status checkAuthForOperation(OperationContext* opCtx,
-                                 const std::string& dbname,
-                                 const BSONObj& cmdObj) const override {
-        return Status::OK();
-    }
-
-    bool run(OperationContext* opCtx,
-             const std::string& dbname,
-             const BSONObj& cmdObj,
-             BSONObjBuilder& result) override {
-        auto txnParticipant = TransactionParticipant::get(opCtx);
-        uassert(ErrorCodes::CommandFailed,
-                "prepareTransaction must be run within a transaction",
-                txnParticipant);
-
-        uassert(ErrorCodes::CommandNotSupported,
-                "'prepareTransaction' is only supported in feature compatibility version 4.2",
-                (serverGlobalParams.featureCompatibility.getVersion() ==
-                 ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo42));
-
-        uassert(ErrorCodes::NoSuchTransaction,
-                "Transaction isn't in progress",
-                txnParticipant->inMultiDocumentTransaction());
-
-        if (txnParticipant->transactionIsPrepared()) {
-            auto& replClient = repl::ReplClientInfo::forClient(opCtx->getClient());
-            auto prepareOpTime = txnParticipant->getPrepareOpTime();
-            // Set the client optime to be prepareOpTime if it's not already later than
-            // prepareOpTime.
-            // This ensures that we wait for writeConcern and that prepareOpTime will be committed.
-            if (prepareOpTime > replClient.getLastOp()) {
-                replClient.setLastOp(prepareOpTime);
-            }
-
-            invariant(opCtx->recoveryUnit()->getPrepareTimestamp() == prepareOpTime.getTimestamp(),
-                      str::stream() << "recovery unit prepareTimestamp: "
-                                    << opCtx->recoveryUnit()->getPrepareTimestamp().toString()
-                                    << " participant prepareOpTime: "
-                                    << prepareOpTime.toString());
-
-            result.append("prepareTimestamp", prepareOpTime.getTimestamp());
-            return true;
-        }
-
-        // Add prepareTimestamp to the command response.
-        auto timestamp = txnParticipant->prepareTransaction(opCtx, {});
-        result.append("prepareTimestamp", timestamp);
-
-        return true;
+    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
+        return AllowedOnSecondary::kNever;
     }
 } prepareTransactionCmd;
 
@@ -133,6 +251,11 @@ public:
                  ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo42));
 
             const auto& cmd = request();
+
+            LOG(3) << "Coordinator shard received voteCommit from " << cmd.getShardId()
+                   << " with prepare timestamp " << cmd.getPrepareTimestamp() << " for transaction "
+                   << opCtx->getTxnNumber() << " on session "
+                   << opCtx->getLogicalSessionId()->toBSON();
 
             TransactionCoordinatorService::get(opCtx)->voteCommit(
                 opCtx,
@@ -188,6 +311,10 @@ public:
 
             const auto& cmd = request();
 
+            LOG(3) << "Coordinator shard received voteAbort from " << cmd.getShardId()
+                   << " for transaction " << opCtx->getTxnNumber() << " on session "
+                   << opCtx->getLogicalSessionId()->toBSON();
+
             TransactionCoordinatorService::get(opCtx)->voteAbort(opCtx,
                                                                  opCtx->getLogicalSessionId().get(),
                                                                  opCtx->getTxnNumber().get(),
@@ -220,6 +347,7 @@ public:
     }
 } voteAbortTransactionCmd;
 
+// TODO (SERVER-37440): Make coordinateCommit idempotent.
 class CoordinateCommitTransactionCmd : public TypedCommand<CoordinateCommitTransactionCmd> {
 public:
     using Request = CoordinateCommitTransaction;
@@ -245,6 +373,8 @@ public:
             // the list are unique.
             // TODO (PM-564): Propagate the 'readOnly' flag down into the TransactionCoordinator.
             std::set<ShardId> participantList;
+            StringBuilder ss;
+            ss << "[";
             for (const auto& participant : cmd.getParticipants()) {
                 const auto shardId = participant.getShardId();
                 uassert(ErrorCodes::InvalidOptions,
@@ -252,17 +382,41 @@ public:
                         std::find(participantList.begin(), participantList.end(), shardId) ==
                             participantList.end());
                 participantList.insert(shardId);
+                ss << shardId << " ";
             }
+            ss << "]";
+            LOG(3) << "Coordinator shard received participant list with shards " << ss.str()
+                   << " for transaction " << opCtx->getTxnNumber() << " on session "
+                   << opCtx->getLogicalSessionId()->toBSON();
 
-            TransactionCoordinatorService::get(opCtx)->coordinateCommit(
+            auto commitDecisionFuture = TransactionCoordinatorService::get(opCtx)->coordinateCommit(
                 opCtx,
                 opCtx->getLogicalSessionId().get(),
                 opCtx->getTxnNumber().get(),
                 participantList);
 
-            // Execute the 'prepare' logic on the local participant (the router does not send a
-            // separate 'prepare' message to the coordinator shard.
-            {
+            // If the commit decision is already available before we prepare locally, it means the
+            // transaction has completed and we should skip preparing locally.
+            //
+            // TODO (SERVER-37440): Reconsider when coordinateCommit is made idempotent.
+            if (!commitDecisionFuture.isReady()) {
+                // Execute the 'prepare' logic on the local participant (the router does not send a
+                // separate 'prepare' message to the coordinator shard).
+                _callPrepareOnLocalParticipant(opCtx);
+            }
+
+            // Block waiting for the commit decision.
+            auto commitDecision = commitDecisionFuture.get(opCtx);
+
+            // If the decision was abort, propagate NoSuchTransaction exception back to mongos.
+            uassert(ErrorCodes::NoSuchTransaction,
+                    "Transaction was aborted",
+                    commitDecision != TransactionCoordinatorService::CommitDecision::kAbort);
+        }
+
+    private:
+        void _callPrepareOnLocalParticipant(OperationContext* opCtx) {
+            auto localParticipantPrepareTimestamp = [&]() -> Timestamp {
                 OperationContextSessionMongod checkOutSession(
                     opCtx, true, false, boost::none, false);
 
@@ -273,14 +427,27 @@ public:
                     txnParticipant->abortActiveUnpreparedOrStashPreparedTransaction(opCtx);
                 });
 
-                txnParticipant->prepareTransaction(opCtx, {});
+                auto prepareTimestamp = txnParticipant->prepareTransaction(opCtx, {});
 
                 txnParticipant->stashTransactionResources(opCtx);
                 guard.Dismiss();
-            }
+                return prepareTimestamp;
+            }();
+
+            LOG(3) << "Participant shard delivering voteCommit with prepareTimestamp "
+                   << localParticipantPrepareTimestamp << " to local coordinator for transaction "
+                   << opCtx->getTxnNumber() << " on session "
+                   << opCtx->getLogicalSessionId()->toBSON();
+
+            // Deliver the local participant's vote to the coordinator.
+            TransactionCoordinatorService::get(opCtx)->voteCommit(
+                opCtx,
+                opCtx->getLogicalSessionId().get(),
+                opCtx->getTxnNumber().get(),
+                ShardingState::get(opCtx)->shardId(),
+                localParticipantPrepareTimestamp);
         }
 
-    private:
         bool supportsWriteConcern() const override {
             return true;
         }

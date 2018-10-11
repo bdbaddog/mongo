@@ -37,8 +37,8 @@
 #include "mongo/db/catalog/index_catalog.h"
 #include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/fts/fts_spec.h"
-#include "mongo/db/index/all_paths_key_generator.h"
 #include "mongo/db/index/index_descriptor.h"
+#include "mongo/db/index/wildcard_key_generator.h"
 #include "mongo/db/index_legacy.h"
 #include "mongo/db/query/get_executor.h"
 #include "mongo/db/query/plan_cache.h"
@@ -90,9 +90,9 @@ void CollectionInfoCacheImpl::computeIndexKeys(OperationContext* opCtx) {
     while (i.more()) {
         IndexDescriptor* descriptor = i.next();
 
-        if (descriptor->getAccessMethodName() == IndexNames::ALLPATHS) {
+        if (descriptor->getAccessMethodName() == IndexNames::WILDCARD) {
             // Obtain the projection used by the $** index's key generator.
-            auto pathProj = AllPathsKeyGenerator::createProjectionExec(
+            auto pathProj = WildcardKeyGenerator::createProjectionExec(
                 descriptor->keyPattern(), descriptor->pathProjection());
             // If the projection is an exclusion, then we must check the new document's keys on all
             // updates, since we do not exhaustively know the set of paths to be indexed.
@@ -112,15 +112,15 @@ void CollectionInfoCacheImpl::computeIndexKeys(OperationContext* opCtx) {
                 _indexedPaths.allPathsIndexed();
             } else {
                 for (size_t i = 0; i < ftsSpec.numExtraBefore(); ++i) {
-                    _indexedPaths.addPath(ftsSpec.extraBefore(i));
+                    _indexedPaths.addPath(FieldRef(ftsSpec.extraBefore(i)));
                 }
                 for (fts::Weights::const_iterator it = ftsSpec.weights().begin();
                      it != ftsSpec.weights().end();
                      ++it) {
-                    _indexedPaths.addPath(it->first);
+                    _indexedPaths.addPath(FieldRef(it->first));
                 }
                 for (size_t i = 0; i < ftsSpec.numExtraAfter(); ++i) {
-                    _indexedPaths.addPath(ftsSpec.extraAfter(i));
+                    _indexedPaths.addPath(FieldRef(ftsSpec.extraAfter(i)));
                 }
                 // Any update to a path containing "language" as a component could change the
                 // language of a subdocument.  Add the override field as a path component.
@@ -135,7 +135,7 @@ void CollectionInfoCacheImpl::computeIndexKeys(OperationContext* opCtx) {
             BSONObjIterator j(key);
             while (j.more()) {
                 BSONElement e = j.next();
-                _indexedPaths.addPath(e.fieldName());
+                _indexedPaths.addPath(FieldRef(e.fieldName()));
             }
         }
 
@@ -146,7 +146,7 @@ void CollectionInfoCacheImpl::computeIndexKeys(OperationContext* opCtx) {
             stdx::unordered_set<std::string> paths;
             QueryPlannerIXSelect::getFields(filter, &paths);
             for (auto it = paths.begin(); it != paths.end(); ++it) {
-                _indexedPaths.addPath(*it);
+                _indexedPaths.addPath(FieldRef(*it));
             }
         }
     }

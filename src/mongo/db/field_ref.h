@@ -30,6 +30,7 @@
 
 #include <boost/optional.hpp>
 #include <iosfwd>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -50,6 +51,19 @@ namespace mongo {
  */
 class FieldRef {
 public:
+    /**
+     * Returns true if the argument is a numeric string which is eligible to act as the key name for
+     * an element in a BSON array; in other words, the string matches the regex ^(0|[1-9]+[0-9]*)$.
+     */
+    static bool isNumericPathComponentStrict(StringData component);
+
+    /**
+     * Similar to the function above except strings that contain leading zero's are considered
+     * numeric. For instance, the above function would return false for an input "01" however this
+     * function will return true.
+     */
+    static bool isNumericPathComponentLenient(StringData component);
+
     FieldRef() = default;
 
     explicit FieldRef(StringData path);
@@ -94,9 +108,31 @@ public:
     bool isPrefixOf(const FieldRef& other) const;
 
     /**
+     * Returns true if 'this' FieldRef is a prefix of 'other', or if both paths are identical.
+     */
+    bool isPrefixOfOrEqualTo(const FieldRef& other) const;
+
+    /**
      * Returns the number of field parts in the prefix that 'this' and 'other' share.
      */
     size_t commonPrefixSize(const FieldRef& other) const;
+
+    /**
+     * Returns true if the specified path component is a numeric string which is eligible to act as
+     * the key name for an element in a BSON array; in other words, the fieldname matches the regex
+     * ^(0|[1-9]+[0-9]*)$.
+     */
+    bool isNumericPathComponentStrict(size_t i) const;
+
+    /**
+     * Returns true if this FieldRef has any numeric path components.
+     */
+    bool hasNumericPathComponents() const;
+
+    /**
+     * Returns the positions of all numeric path components, starting from the given position.
+     */
+    std::set<size_t> getNumericPathComponents(size_t startPart = 0) const;
 
     /**
      * Returns a StringData of the full dotted field in its current state (i.e., some parts may

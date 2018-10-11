@@ -74,23 +74,6 @@ public:
         const stdx::unordered_set<std::string>& fields, const std::vector<IndexEntry>& allIndices);
 
     /**
-     * Return true if the index key pattern field 'keyPatternElt' (which belongs to 'index' and is
-     * at position 'keyPatternIndex' in the index's keyPattern) can be used to answer the predicate
-     * 'node'. When 'node' is a sub-tree of a larger MatchExpression, 'fullPathToNode' is the path
-     * traversed to get to this node, otherwise it is empty.
-     *
-     * For example, {field: "hashed"} can only be used with sets of equalities.
-     *              {field: "2d"} can only be used with some geo predicates.
-     *              {field: "2dsphere"} can only be used with some other geo predicates.
-     */
-    static bool compatible(const BSONElement& keyPatternElt,
-                           const IndexEntry& index,
-                           std::size_t keyPatternIndex,
-                           MatchExpression* node,
-                           StringData fullPathToNode,
-                           const CollatorInterface* collator);
-
-    /**
      * Determine how useful all of our relevant 'indices' are to all predicates in the subtree
      * rooted at 'node'.  Affixes a RelevantTag to all predicate nodes which can use an index.
      *
@@ -151,6 +134,17 @@ public:
     static std::vector<IndexEntry> expandIndexes(const stdx::unordered_set<std::string>& fields,
                                                  const std::vector<IndexEntry>& relevantIndices);
 
+    /**
+     * Check if this match expression is a leaf and is supported by a wildcard index.
+     */
+    static bool nodeIsSupportedByWildcardIndex(const MatchExpression* queryExpr);
+
+    /*
+     * Return true if the given match expression can use a sparse index, false otherwise. This will
+     * not traverse the children of the given match expression.
+     */
+    static bool nodeIsSupportedBySparseIndex(const MatchExpression* queryExpr, bool isInElemMatch);
+
 private:
     /**
      * Used to keep track of if any $elemMatch predicates were encountered when walking a
@@ -165,6 +159,16 @@ private:
         StringData fullPathToParentElemMatch{""_sd};
     };
 
+    /**
+     * Return true if the index key pattern field 'keyPatternElt' (which belongs to 'index' and is
+     * at position 'keyPatternIndex' in the index's keyPattern) can be used to answer the predicate
+     * 'node'. When 'node' is a sub-tree of a larger MatchExpression, 'fullPathToNode' is the path
+     * traversed to get to this node, otherwise it is empty.
+     *
+     * For example, {field: "hashed"} can only be used with sets of equalities.
+     *              {field: "2d"} can only be used with some geo predicates.
+     *              {field: "2dsphere"} can only be used with some other geo predicates.
+     */
     static bool _compatible(const BSONElement& keyPatternElt,
                             const IndexEntry& index,
                             std::size_t keyPatternIndex,
@@ -234,14 +238,14 @@ private:
                                                          const std::vector<IndexEntry>& indices);
 
     /**
-     * This function strips RelevantTag assignments to expanded 'allPaths' indexes, in cases where
+     * This function strips RelevantTag assignments to expanded 'wildcard' indexes, in cases where
      * the assignment is incompatible with the query.
      *
-     * Specifically, if the query has a TEXT node with both 'text' and 'allPaths' indexes present,
-     * then the 'allPaths' index will mark itself as relevant to the '_fts' path reported by the
-     * TEXT node. We therefore remove any such misassigned 'allPaths' tags here.
+     * Specifically, if the query has a TEXT node with both 'text' and 'wildcard' indexes present,
+     * then the 'wildcard' index will mark itself as relevant to the '_fts' path reported by the
+     * TEXT node. We therefore remove any such misassigned 'wildcard' tags here.
      */
-    static void stripInvalidAssignmentsToAllPathsIndexes(MatchExpression* root,
+    static void stripInvalidAssignmentsToWildcardIndexes(MatchExpression* root,
                                                          const std::vector<IndexEntry>& indices);
 
     /**

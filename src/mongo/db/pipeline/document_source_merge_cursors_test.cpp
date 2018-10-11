@@ -28,7 +28,7 @@
 
 #include "mongo/platform/basic.h"
 
-#include "mongo/db/pipeline/document_source_merge_cursors.h"
+#include "mongo/s/query/document_source_merge_cursors.h"
 
 #include "mongo/client/remote_command_targeter_factory_mock.h"
 #include "mongo/client/remote_command_targeter_mock.h"
@@ -267,7 +267,7 @@ TEST_F(DocumentSourceMergeCursorsTest, ShouldBeAbleToIterateCursorsUntilEOF) {
     future.timed_get(kFutureTimeout);
 }
 
-TEST_F(DocumentSourceMergeCursorsTest, ShouldNotKillCursorsIfNeverIterated) {
+TEST_F(DocumentSourceMergeCursorsTest, ShouldNotKillCursorsIfTheyAreNotOwned) {
     auto expCtx = getExpCtx();
     AsyncResultsMergerParams armParams;
     armParams.setNss(kTestNss);
@@ -280,6 +280,10 @@ TEST_F(DocumentSourceMergeCursorsTest, ShouldNotKillCursorsIfNeverIterated) {
     auto pipeline = uassertStatusOK(Pipeline::create({}, expCtx));
     pipeline->addInitialSource(
         DocumentSourceMergeCursors::create(executor(), std::move(armParams), expCtx));
+
+    auto mergeCursors =
+        checked_cast<DocumentSourceMergeCursors*>(pipeline->getSources().front().get());
+    mergeCursors->dismissCursorOwnership();
 
     pipeline.reset();  // Delete the pipeline before using it.
 

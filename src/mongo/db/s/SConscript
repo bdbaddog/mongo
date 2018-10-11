@@ -70,6 +70,7 @@ env.Library(
         '$BUILD_DIR/mongo/db/commands/mongod_fcv',
         '$BUILD_DIR/mongo/db/db_raii',
         '$BUILD_DIR/mongo/db/dbhelpers',
+        '$BUILD_DIR/mongo/db/op_observer_impl',
         '$BUILD_DIR/mongo/db/ops/write_ops_exec',
         '$BUILD_DIR/mongo/db/repl/oplog',
         '$BUILD_DIR/mongo/db/repl/repl_coordinator_interface',
@@ -90,6 +91,19 @@ env.Library(
     ],
     LIBDEPS=[
         'sharding_api_d',
+    ],
+)
+
+env.Library(
+    target='op_observer_sharding_impl',
+    source=[
+        'op_observer_sharding_impl.cpp',
+    ],
+    LIBDEPS=[
+        '$BUILD_DIR/mongo/db/op_observer_impl',
+    ],
+    LIBDEPS_PRIVATE=[
+        'sharding_runtime_d',
     ],
 )
 
@@ -223,6 +237,7 @@ env.Library(
     ],
     LIBDEPS_PRIVATE=[
         '$BUILD_DIR/mongo/db/commands/mongod_fcv',
+        '$BUILD_DIR/mongo/s/catalog/sharding_catalog_client_impl',
     ],
 )
 
@@ -281,8 +296,9 @@ env.Library(
         '$BUILD_DIR/mongo/db/index_d',
         '$BUILD_DIR/mongo/db/repl/repl_coordinator_interface',
         '$BUILD_DIR/mongo/db/repl/replica_set_messages',
-        '$BUILD_DIR/mongo/s/commands/cluster_commands_helpers',
+        '$BUILD_DIR/mongo/db/transaction_coordinator',
         '$BUILD_DIR/mongo/s/commands/shared_cluster_commands',
+        '$BUILD_DIR/mongo/s/sharding_router_api',
         '$BUILD_DIR/mongo/s/sharding_initialization',
         'balancer',
         'sharding_runtime_d',

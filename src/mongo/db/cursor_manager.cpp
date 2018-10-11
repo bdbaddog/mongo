@@ -511,6 +511,8 @@ std::size_t CursorManager::timeoutCursors(OperationContext* opCtx, Date_t now) {
 
     // Be careful not to dispose of cursors while holding the partition lock.
     for (auto&& cursor : toDisposeWithoutMutex) {
+        log() << "Cursor id " << cursor->cursorid() << " timed out, idle since "
+              << cursor->getLastUseDate();
         cursor->dispose(opCtx);
     }
     return toDisposeWithoutMutex.size();
@@ -565,7 +567,7 @@ StatusWith<ClientCursorPin> CursorManager::pinCursor(OperationContext* opCtx,
 
     cursor->_operationUsingCursor = opCtx;
 
-    // We use pinning of a cursor as a proxy for active, user-initiated use of a cursor.  Therefor,
+    // We use pinning of a cursor as a proxy for active, user-initiated use of a cursor.  Therefore,
     // we pass down to the logical session cache and vivify the record (updating last use).
     if (cursor->getSessionId()) {
         auto vivifyCursorStatus =
@@ -622,19 +624,6 @@ void CursorManager::appendActiveSessions(LogicalSessionIdSet* lsids) const {
     }
 }
 
-GenericCursor CursorManager::buildGenericCursor_inlock(const ClientCursor* cursor) const {
-    GenericCursor gc;
-    gc.setCursorId(cursor->_cursorid);
-    gc.setNs(cursor->nss());
-    gc.setLsid(cursor->getSessionId());
-    gc.setNDocsReturned(cursor->pos());
-    gc.setTailable(cursor->isTailable());
-    gc.setAwaitData(cursor->isAwaitData());
-    gc.setOriginatingCommand(cursor->getOriginatingCommandObj());
-    gc.setNoCursorTimeout(cursor->isNoTimeout());
-    return gc;
-}
-
 void CursorManager::appendIdleCursors(AuthorizationSession* ctxAuth,
                                       MongoProcessInterface::CurrentOpUserMode userMode,
                                       std::vector<GenericCursor>* cursors) const {
@@ -653,7 +642,7 @@ void CursorManager::appendIdleCursors(AuthorizationSession* ctxAuth,
             if (cursor->_operationUsingCursor) {
                 continue;
             }
-            cursors->emplace_back(buildGenericCursor_inlock(cursor));
+            cursors->emplace_back(cursor->toGenericCursor());
         }
     }
 }

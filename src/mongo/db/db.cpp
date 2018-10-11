@@ -91,7 +91,6 @@
 #include "mongo/db/logical_time_metadata_hook.h"
 #include "mongo/db/logical_time_validator.h"
 #include "mongo/db/mongod_options.h"
-#include "mongo/db/op_observer_impl.h"
 #include "mongo/db/op_observer_registry.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/periodic_runner_job_abort_expired_transactions.h"
@@ -112,6 +111,7 @@
 #include "mongo/db/s/balancer/balancer.h"
 #include "mongo/db/s/config/sharding_catalog_manager.h"
 #include "mongo/db/s/config_server_op_observer.h"
+#include "mongo/db/s/op_observer_sharding_impl.h"
 #include "mongo/db/s/shard_server_op_observer.h"
 #include "mongo/db/s/sharding_initialization_mongod.h"
 #include "mongo/db/s/sharding_state_recovery.h"
@@ -123,7 +123,7 @@
 #include "mongo/db/session_killer.h"
 #include "mongo/db/startup_warnings_mongod.h"
 #include "mongo/db/stats/counters.h"
-#include "mongo/db/storage/backup_cursor_service.h"
+#include "mongo/db/storage/backup_cursor_hooks.h"
 #include "mongo/db/storage/encryption_hooks.h"
 #include "mongo/db/storage/storage_engine.h"
 #include "mongo/db/storage/storage_engine_init.h"
@@ -281,7 +281,7 @@ ExitCode _initAndListen(int listenPort) {
 
     serviceContext->setFastClockSource(FastClockSourceFactory::create(Milliseconds(10)));
     auto opObserverRegistry = stdx::make_unique<OpObserverRegistry>();
-    opObserverRegistry->addObserver(stdx::make_unique<OpObserverImpl>());
+    opObserverRegistry->addObserver(stdx::make_unique<OpObserverShardingImpl>());
     opObserverRegistry->addObserver(stdx::make_unique<UUIDCatalogObserver>());
 
     if (serverGlobalParams.clusterRole == ClusterRole::ShardServer) {
@@ -414,9 +414,8 @@ ExitCode _initAndListen(int listenPort) {
 
     auto startupOpCtx = serviceContext->makeOperationContext(&cc());
 
-    // TODO: Remove biggie from this list after implemented
-    bool canCallFCVSetIfCleanStartup = !storageGlobalParams.readOnly &&
-        (storageGlobalParams.engine != "devnull") && (storageGlobalParams.engine != "biggie");
+    bool canCallFCVSetIfCleanStartup =
+        !storageGlobalParams.readOnly && (storageGlobalParams.engine != "devnull");
     if (canCallFCVSetIfCleanStartup && !replSettings.usingReplSets()) {
         Lock::GlobalWrite lk(startupOpCtx.get());
         FeatureCompatibilityVersion::setIfCleanStartup(startupOpCtx.get(),
@@ -532,7 +531,7 @@ ExitCode _initAndListen(int listenPort) {
 
     auto storageEngine = serviceContext->getStorageEngine();
     invariant(storageEngine);
-    BackupCursorService::set(serviceContext, stdx::make_unique<BackupCursorService>(storageEngine));
+    BackupCursorHooks::initialize(serviceContext, storageEngine);
 
     if (!storageGlobalParams.readOnly) {
 
@@ -549,7 +548,9 @@ ExitCode _initAndListen(int listenPort) {
         if (serverGlobalParams.clusterRole == ClusterRole::ShardServer) {
             // Note: For replica sets, ShardingStateRecovery happens on transition to primary.
             if (!repl::ReplicationCoordinator::get(startupOpCtx.get())->isReplEnabled()) {
-                uassertStatusOK(ShardingStateRecovery::recover(startupOpCtx.get()));
+                if (ShardingState::get(startupOpCtx.get())->enabled()) {
+                    uassertStatusOK(ShardingStateRecovery::recover(startupOpCtx.get()));
+                }
             }
         } else if (serverGlobalParams.clusterRole == ClusterRole::ConfigServer) {
             initializeGlobalShardingStateForMongoD(startupOpCtx.get(),
@@ -877,6 +878,11 @@ void shutdownTask() {
     // Shut down the global dbclient pool so callers stop waiting for connections.
     globalConnPool.shutdown();
 
+    // Shut down the background periodic task runner
+    if (auto runner = serviceContext->getPeriodicRunner()) {
+        runner->shutdown();
+    }
+
     if (serviceContext->getStorageEngine()) {
         ServiceContext::UniqueOperationContext uniqueOpCtx;
         OperationContext* opCtx = client->getOperationContext();
@@ -896,11 +902,6 @@ void shutdownTask() {
     }
 
     serviceContext->setKillAllOperations();
-
-    // Shut down the background periodic task runner
-    if (auto runner = serviceContext->getPeriodicRunner()) {
-        runner->shutdown();
-    }
 
     ReplicaSetMonitor::shutdown();
 

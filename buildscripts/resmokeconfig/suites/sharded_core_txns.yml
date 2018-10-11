@@ -25,7 +25,6 @@ selector:
   - jstests/core/txns/no_writes_to_config_transactions_with_prepared_transaction.js
   - jstests/core/txns/prepare_committed_transaction.js
   - jstests/core/txns/prepare_conflict.js
-  - jstests/core/txns/prepare_conflict_read_concern_behavior.js
   - jstests/core/txns/prepare_nonexistent_transaction.js
   - jstests/core/txns/prepare_prepared_transaction.js
   - jstests/core/txns/prepare_requires_fcv42.js
@@ -62,9 +61,6 @@ selector:
   # TODO SERVER-35825: Mongos should only allow readConcern on writes that start transactions.
   - jstests/core/txns/no_read_concern_snapshot_outside_txn.js
 
-  # TODO SERVER-37209: Allow mongos to retry on view errors.
-  - jstests/core/txns/view_reads_in_transaction.js
-
   # Uses hangAfterCollectionInserts failpoint not available on mongos.
   - jstests/core/txns/speculative_snapshot_includes_all_writes.js
 executor:
@@ -87,7 +83,6 @@ executor:
       set_parameters:
         enableTestCommands: 1
     mongod_options:
-      enableMajorityReadConcern: ''
       set_parameters:
         enableTestCommands: 1
         numInitialSyncAttempts: 1

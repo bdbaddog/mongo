@@ -1,11 +1,43 @@
 # -*- mode: python; -*-
 
-import libdeps
+# -*- mode: python; -*-
 
 Import("env")
 Import("get_option")
 
 env = env.Clone()
+
+env.AppendUnique(
+    CPPPATH=["$BUILD_DIR/mongo/embedded"],
+)
+
+# Inject this before we call the framework directory SConscripts so that
+# they can both use it.
+
+frameworksEnv = env.Clone()
+def mongo_export_file_generator(target, source, env, for_signature):
+    if env.ToolchainIs('msvc'):
+        script = env.File(env.subst("${TARGET.base}.def", target=target))
+        return script.get_csig() if for_signature else "/DEF:" + str(script)
+    elif env.TargetOSIs('darwin'):
+        script = env.File(env.subst("${TARGET.base}.exported_symbols_list", target=target))
+        return script.get_csig() if for_signature else "-Wl,-exported_symbols_list," + str(script)
+    elif env.TargetOSIs('posix'):
+        script = env.File(env.subst("${TARGET.base}.version_script", target=target))
+        return script.get_csig() if for_signature else "-Wl,--version-script," + str(script)
+    else:
+        pass
+frameworksEnv['MONGO_EXPORT_FILE_SHLINKFLAGS'] = mongo_export_file_generator
+
+env.SConscript(
+    dirs=[
+        'mongo_embedded',
+        'mongoc_embedded',
+    ],
+    exports={
+        'env' : frameworksEnv,
+    },
+)
 
 if get_option('install-mode') == 'hygienic':
     env.AutoInstall(
@@ -34,8 +66,11 @@ env.Library(
         'embedded_options_parser_init.cpp',
         'logical_session_cache_factory_embedded.cpp',
         'periodic_runner_embedded.cpp',
+        'process_interface_factory_embedded.cpp',
+        'read_concern_embedded.cpp',
         'replication_coordinator_embedded.cpp',
         'service_entry_point_embedded.cpp',
+        'transaction_coordinator_factory_embedded.cpp',
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/base',
@@ -51,14 +86,15 @@ env.Library(
         '$BUILD_DIR/mongo/db/concurrency/lock_manager',
         '$BUILD_DIR/mongo/db/logical_session_cache',
         '$BUILD_DIR/mongo/db/logical_session_cache_impl',
-        '$BUILD_DIR/mongo/db/op_observer_d',
+        '$BUILD_DIR/mongo/db/op_observer_impl',
+        '$BUILD_DIR/mongo/db/pipeline/process_interface_standalone',
         '$BUILD_DIR/mongo/db/repair_database_and_check_version',
         '$BUILD_DIR/mongo/db/repl/repl_coordinator_interface',
         '$BUILD_DIR/mongo/db/repl/replica_set_messages',
         '$BUILD_DIR/mongo/db/repl/storage_interface_impl',
         '$BUILD_DIR/mongo/db/rw_concern_d',
         '$BUILD_DIR/mongo/db/s/sharding_api_d',
-        '$BUILD_DIR/mongo/db/s/sharding_runtime_d',
+        '$BUILD_DIR/mongo/db/s/sharding_runtime_d_embedded',
         '$BUILD_DIR/mongo/db/server_options',
         '$BUILD_DIR/mongo/db/service_context',
         '$BUILD_DIR/mongo/db/service_entry_point_common',
@@ -88,91 +124,7 @@ env.Library(
     ],
 )
 
-def mongo_export_file_generator(target, source, env, for_signature):
-    if env.ToolchainIs('msvc'):
-        script = env.File(env.subst("${TARGET.base}.def", target=target))
-        return script.get_csig() if for_signature else "/DEF:" + str(script)
-    elif env.TargetOSIs('darwin'):
-        script = env.File(env.subst("${TARGET.base}.exported_symbols_list", target=target))
-        return script.get_csig() if for_signature else "-Wl,-exported_symbols_list," + str(script)
-    elif env.TargetOSIs('posix'):
-        script = env.File(env.subst("${TARGET.base}.version_script", target=target))
-        return script.get_csig() if for_signature else "-Wl,--version-script," + str(script)
-    else:
-        pass
-env['MONGO_EXPORT_FILE_SHLINKFLAGS'] = mongo_export_file_generator
-
-capiEnv = env.Clone()
-capiEnv.AppendUnique(
-    CPPDEFINES=[
-        'MONGO_EMBEDDED_CAPI_COMPILING',
-    ],
-)
-
-if get_option('link-model') == 'static':
-    capiEnv.AppendUnique(
-        CPPDEFINES=[
-            'MONGO_EMBEDDED_CAPI_STATIC',
-        ],
-    )
-elif get_option('link-model') == 'dynamic-sdk':
-    capiEnv['LIBDEPS_SHLIBEMITTER'] = libdeps.make_libdeps_emitter(
-        'SharedArchive',
-        libdeps.dependency_visibility_honored
-    )
-
-capiEnv.AppendUnique(
-    SHLINKFLAGS=['$MONGO_EXPORT_FILE_SHLINKFLAGS']
-)
-
-capiEnv.Library(
-    target='mongo_embedded_capi',
-    source=[
-        'capi.cpp',
-    ],
-    LIBDEPS_PRIVATE=[
-        '$BUILD_DIR/mongo/db/service_context',
-        '$BUILD_DIR/mongo/rpc/protocol',
-        '$BUILD_DIR/mongo/transport/transport_layer_mock',
-        'embedded',
-    ],
-    INSTALL_ALIAS=[
-        'embedded-dev',
-    ],
-)
-
-if get_option('install-mode') == 'hygienic':
-    env.AutoInstall(
-        'include/mongo/embedded-v1/mongo/embedded',
-        source=['capi.h'],
-        INSTALL_ALIAS=[
-            'embedded-dev',
-        ],
-    )
-
 if get_option('link-model') != 'dynamic-sdk':
-    capiTest = yamlEnv.Program(
-        target='mongo_embedded_capi_test',
-        source=[
-            'capi_test.cpp',
-        ],
-        LIBDEPS=[
-            '$BUILD_DIR/mongo/base',
-            '$BUILD_DIR/mongo/db/commands/test_commands_enabled',
-            '$BUILD_DIR/mongo/db/server_options_core',
-            '$BUILD_DIR/mongo/rpc/protocol',
-            '$BUILD_DIR/mongo/unittest/unittest',
-            '$BUILD_DIR/mongo/util/net/network',
-            '$BUILD_DIR/mongo/util/options_parser/options_parser',
-            'mongo_embedded_capi',
-        ],
-        INSTALL_ALIAS=[
-            'embedded-test',
-        ],
-    )
-
-    env.RegisterUnitTest(capiTest[0])
-
     mongoed = yamlEnv.Program(
         target='mongoed',
         source=[
@@ -183,11 +135,11 @@ if get_option('link-model') != 'dynamic-sdk':
             '$BUILD_DIR/mongo/db/mongod_options',
             '$BUILD_DIR/mongo/db/server_options',
             '$BUILD_DIR/mongo/db/repl/repl_set_status_commands',
+            '$BUILD_DIR/mongo/embedded/embedded',
+            '$BUILD_DIR/mongo/embedded/embedded_integration_helpers',
             '$BUILD_DIR/mongo/transport/service_entry_point',
             '$BUILD_DIR/mongo/transport/transport_layer_manager',
             '$BUILD_DIR/mongo/util/signal_handlers',
-            'embedded',
-            'embedded_integration_helpers',
         ],
         INSTALL_ALIAS=[
             'embedded-test',
@@ -200,73 +152,3 @@ if get_option('link-model') != 'dynamic-sdk':
 
     if not hygienic:
         env.Install('#/', mongoed)
-
-if not env['MONGO_HAVE_LIBMONGOC']:
-    Return()
-
-mongocClientEnv = env.Clone()
-mongocClientEnv.AppendUnique(
-    CPPDEFINES=[
-        'MONGO_EMBEDDED_MONGOC_CLIENT_COMPILING',
-     ],
-)
-
-if get_option('link-model') == 'static':
-    mongocClientEnv.AppendUnique(
-        CPPDEFINES=[
-            'MONGO_EMBEDDED_MONGOC_CLIENT_STATIC',
-        ],
-    )
-
-mongocClientEnv.AppendUnique(
-    SHLINKFLAGS=['$MONGO_EXPORT_FILE_SHLINKFLAGS']
-)
-
-mongocClientEnv.Library(
-    target='mongo_embedded_mongoc_client',
-    source=[
-        'mongoc_client.cpp',
-    ],
-    LIBDEPS=[
-        # No LIBDEPS or LIBDEPS_PRIVATE to mongo libraries are allowed in this library. They would get duplicated in mongo_embedded_capi.
-        'mongo_embedded_capi',
-    ],
-    SYSLIBDEPS=[
-        # No other SYSLIBDEPS than mongoc and bson are allowed in this library.
-        'mongoc-1.0',
-        'bson-1.0',
-    ],
-    INSTALL_ALIAS=[
-        'embedded-dev',
-    ],
-)
-
-if get_option('install-mode') == 'hygienic':
-    env.AutoInstall(
-        'include/mongo/embedded-v1/mongo/embedded',
-        source=['mongoc_client.h'],
-        INSTALL_ALIAS=[
-            'embedded-dev',
-        ],
-    )
-
-if get_option('link-model') != 'dynamic-sdk':
-    clientTest = yamlEnv.Program(
-        target='mongo_embedded_mongoc_client_test',
-        source=[
-            'mongo_embedded_mongoc_client_test.cpp',
-            'functions_for_test.cpp',
-        ],
-        LIBDEPS=[
-            '$BUILD_DIR/mongo/base',
-            '$BUILD_DIR/mongo/db/server_options_core',
-            '$BUILD_DIR/mongo/unittest/unittest',
-            '$BUILD_DIR/mongo/util/options_parser/options_parser',
-            'mongo_embedded_mongoc_client',
-        ],
-        INSTALL_ALIAS=[
-            'embedded-test',
-        ],
-    )
-
-    env.RegisterUnitTest(clientTest[0]);

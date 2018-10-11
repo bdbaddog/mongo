@@ -213,6 +213,36 @@ public:
         long long getNumReturnedSoFar() const;
 
         /**
+         * Returns the creation date of the cursor.
+         */
+        Date_t getCreatedDate() const;
+
+        /**
+         * Returns the time the cursor was last used.
+         */
+        Date_t getLastUseDate() const;
+
+        /**
+         * Set the cursor's lastUseDate to the given time.
+         */
+        void setLastUseDate(Date_t now);
+
+        /**
+         * Increment the number of batches returned by this cursor.
+         */
+        void incNBatches();
+
+        /**
+         * Get the number of batches returned by this cursor.
+         */
+        long long getNBatches() const;
+
+        /**
+         * Returns a GenericCursor version of the pinned cursor.
+         */
+        GenericCursor toGenericCursor() const;
+
+        /**
          * Stashes 'obj' to be returned later by this cursor. A cursor must be owned.
          */
         void queueResult(const ClusterQueryResult& result);
@@ -406,7 +436,8 @@ public:
     /**
      * Returns a list of GenericCursors for all idle (non-pinned) cursors in the cursor manager.
      */
-    std::vector<GenericCursor> getIdleCursors() const;
+    std::vector<GenericCursor> getIdleCursors(
+        const OperationContext* opCtx, MongoProcessInterface::CurrentOpUserMode userMode) const;
 
     std::pair<Status, int> killCursorsWithMatchingSessions(OperationContext* opCtx,
                                                            const SessionKiller::Matcher& matcher);

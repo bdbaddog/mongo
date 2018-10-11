@@ -15,7 +15,7 @@ env.Library(
         '$BUILD_DIR/mongo/db/curop',
         '$BUILD_DIR/mongo/db/curop_failpoint_helpers',
         '$BUILD_DIR/mongo/db/query/query_common',
-        '$BUILD_DIR/mongo/s/commands/cluster_commands_helpers',
+        '$BUILD_DIR/mongo/s/sharding_router_api',
         "cluster_client_cursor",
         "cluster_cursor_cleanup_job",
         "store_possible_cursor",
@@ -64,15 +64,17 @@ env.Library(
 env.Library(
     target="router_exec_stage",
     source=[
-        "router_stage_limit.cpp",
-        "router_stage_mock.cpp",
-        "router_stage_pipeline.cpp",
-        "router_stage_remove_metadata_fields.cpp",
-        "router_stage_skip.cpp",
+        'document_source_merge_cursors.cpp',
+        'document_source_update_on_add_shard.cpp',
+        'router_stage_limit.cpp',
+        'router_stage_mock.cpp',
+        'router_stage_pipeline.cpp',
+        'router_stage_remove_metadata_fields.cpp',
+        'router_stage_skip.cpp',
     ],
     LIBDEPS=[
-        "async_results_merger",
-        "$BUILD_DIR/mongo/db/pipeline/pipeline",
+        '$BUILD_DIR/mongo/db/pipeline/pipeline',
+        'async_results_merger',
     ],
 )
 
@@ -101,9 +103,9 @@ env.Library(
         "$BUILD_DIR/mongo/db/query/command_request_response",
         "$BUILD_DIR/mongo/db/query/query_common",
         "$BUILD_DIR/mongo/executor/task_executor_interface",
-        "$BUILD_DIR/mongo/s/async_requests_sender",
         "$BUILD_DIR/mongo/s/client/sharding_client",
         '$BUILD_DIR/mongo/s/catalog/sharding_catalog_client_impl',
+        "$BUILD_DIR/mongo/s/sharding_router_api",
     ],
 )
 

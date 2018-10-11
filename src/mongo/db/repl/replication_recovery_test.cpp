@@ -78,11 +78,22 @@ public:
         _supportsRecoverToStableTimestamp = supports;
     }
 
+    bool supportsRecoveryTimestamp(ServiceContext* serviceCtx) const override {
+        stdx::lock_guard<stdx::mutex> lock(_mutex);
+        return _supportsRecoveryTimestamp;
+    }
+
+    void setSupportsRecoveryTimestamp(bool supports) {
+        stdx::lock_guard<stdx::mutex> lock(_mutex);
+        _supportsRecoveryTimestamp = supports;
+    }
+
 private:
     mutable stdx::mutex _mutex;
     Timestamp _initialDataTimestamp = Timestamp::min();
     boost::optional<Timestamp> _recoveryTimestamp = boost::none;
     bool _supportsRecoverToStableTimestamp = true;
+    bool _supportsRecoveryTimestamp = true;
 };
 
 class ReplicationRecoveryTest : public ServiceContextMongoDTest {
@@ -189,6 +200,36 @@ repl::OplogEntry _makeOplogEntry(repl::OpTime opTime,
                             boost::none,   // optime of previous write within same transaction
                             boost::none,   // pre-image optime
                             boost::none);  // post-image optime
+}
+
+/**
+ * Creates a prepareTransaction, commitTransaction or abortTransaction OplogEntry.
+ */
+repl::OplogEntry _makeTransactionOplogEntry(repl::OpTime opTime,
+                                            repl::OpTypeEnum opType,
+                                            BSONObj object,
+                                            repl::OpTime prevOpTime,
+                                            bool prepare,
+                                            StmtId stmtId,
+                                            OperationSessionInfo sessionInfo,
+                                            Date_t wallTime) {
+    BSONObjBuilder builder;
+    sessionInfo.serialize(&builder);
+    builder.append("ts", opTime.getTimestamp());
+    builder.append("t", opTime.getTerm());
+    builder.append("h", 1LL);
+    builder.append("v", repl::OplogEntry::kOplogVersion);
+    builder.append("op", "c");
+    builder.append("ns", testNs.toString());
+    builder.append("o", object);
+    builder.append("wall", wallTime);
+    builder.append("stmtId", stmtId);
+    builder.append("prevOpTime", prevOpTime.toBSON());
+    if (prepare) {
+        builder.append("prepare", prepare);
+    }
+
+    return uassertStatusOK(repl::OplogEntry::parse(builder.obj()));
 }
 
 /**
@@ -357,9 +398,9 @@ DEATH_TEST_F(ReplicationRecoveryTest,
 }
 
 DEATH_TEST_F(ReplicationRecoveryTest,
-             RecoveryInvariantsIfStableTimestampAndDoesNotSupportRTT,
+             RecoveryInvariantsIfStableTimestampAndDoesNotSupportRecoveryTimestamp,
              "Invariant failure") {
-    getStorageInterfaceRecovery()->setSupportsRecoverToStableTimestamp(false);
+    getStorageInterfaceRecovery()->setSupportsRecoveryTimestamp(false);
     ReplicationRecoveryImpl recovery(getStorageInterface(), getConsistencyMarkers());
     auto opCtx = getOperationContext();
 
@@ -808,6 +849,151 @@ TEST_F(ReplicationRecoveryTest, CorrectlyUpdatesConfigTransactions) {
 
     ASSERT_EQ(getConsistencyMarkers()->getOplogTruncateAfterPoint(opCtx), Timestamp());
     ASSERT_EQ(getConsistencyMarkers()->getAppliedThrough(opCtx), OpTime(Timestamp(3, 0), 1));
+}
+
+TEST_F(ReplicationRecoveryTest, PrepareTransactionOplogEntryCorrectlyUpdatesConfigTransactions) {
+    ReplicationRecoveryImpl recovery(getStorageInterface(), getConsistencyMarkers());
+    auto opCtx = getOperationContext();
+
+    const auto appliedThrough = OpTime(Timestamp(1, 1), 1);
+    getStorageInterfaceRecovery()->setSupportsRecoverToStableTimestamp(true);
+    getStorageInterfaceRecovery()->setRecoveryTimestamp(appliedThrough.getTimestamp());
+    getConsistencyMarkers()->setAppliedThrough(opCtx, appliedThrough);
+    _setUpOplog(opCtx, getStorageInterface(), {1});
+
+    const auto sessionId = makeLogicalSessionIdForTest();
+    OperationSessionInfo sessionInfo;
+    sessionInfo.setSessionId(sessionId);
+    sessionInfo.setTxnNumber(3);
+
+    const auto lastDate = Date_t::now();
+    const auto prepareOp =
+        _makeTransactionOplogEntry({Timestamp(2, 0), 1},
+                                   repl::OpTypeEnum::kCommand,
+                                   BSON("applyOps" << BSONArray() << "prepare" << true),
+                                   OpTime(Timestamp(0, 0), -1),
+                                   true,  // prepare
+                                   0,
+                                   sessionInfo,
+                                   lastDate);
+
+    ASSERT_OK(getStorageInterface()->insertDocument(
+        opCtx, oplogNs, {prepareOp.toBSON(), Timestamp(2, 0)}, 1));
+
+    recovery.recoverFromOplog(opCtx, boost::none);
+
+    SessionTxnRecord expectedTxnRecord;
+    expectedTxnRecord.setSessionId(*sessionInfo.getSessionId());
+    expectedTxnRecord.setTxnNum(*sessionInfo.getTxnNumber());
+    expectedTxnRecord.setLastWriteOpTime({Timestamp(2, 0), 1});
+    expectedTxnRecord.setLastWriteDate(lastDate);
+    expectedTxnRecord.setState(DurableTxnStateEnum::kPrepared);
+
+    std::vector<BSONObj> expectedTxnColl{expectedTxnRecord.toBSON()};
+
+    // Make sure that the transaction table shows that the transaction is prepared.
+    _assertDocumentsInCollectionEquals(
+        opCtx, NamespaceString::kSessionTransactionsTableNamespace, expectedTxnColl);
+
+    ASSERT_EQ(getConsistencyMarkers()->getOplogTruncateAfterPoint(opCtx), Timestamp());
+    ASSERT_EQ(getConsistencyMarkers()->getAppliedThrough(opCtx), OpTime(Timestamp(2, 0), 1));
+}
+
+TEST_F(ReplicationRecoveryTest, AbortTransactionOplogEntryCorrectlyUpdatesConfigTransactions) {
+    ReplicationRecoveryImpl recovery(getStorageInterface(), getConsistencyMarkers());
+    auto opCtx = getOperationContext();
+
+    const auto appliedThrough = OpTime(Timestamp(1, 1), 1);
+    getStorageInterfaceRecovery()->setSupportsRecoverToStableTimestamp(true);
+    getStorageInterfaceRecovery()->setRecoveryTimestamp(appliedThrough.getTimestamp());
+    getConsistencyMarkers()->setAppliedThrough(opCtx, appliedThrough);
+    _setUpOplog(opCtx, getStorageInterface(), {1});
+
+    const auto sessionId = makeLogicalSessionIdForTest();
+    OperationSessionInfo sessionInfo;
+    sessionInfo.setSessionId(sessionId);
+    sessionInfo.setTxnNumber(3);
+
+    const auto prepareDate = Date_t::now();
+    const auto prepareOp =
+        _makeTransactionOplogEntry({Timestamp(2, 0), 1},
+                                   repl::OpTypeEnum::kCommand,
+                                   BSON("applyOps" << BSONArray() << "prepare" << true),
+                                   OpTime(Timestamp(0, 0), -1),
+                                   true,  // prepare
+                                   0,
+                                   sessionInfo,
+                                   prepareDate);
+
+    ASSERT_OK(getStorageInterface()->insertDocument(
+        opCtx, oplogNs, {prepareOp.toBSON(), Timestamp(2, 0)}, 1));
+
+    const auto abortDate = Date_t::now();
+    const auto abortOp = _makeTransactionOplogEntry({Timestamp(3, 0), 1},
+                                                    repl::OpTypeEnum::kCommand,
+                                                    BSON("abortTransaction" << 1),
+                                                    OpTime(Timestamp(2, 0), 1),
+                                                    false,  // prepare
+                                                    1,
+                                                    sessionInfo,
+                                                    abortDate);
+
+    ASSERT_OK(getStorageInterface()->insertDocument(
+        opCtx, oplogNs, {abortOp.toBSON(), Timestamp(3, 0)}, 1));
+
+    recovery.recoverFromOplog(opCtx, boost::none);
+
+    SessionTxnRecord expectedTxnRecord;
+    expectedTxnRecord.setSessionId(*sessionInfo.getSessionId());
+    expectedTxnRecord.setTxnNum(*sessionInfo.getTxnNumber());
+    expectedTxnRecord.setLastWriteOpTime({Timestamp(3, 0), 1});
+    expectedTxnRecord.setLastWriteDate(abortDate);
+    expectedTxnRecord.setState(DurableTxnStateEnum::kAborted);
+
+    std::vector<BSONObj> expectedTxnColl{expectedTxnRecord.toBSON()};
+
+    // Make sure that the transaction table shows that the transaction is aborted.
+    _assertDocumentsInCollectionEquals(
+        opCtx, NamespaceString::kSessionTransactionsTableNamespace, expectedTxnColl);
+
+    ASSERT_EQ(getConsistencyMarkers()->getOplogTruncateAfterPoint(opCtx), Timestamp());
+    ASSERT_EQ(getConsistencyMarkers()->getAppliedThrough(opCtx), OpTime(Timestamp(3, 0), 1));
+}
+
+DEATH_TEST_F(ReplicationRecoveryTest,
+             RecoveryFailsWithPrepareAndEnableReadConcernMajorityFalse,
+             "Fatal Assertion 50964") {
+    ReplicationRecoveryImpl recovery(getStorageInterface(), getConsistencyMarkers());
+    auto opCtx = getOperationContext();
+
+    const auto appliedThrough = OpTime(Timestamp(1, 1), 1);
+    getStorageInterfaceRecovery()->setSupportsRecoverToStableTimestamp(true);
+    getStorageInterfaceRecovery()->setRecoveryTimestamp(appliedThrough.getTimestamp());
+    getConsistencyMarkers()->setAppliedThrough(opCtx, appliedThrough);
+    _setUpOplog(opCtx, getStorageInterface(), {1});
+
+    const auto sessionId = makeLogicalSessionIdForTest();
+    OperationSessionInfo sessionInfo;
+    sessionInfo.setSessionId(sessionId);
+    sessionInfo.setTxnNumber(3);
+
+    const auto lastDate = Date_t::now();
+    const auto prepareOp =
+        _makeTransactionOplogEntry({Timestamp(2, 0), 1},
+                                   repl::OpTypeEnum::kCommand,
+                                   BSON("applyOps" << BSONArray() << "prepare" << true),
+                                   OpTime(Timestamp(0, 0), -1),
+                                   true,  // prepare
+                                   0,
+                                   sessionInfo,
+                                   lastDate);
+
+    ASSERT_OK(getStorageInterface()->insertDocument(
+        opCtx, oplogNs, {prepareOp.toBSON(), Timestamp(2, 0)}, 1));
+
+    serverGlobalParams.enableMajorityReadConcern = false;
+
+    recovery.recoverFromOplog(opCtx, boost::none);
 }
 
 }  // namespace

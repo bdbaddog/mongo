@@ -52,7 +52,7 @@
 #include "mongo/platform/overflow_arithmetic.h"
 #include "mongo/s/catalog_cache.h"
 #include "mongo/s/client/shard_registry.h"
-#include "mongo/s/commands/cluster_commands_helpers.h"
+#include "mongo/s/cluster_commands_helpers.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/query/async_results_merger.h"
 #include "mongo/s/query/cluster_client_cursor_impl.h"
@@ -61,7 +61,7 @@
 #include "mongo/s/query/establish_cursors.h"
 #include "mongo/s/query/store_possible_cursor.h"
 #include "mongo/s/stale_exception.h"
-#include "mongo/s/transaction/transaction_router.h"
+#include "mongo/s/transaction_router.h"
 #include "mongo/stdx/memory.h"
 #include "mongo/util/fail_point_service.h"
 #include "mongo/util/log.h"
@@ -241,6 +241,10 @@ CursorId runQueryWithoutRetrying(OperationContext* opCtx,
     params.lsid = opCtx->getLogicalSessionId();
     params.txnNumber = opCtx->getTxnNumber();
 
+    if (TransactionRouter::get(opCtx)) {
+        params.isAutoCommit = false;
+    }
+
     // This is the batchSize passed to each subsequent getMore command issued by the cursor. We
     // usually use the batchSize associated with the initial find, but as it is illegal to send a
     // getMore with a batchSize of 0, we set it to use the default batchSize logic.
@@ -357,6 +361,7 @@ CursorId runQueryWithoutRetrying(OperationContext* opCtx,
         ? ClusterCursorManager::CursorLifetime::Immortal
         : ClusterCursorManager::CursorLifetime::Mortal;
     auto authUsers = AuthorizationSession::get(opCtx->getClient())->getAuthenticatedUserNames();
+    ccc->incNBatches();
 
     auto cursorId = uassertStatusOK(cursorManager->registerCursor(
         opCtx, ccc.releaseCursor(), query.nss(), cursorType, cursorLifetime, authUsers));
@@ -571,6 +576,7 @@ StatusWith<CursorResponse> ClusterFind::runGetMore(OperationContext* opCtx,
         stdx::lock_guard<Client> lk(*opCtx->getClient());
         CurOp::get(opCtx)->setOriginatingCommand_inlock(
             pinnedCursor.getValue().getOriginatingCommand());
+        CurOp::get(opCtx)->setGenericCursor_inlock(pinnedCursor.getValue().toGenericCursor());
     }
 
     // If the 'waitAfterPinningCursorBeforeGetMoreBatch' fail point is enabled, set the 'msg'
@@ -641,6 +647,7 @@ StatusWith<CursorResponse> ClusterFind::runGetMore(OperationContext* opCtx,
     }
 
     pinnedCursor.getValue().setLeftoverMaxTimeMicros(opCtx->getRemainingMaxTimeMicros());
+    pinnedCursor.getValue().incNBatches();
     // Upon successful completion, transfer ownership of the cursor back to the cursor manager. If
     // the cursor has been exhausted, the cursor manager will clean it up for us.
     pinnedCursor.getValue().returnCursor(cursorState);

@@ -44,7 +44,7 @@
 #include "mongo/s/cluster_last_error_info.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/is_mongos.h"
-#include "mongo/s/transaction/transaction_router.h"
+#include "mongo/s/transaction_router.h"
 #include "mongo/util/log.h"
 #include "mongo/util/scopeguard.h"
 
@@ -121,51 +121,47 @@ StatusWith<TaskExecutor::CallbackHandle> ShardingTaskExecutor::scheduleRemoteCom
         return _executor->scheduleRemoteCommand(request, cb, baton);
     }
 
-    boost::optional<RemoteCommandRequest> newRequest;
+    boost::optional<RemoteCommandRequest> requestWithFixedLsid = [&] {
+        boost::optional<RemoteCommandRequest> newRequest;
 
-    if (request.opCtx->getLogicalSessionId() && !request.cmdObj.hasField("lsid")) {
-        newRequest.emplace(request);
-
-        BSONObjBuilder bob(std::move(newRequest->cmdObj));
-        {
-            // TODO SERVER-33702.
-            BSONObjBuilder subbob(bob.subobjStart("lsid"));
-            request.opCtx->getLogicalSessionId()->serialize(&subbob);
+        if (!request.opCtx->getLogicalSessionId()) {
+            return newRequest;
         }
 
-        newRequest->cmdObj = bob.obj();
-    }
+        if (request.cmdObj.hasField("lsid")) {
+            auto cmdObjLsid =
+                LogicalSessionFromClient::parse("lsid"_sd, request.cmdObj["lsid"].Obj());
 
-    auto txnRouter = TransactionRouter::get(request.opCtx);
-    if (txnRouter) {
-        auto shard =
-            Grid::get(request.opCtx)->shardRegistry()->getShardForHostNoReload(request.target);
+            if (cmdObjLsid.getUid()) {
+                invariant(*cmdObjLsid.getUid() == request.opCtx->getLogicalSessionId()->getUid());
+                return newRequest;
+            }
 
-        if (!shard) {
-            return {ErrorCodes::ShardNotFound,
-                    str::stream() << "Could not find shard containing host: "
-                                  << request.target.toString()};
+            newRequest.emplace(request);
+            newRequest->cmdObj = newRequest->cmdObj.removeField("lsid");
         }
 
         if (!newRequest) {
             newRequest.emplace(request);
         }
 
-        auto& participant = txnRouter->getOrCreateParticipant(shard->getId());
-        newRequest->cmdObj = participant.attachTxnFieldsIfNeeded(newRequest->cmdObj);
-
-        // The callback only needs a pointer to the transaction router if it attempted to start a
-        // transaction.
-        if (!participant.mustStartTransaction()) {
-            txnRouter = nullptr;
+        BSONObjBuilder bob(std::move(newRequest->cmdObj));
+        {
+            BSONObjBuilder subbob(bob.subobjStart("lsid"));
+            request.opCtx->getLogicalSessionId()->serialize(&subbob);
+            subbob.done();
         }
-    }
+
+        newRequest->cmdObj = bob.obj();
+
+        return newRequest;
+    }();
 
     std::shared_ptr<OperationTimeTracker> timeTracker = OperationTimeTracker::get(request.opCtx);
 
     auto clusterGLE = ClusterLastErrorInfo::get(request.opCtx->getClient());
 
-    auto shardingCb = [ timeTracker, clusterGLE, cb, grid = Grid::get(request.opCtx), txnRouter ](
+    auto shardingCb = [ timeTracker, clusterGLE, cb, grid = Grid::get(request.opCtx) ](
         const TaskExecutor::RemoteCommandCallbackArgs& args) {
         ON_BLOCK_EXIT([&cb, &args]() { cb(args); });
 
@@ -173,10 +169,6 @@ StatusWith<TaskExecutor::CallbackHandle> ShardingTaskExecutor::scheduleRemoteCom
         auto shard = grid->shardRegistry()->getShardForHostNoReload(args.request.target);
         if (!shard) {
             LOG(1) << "Could not find shard containing host: " << args.request.target.toString();
-        } else if (txnRouter) {
-            // TODO: SERVER-35707 only mark as sent for non-network error?
-            auto& participant = txnRouter->getOrCreateParticipant(shard->getId());
-            participant.markAsCommandSent();
         }
 
         if (!args.response.isOK()) {
@@ -233,15 +225,16 @@ StatusWith<TaskExecutor::CallbackHandle> ShardingTaskExecutor::scheduleRemoteCom
         }
     };
 
-    return _executor->scheduleRemoteCommand(newRequest ? *newRequest : request, shardingCb, baton);
+    return _executor->scheduleRemoteCommand(
+        requestWithFixedLsid ? *requestWithFixedLsid : request, shardingCb, baton);
 }
 
 void ShardingTaskExecutor::cancel(const CallbackHandle& cbHandle) {
     _executor->cancel(cbHandle);
 }
 
-void ShardingTaskExecutor::wait(const CallbackHandle& cbHandle) {
-    _executor->wait(cbHandle);
+void ShardingTaskExecutor::wait(const CallbackHandle& cbHandle, Interruptible* interruptible) {
+    _executor->wait(cbHandle, interruptible);
 }
 
 void ShardingTaskExecutor::appendConnectionStats(ConnectionPoolStats* stats) const {

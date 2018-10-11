@@ -36,6 +36,7 @@
 #include "mongo/client/remote_command_targeter.h"
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/commands.h"
+#include "mongo/db/commands/list_databases_gen.h"
 #include "mongo/s/client/shard.h"
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/commands/strategy.h"
@@ -81,7 +82,28 @@ public:
              const std::string& dbname_unused,
              const BSONObj& cmdObj,
              BSONObjBuilder& result) override {
-        const bool nameOnly = cmdObj["nameOnly"].trueValue();
+        IDLParserErrorContext ctx("listDatabases");
+        auto cmd = ListDatabasesCommand::parse(ctx, cmdObj);
+        auto* as = AuthorizationSession::get(opCtx->getClient());
+
+        // { nameOnly: bool } - Default false.
+        const bool nameOnly = cmd.getNameOnly();
+
+        // { authorizedDatabases: bool } - Dynamic default based on perms.
+        const bool authorizedDatabases = ([as](const boost::optional<bool>& authDB) {
+            const bool mayListAllDatabases = as->isAuthorizedForActionsOnResource(
+                ResourcePattern::forClusterResource(), ActionType::listDatabases);
+            if (authDB) {
+                uassert(ErrorCodes::Unauthorized,
+                        "Insufficient permissions to list all databases",
+                        authDB.get() || mayListAllDatabases);
+                return authDB.get();
+            }
+
+            // By default, list all databases if we can, otherwise
+            // only those we're allowed to find on.
+            return !mayListAllDatabases;
+        })(cmd.getAuthorizedDatabases());
 
         auto const shardRegistry = Grid::get(opCtx)->shardRegistry();
 
@@ -92,6 +114,7 @@ public:
         shardRegistry->getAllShardIdsNoReload(&shardIds);
         shardIds.emplace_back(ShardRegistry::kConfigServerShardId);
 
+        // { filter: matchExpression }.
         auto filteredCmd = CommandHelpers::filterCommandRequestForPassthrough(cmdObj);
 
         for (const ShardId& shardId : shardIds) {
@@ -146,14 +169,6 @@ public:
             }
         }
 
-        // If we have ActionType::listDatabases,
-        // then we don't need to test each record in the output.
-        // Otherwise, we'll test the database names as we enumerate them.
-        const auto as = AuthorizationSession::get(opCtx->getClient());
-        const bool checkAuth = as &&
-            !as->isAuthorizedForActionsOnResource(ResourcePattern::forClusterResource(),
-                                                  ActionType::listDatabases);
-
         // Now that we have aggregated results for all the shards, convert to a response,
         // and compute total sizes.
         long long totalSize = 0;
@@ -168,7 +183,7 @@ public:
                 if (name == NamespaceString::kLocalDb)
                     continue;
 
-                if (checkAuth && as &&
+                if (authorizedDatabases &&
                     !as->isAuthorizedForActionsOnResource(ResourcePattern::forDatabaseName(name),
                                                           ActionType::find)) {
                     // We don't have listDatabases on the cluser or find on this database.
