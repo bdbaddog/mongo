@@ -692,7 +692,6 @@ class Base(SCons.Node.Node):
         raise AttributeError("%r object has no attribute %r" %
                          (self.__class__, attr))
 
-    # @profile
     def __str__(self):
         """A Node.FS.Base object's string representation is its path
         name."""
@@ -3280,6 +3279,7 @@ class File(Base):
     __dmap_cache = {}
     __dmap_sig_cache = {}
 
+    #@profile
     def _build_dependency_map(self, binfo):
         """
         Build mapping from file -> signature
@@ -3305,6 +3305,7 @@ class File(Base):
 
         return binfo.dependency_map
 
+    #@profile
     def _get_previous_signatures(self, dmap):
         """
         Return a list of corresponding csigs from previous
@@ -3320,7 +3321,8 @@ class File(Base):
         prev = []
 
         # First try the simple name for node
-        c_str = str(self)
+        #c_str = str(self)
+        c_str = self._save_str()
         if os.altsep:
             c_str = c_str.replace(os.sep, os.altsep)
         df = dmap.get(c_str, None)
@@ -3339,6 +3341,7 @@ class File(Base):
 
         return df
 
+    #@profile
     def changed_timestamp_then_content(self, target, prev_ni, node=None):
         """
         Used when decider for file is Timestamp-MD5
