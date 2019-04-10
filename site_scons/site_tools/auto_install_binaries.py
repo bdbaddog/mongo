@@ -156,6 +156,7 @@ def generate(env):
         # installation.
         tags = kwargs.get('INSTALL_ALIAS', None)
         normalized_tags = list()
+        # MAT TODO: something seems fishy about this
         if tags is None or tags:
             tags = set(tags or [])
             for tag in tags:
@@ -163,6 +164,7 @@ def generate(env):
                     normalized_tags.append(tag)
                     continue
                 normalized_tags.append('-'.join(tag))
+                # MAT TODO: Ask about this
                 normalized_tags.append(tag[-1])
         tags = set(normalized_tags)
 
