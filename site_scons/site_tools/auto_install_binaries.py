@@ -196,8 +196,8 @@ def generate(env):
             env.Alias('install', 'install-default')
             env.Default('install')
 
-        for component, rolemap in alias_map.iteritems():
-            for role, info in rolemap.iteritems():
+        for component, rolemap in alias_map.items():
+            for role, info in rolemap.items():
 
                 if common_rolemap and component != 'common' and role in common_rolemap:
                     env.Depends(info[1], common_rolemap[role][1])
