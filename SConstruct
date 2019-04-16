@@ -97,6 +97,11 @@ add_option('prefix',
     help='installation prefix',
 )
 
+add_option('dest-dir',
+    default='$BUILD_ROOT/dest$PREFIX',
+    help='root of installation as a subdirectory of $BUILD_DIR'
+)
+
 add_option('install-mode',
     choices=['legacy', 'hygienic'],
     default='legacy',
@@ -928,9 +933,15 @@ if cacheDir[0] not in ['$', '#']:
         print("Do not use relative paths with --cache-dir")
         Exit(1)
 
-installDir = get_option('prefix').rstrip('/')
+installDir = get_option('dest-dir').rstrip('/')
 if installDir[0] not in ['$', '#']:
     if not os.path.isabs(installDir):
+        print("Do not use relative paths with --dest-dir")
+        Exit(1)
+
+prefix = get_option('prefix').rstrip('/')
+if prefix[0] not in ['$', '#']:
+    if not os.path.isabs(prefix):
         print("Do not use relative paths with --prefix")
         Exit(1)
 
@@ -1009,6 +1020,7 @@ envDict = dict(BUILD_ROOT=buildDir,
                CONFIGUREDIR='$BUILD_ROOT/scons/$VARIANT_DIR/sconf_temp',
                CONFIGURELOG='$BUILD_ROOT/scons/config.log',
                INSTALL_DIR=installDir,
+               PREFIX=get_option('prefix'),
                CONFIG_HEADER_DEFINES={},
                LIBDEPS_TAG_EXPANSIONS=[],
                )
@@ -3576,7 +3588,7 @@ if get_option('install-mode') == 'hygienic':
     if env['PLATFORM'] == 'posix':
         env.AppendUnique(
             RPATH=[
-                env.Literal('\\$$ORIGIN/../lib')
+                '$PREFIX'
             ],
             LINKFLAGS=[
                 # Most systems *require* -z,origin to make origin work, but android
