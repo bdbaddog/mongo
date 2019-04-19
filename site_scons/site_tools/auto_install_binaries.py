@@ -17,10 +17,20 @@
 # TODO: Namedtuple for alias_map
 
 import itertools
-from collections import defaultdict
+from collections import defaultdict, namedtuple
 
 import SCons
 
+
+RoleInfo = namedtuple(
+    'RoleInfo',
+    [
+        'alias_name',
+        'alias',
+        'prealias_name',
+        'prealias',
+    ],
+)
 
 def exists(_env):
     """Always activate this tool."""
@@ -142,48 +152,32 @@ def generate(env): # pylint: disable=too-many-statements
         for s in source:
             s.attributes.aib_install_actions = actions
 
-        # Get the tags. If no tags were set, or a non-falsish thing
-        # was set then interpret that as a request for normal
-        # tagging. Auto include the 'all' tag, and generate
-        # aliases. If the user explicitly set the INSTALL_ALIAS to
-        # something falsy, interpret that as meaning no tags at all,
-        # so that we have a way to exempt targets from auto
-        # installation.
-        tags = kwargs.get("INSTALL_ALIAS", None)
-        normalized_tags = list()
-        # MAT TODO: something seems fishy about this
-        if tags is None or tags:
-            tags = set(tags or [])
-            for tag in tags:
-                if not isinstance(tag, tuple):
-                    normalized_tags.append(tag)
-                    continue
-                normalized_tags.append("-".join(tag))
-                # MAT TODO: Ask about this
-                normalized_tags.append(tag[-1])
-        tags = set(normalized_tags)
+        roles = {
+            kwargs.get("INSTALL_ROLE"),
+            # The 'meta' tag is implicitly attached as a role.
+            "meta",
+        }
+        components = {
+            kwargs.get("INSTALL_COMPONENT"),
+            # The 'all' tag is implicitly attached as a component
+            "all",
+        }
 
-        applied_role_tags = role_tags.intersection(tags)
-        applied_component_tags = tags - applied_role_tags
+        # Remove false values such as None
+        roles = {role for role in roles if role}
+        components = {component for component in components if component}
 
-        # The 'all' tag is implicitly attached as a component, and the
-        # 'meta' tag is implicitly attached as a role.
-        applied_role_tags.add("meta")
-        applied_component_tags.add("all")
-
-        for component_tag, role_tag in itertools.product(
-            applied_component_tags, applied_role_tags
-        ):
+        for component_tag, role_tag in itertools.product(components, roles):
             alias_name = "install-" + component_tag
             alias_name = alias_name + ("" if role_tag == "runtime" else "-" + role_tag)
             prealias_name = "pre" + alias_name
             alias = env.Alias(alias_name, actions)
             prealias = env.Alias(prealias_name, source)
-            alias_map[component_tag][role_tag] = (
-                alias_name,
-                alias,
-                prealias_name,
-                prealias,
+            alias_map[component_tag][role_tag] = RoleInfo(
+                alias_name=alias_name,
+                alias=alias,
+                prealias_name=prealias_name,
+                prealias=prealias,
             )
 
         return actions
@@ -202,14 +196,14 @@ def generate(env): # pylint: disable=too-many-statements
             for role, info in rolemap.items():
 
                 if common_rolemap and component != "common" and role in common_rolemap:
-                    env.Depends(info[1], common_rolemap[role][1])
-                    env.Depends(info[3], common_rolemap[role][3])
+                    env.Depends(info.alias, common_rolemap[role].alias)
+                    env.Depends(info.prealias, common_rolemap[role].prealias)
 
                 for dependency in role_dependencies.get(role, []):
                     dependency_info = rolemap.get(dependency, [])
                     if dependency_info:
-                        env.Depends(info[1], dependency_info[1])
-                        env.Depends(info[3], dependency_info[3])
+                        env.Depends(info.alias, dependency_info.alias)
+                        env.Depends(info.prealias, dependency_info.prealias)
 
         installedFiles = env.FindInstalledFiles()
         env.NoCache(installedFiles)
@@ -244,19 +238,21 @@ def generate(env): # pylint: disable=too-many-statements
         results = []
         install_sources = node.sources
         for install_source in install_sources:
-            is_executor = install_source.get_executor()
-            if not is_executor:
+            install_executor = install_source.get_executor()
+            if not install_executor:
                 continue
-            is_targets = is_executor.get_all_targets()
-            for is_target in is_targets or []:
-                grandchildren = is_target.children()
+            install_targets = install_executor.get_all_targets()
+            if not install_targets:
+                continue
+            for install_target in install_targets:
+                grandchildren = install_target.children()
                 for grandchild in grandchildren:
                     actions = getattr(
                         grandchild.attributes, "aib_install_actions", None
                     )
                     if actions:
                         results.extend(actions)
-        results = sorted(results, key=lambda t: str(t))
+        results = sorted(results, key=str)
         return results
 
     from SCons.Tool import install
