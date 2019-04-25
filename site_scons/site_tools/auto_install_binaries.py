@@ -20,6 +20,7 @@ import itertools
 from collections import defaultdict, namedtuple
 
 import SCons
+from SCons.Tool import install
 
 
 RoleInfo = namedtuple(
@@ -32,19 +33,18 @@ RoleInfo = namedtuple(
     ],
 )
 
+
 def exists(_env):
     """Always activate this tool."""
     return True
 
 
-def generate(env): # pylint: disable=too-many-statements
+def generate(env):  # pylint: disable=too-many-statements
     """Generate the auto install builders."""
 
     env["INSTALLDIR_BINDIR"] = "$INSTALL_DIR/bin"
     env["INSTALLDIR_LIBDIR"] = "$INSTALL_DIR/lib"
     env["INSTALLDIR_INCLUDEDIR"] = "$INSTALL_DIR/include"
-
-    role_tags = set(["common", "debug", "dev", "meta", "runtime"])
 
     role_dependencies = {
         "debug": [
@@ -70,57 +70,56 @@ def generate(env): # pylint: disable=too-many-statements
     # TODO: These probably need to be patterns of some sort, not just suffixes.
     # TODO: The runtime libs should be in runtime, the dev symlinks in dev
     suffix_map = {
-        env.subst("$PROGSUFFIX") : (
+        env.subst("$PROGSUFFIX"): (
             "$INSTALLDIR_BINDIR", [
                 "runtime",
             ]
         ),
 
-        env.subst("$LIBSUFFIX") : (
+        env.subst("$LIBSUFFIX"): (
             "$INSTALLDIR_LIBDIR", [
                 "dev",
             ]
         ),
 
-        ".dll" : (
+        ".dll": (
             "$INSTALLDIR_BINDIR", [
                 "runtime",
             ]
         ),
 
-        ".dylib" : (
+        ".dylib": (
             "$INSTALLDIR_LIBDIR", [
                 "runtime",
                 "dev",
             ]
         ),
 
-        ".so" : (
+        ".so": (
             "$INSTALLDIR_LIBDIR", [
                 "runtime",
                 "dev",
             ]
         ),
 
-        ".debug" : (
+        ".debug": (
             "$INSTALLDIR_DEBUGDIR", [
                 "debug",
             ]
         ),
 
-        ".dSYM" : (
+        ".dSYM": (
             "$INSTALLDIR_LIBDIR", [
                 "runtime"
             ]
         ),
 
-        ".lib" : (
+        ".lib": (
             "$INSTALLDIR_LIBDIR", [
                 "runtime"
             ]
         ),
     }
-
 
     def _aib_debugdir(source, target, env, for_signature):
         for s in source:
@@ -131,10 +130,9 @@ def generate(env): # pylint: disable=too-many-statements
             osuf = oentry.get_suffix()
             return suffix_map.get(osuf)[0]
 
-
     env["INSTALLDIR_DEBUGDIR"] = _aib_debugdir
 
-    alias_map = defaultdict(dict)
+    alias_map = dict()
 
     def auto_install(env, target, source, **kwargs):
 
@@ -226,11 +224,13 @@ def generate(env): # pylint: disable=too-many-statements
 
     def add_emitter(builder):
         base_emitter = builder.emitter
-        new_emitter = SCons.Builder.ListEmitter([base_emitter, auto_install_emitter])
+        new_emitter = SCons.Builder.ListEmitter([
+            base_emitter,
+            auto_install_emitter,
+        ])
         builder.emitter = new_emitter
 
-    target_builders = ["Program", "SharedLibrary", "LoadableModule", "StaticLibrary"]
-    for builder in target_builders:
+    for builder in ["Program", "SharedLibrary", "LoadableModule", "StaticLibrary"]:
         builder = env["BUILDERS"][builder]
         add_emitter(builder)
 
@@ -254,8 +254,6 @@ def generate(env): # pylint: disable=too-many-statements
                         results.extend(actions)
         results = sorted(results, key=str)
         return results
-
-    from SCons.Tool import install
 
     base_install_builder = install.BaseInstallBuilder
     assert base_install_builder.target_scanner is None
