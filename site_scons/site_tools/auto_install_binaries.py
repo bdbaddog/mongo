@@ -39,6 +39,11 @@ def exists(_env):
     return True
 
 
+
+
+
+
+
 def generate(env):  # pylint: disable=too-many-statements
     """Generate the auto install builders."""
 
@@ -134,6 +139,7 @@ def generate(env):  # pylint: disable=too-many-statements
 
     alias_map = defaultdict(dict)
 
+
     def auto_install(env, target, source, **kwargs):
 
         target = env.Dir(env.subst(target, source=source))
@@ -156,13 +162,13 @@ def generate(env):  # pylint: disable=too-many-statements
             "meta",
         }
 
-        component_tag = env.get("COMPONENT_TAG")
+        component_tag = kwargs.get('COMPONENT_TAG', None)
         if (
                 component_tag is not None
                 and (not isinstance(component_tag, str) or " " in component_tag)
         ):
             raise Exception(
-                "COMPONENT_TAG must be a string and contain no whitespace."
+                "COMPONENT_TAG='%s' must be a string and contain no whitespace." % component_tag
             )
         components = {
             component_tag,
@@ -227,13 +233,15 @@ def generate(env):  # pylint: disable=too-many-statements
 
     env.AddMethod(finalize_install_dependencies, "FinalizeInstallDependencies")
 
+
     def auto_install_emitter(target, source, env):
+
         for t in target:
             tentry = env.Entry(t)
             tsuf = tentry.get_suffix()
             auto_install_location = suffix_map.get(tsuf)
             if auto_install_location:
-                env.AutoInstall(auto_install_location[0], tentry)
+                env.AutoInstall(auto_install_location[0], tentry, COMPONENT_TAG=env.get('COMPONENT_TAG', None))
         return (target, source)
 
     def add_emitter(builder):
