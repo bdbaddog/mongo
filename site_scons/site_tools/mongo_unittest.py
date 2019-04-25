@@ -1,9 +1,10 @@
-"""Pseudo-builders for building and registering unit tests.
-"""
+"""Pseudo-builders for building and registering unit tests."""
 from SCons.Script import Action
+
 
 def exists(env):
     return True
+
 
 _unittests = []
 def register_unit_test(env, test):
@@ -24,10 +25,12 @@ def build_cpp_unit_test(env, target, source, **kwargs):
     libdeps.append( '$BUILD_DIR/mongo/unittest/unittest_main' )
 
     kwargs['LIBDEPS'] = libdeps
-    if kwargs.get('INSTALL_ALIAS'):
-        kwargs['INSTALL_ALIAS'] += ['tests', 'unittests']
-    else:
-        kwargs['INSTALL_ALIAS'] = ['tests', 'unittests']
+    kwargs['ADDITIONAL_COMPONENTS'] = {'tests', 'unittests'}
+    if (
+            "COMPONENT_TAG" in kwargs
+            and not kwargs["COMPONENT_TAG"].endswith("-test")
+    ):
+        kwargs["COMPONENT_TAG"] += "-test"
 
     result = env.Program(target, source, **kwargs)
     env.RegisterUnitTest(result[0])
