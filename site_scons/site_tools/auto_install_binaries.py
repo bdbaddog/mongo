@@ -132,7 +132,7 @@ def generate(env):  # pylint: disable=too-many-statements
 
     env["INSTALLDIR_DEBUGDIR"] = _aib_debugdir
 
-    alias_map = dict()
+    alias_map = defaultdict(dict)
 
     def auto_install(env, target, source, **kwargs):
 
@@ -155,11 +155,14 @@ def generate(env):  # pylint: disable=too-many-statements
             # The 'meta' tag is implicitly attached as a role.
             "meta",
         }
-        component_tag = kwargs.get("COMPONENT_TAG")
-        if not isinstance(component_tag, str) or " " in component_tag:
+
+        component_tag = env.get("COMPONENT_TAG")
+        if (
+                component_tag is not None
+                and (not isinstance(component_tag, str) or " " in component_tag)
+        ):
             raise Exception(
-                "COMPONENT_TAG must be a string and have"
-                " exactly one value with no whitespace."
+                "COMPONENT_TAG must be a string and contain no whitespace."
             )
         components = {
             component_tag,
@@ -180,6 +183,8 @@ def generate(env):  # pylint: disable=too-many-statements
         target.attributes.roles = roles
 
         for component_tag, role_tag in itertools.product(components, roles):
+            if component_tag != "all":
+                print(component_tag)
             alias_name = "install-" + component_tag
             alias_name = alias_name + ("" if role_tag == "runtime" else "-" + role_tag)
             prealias_name = "pre" + alias_name
