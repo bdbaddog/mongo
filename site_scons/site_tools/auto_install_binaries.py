@@ -151,19 +151,33 @@ def generate(env):  # pylint: disable=too-many-statements
             s.attributes.aib_install_actions = actions
 
         roles = {
-            kwargs.get("INSTALL_ROLE"),
+            kwargs.get("ROLE_TAG"),
             # The 'meta' tag is implicitly attached as a role.
             "meta",
         }
+        component_tag = kwargs.get("COMPONENT_TAG")
+        if not isinstance(component_tag, str) or " " in component_tag:
+            raise Exception(
+                "COMPONENT_TAG must be a string and have"
+                " exactly one value with no whitespace."
+            )
         components = {
-            kwargs.get("INSTALL_COMPONENT"),
+            component_tag,
             # The 'all' tag is implicitly attached as a component
             "all",
         }
+        # Some tools will need to create multiple components so we add
+        # this "hidden" argument that accepts a set.
+        if "ADDITIONAL_COMPONENTS" in kwargs:
+            components += kwargs["ADDITIONAL_COMPONENTS"]
 
         # Remove false values such as None
         roles = {role for role in roles if role}
         components = {component for component in components if component}
+        # MAT TODO: I don't think we ever consume these should we even
+        # store them?
+        target.attributes.components = components
+        target.attributes.roles = roles
 
         for component_tag, role_tag in itertools.product(components, roles):
             alias_name = "install-" + component_tag
@@ -214,12 +228,7 @@ def generate(env):  # pylint: disable=too-many-statements
             tsuf = tentry.get_suffix()
             auto_install_location = suffix_map.get(tsuf)
             if auto_install_location:
-                tentry_install_tags = env.get("INSTALL_ALIAS", [])
-                tentry_install_tags.extend(auto_install_location[1])
-                setattr(tentry.attributes, "INSTALL_ALIAS", tentry_install_tags)
-                env.AutoInstall(
-                    auto_install_location[0], tentry, INSTALL_ALIAS=tentry_install_tags
-                )
+                env.AutoInstall(auto_install_location[0], tentry)
         return (target, source)
 
     def add_emitter(builder):
