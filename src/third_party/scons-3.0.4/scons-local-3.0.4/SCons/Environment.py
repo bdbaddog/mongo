@@ -1444,8 +1444,8 @@ class Base(SubstitutionEnvironment):
         else:
             return target_env.decide_target(dependency, target, prev_ni)
 
-    def _changed_timestamp_then_content(self, dependency, target, prev_ni):
-        return dependency.changed_timestamp_then_content(target, prev_ni)
+    def _changed_timestamp_then_content(self, dependency, target, prev_ni, node=None):
+        return dependency.changed_timestamp_then_content(target, prev_ni, node)
 
     def _changed_timestamp_newer(self, dependency, target, prev_ni):
         return dependency.changed_timestamp_newer(target, prev_ni)
