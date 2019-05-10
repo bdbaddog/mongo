@@ -2642,6 +2642,7 @@ class File(Base):
         if SCons.Debug.track_instances: logInstanceCreation(self, 'Node.FS.File')
         Base.__init__(self, name, directory, fs)
         self._morph()
+        self.attributes.changed_timestamp_then_content = None
 
     def Entry(self, name):
         """Create an entry node named 'name' relative to
@@ -3305,7 +3306,7 @@ class File(Base):
     __dmap_cache = {}
     __dmap_sig_cache = {}
 
-
+    # @profile
     def _build_dependency_map(self, binfo):
         """
         Build mapping from file -> signature
@@ -3326,11 +3327,36 @@ class File(Base):
 
 
         # store this info so we can avoid regenerating it.
-        binfo.dependency_map = { str(child):signature for child, signature in zip(chain(binfo.bsources, binfo.bdepends, binfo.bimplicit),
+        # binfo.dependency_map = { str(child):signature for child, signature in zip(chain(binfo.bsources, binfo.bdepends, binfo.bimplicit),
+        #                              chain(binfo.bsourcesigs, binfo.bdependsigs, binfo.bimplicitsigs))}
+
+        binfo.dependency_map = { child:signature for child, signature in zip(chain(binfo.bsources, binfo.bdepends, binfo.bimplicit),
                                      chain(binfo.bsourcesigs, binfo.bdependsigs, binfo.bimplicitsigs))}
+
+
+        # for debugging
+        # binfo.dependency_map = {}
+        # for child, signature in zip(chain(binfo.bsources, binfo.bdepends, binfo.bimplicit),
+        #                              chain(binfo.bsourcesigs, binfo.bdependsigs, binfo.bimplicitsigs)):
+        #     binfo.dependency_map[str(child)] = signature
+        #     binfo.dependency_map[child] = signature
+
 
         return binfo.dependency_map
 
+    # @profile
+    def _add_strings_to_dependency_map(self, dmap):
+        """
+        In the case comparing node objects isn't sufficient, we'll add the strings for the nodes to the dependency map
+        :return:
+        """
+
+        string_dict = { str(child):signature for child, signature in dmap.items()}
+        dmap.update(string_dict)
+
+        return dmap
+
+    # @profile
     def _get_previous_signatures(self, dmap):
         """
         Return a list of corresponding csigs from previous
@@ -3343,13 +3369,32 @@ class File(Base):
         Returns:
             List of csigs for provided list of children
         """
-        prev = []
 
-        # First try the simple name for node
-        c_str = str(self)
-        if os.altsep:
-            c_str = c_str.replace(os.sep, os.altsep)
-        df = dmap.get(c_str, None)
+        # First try retrieving via Node
+        df = dmap.get(self, None)
+        if not df:
+            # First try the simple name for node
+            c_str = str(self)
+
+            if os.altsep:
+                c_str = c_str.replace(os.sep, os.altsep)
+
+            # print("MD5: had to stringify :%s"%c_str)
+
+            df = dmap.get(c_str, None)
+            if not df:
+                dmap = self._add_strings_to_dependency_map(dmap)
+                df = dmap.get(c_str, None)
+        # else:
+        #     # First try the simple name for node
+        #     c_str = str(self)
+        #
+        #     if os.altsep:
+        #         c_str = c_str.replace(os.sep, os.altsep)
+        #
+        #
+        #     print("MD5: used Node        :%s"%c_str)
+
         if not df:
             try:
                 # this should yield a path which matches what's in the sconsign
@@ -3364,6 +3409,7 @@ class File(Base):
 
         return df
 
+    # @profile
     def changed_timestamp_then_content(self, target, prev_ni, node=None):
         """
         Used when decider for file is Timestamp-MD5
@@ -3385,8 +3431,9 @@ class File(Base):
             Boolean - Indicates if node(File) has changed.
         """
         if node is None:
+            node = self
             # We need required node argument to get BuildInfo to function
-            raise DeciderNeedsNode(self.changed_timestamp_then_content)
+            # raise DeciderNeedsNode(self.changed_timestamp_then_content)
 
         # Now get sconsign name -> csig map and then get proper prev_ni if possible
         bi = node.get_stored_info().binfo
