@@ -3353,8 +3353,11 @@ class File(Base):
         :return:
         """
 
-        string_dict = { str(child):signature for child, signature in dmap.items()}
-        dmap.update(string_dict)
+        first_string = str(next(iter(dmap)))
+
+        if first_string not in dmap:
+            string_dict = { str(child):signature for child, signature in dmap.items()}
+            dmap.update(string_dict)
         # dmap.has_strings = True
 
         return dmap
