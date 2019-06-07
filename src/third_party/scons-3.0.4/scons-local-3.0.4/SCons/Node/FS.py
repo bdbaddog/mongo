@@ -3333,7 +3333,7 @@ class File(Base):
         binfo.dependency_map = { child:signature for child, signature in zip(chain(binfo.bsources, binfo.bdepends, binfo.bimplicit),
                                      chain(binfo.bsourcesigs, binfo.bdependsigs, binfo.bimplicitsigs))}
 
-        binfo.dependency_map.has_strings = False
+        # binfo.dependency_map.has_strings = False
 
 
         # for debugging
@@ -3355,7 +3355,7 @@ class File(Base):
 
         string_dict = { str(child):signature for child, signature in dmap.items()}
         dmap.update(string_dict)
-        dmap.has_strings = True
+        # dmap.has_strings = True
 
         return dmap
 
@@ -3382,8 +3382,8 @@ class File(Base):
         # If there are no strings in this dmap, then add them.
         # This may not be necessary, we could walk the nodes in the dmap and check each string
         # rather than adding ALL the strings to dmap. In theory that would be n/2 vs 2n str() calls on node
-        if not dmap.has_strings:
-            dmap = self._add_strings_to_dependency_map(dmap)
+        # if not dmap.has_strings:
+        dmap = self._add_strings_to_dependency_map(dmap)
 
         # get default string for node and then also string swapping os.altsep for os.sep (/ for \)
         c_strs = [str(self)]
@@ -3434,9 +3434,9 @@ class File(Base):
             Boolean - Indicates if node(File) has changed.
         """
         if node is None:
-            node = self
+            # node = self
             # We need required node argument to get BuildInfo to function
-            # raise DeciderNeedsNode(self.changed_timestamp_then_content)
+            raise DeciderNeedsNode(self.changed_timestamp_then_content)
 
         # Now get sconsign name -> csig map and then get proper prev_ni if possible
         bi = node.get_stored_info().binfo
