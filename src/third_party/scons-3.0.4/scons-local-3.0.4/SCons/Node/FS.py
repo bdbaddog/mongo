@@ -3350,9 +3350,11 @@ class File(Base):
         In the case comparing node objects isn't sufficient, we'll add the strings for the nodes to the dependency map
         :return:
         """
+        first_string = str(next(iter(dmap)))
 
-        string_dict = { str(child):signature for child, signature in dmap.items()}
-        dmap.update(string_dict)
+        if first_string not in dmap:
+            string_dict = { str(child):signature for child, signature in dmap.items()}
+            dmap.update(string_dict)
 
         return dmap
 
@@ -3369,24 +3371,30 @@ class File(Base):
         Returns:
             List of csigs for provided list of children
         """
-
-
         # First try retrieving via Node
-        df = dmap.get(self, None)
-        if not df:
-            # First try the simple name for node
-            c_str = str(self)
+        df = dmap.get(self, False)
+        if df:
+            return df
 
-            if os.altsep:
-                c_str = c_str.replace(os.sep, os.altsep)
+        # If there are no strings in this dmap, then add them.
+        # This may not be necessary, we could walk the nodes in the dmap and check each string
+        # rather than adding ALL the strings to dmap. In theory that would be n/2 vs 2n str() calls on node
+        # if not dmap.has_strings:
+        dmap = self._add_strings_to_dependency_map(dmap)
 
-            # print("MD5: had to stringify :%s"%c_str)
+        # get default string for node and then also string swapping os.altsep for os.sep (/ for \)
+        c_strs = [str(self)]
 
-            df = dmap.get(c_str, None)
-            if not df:
-                dmap = self._add_strings_to_dependency_map(dmap)
-                df = dmap.get(c_str, None)
+        if os.altsep:
+            c_strs.append(c_strs[0].replace(os.sep, os.altsep))
 
+        # Check if either string is now in dmap.
+        for s in c_strs:
+            df = dmap.get(s, False)
+            if df:
+                return df
+
+        # Lastly use nodes get_path() to generate string and see if that's in dmap
         if not df:
             try:
                 # this should yield a path which matches what's in the sconsign
@@ -3423,9 +3431,8 @@ class File(Base):
             Boolean - Indicates if node(File) has changed.
         """
         if node is None:
-            node = self
             # We need required node argument to get BuildInfo to function
-            # raise DeciderNeedsNode(self.changed_timestamp_then_content)
+            raise DeciderNeedsNode(self.changed_timestamp_then_content)
 
         # Now get sconsign name -> csig map and then get proper prev_ni if possible
         bi = node.get_stored_info().binfo
