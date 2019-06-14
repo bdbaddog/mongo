@@ -120,6 +120,7 @@ StageConstraints DocumentSourceOplogMatch::constraints(Pipeline::SplitState pipe
                                  DiskUseRequirement::kNoDiskUse,
                                  FacetRequirement::kNotAllowed,
                                  TransactionRequirement::kNotAllowed,
+                                 LookupRequirement::kNotAllowed,
                                  ChangeStreamRequirement::kChangeStreamStage);
     constraints.isIndependentOfAnyCollection =
         pExpCtx->ns.isCollectionlessAggregateNS() ? true : false;
@@ -158,19 +159,46 @@ void DocumentSourceChangeStream::checkValueType(const Value v,
 namespace {
 
 /**
- * Constructs a filter matching 'applyOps' oplog entries that:
- * 1) Represent a committed transaction (i.e., not just the "prepare" part of a two-phase
- *    transaction).
- * 2) Have sub-entries which should be returned in the change stream.
+ * Constructs a filter matching any 'applyOps' commands that commit a transaction. An 'applyOps'
+ * command implicitly commits a transaction if _both_ of the following are true:
+ * 1) it is not marked with the 'partialTxn' field, which would indicate that there are more entries
+ *    to come in the transaction and
+ * 2) it is not marked with the 'prepare' field, which would indicate that the transaction is only
+ *    committed if there is a follow-up 'commitTransaction' command in the oplog.
+ *
+ * This filter will ignore all but the last 'applyOps' command in a transaction comprising multiple
+ * 'applyOps' commands, and it will ignore all 'applyOps' commands in a prepared transaction. The
+ * change stream traverses back through the oplog to recover the ignored commands when it sees an
+ * entry that commits a transaction.
+ *
+ * As an optimization, this filter also ignores any transaction with just a single 'applyOps' if
+ * that 'applyOps' does not contain any updates that modify the namespace that the change stream is
+ * watching.
  */
 BSONObj getTxnApplyOpsFilter(BSONElement nsMatch, const NamespaceString& nss) {
     BSONObjBuilder applyOpsBuilder;
     applyOpsBuilder.append("op", "c");
+
+    // "o.applyOps" must be an array with at least one element
+    applyOpsBuilder.append("o.applyOps.0", BSON("$exists" << true));
     applyOpsBuilder.append("lsid", BSON("$exists" << true));
     applyOpsBuilder.append("txnNumber", BSON("$exists" << true));
-    applyOpsBuilder.append("prepare", BSON("$not" << BSON("$eq" << true)));
-    const std::string& kApplyOpsNs = "o.applyOps.ns";
-    applyOpsBuilder.appendAs(nsMatch, kApplyOpsNs);
+    applyOpsBuilder.append("o.prepare", BSON("$not" << BSON("$eq" << true)));
+    applyOpsBuilder.append("o.partialTxn", BSON("$not" << BSON("$eq" << true)));
+    {
+        // Include this 'applyOps' if it has an operation with a matching namespace _or_ if it has a
+        // 'prevOpTime' link to another 'applyOps' command, indicating a multi-entry transaction.
+        BSONArrayBuilder orBuilder(applyOpsBuilder.subarrayStart("$or"));
+        {
+            {
+                BSONObjBuilder nsMatchBuilder(orBuilder.subobjStart());
+                nsMatchBuilder.appendAs(nsMatch, "o.applyOps.ns"_sd);
+            }
+            // The default repl::OpTime is the value used to indicate a null "prevOpTime" link.
+            orBuilder.append(BSON(repl::OplogEntry::kPrevWriteOpTimeInTransactionFieldName
+                                  << BSON("$ne" << repl::OpTime().toBSON())));
+        }
+    }
     return applyOpsBuilder.obj();
 }
 }  // namespace
@@ -208,7 +236,8 @@ std::string DocumentSourceChangeStream::getNsRegexForChangeStream(const Namespac
 BSONObj DocumentSourceChangeStream::buildMatchFilter(
     const boost::intrusive_ptr<ExpressionContext>& expCtx,
     Timestamp startFrom,
-    bool startFromInclusive) {
+    bool startFromInclusive,
+    bool showMigrationEvents) {
     auto nss = expCtx->ns;
 
     ChangeStreamType sourceType = getChangeStreamType(nss);
@@ -252,28 +281,44 @@ BSONObj DocumentSourceChangeStream::buildMatchFilter(
                                 << "c"
                                 << OR(commandsOnTargetDb, renameDropTarget, transactionCommit));
 
+    // 2) Supported operations on the operation namespace, optionally including those from
+    // migrations.
+    BSONObj opNsMatch = BSON("ns" << BSONRegEx(getNsRegexForChangeStream(nss)));
+
     // 2.1) Normal CRUD ops.
     auto normalOpTypeMatch = BSON("op" << NE << "n");
 
     // 2.2) A chunk gets migrated to a new shard that doesn't have any chunks.
-    auto chunkMigratedMatch = BSON("op"
-                                   << "n"
-                                   << "o2.type"
-                                   << "migrateChunkToNewShard");
+    auto chunkMigratedNewShardMatch = BSON("op"
+                                           << "n"
+                                           << "o2.type"
+                                           << "migrateChunkToNewShard");
 
-    // 2) Supported operations on the target namespace.
-    BSONObj nsMatch = BSON("ns" << BSONRegEx(getNsRegexForChangeStream(nss)));
-    auto opMatch = BSON(nsMatch["ns"] << OR(normalOpTypeMatch, chunkMigratedMatch));
+    // Supported operations that are either (2.1) or (2.2).
+    BSONObj normalOrChunkMigratedMatch =
+        BSON(opNsMatch["ns"] << OR(normalOpTypeMatch, chunkMigratedNewShardMatch));
+
+    // Filter excluding entries resulting from chunk migration.
+    BSONObj notFromMigrateFilter = BSON("fromMigrate" << NE << true);
+
+    BSONObj opMatch =
+        (showMigrationEvents
+             ? normalOrChunkMigratedMatch
+             : BSON("$and" << BSON_ARRAY(normalOrChunkMigratedMatch << notFromMigrateFilter)));
 
     // 3) Look for 'applyOps' which were created as part of a transaction.
-    BSONObj applyOps = getTxnApplyOpsFilter(nsMatch["ns"], nss);
+    BSONObj applyOps = getTxnApplyOpsFilter(opNsMatch["ns"], nss);
 
-    // Match oplog entries after "start" and are either supported (1) commands or (2) operations,
-    // excepting those tagged "fromMigrate". Include the resume token, if resuming, so we can verify
-    // it was still present in the oplog.
+    // Either (1) or (3), excluding those resulting from chunk migration.
+    BSONObj commandAndApplyOpsMatch =
+        BSON("$and" << BSON_ARRAY(BSON(OR(commandMatch, applyOps)) << notFromMigrateFilter));
+
+    // Match oplog entries after "start" that are either supported (1) commands or (2) operations.
+    // Only include CRUD operations tagged "fromMigrate" when the "showMigrationEvents" option is
+    // set - exempt all other operations and commands with that tag. Include the resume token, if
+    // resuming, so we can verify it was still present in the oplog.
     return BSON("$and" << BSON_ARRAY(BSON("ts" << (startFromInclusive ? GTE : GT) << startFrom)
-                                     << BSON(OR(opMatch, commandMatch, applyOps))
-                                     << BSON("fromMigrate" << NE << true)));
+                                     << BSON(OR(opMatch, commandAndApplyOpsMatch))));
 }
 
 namespace {
@@ -285,6 +330,10 @@ list<intrusive_ptr<DocumentSource>> buildPipeline(const intrusive_ptr<Expression
     boost::optional<Timestamp> startFrom;
     intrusive_ptr<DocumentSource> resumeStage = nullptr;
     bool ignoreFirstInvalidate = false;
+    bool showMigrationEvents = spec.getShowMigrationEvents();
+    uassert(31123,
+            "Change streams from mongos may not show migration events.",
+            !(expCtx->inMongos && showMigrationEvents));
 
     auto resumeAfter = spec.getResumeAfter();
     auto startAfter = spec.getStartAfter();
@@ -351,7 +400,8 @@ list<intrusive_ptr<DocumentSource>> buildPipeline(const intrusive_ptr<Expression
     if (startFrom) {
         const bool startFromInclusive = (resumeStage != nullptr);
         stages.push_back(DocumentSourceOplogMatch::create(
-            DocumentSourceChangeStream::buildMatchFilter(expCtx, *startFrom, startFromInclusive),
+            DocumentSourceChangeStream::buildMatchFilter(
+                expCtx, *startFrom, startFromInclusive, showMigrationEvents),
             expCtx));
 
         // If we haven't already populated the initial PBRT, then we are starting from a specific

@@ -30,6 +30,7 @@
 #pragma once
 
 #include <boost/optional.hpp>
+#include <functional>
 
 #include "mongo/db/auth/privilege.h"
 #include "mongo/db/auth/user_name.h"
@@ -39,7 +40,6 @@
 #include "mongo/db/query/plan_executor.h"
 #include "mongo/db/record_id.h"
 #include "mongo/db/repl/read_concern_level.h"
-#include "mongo/stdx/functional.h"
 
 namespace mongo {
 
@@ -78,13 +78,15 @@ struct ClientCursorParams {
     ClientCursorParams(std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> planExecutor,
                        NamespaceString nss,
                        UserNameIterator authenticatedUsersIter,
+                       WriteConcernOptions writeConcernOptions,
                        repl::ReadConcernArgs readConcernArgs,
                        BSONObj originatingCommandObj,
                        LockPolicy lockPolicy,
                        PrivilegeVector originatingPrivileges)
         : exec(std::move(planExecutor)),
           nss(std::move(nss)),
-          readConcernArgs(readConcernArgs),
+          writeConcernOptions(std::move(writeConcernOptions)),
+          readConcernArgs(std::move(readConcernArgs)),
           queryOptions(exec->getCanonicalQuery()
                            ? exec->getCanonicalQuery()->getQueryRequest().getOptions()
                            : 0),
@@ -113,6 +115,7 @@ struct ClientCursorParams {
     std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> exec;
     const NamespaceString nss;
     std::vector<UserName> authenticatedUsers;
+    const WriteConcernOptions writeConcernOptions;
     const repl::ReadConcernArgs readConcernArgs;
     int queryOptions = 0;
     BSONObj originatingCommandObj;
@@ -163,6 +166,10 @@ public:
 
     repl::ReadConcernArgs getReadConcernArgs() const {
         return _readConcernArgs;
+    }
+
+    WriteConcernOptions getWriteConcernOptions() const {
+        return _writeConcernOptions;
     }
 
     /**
@@ -370,6 +377,7 @@ private:
     // A transaction number for this cursor, if it was provided in the originating command.
     const boost::optional<TxnNumber> _txnNumber;
 
+    const WriteConcernOptions _writeConcernOptions;
     const repl::ReadConcernArgs _readConcernArgs;
 
     // Tracks whether dispose() has been called, to make sure it happens before destruction. It is

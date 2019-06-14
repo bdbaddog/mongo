@@ -1,5 +1,4 @@
-/**
- *    Copyright (C) 2018-present MongoDB, Inc.
+/** *    Copyright (C) 2018-present MongoDB, Inc.
  *
  *    This program is free software: you can redistribute it and/or modify
  *    it under the terms of the Server Side Public License, version 1,
@@ -30,6 +29,7 @@
 #include "mongo/platform/basic.h"
 
 #include <boost/optional/optional_io.hpp>
+#include <memory>
 
 #include "mongo/db/client.h"
 #include "mongo/db/db_raii.h"
@@ -49,11 +49,11 @@
 #include "mongo/db/transaction_participant_gen.h"
 #include "mongo/logger/logger.h"
 #include "mongo/stdx/future.h"
-#include "mongo/stdx/memory.h"
 #include "mongo/unittest/barrier.h"
 #include "mongo/unittest/death_test.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/clock_source_mock.h"
+#include "mongo/util/fail_point_service.h"
 #include "mongo/util/net/socket_utils.h"
 #include "mongo/util/tick_source_mock.h"
 
@@ -88,8 +88,7 @@ repl::OplogEntry makeOplogEntry(repl::OpTime opTime,
         stmtId,                        // statement id
         prevWriteOpTimeInTransaction,  // optime of previous write within same transaction
         boost::none,                   // pre-image optime
-        boost::none,                   // post-image optime
-        boost::none);                  // prepare
+        boost::none);                  // post-image optime
 }
 
 class OpObserverMock : public OpObserverNoop {
@@ -100,13 +99,13 @@ public:
 
     bool onTransactionPrepareThrowsException = false;
     bool transactionPrepared = false;
-    stdx::function<void()> onTransactionPrepareFn = []() {};
+    std::function<void()> onTransactionPrepareFn = []() {};
 
     void onUnpreparedTransactionCommit(OperationContext* opCtx,
                                        const std::vector<repl::ReplOperation>& statements) override;
     bool onUnpreparedTransactionCommitThrowsException = false;
     bool unpreparedTransactionCommitted = false;
-    stdx::function<void(const std::vector<repl::ReplOperation>&)> onUnpreparedTransactionCommitFn =
+    std::function<void(const std::vector<repl::ReplOperation>&)> onUnpreparedTransactionCommitFn =
         [](const std::vector<repl::ReplOperation>& statements) {};
 
 
@@ -117,7 +116,7 @@ public:
         const std::vector<repl::ReplOperation>& statements) noexcept override;
     bool onPreparedTransactionCommitThrowsException = false;
     bool preparedTransactionCommitted = false;
-    stdx::function<void(OplogSlot, Timestamp, const std::vector<repl::ReplOperation>&)>
+    std::function<void(OplogSlot, Timestamp, const std::vector<repl::ReplOperation>&)>
         onPreparedTransactionCommitFn = [](OplogSlot commitOplogEntryOpTime,
                                            Timestamp commitTimestamp,
                                            const std::vector<repl::ReplOperation>& statements) {};
@@ -126,7 +125,6 @@ public:
                             boost::optional<OplogSlot> abortOplogEntryOpTime) override;
     bool onTransactionAbortThrowsException = false;
     bool transactionAborted = false;
-    stdx::function<void()> onTransactionAbortFn = []() {};
 
     repl::OpTime onDropCollection(OperationContext* opCtx,
                                   const NamespaceString& collectionName,
@@ -189,7 +187,6 @@ void OpObserverMock::onTransactionAbort(OperationContext* opCtx,
             "onTransactionAbort() failed",
             !onTransactionAbortThrowsException);
     transactionAborted = true;
-    onTransactionAbortFn();
 }
 
 repl::OpTime OpObserverMock::onDropCollection(OperationContext* opCtx,
@@ -233,7 +230,7 @@ protected:
         const auto service = opCtx()->getServiceContext();
         OpObserverRegistry* opObserverRegistry =
             dynamic_cast<OpObserverRegistry*>(service->getOpObserver());
-        auto mockObserver = stdx::make_unique<OpObserverMock>();
+        auto mockObserver = std::make_unique<OpObserverMock>();
         _opObserver = mockObserver.get();
         opObserverRegistry->addObserver(std::move(mockObserver));
 
@@ -253,6 +250,12 @@ protected:
 
         opCtx()->setLogicalSessionId(_sessionId);
         opCtx()->setTxnNumber(_txnNumber);
+
+        // Normally, committing a transaction is supposed to usassert if the corresponding prepare
+        // has not been majority committed. We excempt our unit tests from this expectation.
+        setGlobalFailPoint("skipCommitTxnCheckPrepareMajorityCommitted",
+                           BSON("mode"
+                                << "alwaysOn"));
     }
 
     void tearDown() override {
@@ -262,6 +265,10 @@ protected:
         SessionCatalog::get(opCtx()->getServiceContext())->reset_forTest();
 
         MockReplCoordServerFixture::tearDown();
+
+        setGlobalFailPoint("skipCommitTxnCheckPrepareMajorityCommitted",
+                           BSON("mode"
+                                << "off"));
     }
 
     SessionCatalog* catalog() {
@@ -1021,7 +1028,7 @@ TEST_F(TxnParticipantTest, CannotInsertInPreparedTransaction) {
     ASSERT(_opObserver->transactionPrepared);
 }
 
-TEST_F(TxnParticipantTest, ImplictAbortDoesNotAbortPreparedTransaction) {
+TEST_F(TxnParticipantTest, ImplicitAbortDoesNotAbortPreparedTransaction) {
     auto outerScopedSession = checkOutSession();
     auto txnParticipant = TransactionParticipant::get(opCtx());
 
@@ -1071,15 +1078,21 @@ TEST_F(TxnParticipantTest, CannotContinueNonExistentTransaction) {
         ErrorCodes::NoSuchTransaction);
 }
 
-// Tests that a transaction aborts if it becomes too large before trying to commit it.
-TEST_F(TxnParticipantTest, TransactionTooLargeWhileBuilding) {
+// Tests that a transaction aborts if it becomes too large based on the server parameter
+// 'transactionLimitBytes'.
+TEST_F(TxnParticipantTest, TransactionExceedsSizeParameter) {
     auto sessionCheckout = checkOutSession();
     auto txnParticipant = TransactionParticipant::get(opCtx());
 
     txnParticipant.unstashTransactionResources(opCtx(), "insert");
+    auto oldLimit = gTransactionSizeLimitBytes.load();
+    ON_BLOCK_EXIT([oldLimit] { gTransactionSizeLimitBytes.store(oldLimit); });
 
-    // Two 6MB operations should succeed; three 6MB operations should fail.
-    constexpr size_t kBigDataSize = 6 * 1024 * 1024;
+    // Set a limit of 2.5 MB
+    gTransactionSizeLimitBytes.store(2 * 1024 * 1024 + 512 * 1024);
+
+    // Two 1MB operations should succeed; three 1MB operations should fail.
+    constexpr size_t kBigDataSize = 1 * 1024 * 1024;
     std::unique_ptr<uint8_t[]> bigData(new uint8_t[kBigDataSize]());
     auto operation = repl::OplogEntry::makeInsertOperation(
         kNss,
@@ -1421,7 +1434,7 @@ protected:
      * Set up and return a mock clock source.
      */
     ClockSourceMock* initMockPreciseClockSource() {
-        getServiceContext()->setPreciseClockSource(stdx::make_unique<ClockSourceMock>());
+        getServiceContext()->setPreciseClockSource(std::make_unique<ClockSourceMock>());
         return dynamic_cast<ClockSourceMock*>(getServiceContext()->getPreciseClockSource());
     }
 
@@ -1429,7 +1442,7 @@ protected:
      * Set up and return a mock tick source.
      */
     TickSourceMicrosecondMock* initMockTickSource() {
-        getServiceContext()->setTickSource(stdx::make_unique<TickSourceMicrosecondMock>());
+        getServiceContext()->setTickSource(std::make_unique<TickSourceMicrosecondMock>());
         auto tickSource =
             dynamic_cast<TickSourceMicrosecondMock*>(getServiceContext()->getTickSource());
         // Ensure that the tick source is not initialized to zero.
@@ -1869,7 +1882,7 @@ TEST_F(TransactionsMetricsTest, SingleTransactionStatsDurationShouldBeSetUponCom
     auto txnParticipant = TransactionParticipant::get(opCtx());
     txnParticipant.unstashTransactionResources(opCtx(), "commitTransaction");
     // The transaction machinery cannot store an empty locker.
-    Lock::GlobalLock lk(opCtx(), MODE_IX, Date_t::now(), Lock::InterruptBehavior::kThrow);
+    { Lock::GlobalLock lk(opCtx(), MODE_IX, Date_t::now(), Lock::InterruptBehavior::kThrow); }
 
     // Advance the clock.
     tickSource->advance(Microseconds(100));
@@ -1887,7 +1900,7 @@ TEST_F(TransactionsMetricsTest, SingleTransactionStatsPreparedDurationShouldBeSe
     auto txnParticipant = TransactionParticipant::get(opCtx());
     txnParticipant.unstashTransactionResources(opCtx(), "commitTransaction");
     // The transaction machinery cannot store an empty locker.
-    Lock::GlobalLock lk(opCtx(), MODE_IX, Date_t::now(), Lock::InterruptBehavior::kThrow);
+    { Lock::GlobalLock lk(opCtx(), MODE_IX, Date_t::now(), Lock::InterruptBehavior::kThrow); }
 
     // Advance the clock.
     tickSource->advance(Microseconds(10));
@@ -1946,7 +1959,7 @@ TEST_F(TransactionsMetricsTest, SingleTransactionStatsDurationShouldKeepIncreasi
     auto txnParticipant = TransactionParticipant::get(opCtx());
     txnParticipant.unstashTransactionResources(opCtx(), "commitTransaction");
     // The transaction machinery cannot store an empty locker.
-    Lock::GlobalLock lk(opCtx(), MODE_IX, Date_t::now(), Lock::InterruptBehavior::kThrow);
+    { Lock::GlobalLock lk(opCtx(), MODE_IX, Date_t::now(), Lock::InterruptBehavior::kThrow); }
 
     tickSource->advance(Microseconds(100));
 
@@ -1978,7 +1991,7 @@ TEST_F(TransactionsMetricsTest,
     auto txnParticipant = TransactionParticipant::get(opCtx());
     txnParticipant.unstashTransactionResources(opCtx(), "commitTransaction");
     // The transaction machinery cannot store an empty locker.
-    Lock::GlobalLock lk(opCtx(), MODE_IX, Date_t::now(), Lock::InterruptBehavior::kThrow);
+    { Lock::GlobalLock lk(opCtx(), MODE_IX, Date_t::now(), Lock::InterruptBehavior::kThrow); }
 
     // Prepare the transaction and extend the duration in the prepared state.
     const auto prepareTimestamp = txnParticipant.prepareTransaction(opCtx(), {});
@@ -2012,7 +2025,7 @@ TEST_F(TransactionsMetricsTest, SingleTransactionStatsDurationShouldKeepIncreasi
     auto txnParticipant = TransactionParticipant::get(opCtx());
     txnParticipant.unstashTransactionResources(opCtx(), "insert");
     // The transaction machinery cannot store an empty locker.
-    Lock::GlobalLock lk(opCtx(), MODE_IX, Date_t::now(), Lock::InterruptBehavior::kThrow);
+    { Lock::GlobalLock lk(opCtx(), MODE_IX, Date_t::now(), Lock::InterruptBehavior::kThrow); }
 
     tickSource->advance(Microseconds(100));
 
@@ -2044,7 +2057,7 @@ TEST_F(TransactionsMetricsTest,
     auto txnParticipant = TransactionParticipant::get(opCtx());
     txnParticipant.unstashTransactionResources(opCtx(), "abortTransaction");
     // The transaction machinery cannot store an empty locker.
-    Lock::GlobalLock lk(opCtx(), MODE_IX, Date_t::now(), Lock::InterruptBehavior::kThrow);
+    { Lock::GlobalLock lk(opCtx(), MODE_IX, Date_t::now(), Lock::InterruptBehavior::kThrow); }
 
     // Prepare the transaction and extend the duration in the prepared state.
     txnParticipant.prepareTransaction(opCtx(), {});
@@ -2727,7 +2740,7 @@ TEST_F(TransactionsMetricsTest, LastClientInfoShouldUpdateUponCommit) {
     auto txnParticipant = TransactionParticipant::get(opCtx());
     txnParticipant.unstashTransactionResources(opCtx(), "insert");
     // The transaction machinery cannot store an empty locker.
-    Lock::GlobalLock lk(opCtx(), MODE_IX, Date_t::now(), Lock::InterruptBehavior::kThrow);
+    { Lock::GlobalLock lk(opCtx(), MODE_IX, Date_t::now(), Lock::InterruptBehavior::kThrow); }
     txnParticipant.commitUnpreparedTransaction(opCtx());
 
     // LastClientInfo should have been set.
@@ -2870,8 +2883,7 @@ std::string buildTransactionInfoString(OperationContext* opCtx,
     StringBuilder readTimestampInfo;
     readTimestampInfo
         << " readTimestamp:"
-        << txnParticipant.getSpeculativeTransactionReadOpTimeForTest().getTimestamp().toString()
-        << ",";
+        << txnParticipant.getSingleTransactionStatsForTest().getReadTimestamp().toString() << ",";
 
     StringBuilder singleTransactionStatsInfo;
     buildSingleTransactionStatsString(&singleTransactionStatsInfo, metricValue);
@@ -3787,6 +3799,5 @@ TEST_F(TxnParticipantTest, ExitPreparePromiseIsFulfilledOnAbortPreparedTransacti
     // ready.
     ASSERT_TRUE(txnParticipant.onExitPrepare().isReady());
 }
-
 }  // namespace
 }  // namespace mongo

@@ -15,14 +15,6 @@
     load("jstests/core/txns/libs/prepare_helpers.js");
     load("jstests/libs/check_log.js");
 
-    function findPrepareEntry(oplogColl) {
-        if (TestData.setParameters.useMultipleOplogEntryFormatForTransactions) {
-            return oplogColl.findOne({op: "c", o: {"prepareTransaction": 1}});
-        } else {
-            return oplogColl.findOne({prepare: true});
-        }
-    }
-
     // A new replica set for both the commit and abort tests to ensure the same clean state.
     function doTest(commitOrAbort) {
         const replSet = new ReplSetTest({
@@ -48,6 +40,10 @@
         assert.commandWorked(session.getDatabase("test").test.insert({myTransaction: 1}));
         const prepareTimestamp = PrepareHelpers.prepareTransaction(session);
 
+        const oldestRequiredTimestampForCrashRecovery =
+            PrepareHelpers.getOldestRequiredTimestampForCrashRecovery(primary.getDB("test"));
+        assert.lte(oldestRequiredTimestampForCrashRecovery, prepareTimestamp);
+
         jsTestLog("Insert documents until oplog exceeds oplogSize");
 
         // Oplog with prepared txn grows indefinitely - let it reach twice its supposed max size.
@@ -60,7 +56,7 @@
             assert.soon(() => {
                 return secondaryOplog.dataSize() >= PrepareHelpers.oplogSizeBytes;
             }, "waiting for secondary oplog to grow", ReplSetTest.kDefaultTimeoutMS);
-            const secondaryOplogEntry = findPrepareEntry(secondaryOplog);
+            const secondaryOplogEntry = PrepareHelpers.findPrepareEntry(secondaryOplog);
             assert.eq(secondaryOplogEntry.ts, prepareTimestamp, tojson(secondaryOplogEntry));
         }
         checkSecondaryOplog();
@@ -82,7 +78,7 @@
             PrepareHelpers.commitTransaction(session, prepareTimestamp);
         } else if (commitOrAbort === "abort") {
             jsTestLog("Abort prepared transaction and wait for oplog to shrink to max oplogSize");
-            session.abortTransaction_forTesting();
+            assert.commandWorked(session.abortTransaction_forTesting());
         } else {
             throw new Error(`Unrecognized value for commitOrAbort: ${commitOrAbort}`);
         }

@@ -1,9 +1,9 @@
 // @tags: [
 //   does_not_support_stepdowns,
+//   requires_capped,
+//   requires_collstats,
 //   requires_non_retryable_commands,
 //   requires_non_retryable_writes,
-//   requires_collstats,
-//   requires_capped,
 // ]
 
 // Test various user operations against "system.profile" collection.  SERVER-18111.

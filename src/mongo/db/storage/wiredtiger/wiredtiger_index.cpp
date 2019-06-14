@@ -33,6 +33,7 @@
 
 #include "mongo/db/storage/wiredtiger/wiredtiger_index.h"
 
+#include <memory>
 #include <set>
 
 #include "mongo/base/checked_cast.h"
@@ -50,7 +51,6 @@
 #include "mongo/db/storage/wiredtiger/wiredtiger_record_store.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_session_cache.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_util.h"
-#include "mongo/stdx/memory.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/fail_point.h"
 #include "mongo/util/hex.h"
@@ -173,8 +173,7 @@ std::string WiredTigerIndex::generateAppMetadataString(const IndexDescriptor& de
 
     // Index metadata
     ss << ",app_metadata=("
-       << "formatVersion=" << keyStringVersion << ',' << "infoObj=" << desc.infoObj().jsonString()
-       << "),";
+       << "formatVersion=" << keyStringVersion << "),";
 
     return (ss.str());
 }
@@ -464,7 +463,7 @@ long long WiredTigerIndex::getSpaceUsedBytes(OperationContext* opCtx) const {
 
         // Helper function to retrieve stats and check for errors
         auto getStats = [&](int key) -> int64_t {
-            StatusWith<int64_t> result = WiredTigerUtil::getStatisticsValueAs<int64_t>(
+            auto result = WiredTigerUtil::getStatisticsValue(
                 session->getSession(), statsUri, "statistics=(fast)", key);
             if (!result.isOK()) {
                 if (result.getStatus().code() == ErrorCodes::CursorNotFound)
@@ -832,7 +831,7 @@ public:
         // end after the key if inclusive and before if exclusive.
         const auto discriminator =
             _forward == inclusive ? KeyString::kExclusiveAfter : KeyString::kExclusiveBefore;
-        _endPosition = stdx::make_unique<KeyString>(_idx.keyStringVersion());
+        _endPosition = std::make_unique<KeyString>(_idx.keyStringVersion());
         _endPosition->resetToKey(stripFieldNames(key), _idx.ordering(), discriminator);
     }
 
@@ -1250,7 +1249,7 @@ WiredTigerIndexUnique::WiredTigerIndexUnique(OperationContext* ctx,
 
 std::unique_ptr<SortedDataInterface::Cursor> WiredTigerIndexUnique::newCursor(
     OperationContext* opCtx, bool forward) const {
-    return stdx::make_unique<WiredTigerIndexUniqueCursor>(*this, opCtx, forward, _prefix);
+    return std::make_unique<WiredTigerIndexUniqueCursor>(*this, opCtx, forward, _prefix);
 }
 
 SortedDataBuilderInterface* WiredTigerIndexUnique::getBulkBuilder(OperationContext* opCtx,
@@ -1556,6 +1555,7 @@ void WiredTigerIndexUnique::_unindexTimestampUnsafe(OperationContext* opCtx,
         }
         int ret = WT_OP_CHECK(c->remove(c));
         if (ret == WT_NOTFOUND) {
+            triggerWriteConflictAtPoint(c);
             return;
         }
         invariantWTOK(ret);
@@ -1666,7 +1666,7 @@ WiredTigerIndexStandard::WiredTigerIndexStandard(OperationContext* ctx,
 
 std::unique_ptr<SortedDataInterface::Cursor> WiredTigerIndexStandard::newCursor(
     OperationContext* opCtx, bool forward) const {
-    return stdx::make_unique<WiredTigerIndexStandardCursor>(*this, opCtx, forward, _prefix);
+    return std::make_unique<WiredTigerIndexStandardCursor>(*this, opCtx, forward, _prefix);
 }
 
 SortedDataBuilderInterface* WiredTigerIndexStandard::getBulkBuilder(OperationContext* opCtx,

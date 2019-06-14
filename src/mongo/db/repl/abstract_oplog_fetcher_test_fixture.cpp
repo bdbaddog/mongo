@@ -62,8 +62,7 @@ repl::OplogEntry makeOplogEntry(repl::OpTime opTime,
                             boost::none,                      // statement id
                             boost::none,   // optime of previous write within same transaction
                             boost::none,   // pre-image optime
-                            boost::none,   // post-image optime
-                            boost::none);  // prepare
+                            boost::none);  // post-image optime
 }
 
 }  // namespace
@@ -112,7 +111,7 @@ void AbstractOplogFetcherTest::setUp() {
     launchExecutorThread();
 
     lastFetched = {{123, 0}, 1};
-    lastFetchedWall = Date_t::min() + Seconds(lastFetched.getSecs());
+    lastFetchedWall = Date_t() + Seconds(lastFetched.getSecs());
 }
 
 executor::RemoteCommandRequest AbstractOplogFetcherTest::processNetworkResponse(

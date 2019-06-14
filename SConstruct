@@ -2919,29 +2919,6 @@ def doConfigure(myenv):
     if conf.CheckCXX14EnableIfT():
         conf.env.SetConfigHeaderDefine('MONGO_CONFIG_HAVE_STD_ENABLE_IF_T')
 
-    myenv = conf.Finish()
-
-    def CheckCXX14MakeUnique(context):
-        test_body = """
-        #include <memory>
-        int main(int argc, char **argv) {
-            auto foo = std::make_unique<int>(5);
-            return 0;
-        }
-        """
-        context.Message('Checking for C++14 std::make_unique support... ')
-        ret = context.TryCompile(textwrap.dedent(test_body), '.cpp')
-        context.Result(ret)
-        return ret
-
-    # Check for std::make_unique support without using the __cplusplus macro
-    conf = Configure(myenv, help=False, custom_tests = {
-        'CheckCXX14MakeUnique': CheckCXX14MakeUnique,
-    })
-
-    if conf.CheckCXX14MakeUnique():
-        conf.env.SetConfigHeaderDefine('MONGO_CONFIG_HAVE_STD_MAKE_UNIQUE')
-
     # pthread_setname_np was added in GLIBC 2.12, and Solaris 11.3
     if posix_system:
         myenv = conf.Finish()
@@ -3288,6 +3265,7 @@ def doConfigure(myenv):
         CPPDEFINES=[
             "BOOST_SYSTEM_NO_DEPRECATED",
             "BOOST_MATH_NO_LONG_DOUBLE_MATH_FUNCTIONS",
+            "BOOST_ENABLE_ASSERT_DEBUG_HANDLER",
             "ABSL_FORCE_ALIGNED_ACCESS",
         ]
     )
@@ -3821,10 +3799,19 @@ env.Alias("distsrc", "distsrc-tgz")
 # reports the number of CPUs for the host system. Perhaps in a future version of
 # psutil it will instead report the correct number when in a container.
 #
+# The presence of the variable ICECC means the icecream tool is
+# enabled and so the default j value should scale accordingly. In this
+# scenario multiply the cpu count by 8 to set a reasonable default since the
+# cluster can handle many more jobs than your local machine but is
+# still throttled by your cpu count in the sense that you can only
+# handle so many python threads sending out jobs.
+#
 # psutil.cpu_count returns None when it can't determine the number. This always
 # fails on BSD's for example.
-if psutil.cpu_count() is not None:
+if psutil.cpu_count() is not None and 'ICECC' not in env:
     env.SetOption('num_jobs', psutil.cpu_count())
+elif psutil.cpu_count() and 'ICECC' in env:
+    env.SetOption('num_jobs', 8 * psutil.cpu_count())
 
 
 # Do this as close to last as possible before reading SConscripts, so

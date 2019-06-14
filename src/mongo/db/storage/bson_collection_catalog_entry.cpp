@@ -32,6 +32,7 @@
 #include <algorithm>
 #include <numeric>
 
+#include "mongo/db/catalog/disable_index_spec_namespace_generation_gen.h"
 #include "mongo/db/field_ref.h"
 
 namespace mongo {
@@ -133,7 +134,15 @@ BSONObj BSONCollectionCatalogEntry::getIndexSpec(OperationContext* opCtx,
 
     int offset = md.findIndexOffset(indexName);
     invariant(offset >= 0);
-    return md.indexes[offset].spec.getOwned();
+
+    BSONObj spec = md.indexes[offset].spec.getOwned();
+    if (spec.hasField("ns") || disableIndexSpecNamespaceGeneration.load()) {
+        return spec;
+    }
+
+    BSONObj nsObj = BSON("ns" << ns().ns());
+    spec = spec.addField(nsObj.firstElement());
+    return spec;
 }
 
 
@@ -181,15 +190,6 @@ bool BSONCollectionCatalogEntry::isIndexMultikey(OperationContext* opCtx,
     }
 
     return md.indexes[offset].multikey;
-}
-
-RecordId BSONCollectionCatalogEntry::getIndexHead(OperationContext* opCtx,
-                                                  StringData indexName) const {
-    MetaData md = _getMetaData(opCtx);
-
-    int offset = md.findIndexOffset(indexName);
-    invariant(offset >= 0);
-    return md.indexes[offset].head;
 }
 
 bool BSONCollectionCatalogEntry::isIndexPresent(OperationContext* opCtx,
@@ -297,7 +297,7 @@ BSONObj BSONCollectionCatalogEntry::MetaData::toBSON() const {
                 subMultikeyPaths.doneFast();
             }
 
-            sub.append("head", static_cast<long long>(indexes[i].head.repr()));
+            sub.append("head", 0ll);  // For backward compatibility with 4.0
             sub.append("prefix", indexes[i].prefix.toBSONValue());
             sub.append("backgroundSecondary", indexes[i].isBackgroundSecondaryBuild);
 
@@ -336,11 +336,6 @@ void BSONCollectionCatalogEntry::MetaData::parse(const BSONObj& obj) {
             IndexMetaData imd;
             imd.spec = idx["spec"].Obj().getOwned();
             imd.ready = idx["ready"].trueValue();
-            if (idx.hasField("head")) {
-                imd.head = RecordId(idx["head"].Long());
-            } else {
-                imd.head = RecordId(idx["head_a"].Int(), idx["head_b"].Int());
-            }
             imd.multikey = idx["multikey"].trueValue();
 
             if (auto multikeyPathsElem = idx["multikeyPaths"]) {

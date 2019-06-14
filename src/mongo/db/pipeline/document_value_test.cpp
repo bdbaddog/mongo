@@ -27,6 +27,8 @@
  *    it in the license file.
  */
 
+#include <math.h>
+
 #include "mongo/platform/basic.h"
 
 #include "mongo/bson/bson_depth.h"
@@ -523,6 +525,51 @@ TEST(MetaFields, RandValBasics) {
     ASSERT_EQ(2.0, doc2.getRandMetaField());
 }
 
+TEST(MetaFields, SearchScoreBasic) {
+    // Documents should not have a search score until it is set.
+    ASSERT_FALSE(Document().hasSearchScore());
+
+    // Setting the search score field should work as expected.
+    MutableDocument docBuilder;
+    docBuilder.setSearchScore(1.23);
+    Document doc = docBuilder.freeze();
+    ASSERT_TRUE(doc.hasSearchScore());
+    ASSERT_EQ(1.23, doc.getSearchScore());
+
+    // Setting the searchScore twice should keep the second value.
+    MutableDocument docBuilder2;
+    docBuilder2.setSearchScore(1.0);
+    docBuilder2.setSearchScore(2.0);
+    Document doc2 = docBuilder2.freeze();
+    ASSERT_TRUE(doc2.hasSearchScore());
+    ASSERT_EQ(2.0, doc2.getSearchScore());
+}
+
+TEST(MetaFields, SearchHighlightsBasic) {
+    // Documents should not have a search highlights until it is set.
+    ASSERT_FALSE(Document().hasSearchHighlights());
+
+    // Setting the search highlights field should work as expected.
+    MutableDocument docBuilder;
+    Value highlights = DOC_ARRAY("a"_sd
+                                 << "b"_sd);
+    docBuilder.setSearchHighlights(highlights);
+    Document doc = docBuilder.freeze();
+    ASSERT_TRUE(doc.hasSearchHighlights());
+    ASSERT_VALUE_EQ(doc.getSearchHighlights(), highlights);
+
+    // Setting the searchHighlights twice should keep the second value.
+    MutableDocument docBuilder2;
+    Value otherHighlights = DOC_ARRAY("snippet1"_sd
+                                      << "snippet2"_sd
+                                      << "snippet3"_sd);
+    docBuilder2.setSearchHighlights(highlights);
+    docBuilder2.setSearchHighlights(otherHighlights);
+    Document doc2 = docBuilder2.freeze();
+    ASSERT_TRUE(doc2.hasSearchHighlights());
+    ASSERT_VALUE_EQ(doc2.getSearchHighlights(), otherHighlights);
+}
+
 class SerializationTest : public unittest::Test {
 protected:
     Document roundTrip(const Document& input) {
@@ -538,10 +585,16 @@ protected:
         ASSERT_DOCUMENT_EQ(output, input);
         ASSERT_EQ(output.hasTextScore(), input.hasTextScore());
         ASSERT_EQ(output.hasRandMetaField(), input.hasRandMetaField());
+        ASSERT_EQ(output.hasSearchScore(), input.hasSearchScore());
+        ASSERT_EQ(output.hasSearchHighlights(), input.hasSearchHighlights());
         if (input.hasTextScore())
             ASSERT_EQ(output.getTextScore(), input.getTextScore());
         if (input.hasRandMetaField())
             ASSERT_EQ(output.getRandMetaField(), input.getRandMetaField());
+        if (input.hasSearchScore())
+            ASSERT_EQ(output.getSearchScore(), input.getSearchScore());
+        if (input.hasSearchHighlights())
+            ASSERT_VALUE_EQ(output.getSearchHighlights(), input.getSearchHighlights());
 
         ASSERT(output.toBson().binaryEqual(input.toBson()));
     }
@@ -551,6 +604,9 @@ TEST_F(SerializationTest, MetaSerializationNoVals) {
     MutableDocument docBuilder;
     docBuilder.setTextScore(10.0);
     docBuilder.setRandMetaField(20.0);
+    docBuilder.setSearchScore(30.0);
+    docBuilder.setSearchHighlights(DOC_ARRAY("abc"_sd
+                                             << "def"_sd));
     assertRoundTrips(docBuilder.freeze());
 }
 
@@ -559,6 +615,19 @@ TEST_F(SerializationTest, MetaSerializationWithVals) {
     MutableDocument docBuilder(DOC("foo" << 10));
     docBuilder.setTextScore(10.0);
     docBuilder.setRandMetaField(20.0);
+    docBuilder.setSearchScore(30.0);
+    docBuilder.setSearchHighlights(DOC_ARRAY("abc"_sd
+                                             << "def"_sd));
+    assertRoundTrips(docBuilder.freeze());
+}
+
+TEST_F(SerializationTest, MetaSerializationSearchHighlightsNonArray) {
+    MutableDocument docBuilder;
+    docBuilder.setTextScore(10.0);
+    docBuilder.setRandMetaField(20.0);
+    docBuilder.setSearchScore(30.0);
+    // Everything should still round trip even if the searchHighlights metadata isn't an array.
+    docBuilder.setSearchHighlights(Value(1.23));
     assertRoundTrips(docBuilder.freeze());
 }
 
@@ -566,15 +635,44 @@ TEST(MetaFields, ToAndFromBson) {
     MutableDocument docBuilder;
     docBuilder.setTextScore(10.0);
     docBuilder.setRandMetaField(20.0);
+    docBuilder.setSearchScore(30.0);
+    docBuilder.setSearchHighlights(DOC_ARRAY("abc"_sd
+                                             << "def"_sd));
     Document doc = docBuilder.freeze();
     BSONObj obj = doc.toBsonWithMetaData();
     ASSERT_EQ(10.0, obj[Document::metaFieldTextScore].Double());
     ASSERT_EQ(20, obj[Document::metaFieldRandVal].numberLong());
+    ASSERT_EQ(30.0, obj[Document::metaFieldSearchScore].Double());
+    ASSERT_BSONOBJ_EQ(obj[Document::metaFieldSearchHighlights].embeddedObject(),
+                      BSON_ARRAY("abc"_sd
+                                 << "def"_sd));
     Document fromBson = Document::fromBsonWithMetaData(obj);
     ASSERT_TRUE(fromBson.hasTextScore());
     ASSERT_TRUE(fromBson.hasRandMetaField());
     ASSERT_EQ(10.0, fromBson.getTextScore());
     ASSERT_EQ(20, fromBson.getRandMetaField());
+}
+
+TEST(MetaFields, MetaFieldsIncludedInDocumentApproximateSize) {
+    MutableDocument docBuilder;
+    docBuilder.setSearchHighlights(DOC_ARRAY("abc"_sd
+                                             << "def"_sd));
+    const size_t smallMetadataDocSize = docBuilder.freeze().getApproximateSize();
+
+    // The second document has a larger "search highlights" object.
+    MutableDocument docBuilder2;
+    docBuilder2.setSearchHighlights(DOC_ARRAY("abc"_sd
+                                              << "def"_sd
+                                              << "ghijklmnop"_sd));
+    Document doc2 = docBuilder2.freeze();
+    const size_t bigMetadataDocSize = doc2.getApproximateSize();
+    ASSERT_GT(bigMetadataDocSize, smallMetadataDocSize);
+
+    // Do a sanity check on the amount of space taken by metadata in document 2.
+    ASSERT_LT(doc2.getMetadataApproximateSize(), 200U);
+
+    Document emptyDoc;
+    ASSERT_LT(emptyDoc.getMetadataApproximateSize(), 100U);
 }
 
 TEST(MetaFields, BadSerialization) {
@@ -1072,8 +1170,8 @@ class LongToInt : public ToIntBase {
     Value value() {
         return Value(0xff00000007LL);
     }
-    int expected() {
-        return 7;
+    bool asserts() {
+        return true;
     }
 };
 
@@ -1112,6 +1210,46 @@ class StringToInt {
 public:
     void run() {
         ASSERT_THROWS(Value(StringData()).coerceToInt(), AssertionException);
+    }
+};
+
+/** Coerce maxInt to int */
+class MaxIntToInt : public ToIntBase {
+    Value value() {
+        return Value((double)std::numeric_limits<int>::max());
+    }
+    int expected() {
+        return std::numeric_limits<int>::max();
+    }
+};
+
+/** Coerce minInt to int */
+class MinIntToInt : public ToIntBase {
+    Value value() {
+        return Value((double)std::numeric_limits<int>::min());
+    }
+    int expected() {
+        return std::numeric_limits<int>::min();
+    }
+};
+
+/** Coerce maxInt + 1 to int */
+class TooLargeToInt : public ToIntBase {
+    Value value() {
+        return Value((double)std::numeric_limits<int>::max() + 1);
+    }
+    bool asserts() {
+        return true;
+    }
+};
+
+/** Coerce minInt - 1 to int */
+class TooLargeNegativeToInt : public ToIntBase {
+    Value value() {
+        return Value((double)std::numeric_limits<int>::min() - 1);
+    }
+    bool asserts() {
+        return true;
     }
 };
 
@@ -1162,6 +1300,57 @@ class DoubleToLong : public ToLongBase {
     }
     long long expected() {
         return 9;
+    }
+};
+
+/** Coerce infinity to long. */
+class InfToLong : public ToLongBase {
+    Value value() {
+        return Value(std::numeric_limits<double>::infinity());
+    }
+    bool asserts() {
+        return true;
+    }
+};
+
+/** Coerce negative infinity to long. **/
+class NegInfToLong : public ToLongBase {
+    Value value() {
+        return Value(std::numeric_limits<double>::infinity() * -1);
+    }
+    bool asserts() {
+        return true;
+    }
+};
+
+/** Coerce large to long. **/
+class InvalidLargeToLong : public ToLongBase {
+    Value value() {
+        return Value(pow(2, 63));
+    }
+    bool asserts() {
+        return true;
+    }
+};
+
+/** Coerce lowest double to long. **/
+class LowestDoubleToLong : public ToLongBase {
+    Value value() {
+        return Value(static_cast<double>(std::numeric_limits<long long>::lowest()));
+    }
+    long long expected() {
+        return std::numeric_limits<long long>::lowest();
+    }
+};
+
+/** Coerce 'towards infinity' to long **/
+class TowardsInfinityToLong : public ToLongBase {
+    Value value() {
+        return Value(static_cast<double>(std::nextafter(std::numeric_limits<long long>::lowest(),
+                                                        std::numeric_limits<double>::lowest())));
+    }
+    bool asserts() {
+        return true;
     }
 };
 
@@ -1853,12 +2042,21 @@ public:
         add<Value::Coerce::NullToInt>();
         add<Value::Coerce::UndefinedToInt>();
         add<Value::Coerce::StringToInt>();
+        add<Value::Coerce::MaxIntToInt>();
+        add<Value::Coerce::MinIntToInt>();
+        add<Value::Coerce::TooLargeToInt>();
+        add<Value::Coerce::TooLargeNegativeToInt>();
         add<Value::Coerce::IntToLong>();
         add<Value::Coerce::LongToLong>();
         add<Value::Coerce::DoubleToLong>();
         add<Value::Coerce::NullToLong>();
         add<Value::Coerce::UndefinedToLong>();
         add<Value::Coerce::StringToLong>();
+        add<Value::Coerce::InfToLong>();
+        add<Value::Coerce::NegInfToLong>();
+        add<Value::Coerce::InvalidLargeToLong>();
+        add<Value::Coerce::LowestDoubleToLong>();
+        add<Value::Coerce::TowardsInfinityToLong>();
         add<Value::Coerce::IntToDouble>();
         add<Value::Coerce::LongToDouble>();
         add<Value::Coerce::DoubleToDouble>();

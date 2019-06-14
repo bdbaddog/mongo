@@ -84,6 +84,7 @@ scratch
 /mongos
 /mongoshim
 /mongosniff
+/mongotmock
 /mongotrafficreader
 /wt
 
@@ -178,3 +179,7 @@ generated_resmoke_config
 
 # Code review tool config
 codereview.rc
+
+# Python venvs and virtualenvs
+python3-venv
+python2-venv

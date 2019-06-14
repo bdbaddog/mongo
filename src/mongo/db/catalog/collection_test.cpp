@@ -29,13 +29,14 @@
 
 #include "mongo/platform/basic.h"
 
+#include <memory>
+
 #include "mongo/bson/oid.h"
 #include "mongo/db/catalog/capped_utils.h"
 #include "mongo/db/catalog/catalog_test_fixture.h"
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/repl/storage_interface_impl.h"
-#include "mongo/stdx/memory.h"
 #include "mongo/stdx/thread.h"
 #include "mongo/unittest/unittest.h"
 
@@ -48,7 +49,7 @@ protected:
     void makeCapped(NamespaceString nss, long long cappedSize = 8192);
     void makeUncapped(NamespaceString nss);
     void checkValidate(Collection* coll, bool valid, int records, int invalid, int errors);
-    std::vector<ValidateCmdLevel> levels{kValidateIndex, kValidateRecordStore, kValidateFull};
+    std::vector<ValidateCmdLevel> levels{kValidateNormal, kValidateFull};
 };
 
 void CollectionTest::makeCapped(NamespaceString nss, long long cappedSize) {

@@ -1,4 +1,6 @@
 // checks that db.serverStatus will not throw errors when metrics tree is not present
+// @tags: [
+// ]
 
 (function() {
     "use strict";

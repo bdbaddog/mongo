@@ -42,6 +42,8 @@
 #include "mongo/db/generic_cursor.h"
 #include "mongo/db/matcher/expression.h"
 #include "mongo/db/namespace_string.h"
+#include "mongo/db/ops/write_ops_exec.h"
+#include "mongo/db/ops/write_ops_parsers.h"
 #include "mongo/db/pipeline/document.h"
 #include "mongo/db/pipeline/field_path.h"
 #include "mongo/db/pipeline/lite_parsed_document_source.h"
@@ -54,9 +56,11 @@
 
 namespace mongo {
 
+class ShardFilterer;
 class ExpressionContext;
 class Pipeline;
 class PipelineDeleter;
+class TransactionHistoryIteratorBase;
 
 /**
  * Any functionality needed by an aggregation stage that is either context specific to a mongod or
@@ -66,6 +70,21 @@ class PipelineDeleter;
  */
 class MongoProcessInterface {
 public:
+    /**
+     * Storage for a batch of BSON Objects to be updated in the write namespace. For each element
+     * in the batch we store a tuple of the folliwng elements:
+     *   1. BSONObj - specifies the query that identifies a document in the to collection to be
+     *      updated.
+     *   2. write_ops::UpdateModification - either the new document we want to upsert or insert into
+     *      the collection (i.e. a 'classic' replacement update), or the pipeline to run to compute
+     *      the new document.
+     *   3. boost::optional<BSONObj> - for pipeline-style updated, specifies variables that can be
+     *      referred to in the pipeline performing the custom update.
+     */
+    using BatchObject =
+        std::tuple<BSONObj, write_ops::UpdateModification, boost::optional<BSONObj>>;
+    using BatchedObjects = std::vector<BatchObject>;
+
     enum class CurrentOpConnectionsMode { kIncludeIdle, kExcludeIdle };
     enum class CurrentOpUserMode { kIncludeAll, kExcludeOthers };
     enum class CurrentOpTruncateMode { kNoTruncation, kTruncateOps };
@@ -87,6 +106,16 @@ public:
         bool attachCursorSource = true;
     };
 
+    /**
+     * This structure holds the result of a batched update operation, such as the number of
+     * documents that matched the query predicate, and the number of documents modified by the
+     * update operation.
+     */
+    struct UpdateResult {
+        int64_t nMatched{0};
+        int64_t nModified{0};
+    };
+
     virtual ~MongoProcessInterface(){};
 
     /**
@@ -103,10 +132,11 @@ public:
     virtual DBClientBase* directClient() = 0;
 
     /**
-     * Query the oplog for an entry with a matching OpTime.
+     * Creates a new TransactionHistoryIterator object. Only applicable in processes which support
+     * locally traversing the oplog.
      */
-    virtual repl::OplogEntry lookUpOplogEntryByOpTime(OperationContext* opCtx,
-                                                      repl::OpTime lookupTime) = 0;
+    virtual std::unique_ptr<TransactionHistoryIteratorBase> createTransactionHistoryIterator(
+        repl::OpTime time) const = 0;
 
     /**
      * Note that in some rare cases this could return a false negative but will never return a false
@@ -116,29 +146,29 @@ public:
     virtual bool isSharded(OperationContext* opCtx, const NamespaceString& ns) = 0;
 
     /**
-     * Inserts 'objs' into 'ns' and throws a UserException if the insert fails. If 'targetEpoch' is
+     * Inserts 'objs' into 'ns' and returns an error Status if the insert fails. If 'targetEpoch' is
      * set, throws ErrorCodes::StaleEpoch if the targeted collection does not have the same epoch or
      * the epoch changes during the course of the insert.
      */
-    virtual void insert(const boost::intrusive_ptr<ExpressionContext>& expCtx,
-                        const NamespaceString& ns,
-                        std::vector<BSONObj>&& objs,
-                        const WriteConcernOptions& wc,
-                        boost::optional<OID> targetEpoch) = 0;
+    virtual Status insert(const boost::intrusive_ptr<ExpressionContext>& expCtx,
+                          const NamespaceString& ns,
+                          std::vector<BSONObj>&& objs,
+                          const WriteConcernOptions& wc,
+                          boost::optional<OID> targetEpoch) = 0;
 
     /**
-     * Updates the documents matching 'queries' with the objects 'updates'. Throws a UserException
-     * if any of the updates fail. If 'targetEpoch' is set, throws ErrorCodes::StaleEpoch if the
-     * targeted collection does not have the same epoch, or if the epoch changes during the update.
+     * Updates the documents matching 'queries' with the objects 'updates'. Returns an error Status
+     * if any of the updates fail, otherwise returns an 'UpdateResult' objects with the details of
+     * the update operation.  If 'targetEpoch' is set, throws ErrorCodes::StaleEpoch if the targeted
+     * collection does not have the same epoch, or if the epoch changes during the update.
      */
-    virtual void update(const boost::intrusive_ptr<ExpressionContext>& expCtx,
-                        const NamespaceString& ns,
-                        std::vector<BSONObj>&& queries,
-                        std::vector<BSONObj>&& updates,
-                        const WriteConcernOptions& wc,
-                        bool upsert,
-                        bool multi,
-                        boost::optional<OID> targetEpoch) = 0;
+    virtual StatusWith<UpdateResult> update(const boost::intrusive_ptr<ExpressionContext>& expCtx,
+                                            const NamespaceString& ns,
+                                            BatchedObjects&& batch,
+                                            const WriteConcernOptions& wc,
+                                            bool upsert,
+                                            bool multi,
+                                            boost::optional<OID> targetEpoch) = 0;
 
     virtual CollectionIndexUsageMap getIndexStats(OperationContext* opCtx,
                                                   const NamespaceString& ns) = 0;
@@ -212,6 +242,29 @@ public:
      */
     virtual std::unique_ptr<Pipeline, PipelineDeleter> attachCursorSourceToPipeline(
         const boost::intrusive_ptr<ExpressionContext>& expCtx, Pipeline* pipeline) = 0;
+
+    /**
+     * Accepts a pipeline and returns a new one which will draw input from the underlying
+     * collection _locally_. Trying to run this method on mongos is a programming error. Running
+     * this method on a shard server will only return results which match the pipeline on that
+     * shard.
+
+     * Performs no further optimization of the pipeline. NamespaceNotFound will be
+     * thrown if ExpressionContext has a UUID and that UUID doesn't exist anymore. That should be
+     * the only case where NamespaceNotFound is returned.
+     *
+     * This function takes ownership of the 'pipeline' argument as if it were a unique_ptr.
+     * Changing it to a unique_ptr introduces a circular dependency on certain platforms where the
+     * compiler expects to find an implementation of PipelineDeleter.
+     */
+    virtual std::unique_ptr<Pipeline, PipelineDeleter> attachCursorSourceToPipelineForLocalRead(
+        const boost::intrusive_ptr<ExpressionContext>& expCtx, Pipeline* pipeline) = 0;
+
+    /**
+     * Produces a ShardFilterer. May return null.
+     */
+    virtual std::unique_ptr<ShardFilterer> getShardFilterer(
+        const boost::intrusive_ptr<ExpressionContext>& expCtx) const = 0;
 
     /**
      * Returns a vector of owned BSONObjs, each of which contains details of an in-progress
@@ -298,15 +351,16 @@ public:
 
     /**
      * Returns true if there is an index on 'nss' with properties that will guarantee that a
-     * document with non-array values for each of 'uniqueKeyPaths' will have at most one matching
+     * document with non-array values for each of 'fieldPaths' will have at most one matching
      * document in 'nss'.
      *
      * Specifically, such an index must include all the fields, be unique, not be a partial index,
      * and match the operation's collation as given by 'expCtx'.
      */
-    virtual bool uniqueKeyIsSupportedByIndex(const boost::intrusive_ptr<ExpressionContext>& expCtx,
-                                             const NamespaceString& nss,
-                                             const std::set<FieldPath>& uniqueKeyPaths) const = 0;
+    virtual bool fieldsHaveSupportingUniqueIndex(
+        const boost::intrusive_ptr<ExpressionContext>& expCtx,
+        const NamespaceString& nss,
+        const std::set<FieldPath>& fieldPaths) const = 0;
 
     /**
      * Refreshes the CatalogCache entry for the namespace 'nss', and returns the epoch associated
@@ -328,6 +382,21 @@ public:
                                               ChunkVersion targetCollectionVersion) const = 0;
 
     virtual std::unique_ptr<ResourceYielder> getResourceYielder() const = 0;
+
+    /**
+     * If the user supplied the 'fields' array, ensures that it can be used to uniquely identify a
+     * document. Otherwise, picks a default unique key, which can be either the "_id" field, or
+     * or a shard key, depending on the 'outputNs' collection type and the server type (mongod or
+     * mongos). Also returns an optional ChunkVersion, populated with the version stored in the
+     * sharding catalog when we asked for the shard key (on mongos only). On mongod, this is the
+     * value of the 'targetCollectionVersion' parameter, which is the target shard version of the
+     * collection, as sent by mongos.
+     */
+    virtual std::pair<std::set<FieldPath>, boost::optional<ChunkVersion>>
+    ensureFieldsUniqueOrResolveDocumentKey(const boost::intrusive_ptr<ExpressionContext>& expCtx,
+                                           boost::optional<std::vector<std::string>> fields,
+                                           boost::optional<ChunkVersion> targetCollectionVersion,
+                                           const NamespaceString& outputNs) const = 0;
 };
 
 }  // namespace mongo

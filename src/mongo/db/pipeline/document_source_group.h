@@ -123,7 +123,8 @@ public:
                 HostTypeRequirement::kNone,
                 DiskUseRequirement::kWritesTmpData,
                 FacetRequirement::kAllowed,
-                TransactionRequirement::kAllowed};
+                TransactionRequirement::kAllowed,
+                LookupRequirement::kAllowed};
     }
 
     /**
@@ -156,8 +157,8 @@ public:
      */
     bool usedDisk() final;
 
-    boost::optional<MergingLogic> mergingLogic() final;
-    bool canRunInParallelBeforeOut(
+    boost::optional<DistributedPlanLogic> distributedPlanLogic() final;
+    bool canRunInParallelBeforeWriteStage(
         const std::set<std::string>& nameOfShardKeyFieldsUponEntryToStage) const final;
 
     /**

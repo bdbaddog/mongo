@@ -45,13 +45,15 @@
 #include "mongo/db/server_options.h"
 #include "mongo/db/storage/flow_control_parameters_gen.h"
 #include "mongo/util/background.h"
+#include "mongo/util/fail_point_service.h"
 #include "mongo/util/log.h"
 
 namespace mongo {
 
+MONGO_FAIL_POINT_DEFINE(flowControlTicketOverride);
+
 namespace {
 const auto getFlowControl = ServiceContext::declareDecoration<std::unique_ptr<FlowControl>>();
-const int kMaxTickets = 1000 * 1000 * 1000;
 
 int multiplyWithOverflowCheck(double term1, double term2, int maxValue) {
     if (term1 == 0.0 || term2 == 0.0) {
@@ -119,11 +121,18 @@ bool sustainerAdvanced(const std::vector<repl::MemberData>& prevMemberData,
 }
 }  // namespace
 
+FlowControl::FlowControl(repl::ReplicationCoordinator* replCoord)
+    : ServerStatusSection("flowControl"),
+      _replCoord(replCoord),
+      _lastTimeSustainerAdvanced(Date_t::now()) {}
+
 FlowControl::FlowControl(ServiceContext* service, repl::ReplicationCoordinator* replCoord)
     : ServerStatusSection("flowControl"),
       _replCoord(replCoord),
       _lastTimeSustainerAdvanced(Date_t::now()) {
-    FlowControlTicketholder::set(service, stdx::make_unique<FlowControlTicketholder>(1000));
+    // Initialize _lastTargetTicketsPermitted to maximum tickets to make sure flow control doesn't
+    // cause a slow start on start up.
+    FlowControlTicketholder::set(service, std::make_unique<FlowControlTicketholder>(_kMaxTickets));
 
     service->getPeriodicRunner()->scheduleJob(
         {"FlowControlRefresher",
@@ -181,18 +190,6 @@ double FlowControl::_getLocksPerOp() {
 
 BSONObj FlowControl::generateSection(OperationContext* opCtx,
                                      const BSONElement& configElement) const {
-    // Flow Control does not have use for lag measured on nodes that cannot accept writes.
-    const bool canAcceptWrites = _replCoord->canAcceptNonLocalWrites();
-
-    // Flow Control is only enabled if FCV is 4.2.
-    const bool isFCV42 =
-        (serverGlobalParams.featureCompatibility.isVersionInitialized() &&
-         serverGlobalParams.featureCompatibility.getVersion() ==
-             ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo42);
-
-    const Date_t myLastAppliedWall = _replCoord->getMyLastAppliedOpTimeAndWallTime().wallTime;
-    const Date_t lastCommittedWall = _replCoord->getLastCommittedOpTimeAndWallTime().wallTime;
-
     BSONObjBuilder bob;
     // Most of these values are only computed and meaningful when flow control is enabled.
     bob.append("enabled", gFlowControlEnabled.load());
@@ -201,9 +198,9 @@ BSONObj FlowControl::generateSection(OperationContext* opCtx,
                FlowControlTicketholder::get(opCtx)->totalTimeAcquiringMicros());
     bob.append("locksPerOp", _lastLocksPerOp.load());
     bob.append("sustainerRate", _lastSustainerAppliedCount.load());
-    bob.append("isLagged",
-               isFCV42 && canAcceptWrites &&
-                   getLagMillis(myLastAppliedWall, lastCommittedWall) >= getThresholdLagMillis());
+    bob.append("isLagged", _isLagged.load());
+    bob.append("isLaggedCount", _isLaggedCount.load());
+    bob.append("isLaggedTimeMicros", _isLaggedTimeMicros.load());
 
     return bob.obj();
 }
@@ -262,7 +259,7 @@ int FlowControl::_calculateNewTicketsForLag(const std::vector<repl::MemberData>&
     if (sustainerAppliedCount == -1) {
         // We don't know how many ops the sustainer applied. Hand out less tickets than were
         // used in the last period.
-        return std::min(static_cast<int>(locksUsedLastPeriod / 2.0), kMaxTickets);
+        return std::min(static_cast<int>(locksUsedLastPeriod / 2.0), _kMaxTickets);
     }
 
     // Given a "sustainer rate", this function wants to calculate what fraction the primary should
@@ -289,13 +286,19 @@ int FlowControl::_calculateNewTicketsForLag(const std::vector<repl::MemberData>&
                          << " Threshold lag: " << thresholdLagMillis << " Exponent: " << exponent
                          << " Reduce: " << reduce << " Penalty: " << sustainerAppliedPenalty;
 
-    return multiplyWithOverflowCheck(locksPerOp, sustainerAppliedPenalty, kMaxTickets);
+    return multiplyWithOverflowCheck(locksPerOp, sustainerAppliedPenalty, _kMaxTickets);
 }
 
 int FlowControl::getNumTickets() {
-
     // Flow Control is only enabled on nodes that can accept writes.
     const bool canAcceptWrites = _replCoord->canAcceptNonLocalWrites();
+
+    MONGO_FAIL_POINT_BLOCK(flowControlTicketOverride, failpointObj) {
+        int numTickets = failpointObj.getData().getIntField("numTickets");
+        if (numTickets > 0 && canAcceptWrites) {
+            return numTickets;
+        }
+    }
 
     // Flow Control is only enabled if FCV is 4.2.
     const bool isFCV42 =
@@ -315,7 +318,7 @@ int FlowControl::getNumTickets() {
         locksPerOp < 0.0) {
         _trimSamples(std::min(lastCommitted.opTime.getTimestamp(),
                               getMedianAppliedTimestamp(_prevMemberData)));
-        return kMaxTickets;
+        return _kMaxTickets;
     }
 
     int ret = 0;
@@ -336,8 +339,13 @@ int FlowControl::getNumTickets() {
         ret = multiplyWithOverflowCheck(_lastTargetTicketsPermitted.load() +
                                             gFlowControlTicketAdderConstant.load(),
                                         gFlowControlTicketMultiplierConstant.load(),
-                                        kMaxTickets);
+                                        _kMaxTickets);
         _lastTimeSustainerAdvanced = Date_t::now();
+        if (_isLagged.load()) {
+            _isLagged.store(false);
+            auto waitTime = curTimeMicros64() - _startWaitTime;
+            _isLaggedTimeMicros.fetchAndAddRelaxed(waitTime);
+        }
     } else if (sustainerAdvanced(_prevMemberData, _currMemberData)) {
         // Expected case where flow control has meaningful data from the last period to make a new
         // calculation.
@@ -348,16 +356,25 @@ int FlowControl::getNumTickets() {
                                        locksPerOp,
                                        getLagMillis(myLastApplied.wallTime, lastCommitted.wallTime),
                                        thresholdLagMillis);
+        if (!_isLagged.load()) {
+            _isLagged.store(true);
+            _isLaggedCount.fetchAndAddRelaxed(1);
+            _startWaitTime = curTimeMicros64();
+        }
     } else {
         // Unexpected case where consecutive readings from the topology state don't meet some basic
         // expectations.
         ret = _lastTargetTicketsPermitted.load();
         _lastTimeSustainerAdvanced = Date_t::now();
+        // Since this case does not give conclusive evidence that isLagged could have meaningfully
+        // transitioned from true to false, it does not make sense to update the _isLagged*
+        // variables here.
     }
 
     ret = std::max(ret, gFlowControlMinTicketsPerSecond.load());
 
-    LOG(DEBUG_LOG_LEVEL) << "Are lagged? " << !isHealthy << " Curr lag millis: "
+    LOG(DEBUG_LOG_LEVEL) << "Are lagged? " << (_isLagged.load() ? "true" : "false")
+                         << " Curr lag millis: "
                          << getLagMillis(myLastApplied.wallTime, lastCommitted.wallTime)
                          << " OpsLagged: "
                          << _approximateOpsBetween(lastCommitted.opTime.getTimestamp(),
@@ -366,7 +383,9 @@ int FlowControl::getNumTickets() {
                          << " Last granted: " << _lastTargetTicketsPermitted.load()
                          << " Last sustainer applied: " << _lastSustainerAppliedCount.load()
                          << " Acquisitions since last check: " << locksUsedLastPeriod
-                         << " Locks per op: " << _lastLocksPerOp.load();
+                         << " Locks per op: " << _lastLocksPerOp.load()
+                         << " Count of lagged periods: " << _isLaggedCount.load()
+                         << " Total duration of lagged periods: " << _isLaggedTimeMicros.load();
 
     _lastTargetTicketsPermitted.store(ret);
 
@@ -382,11 +401,11 @@ std::int64_t FlowControl::_approximateOpsBetween(Timestamp prevTs, Timestamp cur
 
     stdx::lock_guard<stdx::mutex> lk(_sampledOpsMutex);
     for (auto&& sample : _sampledOpsApplied) {
-        if (prevApplied == -1 && prevTs.asULL() < std::get<0>(sample)) {
+        if (prevApplied == -1 && prevTs.asULL() <= std::get<0>(sample)) {
             prevApplied = std::get<1>(sample);
         }
 
-        if (currApplied == -1 && currTs.asULL() < std::get<0>(sample)) {
+        if (currApplied == -1 && currTs.asULL() <= std::get<0>(sample)) {
             currApplied = std::get<1>(sample);
             break;
         }

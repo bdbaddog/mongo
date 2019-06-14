@@ -33,8 +33,10 @@
 
 #include "mongo/unittest/unittest.h"
 
+#include <functional>
 #include <iostream>
 #include <map>
+#include <memory>
 
 #include "mongo/base/checked_cast.h"
 #include "mongo/base/init.h"
@@ -44,8 +46,6 @@
 #include "mongo/logger/logger.h"
 #include "mongo/logger/message_event_utf8_encoder.h"
 #include "mongo/logger/message_log_domain.h"
-#include "mongo/stdx/functional.h"
-#include "mongo/stdx/memory.h"
 #include "mongo/stdx/mutex.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/log.h"
@@ -347,7 +347,8 @@ Result* Suite::run(const std::string& filter, int runsPerTest) {
 
         if (!passes) {
             std::string s = err.str();
-            log() << "FAIL: " << s;
+            // Don't truncate failure messages, e.g: stacktraces.
+            log().setIsTruncatable(false) << "FAIL: " << s;
             r->_fails.push_back(tc->getName());
             r->_messages.push_back(s);
         }
@@ -408,7 +409,7 @@ int Suite::run(const std::vector<std::string>& suites, const std::string& filter
 
     Result::cur = NULL;
     for (const auto& r : results) {
-        log() << r->toString();
+        log().setIsTruncatable(false) << r->toString();
         if (abs(r->rc()) > abs(rc))
             rc = r->rc();
 

@@ -78,8 +78,6 @@ OplogEntry::CommandType parseCommandType(const BSONObj& objectField) {
         return OplogEntry::CommandType::kCommitTransaction;
     } else if (commandString == "abortTransaction") {
         return OplogEntry::CommandType::kAbortTransaction;
-    } else if (commandString == "prepareTransaction") {
-        return OplogEntry::CommandType::kPrepareTransaction;
     } else {
         uasserted(ErrorCodes::BadValue,
                   str::stream() << "Unknown oplog entry command type: " << commandString
@@ -107,8 +105,7 @@ BSONObj makeOplogEntryDoc(OpTime opTime,
                           const boost::optional<StmtId>& statementId,
                           const boost::optional<OpTime>& prevWriteOpTimeInTransaction,
                           const boost::optional<OpTime>& preImageOpTime,
-                          const boost::optional<OpTime>& postImageOpTime,
-                          const boost::optional<bool>& prepare) {
+                          const boost::optional<OpTime>& postImageOpTime) {
     BSONObjBuilder builder;
     sessionInfo.serialize(&builder);
     builder.append(OplogEntryBase::kTimestampFieldName, opTime.getTimestamp());
@@ -150,9 +147,6 @@ BSONObj makeOplogEntryDoc(OpTime opTime,
     if (postImageOpTime) {
         const BSONObj localObject = postImageOpTime.get().toBSON();
         builder.append(OplogEntryBase::kPostImageOpTimeFieldName, localObject);
-    }
-    if (prepare) {
-        builder.append(OplogEntryBase::kPrepareFieldName, prepare.get());
     }
     return builder.obj();
 }
@@ -211,10 +205,10 @@ StatusWith<OplogEntry> OplogEntry::parse(const BSONObj& object) {
     MONGO_UNREACHABLE;
 }
 
-OplogEntry::OplogEntry(BSONObj rawInput) : raw(std::move(rawInput)) {
-    raw = raw.getOwned();
+OplogEntry::OplogEntry(BSONObj rawInput) : _raw(std::move(rawInput)) {
+    _raw = _raw.getOwned();
 
-    parseProtected(IDLParserErrorContext("OplogEntryBase"), raw);
+    parseProtected(IDLParserErrorContext("OplogEntryBase"), _raw);
 
     // Parse command type from 'o' and 'o2' fields.
     if (isCommand()) {
@@ -237,8 +231,7 @@ OplogEntry::OplogEntry(OpTime opTime,
                        const boost::optional<StmtId>& statementId,
                        const boost::optional<OpTime>& prevWriteOpTimeInTransaction,
                        const boost::optional<OpTime>& preImageOpTime,
-                       const boost::optional<OpTime>& postImageOpTime,
-                       const boost::optional<bool>& prepare)
+                       const boost::optional<OpTime>& postImageOpTime)
     : OplogEntry(makeOplogEntryDoc(opTime,
                                    hash,
                                    opType,
@@ -254,8 +247,7 @@ OplogEntry::OplogEntry(OpTime opTime,
                                    statementId,
                                    prevWriteOpTimeInTransaction,
                                    preImageOpTime,
-                                   postImageOpTime,
-                                   prepare)) {}
+                                   postImageOpTime)) {}
 
 bool OplogEntry::isCommand() const {
     return getOpType() == OpTypeEnum::kCommand;
@@ -280,7 +272,8 @@ bool OplogEntry::isCrudOpType() const {
 }
 
 bool OplogEntry::shouldPrepare() const {
-    return getPrepare() && *getPrepare();
+    return getCommandType() == CommandType::kApplyOps &&
+        getObject()[ApplyOpsCommandInfoBase::kPrepareFieldName].booleanSafe();
 }
 
 BSONElement OplogEntry::getIdElement() const {
@@ -314,7 +307,7 @@ OplogEntry::CommandType OplogEntry::getCommandType() const {
 }
 
 int OplogEntry::getRawObjSizeBytes() const {
-    return raw.objsize();
+    return _raw.objsize();
 }
 
 OpTime OplogEntry::getOpTime() const {
@@ -326,7 +319,7 @@ OpTime OplogEntry::getOpTime() const {
 }
 
 std::string OplogEntry::toString() const {
-    return raw.toString();
+    return _raw.toString();
 }
 
 std::ostream& operator<<(std::ostream& s, const OplogEntry& o) {

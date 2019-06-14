@@ -29,6 +29,8 @@
 
 #include "mongo/platform/basic.h"
 
+#include <memory>
+
 #include "mongo/db/client.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/namespace_string.h"
@@ -46,7 +48,6 @@
 #include "mongo/db/service_context_d_test_fixture.h"
 #include "mongo/db/session_catalog_mongod.h"
 #include "mongo/db/session_txn_record_gen.h"
-#include "mongo/stdx/memory.h"
 #include "mongo/unittest/death_test.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/assert_util.h"
@@ -168,15 +169,15 @@ private:
         ServiceContextMongoDTest::setUp();
 
         auto service = getServiceContext();
-        StorageInterface::set(service, stdx::make_unique<StorageInterfaceRecovery>());
+        StorageInterface::set(service, std::make_unique<StorageInterfaceRecovery>());
         _storageInterface = static_cast<StorageInterfaceRecovery*>(StorageInterface::get(service));
 
         _createOpCtx();
-        _consistencyMarkers = stdx::make_unique<ReplicationConsistencyMarkersMock>();
+        _consistencyMarkers = std::make_unique<ReplicationConsistencyMarkersMock>();
 
 
         ReplicationCoordinator::set(
-            service, stdx::make_unique<ReplicationCoordinatorMock>(service, getStorageInterface()));
+            service, std::make_unique<ReplicationCoordinatorMock>(service, getStorageInterface()));
 
         ASSERT_OK(
             ReplicationCoordinator::get(_opCtx.get())->setFollowerMode(MemberState::RS_PRIMARY));
@@ -190,7 +191,9 @@ private:
         observerRegistry->addObserver(std::make_unique<ReplicationRecoveryTestObObserver>());
 
         repl::DropPendingCollectionReaper::set(
-            service, stdx::make_unique<repl::DropPendingCollectionReaper>(_storageInterface));
+            service, std::make_unique<repl::DropPendingCollectionReaper>(_storageInterface));
+
+        setOplogCollectionName(service);
     }
 
     void tearDown() override {
@@ -240,18 +243,16 @@ repl::OplogEntry _makeOplogEntry(repl::OpTime opTime,
                             boost::none,                      // statement id
                             boost::none,   // optime of previous write within same transaction
                             boost::none,   // pre-image optime
-                            boost::none,   // post-image optime
-                            boost::none);  // prepare
+                            boost::none);  // post-image optime
 }
 
 /**
- * Creates a prepareTransaction, commitTransaction or abortTransaction OplogEntry.
+ * Creates a transaction oplog entry.
  */
 repl::OplogEntry _makeTransactionOplogEntry(repl::OpTime opTime,
                                             repl::OpTypeEnum opType,
                                             BSONObj object,
                                             repl::OpTime prevOpTime,
-                                            bool prepare,
                                             StmtId stmtId,
                                             OperationSessionInfo sessionInfo,
                                             Date_t wallTime) {
@@ -266,9 +267,6 @@ repl::OplogEntry _makeTransactionOplogEntry(repl::OpTime opTime,
     builder.append("wall", wallTime);
     builder.append("stmtId", stmtId);
     builder.append("prevOpTime", prevOpTime.toBSON());
-    if (prepare) {
-        builder.append("prepare", prepare);
-    }
 
     return uassertStatusOK(repl::OplogEntry::parse(builder.obj()));
 }
@@ -328,6 +326,9 @@ void _setUpOplog(OperationContext* opCtx, StorageInterface* storage, std::vector
         ASSERT_OK(storage->insertDocument(
             opCtx, oplogNs, _makeInsertOplogEntry(ts), OpTime::kUninitializedTerm));
     }
+
+    // Initialize the cached pointer to the oplog collection.
+    acquireOplogCollectionForLogging(opCtx);
 }
 
 /**
@@ -911,7 +912,6 @@ TEST_F(ReplicationRecoveryTest, PrepareTransactionOplogEntryCorrectlyUpdatesConf
                                    repl::OpTypeEnum::kCommand,
                                    BSON("applyOps" << BSONArray() << "prepare" << true),
                                    OpTime(Timestamp(0, 0), -1),
-                                   true,  // prepare
                                    0,
                                    sessionInfo,
                                    lastDate);
@@ -960,7 +960,6 @@ TEST_F(ReplicationRecoveryTest, AbortTransactionOplogEntryCorrectlyUpdatesConfig
                                    repl::OpTypeEnum::kCommand,
                                    BSON("applyOps" << BSONArray() << "prepare" << true),
                                    OpTime(Timestamp(0, 0), -1),
-                                   true,  // prepare
                                    0,
                                    sessionInfo,
                                    prepareDate);
@@ -973,7 +972,6 @@ TEST_F(ReplicationRecoveryTest, AbortTransactionOplogEntryCorrectlyUpdatesConfig
                                                     repl::OpTypeEnum::kCommand,
                                                     BSON("abortTransaction" << 1),
                                                     OpTime(Timestamp(2, 0), 1),
-                                                    false,  // prepare
                                                     1,
                                                     sessionInfo,
                                                     abortDate);
@@ -1004,7 +1002,7 @@ TEST_F(ReplicationRecoveryTest, AbortTransactionOplogEntryCorrectlyUpdatesConfig
 
 DEATH_TEST_F(ReplicationRecoveryTest,
              RecoveryFailsWithPrepareAndEnableReadConcernMajorityFalse,
-             "Fatal Assertion 50964") {
+             "Fatal Assertion 51146") {
     ReplicationRecoveryImpl recovery(getStorageInterface(), getConsistencyMarkers());
     auto opCtx = getOperationContext();
 
@@ -1025,7 +1023,6 @@ DEATH_TEST_F(ReplicationRecoveryTest,
                                    repl::OpTypeEnum::kCommand,
                                    BSON("applyOps" << BSONArray() << "prepare" << true),
                                    OpTime(Timestamp(0, 0), -1),
-                                   true,  // prepare
                                    0,
                                    sessionInfo,
                                    lastDate);
@@ -1065,7 +1062,6 @@ TEST_F(ReplicationRecoveryTest, CommitTransactionOplogEntryCorrectlyUpdatesConfi
                                    repl::OpTypeEnum::kCommand,
                                    BSON("applyOps" << txnOperations << "prepare" << true),
                                    OpTime(Timestamp(0, 0), -1),
-                                   true,  // prepare
                                    0,
                                    sessionInfo,
                                    prepareDate);
@@ -1079,7 +1075,6 @@ TEST_F(ReplicationRecoveryTest, CommitTransactionOplogEntryCorrectlyUpdatesConfi
         repl::OpTypeEnum::kCommand,
         BSON("commitTransaction" << 1 << "commitTimestamp" << Timestamp(2, 1)),
         OpTime(Timestamp(2, 0), 1),
-        false,  // prepare
         1,
         sessionInfo,
         commitDate);
@@ -1144,7 +1139,6 @@ TEST_F(ReplicationRecoveryTest,
                                    repl::OpTypeEnum::kCommand,
                                    BSON("applyOps" << txnOperations << "prepare" << true),
                                    OpTime(Timestamp(0, 0), -1),
-                                   true,  // prepare
                                    0,
                                    sessionInfo,
                                    prepareDate);
@@ -1170,7 +1164,6 @@ TEST_F(ReplicationRecoveryTest,
         repl::OpTypeEnum::kCommand,
         BSON("commitTransaction" << 1 << "commitTimestamp" << Timestamp(2, 1)),
         OpTime(Timestamp(2, 0), 1),
-        false,  // prepare
         1,
         sessionInfo,
         commitDate);

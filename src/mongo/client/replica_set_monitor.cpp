@@ -157,6 +157,15 @@ struct HostNotIn {
     const std::set<HostAndPort>& _hosts;
 };
 
+int32_t pingTimeMillis(const Node& node) {
+    auto latencyMillis = node.latencyMicros / 1000;
+    if (latencyMillis > numeric_limits<int32_t>::max()) {
+        // In particular, Node::unknownLatency does not fit in an int32.
+        return numeric_limits<int32_t>::max();
+    }
+    return latencyMillis;
+}
+
 /**
  * Replica set refresh period on the task executor.
  */
@@ -258,6 +267,27 @@ void ReplicaSetMonitor::_doScheduledRefresh(const CallbackHandle& currentHandle)
 
 SemiFuture<HostAndPort> ReplicaSetMonitor::getHostOrRefresh(const ReadPreferenceSetting& criteria,
                                                             Milliseconds maxWait) {
+    return _getHostsOrRefresh(criteria, maxWait)
+        .then([](const auto& hosts) {
+            invariant(hosts.size());
+            return hosts[0];
+        })
+        .semi();
+}
+
+SemiFuture<std::vector<HostAndPort>> ReplicaSetMonitor::getHostsOrRefresh(
+    const ReadPreferenceSetting& criteria, Milliseconds maxWait) {
+    return _getHostsOrRefresh(criteria, maxWait).semi();
+}
+
+Future<std::vector<HostAndPort>> ReplicaSetMonitor::_getHostsOrRefresh(
+    const ReadPreferenceSetting& criteria, Milliseconds maxWait) {
+
+    // If we're in shutdown, don't bother
+    if (globalInShutdownDeprecated()) {
+        return Status(ErrorCodes::ShutdownInProgress, "Server is shutting down"_sd);
+    }
+
     if (_isRemovedFromManager.load()) {
         return Status(ErrorCodes::ReplicaSetMonitorRemoved,
                       str::stream() << "ReplicaSetMonitor for set " << getName() << " is removed");
@@ -265,7 +295,7 @@ SemiFuture<HostAndPort> ReplicaSetMonitor::getHostOrRefresh(const ReadPreference
 
     // Fast path, for the failure-free case
     stdx::lock_guard<stdx::mutex> lk(_state->mutex);
-    HostAndPort out = _state->getMatchingHost(criteria);
+    auto out = _state->getMatchingHosts(criteria);
     if (!out.empty())
         return {std::move(out)};
 
@@ -275,7 +305,7 @@ SemiFuture<HostAndPort> ReplicaSetMonitor::getHostOrRefresh(const ReadPreference
 
     // TODO look into putting all PrimaryOnly waiters on a single SharedPromise. The tricky part is
     // dealing with maxWait.
-    auto pf = makePromiseFuture<HostAndPort>();
+    auto pf = makePromiseFuture<decltype(out)>();
     _state->waiters.emplace_back(
         SetState::Waiter{_state->now() + maxWait, criteria, std::move(pf.promise)});
 
@@ -292,9 +322,8 @@ SemiFuture<HostAndPort> ReplicaSetMonitor::getHostOrRefresh(const ReadPreference
         _scheduleRefresh(_state->now() + kExpeditedRefreshPeriod, lk);
     }
 
-    return std::move(pf.future).semi();
+    return std::move(pf.future);
 }
-
 HostAndPort ReplicaSetMonitor::getMasterOrUassert() {
     return getHostOrRefresh(kPrimaryOnlyReadPreference).get();
 }
@@ -392,12 +421,21 @@ ReplicaSetChangeNotifier& ReplicaSetMonitor::getNotifier() {
 }
 
 // TODO move to correct order with non-statics before pushing
-void ReplicaSetMonitor::appendInfo(BSONObjBuilder& bsonObjBuilder) const {
+void ReplicaSetMonitor::appendInfo(BSONObjBuilder& bsonObjBuilder, bool forFTDC) const {
     stdx::lock_guard<stdx::mutex> lk(_state->mutex);
 
+    BSONObjBuilder monitorInfo(bsonObjBuilder.subobjStart(getName()));
+    if (forFTDC) {
+        for (size_t i = 0; i < _state->nodes.size(); i++) {
+            const Node& node = _state->nodes[i];
+            monitorInfo.appendNumber(node.host.toString(), pingTimeMillis(node));
+        }
+        return;
+    }
+
     // NOTE: the format here must be consistent for backwards compatibility
-    BSONArrayBuilder hosts(bsonObjBuilder.subarrayStart("hosts"));
-    for (unsigned i = 0; i < _state->nodes.size(); i++) {
+    BSONArrayBuilder hosts(monitorInfo.subarrayStart("hosts"));
+    for (size_t i = 0; i < _state->nodes.size(); i++) {
         const Node& node = _state->nodes[i];
 
         BSONObjBuilder builder;
@@ -406,15 +444,7 @@ void ReplicaSetMonitor::appendInfo(BSONObjBuilder& bsonObjBuilder) const {
         builder.append("ismaster", node.isMaster);  // intentionally not camelCase
         builder.append("hidden", false);            // we don't keep hidden nodes in the set
         builder.append("secondary", node.isUp && !node.isMaster);
-
-        int32_t pingTimeMillis = 0;
-        if (node.latencyMicros / 1000 > numeric_limits<int32_t>::max()) {
-            // In particular, Node::unknownLatency does not fit in an int32.
-            pingTimeMillis = numeric_limits<int32_t>::max();
-        } else {
-            pingTimeMillis = node.latencyMicros / 1000;
-        }
-        builder.append("pingTimeMillis", pingTimeMillis);
+        builder.append("pingTimeMillis", pingTimeMillis(node));
 
         if (!node.tags.isEmpty()) {
             builder.append("tags", node.tags);
@@ -422,7 +452,6 @@ void ReplicaSetMonitor::appendInfo(BSONObjBuilder& bsonObjBuilder) const {
 
         hosts.append(builder.obj());
     }
-    hosts.done();
 }
 
 void ReplicaSetMonitor::shutdown() {
@@ -680,7 +709,7 @@ void Refresher::receivedIsMaster(const HostAndPort& from,
         _set->notify(/*finishedScan*/ false);
     } else {
         // Populate possibleNodes.
-        receivedIsMasterBeforeFoundMaster(reply);
+        _scan->possibleNodes.insert(reply.normalHosts.begin(), reply.normalHosts.end());
         _scan->unconfirmedReplies[from] = reply;
     }
 
@@ -840,25 +869,6 @@ Status Refresher::receivedIsMasterFromMaster(const HostAndPort& from, const IsMa
     _set->lastSeenMaster = reply.host;
 
     return Status::OK();
-}
-
-void Refresher::receivedIsMasterBeforeFoundMaster(const IsMasterReply& reply) {
-    invariant(!reply.isMaster);
-
-    // Add everyone this host claims is in the set to possibleNodes.
-    _scan->possibleNodes.insert(reply.normalHosts.begin(), reply.normalHosts.end());
-
-    // If this node thinks the primary is someone we haven't tried, make that the next
-    // hostToScan.
-    if (!reply.primary.empty() && !_scan->triedHosts.count(reply.primary)) {
-        std::deque<HostAndPort>::iterator it = std::stable_partition(
-            _scan->hostsToScan.begin(), _scan->hostsToScan.end(), HostIs(reply.primary));
-
-        if (it == _scan->hostsToScan.begin()) {
-            // reply.primary wasn't in hostsToScan
-            _scan->hostsToScan.push_front(reply.primary);
-        }
-    }
 }
 
 void IsMasterReply::parse(const BSONObj& obj) {
@@ -1022,25 +1032,35 @@ SetState::SetState(const MongoURI& uri,
 }
 
 HostAndPort SetState::getMatchingHost(const ReadPreferenceSetting& criteria) const {
+    auto hosts = getMatchingHosts(criteria);
+
+    if (hosts.empty()) {
+        return HostAndPort();
+    }
+
+    return hosts[0];
+}
+
+std::vector<HostAndPort> SetState::getMatchingHosts(const ReadPreferenceSetting& criteria) const {
     switch (criteria.pref) {
         // "Prefered" read preferences are defined in terms of other preferences
         case ReadPreference::PrimaryPreferred: {
-            HostAndPort out =
-                getMatchingHost(ReadPreferenceSetting(ReadPreference::PrimaryOnly, criteria.tags));
+            std::vector<HostAndPort> out =
+                getMatchingHosts(ReadPreferenceSetting(ReadPreference::PrimaryOnly, criteria.tags));
             // NOTE: the spec says we should use the primary even if tags don't match
             if (!out.empty())
                 return out;
-            return getMatchingHost(ReadPreferenceSetting(
+            return getMatchingHosts(ReadPreferenceSetting(
                 ReadPreference::SecondaryOnly, criteria.tags, criteria.maxStalenessSeconds));
         }
 
         case ReadPreference::SecondaryPreferred: {
-            HostAndPort out = getMatchingHost(ReadPreferenceSetting(
+            std::vector<HostAndPort> out = getMatchingHosts(ReadPreferenceSetting(
                 ReadPreference::SecondaryOnly, criteria.tags, criteria.maxStalenessSeconds));
             if (!out.empty())
                 return out;
             // NOTE: the spec says we should use the primary even if tags don't match
-            return getMatchingHost(
+            return getMatchingHosts(
                 ReadPreferenceSetting(ReadPreference::PrimaryOnly, criteria.tags));
         }
 
@@ -1048,14 +1068,14 @@ HostAndPort SetState::getMatchingHost(const ReadPreferenceSetting& criteria) con
             // NOTE: isMaster implies isUp
             Nodes::const_iterator it = std::find_if(nodes.begin(), nodes.end(), isMaster);
             if (it == nodes.end())
-                return HostAndPort();
-            return it->host;
+                return {};
+            return {it->host};
         }
 
         // The difference between these is handled by Node::matches
         case ReadPreference::SecondaryOnly:
         case ReadPreference::Nearest: {
-            stdx::function<bool(const Node&)> matchNode = [](const Node& node) -> bool {
+            std::function<bool(const Node&)> matchNode = [](const Node& node) -> bool {
                 return true;
             };
             // build comparator
@@ -1113,7 +1133,7 @@ HostAndPort SetState::getMatchingHost(const ReadPreferenceSetting& criteria) con
                     continue;
                 }
                 if (matchingNodes.size() == 1) {
-                    return matchingNodes.front()->host;
+                    return {matchingNodes.front()->host};
                 }
 
                 // Only consider nodes that satisfy the minOpTime
@@ -1132,7 +1152,7 @@ HostAndPort SetState::getMatchingHost(const ReadPreferenceSetting& criteria) con
                     }
 
                     if (matchingNodes.size() == 1) {
-                        return matchingNodes.front()->host;
+                        return {matchingNodes.front()->host};
                     }
                 }
 
@@ -1149,17 +1169,26 @@ HostAndPort SetState::getMatchingHost(const ReadPreferenceSetting& criteria) con
                     }
                 }
 
-                // of the remaining nodes, pick one at random (or use round-robin)
-                if (ReplicaSetMonitor::useDeterministicHostSelection) {
-                    // only in tests
-                    return matchingNodes[roundRobin++ % matchingNodes.size()]->host;
-                } else {
-                    // normal case
-                    return matchingNodes[rand.nextInt32(matchingNodes.size())]->host;
-                };
+                std::vector<HostAndPort> hosts;
+                std::transform(matchingNodes.begin(),
+                               matchingNodes.end(),
+                               std::back_inserter(hosts),
+                               [](const auto& node) { return node->host; });
+
+                // Note that the host list is only deterministic (or random) for the first node.
+                // The rest of the list is in matchingNodes order (latency) with one element swapped
+                // for the first element.
+                if (auto bestHostIdx = ReplicaSetMonitor::useDeterministicHostSelection
+                        ? roundRobin++ % hosts.size()
+                        : rand.nextInt32(hosts.size())) {
+                    using std::swap;
+                    swap(hosts[0], hosts[bestHostIdx]);
+                }
+
+                return hosts;
             }
 
-            return HostAndPort();
+            return {};
         }
 
         default:
@@ -1227,7 +1256,7 @@ void SetState::notify(bool finishedScan) {
             continue;
         }
 
-        auto match = getMatchingHost(it->criteria);
+        auto match = getMatchingHosts(it->criteria);
         if (!match.empty()) {
             // match;
             it->promise.emplaceValue(std::move(match));

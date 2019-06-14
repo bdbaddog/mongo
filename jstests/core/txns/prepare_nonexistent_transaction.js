@@ -38,11 +38,11 @@
         autocommit: false
     }),
                                  ErrorCodes.NoSuchTransaction);
-    session.abortTransaction_forTesting();
+    assert.commandWorked(session.abortTransaction_forTesting());
 
     session.startTransaction();
     assert.commandWorked(sessionColl.insert(doc));
-    session.abortTransaction_forTesting();
+    assert.commandWorked(session.abortTransaction_forTesting());
     jsTestLog("Test that if there is no transaction active on the current session, the " +
               "'txnNumber' given matches the last known transaction for this session and the " +
               "last known transaction was aborted then it errors with 'NoSuchTransaction'.");
@@ -62,7 +62,7 @@
         sessionDB.adminCommand(
             {prepareTransaction: 1, txnNumber: NumberLong(0), autocommit: false}),
         ErrorCodes.TransactionTooOld);
-    session.abortTransaction_forTesting();
+    assert.commandWorked(session.abortTransaction_forTesting());
 
     jsTestLog("Test that if there is no transaction active on the current session and the " +
               "'txnNumber' given is less than the current transaction, errors with " +
@@ -77,15 +77,13 @@
     assert.commandFailedWithCode(sessionDB.adminCommand({prepareTransaction: 1, autocommit: false}),
                                  ErrorCodes.InvalidOptions);
 
-    // It isn't ideal that NoSuchTransaction is thrown instead of InvalidOptions here, but it's okay
-    // to leave as is for now since this case fails in some way.
     jsTestLog("Test the error precedence when calling prepare on a nonexistent transaction but " +
               "not providing autocommit to prepareTransaction.");
     assert.commandFailedWithCode(sessionDB.adminCommand({
         prepareTransaction: 1,
         txnNumber: NumberLong(session.getTxnNumber_forTesting() + 1),
     }),
-                                 ErrorCodes.NoSuchTransaction);
+                                 50768);
 
     jsTestLog("Test the error precedence when calling prepare on a nonexistent transaction and " +
               "providing startTransaction to prepareTransaction.");

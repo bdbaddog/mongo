@@ -48,7 +48,7 @@ public:
     public:
         static std::unique_ptr<LiteParsed> parse(const AggregationRequest& request,
                                                  const BSONElement& spec) {
-            return stdx::make_unique<LiteParsed>(request.getNamespaceString());
+            return std::make_unique<LiteParsed>(request.getNamespaceString());
         }
 
         explicit LiteParsed(NamespaceString nss) : _nss(std::move(nss)) {}
@@ -168,7 +168,8 @@ public:
      */
     static BSONObj buildMatchFilter(const boost::intrusive_ptr<ExpressionContext>& expCtx,
                                     Timestamp startFrom,
-                                    bool startFromInclusive);
+                                    bool startFromInclusive,
+                                    bool showMigrationEvents);
 
     /**
      * Parses a $changeStream stage from 'elem' and produces the $match and transformation

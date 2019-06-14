@@ -109,8 +109,11 @@ std::vector<MemberData> ReplicationCoordinatorMock::getMemberData() const {
 }
 
 bool ReplicationCoordinatorMock::canAcceptNonLocalWrites() const {
-    MONGO_UNREACHABLE;
-    return false;
+    return _canAcceptNonLocalWrites;
+}
+
+void ReplicationCoordinatorMock::setCanAcceptNonLocalWrites(bool canAcceptNonLocalWrites) {
+    _canAcceptNonLocalWrites = canAcceptNonLocalWrites;
 }
 
 Status ReplicationCoordinatorMock::waitForMemberState(MemberState expectedState,
@@ -232,7 +235,7 @@ void ReplicationCoordinatorMock::setMyLastDurableOpTimeAndWallTimeForward(
 
 void ReplicationCoordinatorMock::resetMyLastOpTimes() {
     _myLastDurableOpTime = OpTime();
-    _myLastDurableWallTime = Date_t::min();
+    _myLastDurableWallTime = Date_t();
 }
 
 OpTimeAndWallTime ReplicationCoordinatorMock::getMyLastAppliedOpTimeAndWallTime() const {
@@ -340,7 +343,8 @@ Status ReplicationCoordinatorMock::processReplSetGetStatus(BSONObjBuilder*,
     return Status::OK();
 }
 
-void ReplicationCoordinatorMock::fillIsMasterForReplSet(IsMasterResponse* result) {
+void ReplicationCoordinatorMock::fillIsMasterForReplSet(IsMasterResponse* result,
+                                                        const SplitHorizon::Parameters&) {
     result->setReplSetVersion(_getConfigReturnValue.getConfigVersion());
     result->setIsMaster(true);
     result->setIsSecondary(false);
@@ -457,7 +461,7 @@ OpTime ReplicationCoordinatorMock::getLastCommittedOpTime() const {
 }
 
 OpTimeAndWallTime ReplicationCoordinatorMock::getLastCommittedOpTimeAndWallTime() const {
-    return {OpTime(), Date_t::min()};
+    return {OpTime(), Date_t()};
 }
 
 Status ReplicationCoordinatorMock::processReplSetRequestVotes(

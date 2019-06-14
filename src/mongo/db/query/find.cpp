@@ -33,6 +33,8 @@
 
 #include "mongo/db/query/find.h"
 
+#include <memory>
+
 #include "mongo/base/error_codes.h"
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/catalog/collection.h"
@@ -62,7 +64,6 @@
 #include "mongo/db/views/view_catalog.h"
 #include "mongo/s/chunk_version.h"
 #include "mongo/s/stale_exception.h"
-#include "mongo/stdx/memory.h"
 #include "mongo/util/fail_point_service.h"
 #include "mongo/util/log.h"
 #include "mongo/util/scopeguard.h"
@@ -71,7 +72,6 @@
 namespace mongo {
 
 using std::unique_ptr;
-using stdx::make_unique;
 
 // Failpoint for checking whether we've received a getmore.
 MONGO_FAIL_POINT_DEFINE(failReceivedGetmore);
@@ -353,7 +353,7 @@ Message getMore(OperationContext* opCtx,
     *isCursorAuthorized = true;
 
     // Only used by the failpoints.
-    stdx::function<void()> dropAndReaquireReadLock = [&] {
+    std::function<void()> dropAndReaquireReadLock = [&] {
         // Make sure an interrupted operation does not prevent us from reacquiring the lock.
         UninterruptibleLockGuard noInterrupt(opCtx->lockState());
 
@@ -397,6 +397,13 @@ Message getMore(OperationContext* opCtx,
             "OP_GET_MORE operations are not supported on tailable aggregations. Only clients "
             "which support the getMore command can be used on tailable aggregations.",
             readLock || !cursorPin->isAwaitData());
+    uassert(
+        31124,
+        str::stream()
+            << "OP_GET_MORE does not support cursors with a write concern other than the default."
+               " Use the getMore command instead. Write concern was: "
+            << cursorPin->getWriteConcernOptions().toBSON(),
+        cursorPin->getWriteConcernOptions().usedDefault);
 
     // If the operation that spawned this cursor had a time limit set, apply leftover time to this
     // getmore.
@@ -724,6 +731,7 @@ std::string runQuery(OperationContext* opCtx,
             {std::move(exec),
              nss,
              AuthorizationSession::get(opCtx->getClient())->getAuthenticatedUserNames(),
+             opCtx->getWriteConcern(),
              readConcernArgs,
              upconvertedQuery,
              ClientCursorParams::LockPolicy::kLockExternally,

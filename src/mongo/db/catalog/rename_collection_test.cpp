@@ -29,6 +29,7 @@
 
 #include "mongo/platform/basic.h"
 
+#include <memory>
 #include <set>
 #include <string>
 #include <vector>
@@ -56,7 +57,6 @@
 #include "mongo/db/repl/replication_coordinator_mock.h"
 #include "mongo/db/repl/storage_interface_mock.h"
 #include "mongo/db/service_context_d_test_fixture.h"
-#include "mongo/stdx/memory.h"
 #include "mongo/unittest/death_test.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/assert_util.h"
@@ -275,13 +275,13 @@ void RenameCollectionTest::setUp() {
     auto service = getServiceContext();
     _opCtx = cc().makeOperationContext();
 
-    repl::StorageInterface::set(service, stdx::make_unique<repl::StorageInterfaceMock>());
+    repl::StorageInterface::set(service, std::make_unique<repl::StorageInterfaceMock>());
     repl::DropPendingCollectionReaper::set(
         service,
-        stdx::make_unique<repl::DropPendingCollectionReaper>(repl::StorageInterface::get(service)));
+        std::make_unique<repl::DropPendingCollectionReaper>(repl::StorageInterface::get(service)));
 
     // Set up ReplicationCoordinator and create oplog.
-    auto replCoord = stdx::make_unique<repl::ReplicationCoordinatorMock>(service);
+    auto replCoord = std::make_unique<repl::ReplicationCoordinatorMock>(service);
     _replCoord = replCoord.get();
     repl::ReplicationCoordinator::set(service, std::move(replCoord));
     repl::setOplogCollectionName(service);
@@ -291,8 +291,8 @@ void RenameCollectionTest::setUp() {
     ASSERT_OK(_replCoord->setFollowerMode(repl::MemberState::RS_PRIMARY));
 
     // Use OpObserverMock to track notifications for collection and database drops.
-    auto opObserver = stdx::make_unique<OpObserverRegistry>();
-    auto mockObserver = stdx::make_unique<OpObserverMock>();
+    auto opObserver = std::make_unique<OpObserverRegistry>();
+    auto mockObserver = std::make_unique<OpObserverMock>();
     _opObserver = mockObserver.get();
     opObserver->addObserver(std::move(mockObserver));
     service->setOpObserver(std::move(opObserver));
@@ -904,6 +904,22 @@ TEST_F(RenameCollectionTest, RenameCollectionForApplyOpsDropTargetByUUIDEvenIfSo
     ASSERT_TRUE(_collectionExists(_opCtx.get(), _targetNss));
 }
 
+TEST_F(RenameCollectionTest, RenameCollectionForApplyOpsDropTargetByUUIDEvenIfSourceEqualsTarget) {
+    auto dropTargetUUID = _createCollectionWithUUID(_opCtx.get(), _targetNss);
+    auto uuidDoc = BSON("ui" << _createCollectionWithUUID(_opCtx.get(), _sourceNss));
+    auto cmd = BSON("renameCollection" << _sourceNss.ns() << "to" << _sourceNss.ns() << "dropTarget"
+                                       << dropTargetUUID);
+    repl::UnreplicatedWritesBlock uwb(_opCtx.get());
+    repl::OpTime renameOpTime = {Timestamp(Seconds(200), 1U), 1LL};
+    auto dpns = _targetNss.makeDropPendingNamespace(renameOpTime);
+    ASSERT_OK(renameCollectionForApplyOps(
+        _opCtx.get(), _sourceNss.db().toString(), uuidDoc["ui"], cmd, renameOpTime));
+
+    ASSERT_TRUE(_collectionExists(_opCtx.get(), _sourceNss));
+    ASSERT_TRUE(_collectionExists(_opCtx.get(), dpns));
+    ASSERT_FALSE(_collectionExists(_opCtx.get(), _targetNss));
+}
+
 void _testRenameCollectionStayTemp(OperationContext* opCtx,
                                    const NamespaceString& sourceNss,
                                    const NamespaceString& targetNss,
@@ -1026,9 +1042,56 @@ TEST_F(RenameCollectionTest, RenameCollectionAcrossDatabaseOplogEntries) {
         {"create", "index", "inserts", "rename", "drop"});
 }
 
+TEST_F(RenameCollectionTest, RenameCollectionForApplyOpsAcrossDatabaseOplogEntries) {
+    bool forApplyOps = true;
+    _testRenameCollectionAcrossDatabaseOplogEntries(
+        _opCtx.get(),
+        _sourceNss,
+        _targetNssDifferentDb,
+        &_opObserver->oplogEntries,
+        forApplyOps,
+        {"create", "index", "inserts", "rename", "drop"});
+}
+
+TEST_F(RenameCollectionTest, RenameCollectionAcrossDatabaseOplogEntriesDropTarget) {
+    _createCollection(_opCtx.get(), _targetNssDifferentDb);
+    bool forApplyOps = false;
+    _testRenameCollectionAcrossDatabaseOplogEntries(
+        _opCtx.get(),
+        _sourceNss,
+        _targetNssDifferentDb,
+        &_opObserver->oplogEntries,
+        forApplyOps,
+        {"create", "index", "inserts", "rename", "drop"});
+}
+
+TEST_F(RenameCollectionTest, RenameCollectionForApplyOpsAcrossDatabaseOplogEntriesDropTarget) {
+    _createCollection(_opCtx.get(), _targetNssDifferentDb);
+    bool forApplyOps = true;
+    _testRenameCollectionAcrossDatabaseOplogEntries(
+        _opCtx.get(),
+        _sourceNss,
+        _targetNssDifferentDb,
+        &_opObserver->oplogEntries,
+        forApplyOps,
+        {"create", "index", "inserts", "rename", "drop"});
+}
+
 TEST_F(RenameCollectionTest, RenameCollectionAcrossDatabaseOplogEntriesWritesNotReplicated) {
     repl::UnreplicatedWritesBlock uwb(_opCtx.get());
     bool forApplyOps = false;
+    _testRenameCollectionAcrossDatabaseOplogEntries(_opCtx.get(),
+                                                    _sourceNss,
+                                                    _targetNssDifferentDb,
+                                                    &_opObserver->oplogEntries,
+                                                    forApplyOps,
+                                                    {});
+}
+
+TEST_F(RenameCollectionTest,
+       RenameCollectionForApplyOpsAcrossDatabaseOplogEntriesWritesNotReplicated) {
+    repl::UnreplicatedWritesBlock uwb(_opCtx.get());
+    bool forApplyOps = true;
     _testRenameCollectionAcrossDatabaseOplogEntries(_opCtx.get(),
                                                     _sourceNss,
                                                     _targetNssDifferentDb,

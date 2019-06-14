@@ -76,8 +76,7 @@ repl::OplogEntry makeOplogEntry(repl::OpTime opTime,
                                 boost::optional<Date_t> wallClockTime = boost::none,
                                 boost::optional<StmtId> stmtId = boost::none,
                                 boost::optional<UUID> uuid = boost::none,
-                                boost::optional<OpTime> prevOpTime = boost::none,
-                                const boost::optional<bool> prepare = boost::none) {
+                                boost::optional<OpTime> prevOpTime = boost::none) {
     return repl::OplogEntry(opTime,                           // optime
                             boost::none,                      // hash
                             opType,                           // opType
@@ -91,10 +90,9 @@ repl::OplogEntry makeOplogEntry(repl::OpTime opTime,
                             boost::none,                      // upsert
                             wallClockTime,                    // wall clock time
                             stmtId,                           // statement id
-                            prevOpTime,   // optime of previous write within same transaction
-                            boost::none,  // pre-image optime
-                            boost::none,  // post-image optime
-                            prepare);     // prepare
+                            prevOpTime,    // optime of previous write within same transaction
+                            boost::none,   // pre-image optime
+                            boost::none);  // post-image optime
 }
 
 }  // namespace
@@ -254,8 +252,13 @@ OplogEntry makeCreateCollectionOplogEntry(OpTime opTime,
                                           const BSONObj& options) {
     BSONObjBuilder bob;
     bob.append("create", nss.coll());
+    boost::optional<UUID> optionalUUID;
+    if (options.hasField("uuid")) {
+        StatusWith<UUID> uuid = UUID::parse(options.getField("uuid"));
+        optionalUUID = uuid.getValue();
+    }
     bob.appendElements(options);
-    return makeCommandOplogEntry(opTime, nss, bob.obj());
+    return makeCommandOplogEntry(opTime, nss, bob.obj(), optionalUUID);
 }
 
 /**
@@ -394,32 +397,35 @@ void IdempotencyTest::testOpsAreIdempotent(std::vector<OplogEntry> ops, Sequence
     auto iterations = sequenceType == SequenceType::kEntireSequence ? 1 : ops.size();
 
     for (std::size_t i = 0; i < iterations; i++) {
-        ASSERT_OK(resetState());
-        std::vector<OplogEntry> fullSequence;
+        // Since the end state after each iteration is expected to be the same as the start state,
+        // we don't drop and re-create the collections. Dropping and re-creating the collections
+        // won't work either because we don't have ways to wait until second-phase drop to
+        // completely finish.
+        MultiApplier::OperationPtrs fullSequence;
 
         if (sequenceType == SequenceType::kEntireSequence) {
             ASSERT_OK(runOpPtrsInitialSync(opPtrs));
-            fullSequence.insert(fullSequence.end(), ops.begin(), ops.end());
+            fullSequence.insert(fullSequence.end(), opPtrs.begin(), opPtrs.end());
         } else if (sequenceType == SequenceType::kAnyPrefix ||
                    sequenceType == SequenceType::kAnyPrefixOrSuffix) {
-            std::vector<OplogEntry> prefix(ops.begin(), ops.begin() + i + 1);
-            ASSERT_OK(runOpPtrsInitialSync(opPtrs));
+            MultiApplier::OperationPtrs prefix(opPtrs.begin(), opPtrs.begin() + i + 1);
+            ASSERT_OK(runOpPtrsInitialSync(prefix));
             fullSequence.insert(fullSequence.end(), prefix.begin(), prefix.end());
         }
 
         ASSERT_OK(runOpPtrsInitialSync(opPtrs));
-        fullSequence.insert(fullSequence.end(), ops.begin(), ops.end());
+        fullSequence.insert(fullSequence.end(), opPtrs.begin(), opPtrs.end());
 
         if (sequenceType == SequenceType::kAnySuffix ||
             sequenceType == SequenceType::kAnyPrefixOrSuffix) {
-            std::vector<OplogEntry> suffix(ops.begin() + i, ops.end());
-            ASSERT_OK(runOpPtrsInitialSync(opPtrs));
+            MultiApplier::OperationPtrs suffix(opPtrs.begin() + i, opPtrs.end());
+            ASSERT_OK(runOpPtrsInitialSync(suffix));
             fullSequence.insert(fullSequence.end(), suffix.begin(), suffix.end());
         }
 
         auto state2 = validateAllCollections();
         if (state1 != state2) {
-            FAIL(getStateVectorString(state1, state2, fullSequence));
+            FAIL(getStatesString(state1, state2, fullSequence));
         }
     }
 }
@@ -461,32 +467,33 @@ OplogEntry IdempotencyTest::dropIndex(const std::string& indexName, const UUID& 
 OplogEntry IdempotencyTest::prepare(LogicalSessionId lsid,
                                     TxnNumber txnNum,
                                     StmtId stmtId,
-                                    const BSONArray& ops) {
+                                    const BSONArray& ops,
+                                    OpTime prevOpTime) {
     OperationSessionInfo info;
     info.setSessionId(lsid);
     info.setTxnNumber(txnNum);
     return makeOplogEntry(nextOpTime(),
                           OpTypeEnum::kCommand,
                           nss.getCommandNS(),
-                          BSON("applyOps" << ops),
+                          BSON("applyOps" << ops << "prepare" << true),
                           boost::none /* o2 */,
                           info /* sessionInfo */,
                           Date_t::min() /* wallClockTime -- required but not checked */,
                           stmtId,
                           boost::none /* uuid */,
-                          OpTime(),
-                          true);
+                          prevOpTime);
 }
 
 OplogEntry IdempotencyTest::commitUnprepared(LogicalSessionId lsid,
                                              TxnNumber txnNum,
                                              StmtId stmtId,
-                                             const BSONArray& ops) {
+                                             const BSONArray& ops,
+                                             OpTime prevOpTime) {
     OperationSessionInfo info;
     info.setSessionId(lsid);
     info.setTxnNumber(txnNum);
     return makeCommandOplogEntryWithSessionInfoAndStmtId(
-        nextOpTime(), nss, BSON("applyOps" << ops), lsid, txnNum, stmtId, OpTime());
+        nextOpTime(), nss, BSON("applyOps" << ops), lsid, txnNum, stmtId, prevOpTime);
 }
 
 OplogEntry IdempotencyTest::commitPrepared(LogicalSessionId lsid,
@@ -509,6 +516,26 @@ OplogEntry IdempotencyTest::abortPrepared(LogicalSessionId lsid,
                                           OpTime prepareOpTime) {
     return makeCommandOplogEntryWithSessionInfoAndStmtId(
         nextOpTime(), nss, BSON("abortTransaction" << 1), lsid, txnNum, stmtId, prepareOpTime);
+}
+
+OplogEntry IdempotencyTest::partialTxn(LogicalSessionId lsid,
+                                       TxnNumber txnNum,
+                                       StmtId stmtId,
+                                       OpTime prevOpTime,
+                                       const BSONArray& ops) {
+    OperationSessionInfo info;
+    info.setSessionId(lsid);
+    info.setTxnNumber(txnNum);
+    return makeOplogEntry(nextOpTime(),
+                          OpTypeEnum::kCommand,
+                          nss.getCommandNS(),
+                          BSON("applyOps" << ops << "partialTxn" << true),
+                          boost::none /* o2 */,
+                          info /* sessionInfo */,
+                          Date_t::min() /* wallClockTime -- required but not checked */,
+                          stmtId,
+                          boost::none /* uuid */,
+                          prevOpTime);
 }
 
 std::string IdempotencyTest::computeDataHash(Collection* collection) {
@@ -586,7 +613,7 @@ CollectionState IdempotencyTest::validate(const NamespaceString& nss) {
     BSONObjBuilder bob;
 
     Lock::DBLock lk(_opCtx.get(), nss.db(), MODE_IX);
-    auto lock = stdx::make_unique<Lock::CollectionLock>(_opCtx.get(), nss, MODE_X);
+    auto lock = std::make_unique<Lock::CollectionLock>(_opCtx.get(), nss, MODE_X);
     ASSERT_OK(collection->validate(_opCtx.get(), kValidateFull, false, &validateResults, &bob));
     ASSERT_TRUE(validateResults.valid);
 
@@ -607,28 +634,23 @@ CollectionState IdempotencyTest::validate(const NamespaceString& nss) {
     return collectionState;
 }
 
-std::string IdempotencyTest::getStateString(const CollectionState& state1,
-                                            const CollectionState& state2,
-                                            const std::vector<OplogEntry>& ops) {
+std::string IdempotencyTest::getStatesString(const std::vector<CollectionState>& state1,
+                                             const std::vector<CollectionState>& state2,
+                                             const MultiApplier::OperationPtrs& opPtrs) {
     StringBuilder sb;
-    sb << "The state: " << state1 << " does not match with the state: " << state2
-       << " found after applying the operations a second time, therefore breaking idempotency.";
-    return sb.str();
-}
-
-std::string IdempotencyTest::getStateVectorString(std::vector<CollectionState>& state1,
-                                                  std::vector<CollectionState>& state2,
-                                                  const std::vector<OplogEntry>& ops) {
-    StringBuilder sb;
-    sb << "The states: ";
+    sb << "The states:\n";
     for (const auto& s : state1) {
-        sb << s << " ";
+        sb << s << "\n";
     }
-    sb << "do not match with the states: ";
+    sb << "do not match with the states:\n";
     for (const auto& s : state2) {
-        sb << s << " ";
+        sb << s << "\n";
     }
-    sb << " found after applying the operations a second time, therefore breaking idempotency.";
+    sb << "found after applying the operations a second time, therefore breaking idempotency.\n";
+    sb << "Applied ops:\n";
+    for (auto op : opPtrs) {
+        sb << op->toString() << "\n";
+    }
     return sb.str();
 }
 

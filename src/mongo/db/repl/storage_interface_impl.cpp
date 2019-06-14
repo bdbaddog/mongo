@@ -63,6 +63,7 @@
 #include "mongo/db/jsobj.h"
 #include "mongo/db/keypattern.h"
 #include "mongo/db/logical_clock.h"
+#include "mongo/db/matcher/extensions_callback_real.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/ops/delete_request.h"
 #include "mongo/db/ops/parsed_update.h"
@@ -234,7 +235,7 @@ StorageInterfaceImpl::createCollectionForBulkLoading(
             wunit.commit();
         }
 
-        autoColl = stdx::make_unique<AutoGetCollection>(
+        autoColl = std::make_unique<AutoGetCollection>(
             opCtx.get(), nss, fixLockModeForSystemDotViewsChanges(nss, MODE_IX));
 
         // Build empty capped indexes.  Capped indexes cannot be built by the MultiIndexBlock
@@ -270,10 +271,10 @@ StorageInterfaceImpl::createCollectionForBulkLoading(
 
     // Move locks into loader, so it now controls their lifetime.
     auto loader =
-        stdx::make_unique<CollectionBulkLoaderImpl>(Client::releaseCurrent(),
-                                                    std::move(opCtx),
-                                                    std::move(autoColl),
-                                                    options.capped ? BSONObj() : idIndexSpec);
+        std::make_unique<CollectionBulkLoaderImpl>(Client::releaseCurrent(),
+                                                   std::move(opCtx),
+                                                   std::move(autoColl),
+                                                   options.capped ? BSONObj() : idIndexSpec);
 
     status = loader->init(options.capped ? std::vector<BSONObj>() : secondaryIndexSpecs);
     if (!status.isOK()) {
@@ -457,13 +458,14 @@ Status StorageInterfaceImpl::createCollection(OperationContext* opCtx,
 
 Status StorageInterfaceImpl::dropCollection(OperationContext* opCtx, const NamespaceString& nss) {
     return writeConflictRetry(opCtx, "StorageInterfaceImpl::dropCollection", nss.ns(), [&] {
-        AutoGetDb autoDB(opCtx, nss.db(), MODE_X);
-        if (!autoDB.getDb()) {
+        AutoGetDb autoDb(opCtx, nss.db(), MODE_IX);
+        Lock::CollectionLock collLock(opCtx, nss, MODE_X);
+        if (!autoDb.getDb()) {
             // Database does not exist - nothing to do.
             return Status::OK();
         }
         WriteUnitOfWork wunit(opCtx);
-        const auto status = autoDB.getDb()->dropCollectionEvenIfSystem(opCtx, nss);
+        const auto status = autoDb.getDb()->dropCollectionEvenIfSystem(opCtx, nss);
         if (!status.isOK()) {
             return status;
         }
@@ -537,7 +539,7 @@ Status StorageInterfaceImpl::setIndexIsMultikey(OperationContext* opCtx,
     }
 
     return writeConflictRetry(opCtx, "StorageInterfaceImpl::setIndexIsMultikey", nss.ns(), [&] {
-        AutoGetCollection autoColl(opCtx, nss, MODE_X);
+        AutoGetCollection autoColl(opCtx, nss, MODE_IX);
         auto collectionResult = getCollection(
             autoColl, nss, "The collection must exist before setting an index to multikey.");
         if (!collectionResult.isOK()) {
@@ -846,7 +848,8 @@ Status _updateWithQuery(OperationContext* opCtx,
         // ParsedUpdate needs to be inside the write conflict retry loop because it may create a
         // CanonicalQuery whose ownership will be transferred to the plan executor in
         // getExecutorUpdate().
-        ParsedUpdate parsedUpdate(opCtx, &request);
+        const ExtensionsCallbackReal extensionsCallback(opCtx, &request.getNamespaceString());
+        ParsedUpdate parsedUpdate(opCtx, &request, extensionsCallback);
         auto parsedUpdateStatus = parsedUpdate.parseRequest();
         if (!parsedUpdateStatus.isOK()) {
             return parsedUpdateStatus;
@@ -914,7 +917,8 @@ Status StorageInterfaceImpl::upsertById(OperationContext* opCtx,
 
         // ParsedUpdate needs to be inside the write conflict retry loop because it contains
         // the UpdateDriver whose state may be modified while we are applying the update.
-        ParsedUpdate parsedUpdate(opCtx, &request);
+        const ExtensionsCallbackReal extensionsCallback(opCtx, &request.getNamespaceString());
+        ParsedUpdate parsedUpdate(opCtx, &request, extensionsCallback);
         auto parsedUpdateStatus = parsedUpdate.parseRequest();
         if (!parsedUpdateStatus.isOK()) {
             return parsedUpdateStatus;

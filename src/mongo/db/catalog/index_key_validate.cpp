@@ -40,6 +40,7 @@
 
 #include "mongo/base/status.h"
 #include "mongo/base/status_with.h"
+#include "mongo/db/catalog/disable_index_spec_namespace_generation_gen.h"
 #include "mongo/db/field_ref.h"
 #include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/index/wildcard_key_generator.h"
@@ -300,12 +301,21 @@ StatusWith<BSONObj> validateIndexSpec(
                 return keyPatternValidateStatus;
             }
 
+            for (const auto& keyElement : indexSpecElem.Obj()) {
+                if (keyElement.type() == String && keyElement.str().empty()) {
+                    return {ErrorCodes::CannotCreateIndex,
+                            str::stream()
+                                << "Values in the index key pattern cannot be empty strings"};
+                }
+            }
+
             if ((featureCompatibility.getVersion() <
                  ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo42) &&
                 (IndexNames::findPluginName(indexSpec.getObjectField(
                      IndexDescriptor::kKeyPatternFieldName)) == IndexNames::WILDCARD)) {
                 return {ErrorCodes::CannotCreateIndex,
-                        str::stream() << "Unknown index plugin '" << IndexNames::WILDCARD << "'"};
+                        str::stream()
+                            << "Wildcard indexes require feature compatibility version 4.2"};
             }
             hasKeyPatternField = true;
         } else if (IndexDescriptor::kIndexNameFieldName == indexSpecElemFieldName) {
@@ -486,7 +496,9 @@ StatusWith<BSONObj> validateIndexSpec(
     if (!hasNamespaceField || !hasVersionField) {
         BSONObjBuilder bob;
 
-        if (!hasNamespaceField) {
+        // Only generate the 'ns' field for the index spec if it's missing it and if the server test
+        // parameter to disable the generation isn't enabled.
+        if (!hasNamespaceField && !disableIndexSpecNamespaceGeneration.load()) {
             // We create a new index specification with the 'ns' field set as 'expectedNamespace' if
             // the field was omitted.
             bob.append(IndexDescriptor::kNamespaceFieldName, expectedNamespace.ns());

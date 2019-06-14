@@ -422,12 +422,12 @@ bool CurOp::completeAndLogOperation(OperationContext* opCtx,
                 if (lk.isLocked()) {
                     _debug.storageStats = opCtx->recoveryUnit()->getOperationStatistics();
                 } else {
-                    log(component) << "Timed out obtaining lock while trying to gather storage "
-                                      "statistics for a slow operation";
+                    warning(component) << "Unable to gather storage statistics for a slow "
+                                          "operation due to lock aquire timeout";
                 }
             } catch (const ExceptionForCat<ErrorCategory::Interruption>&) {
-                log(component)
-                    << "Interrupted while trying to gather storage statistics for a slow operation";
+                warning(component) << "Unable to gather storage statistics for a slow "
+                                      "operation due to interrupt";
             }
         }
         log(component) << _debug.report(client,
@@ -659,6 +659,9 @@ string OpDebug::report(Client* client,
 
     OPDEBUG_TOSTRING_HELP(nShards);
     OPDEBUG_TOSTRING_HELP(cursorid);
+    if (mongotCursorId) {
+        s << " mongot: " << makeSearchBetaObject().toString();
+    }
     OPDEBUG_TOSTRING_HELP(ntoreturn);
     OPDEBUG_TOSTRING_HELP(ntoskip);
     OPDEBUG_TOSTRING_HELP_BOOL(exhaust);
@@ -673,7 +676,6 @@ string OpDebug::report(Client* client,
     OPDEBUG_TOSTRING_HELP_OPTIONAL("nModified", additiveMetrics.nModified);
     OPDEBUG_TOSTRING_HELP_OPTIONAL("ninserted", additiveMetrics.ninserted);
     OPDEBUG_TOSTRING_HELP_OPTIONAL("ndeleted", additiveMetrics.ndeleted);
-    OPDEBUG_TOSTRING_HELP_BOOL(fastmodinsert);
     OPDEBUG_TOSTRING_HELP_BOOL(upsert);
     OPDEBUG_TOSTRING_HELP_BOOL(cursorExhausted);
 
@@ -761,6 +763,9 @@ void OpDebug::append(const CurOp& curop,
 
     OPDEBUG_APPEND_NUMBER(nShards);
     OPDEBUG_APPEND_NUMBER(cursorid);
+    if (mongotCursorId) {
+        b.append("mongot", makeSearchBetaObject());
+    }
     OPDEBUG_APPEND_BOOL(exhaust);
 
     OPDEBUG_APPEND_OPTIONAL("keysExamined", additiveMetrics.keysExamined);
@@ -773,7 +778,6 @@ void OpDebug::append(const CurOp& curop,
     OPDEBUG_APPEND_OPTIONAL("nModified", additiveMetrics.nModified);
     OPDEBUG_APPEND_OPTIONAL("ninserted", additiveMetrics.ninserted);
     OPDEBUG_APPEND_OPTIONAL("ndeleted", additiveMetrics.ndeleted);
-    OPDEBUG_APPEND_BOOL(fastmodinsert);
     OPDEBUG_APPEND_BOOL(upsert);
     OPDEBUG_APPEND_BOOL(cursorExhausted);
 
@@ -854,6 +858,16 @@ BSONObj OpDebug::makeFlowControlObject(FlowControlTicketholder::CurOp stats) con
     }
 
     return builder.obj();
+}
+
+BSONObj OpDebug::makeSearchBetaObject() const {
+    BSONObjBuilder cursorBuilder;
+    invariant(mongotCursorId);
+    cursorBuilder.append("cursorid", mongotCursorId.get());
+    if (msWaitingForMongot) {
+        cursorBuilder.append("timeWaitingMillis", msWaitingForMongot.get());
+    }
+    return cursorBuilder.obj();
 }
 
 

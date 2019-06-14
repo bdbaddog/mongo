@@ -18,7 +18,7 @@ static int  __evict_server(WT_SESSION_IMPL *, bool *);
 static void __evict_tune_workers(WT_SESSION_IMPL *session);
 static int  __evict_walk(WT_SESSION_IMPL *, WT_EVICT_QUEUE *);
 static int  __evict_walk_tree(
-    WT_SESSION_IMPL *, WT_EVICT_QUEUE *, u_int, u_int *);
+    WT_SESSION_IMPL *, WT_EVICT_QUEUE *, u_int, u_int *, uint64_t *);
 
 #define	WT_EVICT_HAS_WORKERS(s)				\
 	(S2C(s)->evict_threads.current_threads > 1)
@@ -104,6 +104,25 @@ __evict_entry_priority(WT_SESSION_IMPL *session, WT_REF *ref)
 		read_gen += WT_EVICT_INTL_SKEW;
 
 	return (read_gen);
+}
+
+/*
+ * __evict_lru_cmp_debug --
+ *	Qsort function: sort the eviction array.
+ *	Version for eviction debug mode.
+ */
+static int WT_CDECL
+__evict_lru_cmp_debug(const void *a_arg, const void *b_arg)
+{
+	const WT_EVICT_ENTRY *a, *b;
+	uint64_t a_score, b_score;
+
+	a = a_arg;
+	b = b_arg;
+	a_score = (a->ref == NULL ? UINT64_MAX : 0);
+	b_score = (b->ref == NULL ? UINT64_MAX : 0);
+
+	return ((a_score < b_score) ? -1 : (a_score == b_score) ? 0 : 1);
 }
 
 /*
@@ -1257,8 +1276,17 @@ __evict_lru_walk(WT_SESSION_IMPL *session)
 		queue->evict_current = NULL;
 
 	entries = queue->evict_entries;
-	__wt_qsort(queue->evict_queue,
-	    entries, sizeof(WT_EVICT_ENTRY), __evict_lru_cmp);
+	/*
+	 * Style note: __wt_qsort is a macro that can leave a dangling
+	 * else. Full curly braces are needed here for the compiler.
+	 */
+	if (F_ISSET(cache, WT_CACHE_EVICT_DEBUG_MODE)) {
+		__wt_qsort(queue->evict_queue,
+		    entries, sizeof(WT_EVICT_ENTRY), __evict_lru_cmp_debug);
+	} else {
+		__wt_qsort(queue->evict_queue,
+		    entries, sizeof(WT_EVICT_ENTRY), __evict_lru_cmp);
+	}
 
 	/* Trim empty entries from the end. */
 	while (entries > 0 && queue->evict_queue[entries - 1].ref == NULL)
@@ -1347,6 +1375,62 @@ err:	WT_TRACK_OP_END(session);
 }
 
 /*
+ * __evict_walk_choose_dhandle --
+ *	Randomly select a dhandle for the next eviction walk
+ */
+static void
+__evict_walk_choose_dhandle(
+    WT_SESSION_IMPL *session, WT_DATA_HANDLE **dhandle_p)
+{
+	WT_CONNECTION_IMPL *conn;
+	WT_DATA_HANDLE *dhandle;
+	u_int dh_bucket_count, rnd_bucket, rnd_dh;
+
+	conn = S2C(session);
+	*dhandle_p = NULL;
+
+	WT_ASSERT(session, __wt_rwlock_islocked(session, &conn->dhandle_lock));
+
+	/* Nothing to do if the dhandle list is empty. */
+	if (TAILQ_EMPTY(&conn->dhqh))
+		return;
+
+	/*
+	 * If we do not have a lot of dhandles, most hash buckets will be empty.
+	 * Just pick a random dhandle from the list in that case.
+	 */
+	if (conn->dhandle_count < 10 * WT_HASH_ARRAY_SIZE) {
+		rnd_dh = __wt_random(&session->rnd) % conn->dhandle_count;
+		dhandle = TAILQ_FIRST(&conn->dhqh);
+		for (; rnd_dh > 0; rnd_dh--)
+			dhandle = TAILQ_NEXT(dhandle, q);
+		*dhandle_p = dhandle;
+		return;
+	}
+
+	/*
+	 * Keep picking up a random bucket until we find one that is not empty.
+	 */
+	dh_bucket_count = 0;
+	rnd_bucket = 0;
+	while (dh_bucket_count == 0) {
+		rnd_bucket = __wt_random(&session->rnd) % WT_HASH_ARRAY_SIZE;
+		dh_bucket_count = conn->dh_bucket_count[rnd_bucket];
+	}
+
+	/* We can't pick up an empty bucket with a non zero bucket count. */
+	WT_ASSERT(session, !TAILQ_EMPTY(&conn->dhhash[rnd_bucket]));
+
+	/* Pick a random dhandle in the chosen bucket. */
+	rnd_dh = __wt_random(&session->rnd) % dh_bucket_count;
+	dhandle = TAILQ_FIRST(&conn->dhhash[rnd_bucket]);
+	for (; rnd_dh > 0; rnd_dh--)
+		dhandle = TAILQ_NEXT(dhandle, q);
+
+	*dhandle_p = dhandle;
+}
+
+/*
  * __evict_walk --
  *	Fill in the array by walking the next set of pages.
  */
@@ -1359,6 +1443,8 @@ __evict_walk(WT_SESSION_IMPL *session, WT_EVICT_QUEUE *queue)
 	WT_DATA_HANDLE *dhandle;
 	WT_DECL_RET;
 	WT_TRACK_OP_DECL;
+	uint64_t loop_count;
+	uint64_t pages_seen_file, pages_seen_interim, pages_seen_total;
 	u_int max_entries, retries, slot, start_slot, total_candidates;
 	bool dhandle_locked, incr;
 
@@ -1385,8 +1471,31 @@ __evict_walk(WT_SESSION_IMPL *session, WT_EVICT_QUEUE *queue)
 	total_candidates = (u_int)(F_ISSET(cache, WT_CACHE_EVICT_CLEAN) ?
 	    __wt_cache_pages_inuse(cache) : cache->pages_dirty_leaf);
 	max_entries = WT_MIN(max_entries, 1 + total_candidates / 2);
+	pages_seen_interim = pages_seen_total = 0;
 
-retry:	while (slot < max_entries) {
+retry:	loop_count = 0;
+	while (slot < max_entries) {
+		loop_count++;
+
+		/* We're done if shutting down or reconfiguring. */
+		if (F_ISSET(conn, WT_CONN_CLOSING) ||
+		    F_ISSET(conn, WT_CONN_RECONFIGURING))
+			break;
+
+		/* If we have seen enough pages in this walk, we're done. */
+		if (pages_seen_total > WT_EVICT_WALK_INCR * 100)
+			break;
+
+		/*
+		 * If we are not finding pages at all, we're done.
+		 * Every 100th iteration, check if we made progress.
+		 */
+		if (loop_count % 100 == 0) {
+			if (pages_seen_interim == pages_seen_total)
+				break;
+			pages_seen_interim = pages_seen_total;
+		}
+
 		/*
 		 * If another thread is waiting on the eviction server to clear
 		 * the walk point in a tree, give up.
@@ -1407,12 +1516,12 @@ retry:	while (slot < max_entries) {
 			/*
 			 * On entry, continue from wherever we got to in the
 			 * scan last time through.  If we don't have a saved
-			 * handle, start from the beginning of the list.
+			 * handle, pick one randomly from the list.
 			 */
 			if ((dhandle = cache->walk_tree) != NULL)
 				cache->walk_tree = NULL;
 			else
-				dhandle = TAILQ_FIRST(&conn->dhqh);
+				__evict_walk_choose_dhandle(session, &dhandle);
 		} else {
 			if (incr) {
 				WT_ASSERT(session, dhandle->session_inuse > 0);
@@ -1421,10 +1530,10 @@ retry:	while (slot < max_entries) {
 				incr = false;
 				cache->walk_tree = NULL;
 			}
-			dhandle = TAILQ_NEXT(dhandle, q);
+			__evict_walk_choose_dhandle(session, &dhandle);
 		}
 
-		/* If we reach the end of the list, we're done. */
+		/* If we couldn't find any dhandle, we're done. */
 		if (dhandle == NULL)
 			break;
 
@@ -1502,8 +1611,9 @@ retry:	while (slot < max_entries) {
 				 */
 				cache->walk_tree = dhandle;
 				WT_WITH_DHANDLE(session, dhandle,
-				    ret = __evict_walk_tree(
-				    session, queue, max_entries, &slot));
+				    ret = __evict_walk_tree(session, queue,
+					max_entries, &slot, &pages_seen_file));
+				pages_seen_total += pages_seen_file;
 
 				WT_ASSERT(session, __wt_session_gen(
 				    session, WT_GEN_SPLIT) == 0);
@@ -1520,9 +1630,8 @@ retry:	while (slot < max_entries) {
 	}
 
 	/*
-	 * Walk the list of files a few times if we don't find enough pages.
-	 * Try two passes through all the files, give up when we have some
-	 * candidates and we aren't finding more.
+	 * Repeat the walks a few times if we don't find enough pages.
+	 * Give up when we have some candidates and we aren't finding more.
 	 */
 	if (slot < max_entries && (retries < 2 ||
 	    (retries < WT_RETRY_MAX &&
@@ -1682,8 +1791,8 @@ __evict_walk_target(WT_SESSION_IMPL *session, u_int max_entries)
  *	Get a few page eviction candidates from a single underlying file.
  */
 static int
-__evict_walk_tree(WT_SESSION_IMPL *session,
-    WT_EVICT_QUEUE *queue, u_int max_entries, u_int *slotp)
+__evict_walk_tree(WT_SESSION_IMPL *session, WT_EVICT_QUEUE *queue,
+    u_int max_entries, u_int *slotp, uint64_t *pages_seen_p)
 {
 	WT_BTREE *btree;
 	WT_CACHE *cache;
@@ -1703,6 +1812,7 @@ __evict_walk_tree(WT_SESSION_IMPL *session,
 	last_parent = NULL;
 	restarts = 0;
 	give_up = urgent_queued = false;
+	*pages_seen_p = 0;
 
 	/*
 	 * Figure out how many slots to fill from this tree.
@@ -1975,12 +2085,14 @@ __evict_walk_tree(WT_SESSION_IMPL *session,
 		 * cache (indicated by seeing an internal page that is the
 		 * parent of the last page we saw).
 		 *
-		 * Also skip internal page unless we get aggressive or the tree
-		 * is idle (indicated by the tree being skipped for walks).
+		 * Also skip internal page unless we get aggressive, the tree
+		 * is idle (indicated by the tree being skipped for walks),
+		 * or we are in eviction debug mode.
 		 * The goal here is that if trees become completely idle, we
 		 * eventually push them out of cache completely.
 		 */
-		if (WT_PAGE_IS_INTERNAL(page)) {
+		if (!F_ISSET(cache, WT_CACHE_EVICT_DEBUG_MODE) &&
+		    WT_PAGE_IS_INTERNAL(page)) {
 			if (page == last_parent)
 				continue;
 			if (btree->evict_walk_period == 0 &&
@@ -2072,6 +2184,8 @@ fast:		/* If the page can't be evicted, give up. */
 				    session, &ref, &refs_walked, walk_flags));
 		btree->evict_ref = ref;
 	}
+
+	*pages_seen_p = pages_seen;
 
 	WT_STAT_CONN_INCRV(session, cache_eviction_walk, refs_walked);
 	WT_STAT_CONN_INCRV(session, cache_eviction_pages_seen, pages_seen);
@@ -2225,8 +2339,8 @@ __evict_get_ref(WT_SESSION_IMPL *session,
 		 */
 		if (((previous_state = evict->ref->state) != WT_REF_MEM &&
 		    previous_state != WT_REF_LIMBO) ||
-		    !__wt_atomic_casv32(
-		    &evict->ref->state, previous_state, WT_REF_LOCKED)) {
+		    !WT_REF_CAS_STATE(
+		    session, evict->ref, previous_state, WT_REF_LOCKED)) {
 			__evict_list_clear(session, evict);
 			continue;
 		}
@@ -2555,6 +2669,23 @@ __verbose_dump_cache_single(WT_SESSION_IMPL *session,
 	leaf_bytes = leaf_bytes_max = leaf_dirty_bytes = 0;
 	leaf_dirty_bytes_max = leaf_dirty_pages = leaf_pages = 0;
 
+	dhandle = session->dhandle;
+	btree = dhandle->handle;
+	WT_RET(__wt_msg(session, "%s(%s%s)%s%s:",
+	    dhandle->name, dhandle->checkpoint != NULL ? "checkpoint=" : "",
+	    dhandle->checkpoint != NULL ? dhandle->checkpoint : "<live>",
+	    btree->evict_disabled != 0 ?  " eviction disabled" : "",
+	    btree->evict_disabled_open ? " at open" : ""));
+
+	/*
+	 * We cannot walk the tree of a dhandle held exclusively because
+	 * the owning thread could be manipulating it in a way that causes
+	 * us to dump core. So print out that we visited and skipped it.
+	 */
+	if (F_ISSET(dhandle, WT_DHANDLE_EXCLUSIVE))
+		return (__wt_msg(session,
+		    "  Opened exclusively. Cannot walk tree, skipping."));
+
 	next_walk = NULL;
 	while (__wt_tree_walk(session, &next_walk,
 	    WT_READ_CACHE | WT_READ_NO_EVICT | WT_READ_NO_WAIT) == 0 &&
@@ -2585,13 +2716,6 @@ __verbose_dump_cache_single(WT_SESSION_IMPL *session,
 		}
 	}
 
-	dhandle = session->dhandle;
-	btree = dhandle->handle;
-	WT_RET(__wt_msg(session, "%s(%s%s)%s%s:",
-	    dhandle->name, dhandle->checkpoint != NULL ? "checkpoint=" : "",
-	    dhandle->checkpoint != NULL ? dhandle->checkpoint : "<live>",
-	    btree->evict_disabled != 0 ?  "eviction disabled" : "",
-	    btree->evict_disabled_open ? " at open" : ""));
 	if (intl_pages == 0)
 		WT_RET(__wt_msg(session, "internal: 0 pages"));
 	else

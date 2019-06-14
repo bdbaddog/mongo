@@ -46,6 +46,26 @@ public:
 
     const char* getSourceName() const final;
 
+    const FieldPath& getConnectFromField() const {
+        return _connectFromField;
+    }
+
+    const FieldPath& getConnectToField() const {
+        return _connectToField;
+    }
+
+    Expression* getStartWithField() const {
+        return _startWith.get();
+    }
+
+    boost::optional<BSONObj> getAdditionalFilter() const {
+        return _additionalFilter;
+    };
+
+    void setAdditionalFilter(boost::optional<BSONObj> additionalFilter) {
+        _additionalFilter = additionalFilter ? additionalFilter->getOwned() : additionalFilter;
+    };
+
     void serializeToArray(
         std::vector<Value>& array,
         boost::optional<ExplainOptions::Verbosity> explain = boost::none) const final;
@@ -68,15 +88,18 @@ public:
                                      hostRequirement,
                                      DiskUseRequirement::kNoDiskUse,
                                      FacetRequirement::kAllowed,
-                                     TransactionRequirement::kAllowed);
+                                     TransactionRequirement::kAllowed,
+                                     hostRequirement == HostTypeRequirement::kMongoS
+                                         ? LookupRequirement::kNotAllowed
+                                         : LookupRequirement::kAllowed);
 
         constraints.canSwapWithMatch = true;
         return constraints;
     }
 
-    boost::optional<MergingLogic> mergingLogic() final {
+    boost::optional<DistributedPlanLogic> distributedPlanLogic() final {
         // {shardsStage, mergingStage, sortPattern}
-        return MergingLogic{nullptr, this, boost::none};
+        return DistributedPlanLogic{nullptr, this, boost::none};
     }
 
     DepsTracker::State getDependencies(DepsTracker* deps) const final {

@@ -132,6 +132,9 @@ selector:
   # Performs direct writes to system.views
   - jstests/concurrency/fsm_workloads/view_catalog_direct_system_writes.js
 
+  # Expects DocumentValidationFailure which causes transaction to abort and retry indefinitely.
+  - jstests/concurrency/fsm_workloads/schema_validator_with_expr_variables.js
+
   ##
   # Blacklists specific to this suite.
   ##
@@ -148,6 +151,7 @@ selector:
   - jstests/concurrency/fsm_workloads/agg_out.js
 
   exclude_with_any_tags:
+  - does_not_support_causal_consistency
   - requires_replication
   # The touch command does not exist on mongos, which is enforced before session information is
   # parsed, causing state functions in these workloads to fail before starting a transaction despite

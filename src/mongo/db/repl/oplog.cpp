@@ -34,6 +34,7 @@
 #include "mongo/db/repl/oplog.h"
 
 #include <deque>
+#include <memory>
 #include <set>
 #include <vector>
 
@@ -88,13 +89,11 @@
 #include "mongo/db/views/view_catalog.h"
 #include "mongo/platform/random.h"
 #include "mongo/scripting/engine.h"
-#include "mongo/stdx/memory.h"
 #include "mongo/util/concurrency/idle_thread_block.h"
 #include "mongo/util/elapsed_tracker.h"
 #include "mongo/util/fail_point_service.h"
 #include "mongo/util/file.h"
 #include "mongo/util/log.h"
-#include "mongo/util/startup_test.h"
 #include "mongo/util/str.h"
 
 namespace mongo {
@@ -336,21 +335,25 @@ namespace {
  */
 void appendSessionInfo(OperationContext* opCtx,
                        BSONObjBuilder* builder,
-                       StmtId statementId,
+                       boost::optional<StmtId> statementId,
                        const OperationSessionInfo& sessionInfo,
                        const OplogLink& oplogLink) {
     if (!sessionInfo.getTxnNumber()) {
         return;
     }
 
-    // Note: certain operations, like implicit collection creation will not have a stmtId.
+    // Note: certain non-transaction operations, like implicit collection creation will have an
+    // uninitialized statementId.
     if (statementId == kUninitializedStmtId) {
         return;
     }
 
     sessionInfo.serialize(builder);
 
-    builder->append(OplogEntryBase::kStatementIdFieldName, statementId);
+    // Only non-transaction operations will have a statementId.
+    if (statementId) {
+        builder->append(OplogEntryBase::kStatementIdFieldName, *statementId);
+    }
     oplogLink.prevOpTime.append(builder,
                                 OplogEntryBase::kPrevWriteOpTimeInTransactionFieldName.toString());
 
@@ -375,10 +378,8 @@ OplogDocWriter _logOpWriter(OperationContext* opCtx,
                             OpTime optime,
                             Date_t wallTime,
                             const OperationSessionInfo& sessionInfo,
-                            StmtId statementId,
-                            const OplogLink& oplogLink,
-                            bool prepare,
-                            bool inTxn) {
+                            boost::optional<StmtId> statementId,
+                            const OplogLink& oplogLink) {
     BSONObjBuilder b(256);
 
     b.append("ts", optime.getTimestamp());
@@ -404,14 +405,6 @@ OplogDocWriter _logOpWriter(OperationContext* opCtx,
     b.appendDate(OplogEntryBase::kWallClockTimeFieldName, wallTime);
 
     appendSessionInfo(opCtx, &b, statementId, sessionInfo, oplogLink);
-
-    if (prepare) {
-        b.appendBool(OplogEntryBase::kPrepareFieldName, true);
-    }
-
-    if (inTxn) {
-        b.appendBool(OplogEntryBase::kInTxnFieldName, true);
-    }
 
     return OplogDocWriter(OplogDocWriter(b.obj(), obj));
 }
@@ -482,7 +475,7 @@ void _logOpsInner(OperationContext* opCtx,
 
             // We set the last op on the client to 'finalOpTime', because that contains the
             // timestamp of the operation that the client actually performed.
-            ReplClientInfo::forClient(opCtx->getClient()).setLastOp(finalOpTime);
+            ReplClientInfo::forClient(opCtx->getClient()).setLastOp(opCtx, finalOpTime);
         });
 }
 
@@ -495,10 +488,8 @@ OpTime logOp(OperationContext* opCtx,
              bool fromMigrate,
              Date_t wallClockTime,
              const OperationSessionInfo& sessionInfo,
-             StmtId statementId,
+             boost::optional<StmtId> statementId,
              const OplogLink& oplogLink,
-             bool prepare,
-             bool inTxn,
              const OplogSlot& oplogSlot) {
     // All collections should have UUIDs now, so all insert, update, and delete oplog entries should
     // also have uuids. Some no-op (n) and command (c) entries may still elide the uuid field.
@@ -514,10 +505,11 @@ OpTime logOp(OperationContext* opCtx,
     // For commands, the test below is on the command ns and therefore does not check for
     // specific namespaces such as system.profile. This is the caller's responsibility.
     if (replCoord->isOplogDisabledFor(opCtx, nss)) {
+        invariant(statementId);
         uassert(ErrorCodes::IllegalOperation,
                 str::stream() << "retryable writes is not supported for unreplicated ns: "
                               << nss.ns(),
-                statementId == kUninitializedStmtId);
+                *statementId == kUninitializedStmtId);
         return {};
     }
 
@@ -551,9 +543,7 @@ OpTime logOp(OperationContext* opCtx,
                                wallClockTime,
                                sessionInfo,
                                statementId,
-                               oplogLink,
-                               prepare,
-                               inTxn);
+                               oplogLink);
     const DocWriter* basePtr = &writer;
     auto timestamp = slot.getTimestamp();
     _logOpsInner(opCtx, nss, &basePtr, &timestamp, 1, oplog, slot, wallClockTime);
@@ -604,7 +594,7 @@ std::vector<OpTime> logInsertOps(OperationContext* opCtx,
         oplogLink.prevOpTime = txnParticipant.getLastWriteOpTime();
     }
 
-    auto timestamps = stdx::make_unique<Timestamp[]>(count);
+    auto timestamps = std::make_unique<Timestamp[]>(count);
     std::vector<OpTime> opTimes;
     for (size_t i = 0; i < count; i++) {
         // Make a mutable copy.
@@ -613,8 +603,6 @@ std::vector<OpTime> logInsertOps(OperationContext* opCtx,
         if (insertStatementOplogSlot.isNull()) {
             insertStatementOplogSlot = oplogInfo->getNextOpTimes(opCtx, 1U)[0];
         }
-        // Only 'applyOps' oplog entries can be prepared.
-        constexpr bool prepare = false;
         writers.emplace_back(_logOpWriter(opCtx,
                                           "i",
                                           nss,
@@ -626,9 +614,7 @@ std::vector<OpTime> logInsertOps(OperationContext* opCtx,
                                           wallClockTime,
                                           sessionInfo,
                                           begin[i].stmtId,
-                                          oplogLink,
-                                          prepare,
-                                          false /* inTxn */));
+                                          oplogLink));
         oplogLink.prevOpTime = insertStatementOplogSlot;
         timestamps[i] = oplogLink.prevOpTime.getTimestamp();
         opTimes.push_back(insertStatementOplogSlot);
@@ -822,14 +808,14 @@ NamespaceString parseUUIDorNs(OperationContext* opCtx,
     return ui.ok() ? parseUUID(opCtx, ui) : parseNs(ns, cmd);
 }
 
-using OpApplyFn = stdx::function<Status(OperationContext* opCtx,
-                                        const char* ns,
-                                        const BSONElement& ui,
-                                        BSONObj& cmd,
-                                        const OpTime& opTime,
-                                        const OplogEntry& entry,
-                                        OplogApplication::Mode mode,
-                                        boost::optional<Timestamp> stableTimestampForRecovery)>;
+using OpApplyFn = std::function<Status(OperationContext* opCtx,
+                                       const char* ns,
+                                       const BSONElement& ui,
+                                       BSONObj& cmd,
+                                       const OpTime& opTime,
+                                       const OplogEntry& entry,
+                                       OplogApplication::Mode mode,
+                                       boost::optional<Timestamp> stableTimestampForRecovery)>;
 
 struct ApplyOpMetadata {
     OpApplyFn applyFunc;
@@ -1208,7 +1194,12 @@ const StringMap<ApplyOpMetadata> kOpsMap = {
          const OplogEntry& entry,
          OplogApplication::Mode mode,
          boost::optional<Timestamp> stableTimestampForRecovery) -> Status {
-         return applyApplyOpsOplogEntry(opCtx, entry, mode);
+         // The 'applyOps' is either an implicit prepare oplog entry or is an entry that was not
+         // generated by a transaction. Partial and unprepared commit applyOps should
+         // have been dispatched before this point.
+         invariant(!entry.isPartialTransaction());
+         return entry.shouldPrepare() ? applyPrepareTransaction(opCtx, entry, mode)
+                                      : applyApplyOpsOplogEntry(opCtx, entry, mode);
      }}},
     {"convertToCapped",
      {[](OperationContext* opCtx,
@@ -1245,17 +1236,6 @@ const StringMap<ApplyOpMetadata> kOpsMap = {
          OplogApplication::Mode mode,
          boost::optional<Timestamp> stableTimestampForRecovery) -> Status {
          return applyCommitTransaction(opCtx, entry, mode);
-     }}},
-    {"prepareTransaction",
-     {[](OperationContext* opCtx,
-         const char* ns,
-         const BSONElement& ui,
-         BSONObj& cmd,
-         const OpTime& opTime,
-         const OplogEntry& entry,
-         OplogApplication::Mode mode,
-         boost::optional<Timestamp> stableTimestampForRecovery) -> Status {
-         return applyPrepareTransaction(opCtx, entry, mode);
      }}},
     {"abortTransaction",
      {[](OperationContext* opCtx,
@@ -1325,9 +1305,8 @@ Status applyOperation_inlock(OperationContext* opCtx,
         mode == repl::OplogApplication::Mode::kApplyOpsCmd || opCtx->writesAreReplicated();
     OpCounters* opCounters = shouldUseGlobalOpCounters ? &globalOpCounters : &replOpCounters;
 
-    // TODO(SERVER-40763): Remove "inTxn" entirely.
-    std::array<StringData, 9> names = {"ts", "t", "o", "ui", "ns", "op", "b", "o2", "inTxn"};
-    std::array<BSONElement, 9> fields;
+    std::array<StringData, 8> names = {"ts", "t", "o", "ui", "ns", "op", "b", "o2"};
+    std::array<BSONElement, 8> fields;
     op.getFields(names, &fields);
     BSONElement& fieldTs = fields[0];
     BSONElement& fieldT = fields[1];
@@ -1337,16 +1316,10 @@ Status applyOperation_inlock(OperationContext* opCtx,
     BSONElement& fieldOp = fields[5];
     BSONElement& fieldB = fields[6];
     BSONElement& fieldO2 = fields[7];
-    BSONElement& fieldInTxn = fields[8];
 
     BSONObj o;
     if (fieldO.isABSONObj())
         o = fieldO.embeddedObject();
-
-    // Make sure we don't apply partial transactions through applyOps.
-    uassert(51117,
-            "Operations with 'inTxn' set are only used internally by secondaries.",
-            fieldInTxn.eoo());
 
     // operation type -- see logOp() comments for types
     const char* opType = fieldOp.valuestrsafe();
@@ -1557,15 +1530,27 @@ Status applyOperation_inlock(OperationContext* opCtx,
                     str::stream() << "Failed to apply insert due to missing _id: " << op.toString(),
                     o.hasField("_id"));
 
-            // 1. Try insert first, if we have no wrappingWriteUnitOfWork
-            // 2. If okay, commit
-            // 3. If not, do upsert (and commit)
-            // 4. If both !Ok, return status
+            // 1. Insert if
+            //   a) we do not have a wrapping WriteUnitOfWork, which implies we are not part of an
+            //      "applyOps" command, OR
+            //   b) we are part of a multi-document transaction[1].
+            //
+            // 2. Upsert[2] if
+            //   a) we have a wrapping WriteUnitOfWork AND we are not part of a transaction, which
+            //      implies we are part of an "applyOps" command, OR
+            //   b) the previous insert failed with a DuplicateKey error AND we are not part of a
+            //      transaction.
+            //
+            // [1] Transactions should not convert inserts to upserts because on secondaries they
+            //     will perform a lookup that never occurred on the primary. This may cause an
+            //     unintended prepare conflict and block replication. For this reason, transactions
+            //     should always fail with DuplicateKey errors and never retry inserts as upserts.
+            // [2] This upsert behavior exists to support idempotency guarantees outside
+            //     steady-state replication and existing users of applyOps.
 
-            // We cannot rely on a DuplicateKey error if we're part of a larger transaction,
-            // because that would require the transaction to abort. So instead, use upsert in that
-            // case.
-            bool needToDoUpsert = haveWrappingWriteUnitOfWork;
+            const auto txnParticipant = TransactionParticipant::get(opCtx);
+            const bool inTxn = txnParticipant && txnParticipant.inMultiDocumentTransaction();
+            bool needToDoUpsert = haveWrappingWriteUnitOfWork && !inTxn;
 
             Timestamp timestamp;
             long long term = OpTime::kUninitializedTerm;
@@ -1599,6 +1584,12 @@ Status applyOperation_inlock(OperationContext* opCtx,
                 if (status.isOK()) {
                     wuow.commit();
                 } else if (status == ErrorCodes::DuplicateKey) {
+                    // Transactions cannot be retried as upserts once they fail with a duplicate key
+                    // error.
+                    if (inTxn) {
+                        return status;
+                    }
+                    // Continue to the next block to retry the operation as an upsert.
                     needToDoUpsert = true;
                 } else {
                     return status;
@@ -1838,12 +1829,8 @@ Status applyCommand_inlock(OperationContext* opCtx,
     // for each collection dropped. 'applyOps' and 'commitTransaction' will try to apply each
     // individual operation, and those will be caught then if they are a problem. 'abortTransaction'
     // won't ever change the server configuration collection.
-    std::vector<std::string> whitelistedOps{"dropDatabase",
-                                            "applyOps",
-                                            "dbCheck",
-                                            "commitTransaction",
-                                            "abortTransaction",
-                                            "prepareTransaction"};
+    std::vector<std::string> whitelistedOps{
+        "dropDatabase", "applyOps", "dbCheck", "commitTransaction", "abortTransaction"};
     if ((mode == OplogApplication::Mode::kInitialSync) &&
         (std::find(whitelistedOps.begin(), whitelistedOps.end(), o.firstElementFieldName()) ==
          whitelistedOps.end()) &&
@@ -1864,7 +1851,7 @@ Status applyCommand_inlock(OperationContext* opCtx,
         }
     }
 
-    const bool assignCommandTimestamp = [opCtx, mode, &op, &o] {
+    const bool assignCommandTimestamp = [&] {
         const auto replMode = ReplicationCoordinator::get(opCtx)->getReplicationMode();
         if (opCtx->writesAreReplicated()) {
             // We do not assign timestamps on replicated writes since they will get their oplog
@@ -1874,8 +1861,9 @@ Status applyCommand_inlock(OperationContext* opCtx,
 
         // Don't assign commit timestamp for transaction commands.
         const StringData commandName(o.firstElementFieldName());
-        if (op.getBoolField("prepare") || commandName == "abortTransaction" ||
-            commandName == "commitTransaction" || commandName == "prepareTransaction")
+        if (entry.shouldPrepare() ||
+            entry.getCommandType() == OplogEntry::CommandType::kCommitTransaction ||
+            entry.getCommandType() == OplogEntry::CommandType::kAbortTransaction)
             return false;
 
         switch (replMode) {

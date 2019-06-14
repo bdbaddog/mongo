@@ -29,6 +29,7 @@
 
 #pragma once
 
+#include <functional>
 #include <map>
 #include <set>
 #include <unordered_map>
@@ -36,7 +37,6 @@
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/collection_catalog_entry.h"
 #include "mongo/db/service_context.h"
-#include "mongo/stdx/functional.h"
 #include "mongo/util/uuid.h"
 
 namespace mongo {
@@ -56,6 +56,9 @@ class CollectionCatalog {
     struct CollectionInfo;
 
 public:
+    using CollectionInfoFn = std::function<bool(const Collection* collection,
+                                                const CollectionCatalogEntry* catalogEntry)>;
+
     class iterator {
     public:
         using value_type = Collection*;
@@ -217,6 +220,12 @@ public:
     boost::optional<CollectionUUID> lookupUUIDByNSS(const NamespaceString& nss) const;
 
     /**
+     * Returns whether the collection with 'uuid' satisfies the provided 'predicate'. If the
+     * collection with 'uuid' is not found, false is returned.
+     */
+    bool checkIfCollectionSatisfiable(CollectionUUID uuid, CollectionInfoFn predicate) const;
+
+    /**
      * This function gets the UUIDs of all collections from `dbName`.
      *
      * If the caller does not take a strong database lock, some of UUIDs might no longer exist (due
@@ -283,6 +292,10 @@ public:
 private:
     class FinishDropChange;
     friend class CollectionCatalog::iterator;
+
+    Collection* _lookupCollectionByUUID(WithLock, CollectionUUID uuid) const;
+    CollectionCatalogEntry* _lookupCollectionCatalogEntryByUUID(WithLock,
+                                                                CollectionUUID uuid) const;
 
     const std::vector<CollectionUUID>& _getOrdering_inlock(const StringData& db,
                                                            const stdx::lock_guard<stdx::mutex>&);

@@ -49,7 +49,9 @@
 /* Generic option parsing structure shared by all test cases. */
 typedef struct {
 	char  *home;
-	const char  *progname;
+	const char  *argv0;	/* Exec name */
+	const char  *progname;	/* Truncated program name */
+
 	enum {	TABLE_COL=1,	/* Fixed-length column store */
 		TABLE_FIX=2,	/* Variable-length column store */
 		TABLE_ROW=3	/* Row-store */
@@ -224,6 +226,9 @@ u64_to_string_zf(uint64_t n, char *buf, size_t len)
 /* Allow tests to add their own death handling. */
 extern void (*custom_die)(void);
 
+#ifdef _WIN32
+__declspec(noreturn)
+#endif
 void testutil_die(int, const char *, ...)
     WT_GCC_FUNC_DECL_ATTRIBUTE((noreturn));
 

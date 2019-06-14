@@ -571,9 +571,17 @@ Future<SessionHandle> TransportLayerASIO::asyncConnect(HostAndPort peer,
             });
     }
 
+    Date_t timeBefore = Date_t::now();
+
     connector->resolver.asyncResolve(connector->peer, _listenerOptions.enableIPv6)
-        .then([connector](WrappedResolver::EndpointVector results) {
+        .then([connector, timeBefore](WrappedResolver::EndpointVector results) {
             try {
+                Date_t timeAfter = Date_t::now();
+                if (timeAfter - timeBefore > Seconds(1)) {
+                    warning() << "DNS resolution while connecting to " << connector->peer
+                              << " took " << timeAfter - timeBefore;
+                }
+
                 stdx::lock_guard<stdx::mutex> lk(connector->mutex);
 
                 connector->resolvedEndpoint = results.front();
@@ -743,7 +751,7 @@ Status TransportLayerASIO::setup() {
     const auto& sslParams = getSSLGlobalParams();
 
     if (_sslMode() != SSLParams::SSLMode_disabled && _listenerOptions.isIngress()) {
-        _ingressSSLContext = stdx::make_unique<asio::ssl::context>(asio::ssl::context::sslv23);
+        _ingressSSLContext = std::make_unique<asio::ssl::context>(asio::ssl::context::sslv23);
 
         Status status =
             getSSLManager()->initSSLContext(_ingressSSLContext->native_handle(),
@@ -755,7 +763,7 @@ Status TransportLayerASIO::setup() {
     }
 
     if (_listenerOptions.isEgress() && getSSLManager()) {
-        _egressSSLContext = stdx::make_unique<asio::ssl::context>(asio::ssl::context::sslv23);
+        _egressSSLContext = std::make_unique<asio::ssl::context>(asio::ssl::context::sslv23);
         Status status =
             getSSLManager()->initSSLContext(_egressSSLContext->native_handle(),
                                             sslParams,

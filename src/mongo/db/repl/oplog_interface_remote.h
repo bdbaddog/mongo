@@ -29,8 +29,9 @@
 
 #pragma once
 
+#include <functional>
+
 #include "mongo/db/repl/oplog_interface.h"
-#include "mongo/stdx/functional.h"
 
 namespace mongo {
 
@@ -47,7 +48,7 @@ public:
     /**
      * Type of function to return a connection to the sync source.
      */
-    using GetConnectionFn = stdx::function<DBClientBase*()>;
+    using GetConnectionFn = std::function<DBClientBase*()>;
 
     OplogInterfaceRemote(HostAndPort hostAndPort,
                          GetConnectionFn getConnection,
@@ -56,7 +57,7 @@ public:
     std::string toString() const override;
     std::unique_ptr<OplogInterface::Iterator> makeIterator() const override;
     std::unique_ptr<TransactionHistoryIteratorBase> makeTransactionHistoryIterator(
-        const OpTime& startingOpTime) const override;
+        const OpTime& startingOpTime, bool permitYield = false) const override;
     HostAndPort hostAndPort() const override;
 
 private:

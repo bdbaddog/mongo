@@ -33,19 +33,31 @@
 
 #include <algorithm>
 #include <boost/filesystem.hpp>
+#include <boost/iostreams/device/file_descriptor.hpp>
+#include <boost/iostreams/stream.hpp>
+#include <boost/iostreams/stream_buffer.hpp>
 #include <boost/program_options.hpp>
 #include <cctype>
 #include <cerrno>
+#include <fcntl.h>
 #include <fstream>
 #include <stdio.h>
+#include <sys/stat.h>
+#include <sys/types.h>
 #include <yaml-cpp/yaml.h>
+
+#ifdef _WIN32
+#include <io.h>
+#endif
 
 #include "mongo/base/init.h"
 #include "mongo/base/parse_number.h"
 #include "mongo/base/status.h"
+#include "mongo/crypto/sha256_block.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/json.h"
 #include "mongo/util/assert_util.h"
+#include "mongo/util/hex.h"
 #include "mongo/util/log.h"
 #include "mongo/util/net/hostandport.h"
 #include "mongo/util/net/http_client.h"
@@ -64,7 +76,7 @@ namespace optionenvironment {
 namespace po = boost::program_options;
 namespace fs = boost::filesystem;
 
-stdx::function<bool()> OptionsParser::useStrict;
+std::function<bool()> OptionsParser::useStrict;
 
 namespace {
 
@@ -246,11 +258,12 @@ bool OptionIsStringMap(const std::vector<OptionDescription>& options_vector, con
 }
 
 Status parseYAMLConfigFile(const std::string&, YAML::Node*);
+
 /* Searches a YAML node for configuration expansion directives such as:
  * __rest: https://example.com/path?query=val
  * __exec: '/usr/bin/getConfig param'
  *
- * and optionally the fields `type` and `trim`.
+ * and optionally the fields `type`, `trim`, `digest`, and `digest_key`.
  *
  * If the field pairing `trim: whitespace` is present,
  * then the process() method will have standard ctype spaces removed from
@@ -260,6 +273,11 @@ Status parseYAMLConfigFile(const std::string&, YAML::Node*);
  * then the process() method will parse any string provided to it as YAML.
  * If the field is not present, or is set to `string`, then process will
  * encapsulate any provided string in a YAML String Node.
+ *
+ * If the fields `digest` and `digest_key` are present (both a co-required)
+ * then the result of the expansion will be hashed (post trimming)
+ * using SHA256-HMAC. If the resulting digest does not match expectation,
+ * the expansion will be considered to have failed.
  *
  * If no configuration expansion directive is found, the constructor will
  * uassert with ErrorCodes::NoSuchKey.
@@ -297,6 +315,10 @@ public:
                 // Not this kind of expansion block.
                 return {boost::none};
             }
+        };
+
+        const auto uassertedElement = [&prefix](Status status, StringData element) {
+            uasserted(status.code(), str::stream() << prefix << element << ": " << status.reason());
         };
 
         _expansion = ExpansionType::kRest;
@@ -351,10 +373,53 @@ public:
             }
         }
 
+        auto optDigest = getStringField("digest", true);
+        auto optDigestKey = getStringField("digest_key", true);
+
+        if (optDigest) {
+            ++numVisitedFields;
+
+            auto swDigestVec = hexToVec(*optDigest);
+            if (!swDigestVec.isOK()) {
+                uassertedElement(swDigestVec.getStatus(), "digest");
+            }
+            auto digestVec = std::move(swDigestVec.getValue());
+
+            auto swDigest = SHA256Block::fromBuffer(digestVec.data(), digestVec.size());
+            if (!swDigest.isOK()) {
+                uassertedElement(swDigest.getStatus(), "digest");
+            }
+            _digest = std::move(swDigest.getValue());
+
+            uassert(ErrorCodes::BadValue,
+                    str::stream() << prefix << "digest requires digest_key",
+                    optDigestKey);
+        }
+
+        if (optDigestKey) {
+            ++numVisitedFields;
+
+            auto swKeyVec = hexToVec(*optDigestKey);
+            if (!swKeyVec.isOK()) {
+                uassertedElement(swKeyVec.getStatus(), "digest_key");
+            }
+            _digest_key = std::move(swKeyVec.getValue());
+
+            uassert(ErrorCodes::BadValue,
+                    str::stream() << prefix << "digest_key must not be empty",
+                    !_digest_key.empty());
+
+            uassert(ErrorCodes::BadValue,
+                    str::stream() << prefix << "digest_key requires digest",
+                    optDigest);
+        }
+
         uassert(ErrorCodes::BadValue,
-                str::stream() << nodeName << " expansion block must contain only '"
-                              << getExpansionName()
-                              << "', and optionally 'type' and/or 'trim' fields",
+                str::stream()
+                    << nodeName
+                    << " expansion block must contain only '"
+                    << getExpansionName()
+                    << "', and optionally 'type', 'trim', and/or 'digest'/'digest_key' fields",
                 node.size() == numVisitedFields);
 
         uassert(ErrorCodes::BadValue,
@@ -398,6 +463,20 @@ public:
             }
         }
 
+        if (_digest) {
+            SHA256Block computed;
+            SHA256Block::computeHmac(_digest_key.data(),
+                                     _digest_key.size(),
+                                     reinterpret_cast<const std::uint8_t*>(str.c_str()),
+                                     str.size(),
+                                     &computed);
+            uassert(ErrorCodes::BadValue,
+                    str::stream() << "SHA256HMAC of config expansion " << computed.toString()
+                                  << " does not match expected digest: "
+                                  << _digest->toString(),
+                    computed == *_digest);
+        }
+
         if (_type == ContentType::kString) {
             return YAML::Node(str);
         }
@@ -416,6 +495,26 @@ public:
     }
 
 private:
+    static StatusWith<std::vector<std::uint8_t>> hexToVec(StringData hex) {
+        if (!isValidHex(hex)) {
+            return {ErrorCodes::BadValue, "Not a valid, even length hex string"};
+        }
+
+        std::vector<std::uint8_t> ret;
+        ret.reserve(hex.size() / 2);
+
+        for (size_t i = 0; i < hex.size(); i += 2) {
+            auto swFromHex = fromHex(hex.substr(i, 2));
+            if (!swFromHex.isOK()) {
+                // isValidHex() above should guarantee this never occurs.
+                return {ErrorCodes::BadValue, str::stream() << "Invalid hexits at " << i};
+            }
+            ret.push_back(static_cast<std::uint8_t>(swFromHex.getValue()));
+        }
+
+        return ret;
+    }
+
     // The type of expansion represented.
     enum class ExpansionType {
         kRest,
@@ -436,6 +535,9 @@ private:
         kWhitespace,
     };
     Trim _trim = Trim::kNone;
+
+    boost::optional<SHA256Block> _digest;
+    std::vector<std::uint8_t> _digest_key;
 
     std::string _action;
 };
@@ -885,27 +987,38 @@ Status addYAMLNodesToEnvironment(const YAML::Node& root,
             if (!ret.isOK()) {
                 return ret;
             }
-            invariant(option);
+
+            std::string canonicalName;
+            if (option) {
+                canonicalName = option->_dottedName;
+            } else {
+                // Possible if using non-strict parsing.
+                canonicalName = dottedName;
+            }
 
             Value dummyVal;
-            if (environment->get(option->_dottedName, &dummyVal).isOK()) {
+            if (environment->get(canonicalName, &dummyVal).isOK()) {
                 StringBuilder sb;
-                sb << "Error parsing YAML config: duplicate key: " << dottedName
-                   << "(canonical key: " << option->_dottedName << ")";
-                return Status(ErrorCodes::BadValue, sb.str());
+                sb << "Error parsing YAML config: duplicate key: " << dottedName;
+                if (dottedName != canonicalName) {
+                    sb << "(canonical key: " << canonicalName << ")";
+                }
+                return {ErrorCodes::BadValue, sb.str()};
             }
 
             // Only add the value if it is not empty.  YAMLNodeToValue will set the
             // optionValue to an empty Value if we should not set it in the Environment.
             if (!optionValue.isEmpty()) {
-                ret = environment->set(option->_dottedName, optionValue);
+                ret = environment->set(canonicalName, optionValue);
                 if (!ret.isOK()) {
                     return ret;
                 }
 
-                ret = canonicalizeOption(*option, environment);
-                if (!ret.isOK()) {
-                    return ret;
+                if (option) {
+                    ret = canonicalizeOption(*option, environment);
+                    if (!ret.isOK()) {
+                        return ret;
+                    }
                 }
             }
         }
@@ -1248,6 +1361,30 @@ bool isYAMLConfig(const YAML::Node& config) {
     }
 }
 
+#ifndef _WIN32
+Status checkFileOwnershipAndMode(int fd, mode_t prohibit, StringData modeDesc) {
+    struct stat stats;
+
+    if (::fstat(fd, &stats) == -1) {
+        const auto& ewd = errnoWithDescription();
+        return {ErrorCodes::InvalidPath, str::stream() << "Error reading file metadata: " << ewd};
+    }
+
+    if (stats.st_uid != ::getuid()) {
+        // Must be owned by current process user.
+        return {ErrorCodes::InvalidPath, "File is not owned by current user"};
+    }
+
+    if ((stats.st_mode & prohibit) != 0) {
+        // Must not be accessible by non-owner.
+        return {ErrorCodes::InvalidPath,
+                str::stream() << "File is " << modeDesc << " by non-owner users"};
+    }
+
+    return Status::OK();
+}
+#endif
+
 }  // namespace
 
 /**
@@ -1278,23 +1415,58 @@ Status OptionsParser::addDefaultValues(const OptionSection& options, Environment
  * We could redesign the parser to use some kind of streaming interface, but for now this is
  * simple and works for the current use case of config files which should be limited in size.
  */
-Status OptionsParser::readConfigFile(const std::string& filename, std::string* contents) {
-    std::ifstream file;
-    file.open(filename.c_str());
-    if (file.fail()) {
-        const int current_errno = errno;
-        StringBuilder sb;
-        sb << "Error opening config file: " << strerror(current_errno);
-        return Status(ErrorCodes::InternalError, sb.str());
-    }
-
+Status OptionsParser::readConfigFile(const std::string& filename,
+                                     std::string* contents,
+                                     ConfigExpand configExpand) {
     // check if it's a regular file
     fs::path configPath(filename);
     if (!fs::is_regular_file(filename)) {
-        StringBuilder sb;
-        sb << "Error opening config file: " << strerror(EISDIR);
-        return Status(ErrorCodes::InternalError, sb.str());
+        return {ErrorCodes::InternalError,
+                str::stream() << "Error opening config file: " << strerror(EISDIR)};
     }
+
+#ifdef _WIN32
+    int fd = ::_open(filename.c_str(), O_RDONLY);
+#else
+    int fd = ::open(filename.c_str(), O_RDONLY);
+#endif
+
+    if (fd < 0) {
+        const auto& ewd = errnoWithDescription();
+        return {ErrorCodes::InternalError, str::stream() << "Error opening config file: " << ewd};
+    }
+
+#ifdef _WIN32
+    // The checks below are only performed on POSIX systems
+    // due to differing permission models.
+    auto fdguard = makeGuard([&fd] { ::_close(fd); });
+#else
+    auto fdguard = makeGuard([&fd] { ::close(fd); });
+
+    if (configExpand.rest) {
+        auto status = checkFileOwnershipAndMode(fd, S_IRGRP | S_IROTH, "readable"_sd);
+        if (!status.isOK()) {
+            return {status.code(),
+                    str::stream() << "When using --configExpand=rest, config file must be "
+                                  << "exclusively readable by current process user. "
+                                  << status.reason()};
+        }
+    }
+
+    if (configExpand.exec) {
+        auto status = checkFileOwnershipAndMode(fd, S_IWGRP | S_IWOTH, "writable"_sd);
+        if (!status.isOK()) {
+            return {status.code(),
+                    str::stream() << "When using --configExpand=exec, config file must be "
+                                  << "exclusively writable by current process user. "
+                                  << status.reason()};
+        }
+    }
+#endif
+
+    boost::iostreams::stream_buffer<boost::iostreams::file_descriptor_source> fdBuf(
+        fd, boost::iostreams::file_descriptor_flags::never_close_handle);
+    std::istream file(&fdBuf);
 
     // Transfer data to a stringstream
     std::stringstream config;
@@ -1601,17 +1773,17 @@ Status OptionsParser::run(const OptionSection& options,
             return ret;
         }
 
-        std::string config_file;
-        ret = readConfigFile(config_filename, &config_file);
-        if (!ret.isOK()) {
-            return ret;
-        }
-
         auto swExpand = parseConfigExpand(commandLineEnvironment);
         if (!swExpand.isOK()) {
             return swExpand.getStatus();
         }
         auto configExpand = std::move(swExpand.getValue());
+
+        std::string config_file;
+        ret = readConfigFile(config_filename, &config_file, configExpand);
+        if (!ret.isOK()) {
+            return ret;
+        }
 
         ret = parseConfigFile(options, config_file, &configEnvironment, configExpand);
         if (!ret.isOK()) {

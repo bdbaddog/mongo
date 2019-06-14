@@ -39,7 +39,7 @@
     let res = sessionUnsharded.aggregate([{$match: {_id: {$gte: -200}}}]).toArray();
     assert.eq(2, res.length, tojson(res));
 
-    session.abortTransaction_forTesting();
+    assert.commandWorked(session.abortTransaction_forTesting());
 
     // merge on mongos
 
@@ -52,7 +52,7 @@
     res = sessionColl.aggregate([{$match: {_id: {$gte: -200}}}], {allowDiskUse: false}).toArray();
     assert.eq(2, res.length, tojson(res));
 
-    session.abortTransaction_forTesting();
+    assert.commandWorked(session.abortTransaction_forTesting());
 
     // merge on shard. This will require the merging shard to open a cursor on itself.
     session.startTransaction();
@@ -68,7 +68,7 @@
             .toArray();
     assert.eq(2, res.length, tojson(res));
 
-    session.abortTransaction_forTesting();
+    assert.commandWorked(session.abortTransaction_forTesting());
 
     // Error case: provide a readConcern on an operation which comes in the middle of a transaction.
     session.startTransaction();
@@ -84,7 +84,7 @@
             ));
     assert.eq(err.code, ErrorCodes.InvalidOptions, err);
 
-    session.abortTransaction();
+    assert.commandWorked(session.abortTransaction_forTesting());
 
     // Insert some data outside of a transaction.
     assert.commandWorked(sessionColl.insert([{_id: -1}, {_id: 0}, {_id: 1}]));
@@ -96,7 +96,7 @@
         sessionColl
             .aggregate([{$_internalSplitPipeline: {mergeType: "primaryShard"}}, {$sort: {_id: 1}}])
             .toArray());
-    session.commitTransaction();
+    assert.commandWorked(session.commitTransaction_forTesting());
 
     // Move all of the data to shard 1.
     assert.commandWorked(
@@ -111,7 +111,7 @@
     // chunks for the collection.
     session.startTransaction();
     assert.eq([{_id: -1}, {_id: 0}, {_id: 1}], sessionColl.aggregate(pipeline).toArray());
-    session.commitTransaction();
+    assert.commandWorked(session.commitTransaction_forTesting());
 
     st.stop();
 })();

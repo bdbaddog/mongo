@@ -22,9 +22,6 @@
             // Constrain the storage engine cache size to make it easier to fill it up with
             // unflushed modifications.
             wiredTigerCacheSizeGB: 1,
-            // TODO: SERVER-39810 Remove this early return once the new oplog format for large
-            // transactions is made the default.
-            setParameter: "useMultipleOplogEntryFormatForTransactions=true",
         },
     });
     const nodes = rst.startSet();
@@ -62,7 +59,7 @@
             assert.writeOK(sessionColl.update({_id: i}, {$inc: {i: 1}}));
         }
     }
-    session.commitTransaction();
+    assert.commandWorked(session.commitTransaction_forTesting());
     session.endSession();
 
     jsTestLog('Applying updates on secondary ' + secondary.host);

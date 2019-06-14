@@ -33,6 +33,7 @@
 
 #include <boost/intrusive_ptr.hpp>
 #include <boost/optional.hpp>
+#include <functional>
 #include <list>
 #include <memory>
 #include <string>
@@ -54,7 +55,6 @@
 #include "mongo/db/pipeline/stage_constraints.h"
 #include "mongo/db/pipeline/value.h"
 #include "mongo/db/query/explain_options.h"
-#include "mongo/stdx/functional.h"
 #include "mongo/util/intrusive_counter.h"
 
 namespace mongo {
@@ -129,7 +129,7 @@ class Document;
 
 class DocumentSource : public RefCountable {
 public:
-    using Parser = stdx::function<std::list<boost::intrusive_ptr<DocumentSource>>(
+    using Parser = std::function<std::list<boost::intrusive_ptr<DocumentSource>>(
         BSONElement, const boost::intrusive_ptr<ExpressionContext>&)>;
 
     using ChangeStreamRequirement = StageConstraints::ChangeStreamRequirement;
@@ -139,6 +139,7 @@ public:
     using FacetRequirement = StageConstraints::FacetRequirement;
     using StreamType = StageConstraints::StreamType;
     using TransactionRequirement = StageConstraints::TransactionRequirement;
+    using LookupRequirement = StageConstraints::LookupRequirement;
 
     /**
      * This is what is returned from the main DocumentSource API: getNext(). It is essentially a
@@ -219,7 +220,7 @@ public:
      * A struct representing the information needed to execute this stage on a distributed
      * collection. Describes how a pipeline should be split for sharded execution.
      */
-    struct MergingLogic {
+    struct DistributedPlanLogic {
         // A stage which executes on each shard in parallel, or nullptr if nothing can be done in
         // parallel. For example, a partial $group before a subsequent global $group.
         boost::intrusive_ptr<DocumentSource> shardsStage = nullptr;
@@ -430,6 +431,13 @@ public:
     }
 
     /**
+     * Returns the expression context from the stage's context.
+     */
+    const ExpressionContext& getContext() const {
+        return *pExpCtx;
+    }
+
+    /**
      * Given 'currentNames' which describes a set of paths which the caller is interested in,
      * returns boost::none if any of those paths are modified by this stage, or a mapping from
      * their old name to their new name if they are preserved but possibly renamed by this stage.
@@ -453,17 +461,18 @@ public:
      * Otherwise, returns a struct representing what needs to be done to merge each shard's pipeline
      * into a single stream of results. Must not mutate the existing source object; if different
      * behaviour is required, a new source should be created and configured appropriately. It is an
-     * error for the returned MergingLogic to have identical pointers for 'shardsStage' and
+     * error for the returned DistributedPlanLogic to have identical pointers for 'shardsStage' and
      * 'mergingStage'.
      */
-    virtual boost::optional<MergingLogic> mergingLogic() = 0;
+    virtual boost::optional<DistributedPlanLogic> distributedPlanLogic() = 0;
 
     /**
      * Returns true if it would be correct to execute this stage in parallel across the shards in
-     * cases where the final stage is an $out. For example, a $group stage which is just merging the
-     * groups from the shards can be run in parallel since it will preserve the shard key.
+     * cases where the final stage is a stage which can perform a write operation, such as $merge.
+     * For example, a $group stage which is just merging the groups from the shards can be run in
+     * parallel since it will preserve the shard key.
      */
-    virtual bool canRunInParallelBeforeOut(
+    virtual bool canRunInParallelBeforeWriteStage(
         const std::set<std::string>& nameOfShardKeyFieldsUponEntryToStage) const {
         return false;
     }
@@ -473,11 +482,10 @@ protected:
 
     /**
      * Attempt to perform an optimization with the following source in the pipeline. 'container'
-     * refers to the entire pipeline, and 'itr' points to this stage within the pipeline. The caller
-     * must guarantee that std::next(itr) != container->end().
+     * refers to the entire pipeline, and 'itr' points to this stage within the pipeline.
      *
      * The return value is an iterator over the same container which points to the first location
-     * in the container at which an optimization may be possible.
+     * in the container at which an optimization may be possible, or the end of the container().
      *
      * For example, if a swap takes place, the returned iterator should just be the position
      * directly preceding 'itr', if such a position exists, since the stage at that position may be

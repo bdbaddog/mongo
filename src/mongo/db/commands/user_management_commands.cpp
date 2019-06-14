@@ -33,6 +33,7 @@
 
 #include "mongo/db/commands/user_management_commands.h"
 
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -68,7 +69,6 @@
 #include "mongo/db/service_context.h"
 #include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/s/write_ops/batched_command_response.h"
-#include "mongo/stdx/functional.h"
 #include "mongo/stdx/mutex.h"
 #include "mongo/stdx/unordered_set.h"
 #include "mongo/util/icu.h"
@@ -246,7 +246,7 @@ Status queryAuthzDocument(OperationContext* opCtx,
                           const NamespaceString& collectionName,
                           const BSONObj& query,
                           const BSONObj& projection,
-                          const stdx::function<void(const BSONObj&)>& resultProcessor) {
+                          const std::function<void(const BSONObj&)>& resultProcessor) {
     try {
         DBDirectClient client(opCtx);
         client.query(resultProcessor, collectionName, query, &projection);
@@ -562,31 +562,41 @@ Status writeAuthSchemaVersionIfNeeded(OperationContext* opCtx,
     return status;
 }
 
+auto getUMCMutex = ServiceContext::declareDecoration<stdx::mutex>();
+
 class AuthzLockGuard {
     AuthzLockGuard(AuthzLockGuard&) = delete;
     AuthzLockGuard& operator=(AuthzLockGuard&) = delete;
 
 public:
-    AuthzLockGuard(OperationContext* opCtx, LockMode mode)
+    enum InvalidationMode { kInvalidate, kReadOnly };
+    AuthzLockGuard(OperationContext* opCtx, InvalidationMode mode)
         : _opCtx(opCtx),
-          _lock(_opCtx,
-                AuthorizationManager::usersCollectionNamespace.db(),
-                mode,
-                _opCtx->getDeadline()) {
-        auto authzMgr = AuthorizationManager::get(_opCtx->getServiceContext());
-        authzMgr->setInUserManagementCommand(_opCtx, true);
-    }
+          _authzManager(AuthorizationManager::get(_opCtx->getServiceContext())),
+          _lock(getUMCMutex(opCtx->getServiceContext())),
+          _mode(mode),
+          _cacheGeneration(_authzManager->getCacheGeneration()) {}
 
     ~AuthzLockGuard() {
-        auto authzMgr = AuthorizationManager::get(_opCtx->getServiceContext());
-        authzMgr->setInUserManagementCommand(_opCtx, false);
+        if (!_lock.owns_lock() || _mode == kReadOnly) {
+            return;
+        }
+
+        if (_authzManager->getCacheGeneration() == _cacheGeneration) {
+            LOG(1) << "User management command did not invalidate the user cache.";
+            _authzManager->invalidateUserCache(_opCtx);
+        }
     }
 
     AuthzLockGuard(AuthzLockGuard&&) = default;
+    AuthzLockGuard& operator=(AuthzLockGuard&&) = default;
 
 private:
     OperationContext* _opCtx;
-    Lock::DBLock _lock;
+    AuthorizationManager* _authzManager;
+    stdx::unique_lock<stdx::mutex> _lock;
+    InvalidationMode _mode;
+    OID _cacheGeneration;
 };
 
 /**
@@ -600,7 +610,7 @@ StatusWith<AuthzLockGuard> requireWritableAuthSchema28SCRAM(OperationContext* op
     // We take a MODE_X lock during writes because we want to be sure that we can read any pinned
     // user documents back out of the database after writing them during the user management
     // commands, and to ensure only one user management command is running at a time.
-    AuthzLockGuard lk(opCtx, MODE_X);
+    AuthzLockGuard lk(opCtx, AuthzLockGuard::kInvalidate);
     Status status = authzManager->getAuthorizationVersion(opCtx, &foundSchemaVersion);
     if (!status.isOK()) {
         return status;
@@ -638,7 +648,7 @@ StatusWith<AuthzLockGuard> requireWritableAuthSchema28SCRAM(OperationContext* op
 StatusWith<AuthzLockGuard> requireReadableAuthSchema26Upgrade(OperationContext* opCtx,
                                                               AuthorizationManager* authzManager) {
     int foundSchemaVersion;
-    AuthzLockGuard lk(opCtx, MODE_IS);
+    AuthzLockGuard lk(opCtx, AuthzLockGuard::kReadOnly);
     Status status = authzManager->getAuthorizationVersion(opCtx, &foundSchemaVersion);
     if (!status.isOK()) {
         return status;

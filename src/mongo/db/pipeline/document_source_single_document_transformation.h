@@ -62,6 +62,7 @@ public:
                                      DiskUseRequirement::kNoDiskUse,
                                      FacetRequirement::kAllowed,
                                      TransactionRequirement::kAllowed,
+                                     LookupRequirement::kAllowed,
                                      ChangeStreamRequirement::kWhitelist);
         constraints.canSwapWithMatch = true;
         constraints.canSwapWithLimitAndSample = true;
@@ -72,12 +73,16 @@ public:
         return constraints;
     }
 
-    boost::optional<MergingLogic> mergingLogic() final {
+    boost::optional<DistributedPlanLogic> distributedPlanLogic() final {
         return boost::none;
     }
 
     TransformerInterface::TransformerType getType() const {
         return _parsedTransform->getType();
+    }
+
+    const auto& getTransformer() const {
+        return *_parsedTransform;
     }
 
     bool isSubsetOfProjection(const BSONObj& proj) const {

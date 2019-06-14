@@ -33,13 +33,13 @@
 
 #include "mongo/db/concurrency/d_concurrency.h"
 
+#include <memory>
 #include <string>
 #include <vector>
 
 #include "mongo/db/concurrency/flow_control_ticketholder.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/service_context.h"
-#include "mongo/stdx/memory.h"
 #include "mongo/stdx/mutex.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/log.h"
@@ -215,8 +215,7 @@ void Lock::GlobalLock::waitForLockUntil(Date_t deadline) {
             throw;
     }
 
-    const ResourceId globalResId(RESOURCE_GLOBAL, ResourceId::SINGLETON_GLOBAL);
-    auto lockMode = _opCtx->lockState()->getLockMode(globalResId);
+    auto lockMode = _opCtx->lockState()->getLockMode(resourceIdGlobal);
     _opCtx->lockState()->setGlobalLockTakenInMode(lockMode);
 }
 

@@ -29,6 +29,7 @@
 
 #pragma once
 
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -40,7 +41,6 @@
 #include "mongo/db/repl/oplog_entry.h"
 #include "mongo/db/repl/optime.h"
 #include "mongo/db/repl/replication_coordinator.h"
-#include "mongo/stdx/functional.h"
 
 namespace mongo {
 class Collection;
@@ -120,11 +120,12 @@ std::vector<OpTime> logInsertOps(OperationContext* opCtx,
  * wallClockTime this specifies the wall-clock timestamp of then this oplog entry was generated. It
  *   is purely informational, may not be monotonically increasing and is not interpreted in any way
  *   by the replication subsystem.
+ * stmtId specifies the statementId of an operation. For transaction operations, stmtId is always
+ *   boost::none.
  * oplogLink this contains the timestamp that points to the previous write that will be
  *   linked via prevTs, and the timestamps of the oplog entry that contains the document
  *   before/after update was applied. The timestamps are ignored if isNull() is true.
  * prepare this specifies if the oplog entry should be put into a 'prepare' state.
- * inTxn this specifies that the oplog entry is part of a transaction in progress.
  * oplogSlot If non-null, use this reserved oplog slot instead of a new one.
  *
  * Returns the optime of the oplog entry written to the oplog.
@@ -139,10 +140,8 @@ OpTime logOp(OperationContext* opCtx,
              bool fromMigrate,
              Date_t wallClockTime,
              const OperationSessionInfo& sessionInfo,
-             StmtId stmtId,
+             boost::optional<StmtId> stmtId,
              const OplogLink& oplogLink,
-             bool prepare,
-             bool inTxn,
              const OplogSlot& oplogSlot);
 
 // Flush out the cached pointer to the oplog.
@@ -163,7 +162,7 @@ void acquireOplogCollectionForLogging(OperationContext* opCtx);
  */
 void establishOplogCollectionForLogging(OperationContext* opCtx, Collection* oplog);
 
-using IncrementOpsAppliedStatsFn = stdx::function<void()>;
+using IncrementOpsAppliedStatsFn = std::function<void()>;
 
 /**
  * This class represents the different modes of oplog application that are used within the

@@ -33,6 +33,8 @@
 
 #include "mongo/db/auth/authz_manager_external_state_d.h"
 
+#include <memory>
+
 #include "mongo/base/status.h"
 #include "mongo/db/auth/authz_session_external_state_d.h"
 #include "mongo/db/auth/user_name.h"
@@ -44,7 +46,6 @@
 #include "mongo/db/operation_context.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/storage/storage_engine.h"
-#include "mongo/stdx/memory.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/log.h"
 #include "mongo/util/str.h"
@@ -56,44 +57,14 @@ AuthzManagerExternalStateMongod::~AuthzManagerExternalStateMongod() = default;
 
 std::unique_ptr<AuthzSessionExternalState>
 AuthzManagerExternalStateMongod::makeAuthzSessionExternalState(AuthorizationManager* authzManager) {
-    return stdx::make_unique<AuthzSessionExternalStateMongod>(authzManager);
+    return std::make_unique<AuthzSessionExternalStateMongod>(authzManager);
 }
-
-class AuthzLock : public AuthzManagerExternalState::StateLock {
-public:
-    explicit AuthzLock(OperationContext* opCtx)
-        : _lock(opCtx,
-                AuthorizationManager::usersCollectionNamespace.db(),
-                MODE_S,
-                opCtx->getDeadline()) {}
-
-    static bool isLocked(OperationContext* opCtx);
-
-private:
-    Lock::DBLock _lock;
-};
-
-bool AuthzLock::isLocked(OperationContext* opCtx) {
-    return opCtx->lockState()->isDbLockedForMode(
-        AuthorizationManager::usersCollectionNamespace.db(), MODE_S);
-}
-
-std::unique_ptr<AuthzManagerExternalState::StateLock> AuthzManagerExternalStateMongod::lock(
-    OperationContext* opCtx) {
-    return std::make_unique<AuthzLock>(opCtx);
-}
-
-bool AuthzManagerExternalStateMongod::needsLockForUserName(OperationContext* opCtx,
-                                                           const UserName& name) {
-    return (shouldUseRolesFromConnection(opCtx, name) == false);
-}
-
 Status AuthzManagerExternalStateMongod::query(
     OperationContext* opCtx,
     const NamespaceString& collectionName,
     const BSONObj& query,
     const BSONObj& projection,
-    const stdx::function<void(const BSONObj&)>& resultProcessor) {
+    const std::function<void(const BSONObj&)>& resultProcessor) {
     try {
         DBDirectClient client(opCtx);
         client.query(resultProcessor, collectionName, query, &projection);

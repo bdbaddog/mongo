@@ -297,7 +297,7 @@ void Pipeline::optimizePipeline() {
     stitch();
 }
 
-bool Pipeline::aggSupportsWriteConcern(const BSONObj& cmd) {
+bool Pipeline::aggHasWriteStage(const BSONObj& cmd) {
     auto pipelineElement = cmd["pipeline"];
     if (pipelineElement.type() != BSONType::Array) {
         return false;
@@ -407,7 +407,7 @@ bool Pipeline::requiredToRunOnMongos() const {
     for (auto&& stage : _sources) {
         // If this pipeline is capable of splitting before the mongoS-only stage, then the pipeline
         // as a whole is not required to run on mongoS.
-        if (_splitState == SplitState::kUnsplit && stage->mergingLogic()) {
+        if (_splitState == SplitState::kUnsplit && stage->distributedPlanLogic()) {
             return false;
         }
 
@@ -684,7 +684,7 @@ boost::intrusive_ptr<DocumentSource> Pipeline::popFrontWithName(StringData targe
 }
 
 boost::intrusive_ptr<DocumentSource> Pipeline::popFrontWithNameAndCriteria(
-    StringData targetStageName, stdx::function<bool(const DocumentSource* const)> predicate) {
+    StringData targetStageName, std::function<bool(const DocumentSource* const)> predicate) {
     if (_sources.empty() || _sources.front()->getSourceName() != targetStageName) {
         return nullptr;
     }

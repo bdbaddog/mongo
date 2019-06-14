@@ -168,6 +168,11 @@ public:
      */
     BSONObj makeFlowControlObject(FlowControlTicketholder::CurOp flowControlStats) const;
 
+    /**
+     * Make object from $searchBeta stats with non-populated values omitted.
+     */
+    BSONObj makeSearchBetaObject() const;
+
     // -------------------
 
     // basic options
@@ -185,6 +190,10 @@ public:
     long long ntoskip{-1};
     bool exhaust{false};
 
+    // For searchBeta.
+    boost::optional<long long> mongotCursorId{boost::none};
+    boost::optional<long long> msWaitingForMongot{boost::none};
+
     bool hasSortStage{false};  // true if the query plan involves an in-memory sort
 
     bool usedDisk{false};  // true if the given query used disk
@@ -196,8 +205,7 @@ public:
     // True if a replan was triggered during the execution of this operation.
     bool replanned{false};
 
-    bool fastmodinsert{false};  // upsert of an $operation. builds a default object
-    bool upsert{false};         // true if the update actually did an insert
+    bool upsert{false};  // true if the update actually did an insert
     bool cursorExhausted{
         false};  // true if the cursor has been closed at end a find/getMore operation
 

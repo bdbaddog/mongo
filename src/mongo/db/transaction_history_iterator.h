@@ -36,8 +36,8 @@ namespace mongo {
 class OperationContext;
 
 /**
- * An iterator class that can traverse through the oplog entries that are linked via the prevTs
- * field.
+ * An iterator class that traverses backwards through a transaction's oplog entries by following the
+ * "prevOpTime" link in each entry.
  */
 class TransactionHistoryIteratorBase {
 public:
@@ -49,12 +49,17 @@ public:
     virtual bool hasNext() const = 0;
 
     /**
-     * Returns the next oplog entry.
+     * Returns an oplog entry and advances the iterator one step back through the oplog.
      * Should not be called if hasNext is false.
      * Throws if next oplog entry is in a unrecognized format or if it can't find the next oplog
      * entry.
      */
     virtual repl::OplogEntry next(OperationContext* opCtx) = 0;
+
+    /**
+     * Same as next() but returns only the OpTime, instead of the entire entry.
+     */
+    virtual repl::OpTime nextOpTime(OperationContext* opCtx) = 0;
 };
 
 class TransactionHistoryIterator : public TransactionHistoryIteratorBase {
@@ -62,13 +67,24 @@ public:
     /**
      * Creates a new iterator starting with an oplog entry with the given start opTime.
      */
-    TransactionHistoryIterator(repl::OpTime startingOpTime);
+    TransactionHistoryIterator(repl::OpTime startingOpTime, bool permitYield = false);
     virtual ~TransactionHistoryIterator() = default;
 
     bool hasNext() const override;
-    repl::OplogEntry next(OperationContext* opCtx);
+    repl::OplogEntry next(OperationContext* opCtx) override;
+    repl::OpTime nextOpTime(OperationContext* opCtx) override;
+
+    /**
+     * Same as next() but makes exceptions fatal.
+     */
+    repl::OplogEntry nextFatalOnErrors(OperationContext* opCtx);
 
 private:
+    // Clients can set this to allow PlanExecutors created by this TransactionHistoryIterator to
+    // have a YIELD_AUTO yield policy. It is only safe to set this if next() will never be called
+    // while holding a lock that should not be yielded, such as the PBWM lock.
+    bool _permitYield;
+
     repl::OpTime _nextOpTime;
 };
 

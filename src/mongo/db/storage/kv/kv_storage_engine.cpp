@@ -42,6 +42,7 @@
 #include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/logical_clock.h"
 #include "mongo/db/operation_context_noop.h"
+#include "mongo/db/server_options.h"
 #include "mongo/db/storage/kv/kv_catalog_feature_tracker.h"
 #include "mongo/db/storage/kv/kv_engine.h"
 #include "mongo/db/storage/kv/temporary_kv_record_store.h"
@@ -183,8 +184,7 @@ void KVStorageEngine::loadCatalog(OperationContext* opCtx) {
     }
 
     KVPrefix maxSeenPrefix = KVPrefix::kNotPrefixed;
-    for (const auto& coll : collectionsKnownToCatalog) {
-        NamespaceString nss(coll);
+    for (const auto& nss : collectionsKnownToCatalog) {
         std::string dbName = nss.db().toString();
 
         if (loadingFromUncleanShutdownOrRepair) {
@@ -192,7 +192,7 @@ void KVStorageEngine::loadCatalog(OperationContext* opCtx) {
             // possible that there are collections in the catalog that are unknown to the storage
             // engine. If we can't find a table in the list of storage engine idents, either
             // attempt to recover the ident or drop it.
-            const auto collectionIdent = _catalog->getCollectionIdent(coll);
+            const auto collectionIdent = _catalog->getCollectionIdent(nss);
             bool orphan = !std::binary_search(identsKnownToStorageEngine.begin(),
                                               identsKnownToStorageEngine.end(),
                                               collectionIdent);
@@ -202,14 +202,14 @@ void KVStorageEngine::loadCatalog(OperationContext* opCtx) {
             if (orphan) {
                 auto status = _recoverOrphanedCollection(opCtx, nss, collectionIdent);
                 if (!status.isOK()) {
-                    warning() << "Failed to recover orphaned data file for collection '" << coll
+                    warning() << "Failed to recover orphaned data file for collection '" << nss
                               << "': " << status;
                     WriteUnitOfWork wuow(opCtx);
-                    fassert(50716, _catalog->_removeEntry(opCtx, coll));
+                    fassert(50716, _catalog->_removeEntry(opCtx, nss));
 
                     if (_options.forRepair) {
                         StorageRepairObserver::get(getGlobalServiceContext())
-                            ->onModification(str::stream() << "Collection " << coll << " dropped: "
+                            ->onModification(str::stream() << "Collection " << nss << " dropped: "
                                                            << status.reason());
                     }
                     wuow.commit();
@@ -218,8 +218,8 @@ void KVStorageEngine::loadCatalog(OperationContext* opCtx) {
             }
         }
 
-        _catalog->initCollection(opCtx, coll, _options.forRepair);
-        auto maxPrefixForCollection = _catalog->getMetaData(opCtx, coll).getMaxPrefix();
+        _initCollection(opCtx, nss, _options.forRepair);
+        auto maxPrefixForCollection = _catalog->getMetaData(opCtx, nss).getMaxPrefix();
         maxSeenPrefix = std::max(maxSeenPrefix, maxPrefixForCollection);
 
         if (nss.isOrphanCollection()) {
@@ -233,6 +233,20 @@ void KVStorageEngine::loadCatalog(OperationContext* opCtx) {
     // Unset the unclean shutdown flag to avoid executing special behavior if this method is called
     // after startup.
     startingAfterUncleanShutdown(getGlobalServiceContext()) = false;
+}
+
+void KVStorageEngine::_initCollection(OperationContext* opCtx,
+                                      const NamespaceString& nss,
+                                      bool forRepair) {
+    auto catalogEntry = _catalog->makeCollectionCatalogEntry(opCtx, nss, forRepair);
+    auto uuid = catalogEntry->getCollectionOptions(opCtx).uuid.get();
+
+    auto collectionFactory = Collection::Factory::get(getGlobalServiceContext());
+    auto collection = collectionFactory->make(opCtx, catalogEntry.get());
+
+    auto& collectionCatalog = CollectionCatalog::get(getGlobalServiceContext());
+    collectionCatalog.registerCatalogEntry(uuid, std::move(catalogEntry));
+    collectionCatalog.registerCollectionObject(uuid, std::move(collection));
 }
 
 void KVStorageEngine::closeCatalog(OperationContext* opCtx) {
@@ -431,9 +445,18 @@ KVStorageEngine::reconcileCatalogAndIdents(OperationContext* opCtx) {
             // table is not found, or the index build did not successfully complete, this code
             // will return the index to be rebuilt.
             if (indexMetaData.isBackgroundSecondaryBuild && (!foundIdent || !indexMetaData.ready)) {
-                log()
-                    << "Expected background index build did not complete, rebuilding. Collection: "
-                    << coll << " Index: " << indexName;
+                if (!serverGlobalParams.indexBuildRetry) {
+                    log() << "Dropping an unfinished index because --noIndexBuildRetry is set. "
+                             "Collection: "
+                          << coll << " Index: " << indexName;
+                    fassert(51197, _engine->dropIdent(opCtx, indexIdent));
+                    indexesToDrop.push_back(indexName);
+                    continue;
+                }
+
+                log() << "Expected background index build did not complete, rebuilding. "
+                         "Collection: "
+                      << coll << " Index: " << indexName;
                 ret.emplace_back(coll.ns(), indexName);
                 continue;
             }
@@ -641,8 +664,19 @@ Status KVStorageEngine::repairRecordStore(OperationContext* opCtx, const Namespa
         repairObserver->onModification(str::stream() << "Collection " << nss << ": "
                                                      << status.reason());
     }
-    _catalog->reinitCollectionAfterRepair(opCtx, nss);
 
+    auto& collectionCatalog = CollectionCatalog::get(getGlobalServiceContext());
+    auto uuid = collectionCatalog.lookupUUIDByNSS(nss).get();
+
+    // It's possible the Collection may not already have been removed if the no DatabaseHolder was
+    // opened for a database.
+    if (collectionCatalog.lookupCollectionByUUID(uuid)) {
+        collectionCatalog.deregisterCollectionObject(uuid);
+    }
+    collectionCatalog.deregisterCatalogEntry(uuid);
+
+    // After repairing, initialize the collection with a valid RecordStore.
+    _initCollection(opCtx, nss, false);
     return Status::OK();
 }
 
@@ -681,12 +715,12 @@ void KVStorageEngine::setOldestActiveTransactionTimestampCallback(
     _engine->setOldestActiveTransactionTimestampCallback(callback);
 }
 
-bool KVStorageEngine::isCacheUnderPressure(OperationContext* opCtx) const {
-    return _engine->isCacheUnderPressure(opCtx);
+int64_t KVStorageEngine::getCacheOverflowTableInsertCount(OperationContext* opCtx) const {
+    return _engine->getCacheOverflowTableInsertCount(opCtx);
 }
 
-void KVStorageEngine::setCachePressureForTest(int pressure) {
-    return _engine->setCachePressureForTest(pressure);
+void KVStorageEngine::setCacheOverflowTableInsertCountForTest(int insertCount) {
+    return _engine->setCacheOverflowTableInsertCountForTest(insertCount);
 }
 
 bool KVStorageEngine::supportsRecoverToStableTimestamp() const {
@@ -757,6 +791,10 @@ Timestamp KVStorageEngine::getAllCommittedTimestamp() const {
 
 Timestamp KVStorageEngine::getOldestOpenReadTimestamp() const {
     return _engine->getOldestOpenReadTimestamp();
+}
+
+boost::optional<Timestamp> KVStorageEngine::getOplogNeededForCrashRecovery() const {
+    return _engine->getOplogNeededForCrashRecovery();
 }
 
 void KVStorageEngine::_dumpCatalog(OperationContext* opCtx) {
@@ -845,6 +883,9 @@ void KVStorageEngine::TimestampMonitor::startup() {
                     uOpCtx = client->makeOperationContext();
                     opCtx = uOpCtx.get();
                 }
+
+                ShouldNotConflictWithSecondaryBatchApplicationBlock shouldNotConflictBlock(
+                    opCtx->lockState());
                 Lock::GlobalLock lock(opCtx, MODE_IS);
 
                 // The checkpoint timestamp is not cached in mongod and needs to be fetched with a
@@ -915,7 +956,10 @@ int64_t KVStorageEngine::sizeOnDiskForDb(OperationContext* opCtx, StringData dbN
     int64_t size = 0;
 
     catalog::forEachCollectionFromDb(
-        opCtx, dbName, MODE_IS, [&](Collection* collection, CollectionCatalogEntry* catalogEntry) {
+        opCtx,
+        dbName,
+        MODE_IS,
+        [&](const Collection* collection, const CollectionCatalogEntry* catalogEntry) {
             size += catalogEntry->getRecordStore()->storageSize(opCtx);
 
             std::vector<std::string> indexNames;

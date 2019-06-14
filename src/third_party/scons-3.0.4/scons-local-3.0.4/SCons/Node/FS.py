@@ -3370,6 +3370,7 @@ class File(Base):
             List of csigs for provided list of children
         """
 
+
         # First try retrieving via Node
         df = dmap.get(self, None)
         if not df:
@@ -3385,15 +3386,6 @@ class File(Base):
             if not df:
                 dmap = self._add_strings_to_dependency_map(dmap)
                 df = dmap.get(c_str, None)
-        # else:
-        #     # First try the simple name for node
-        #     c_str = str(self)
-        #
-        #     if os.altsep:
-        #         c_str = c_str.replace(os.sep, os.altsep)
-        #
-        #
-        #     print("MD5: used Node        :%s"%c_str)
 
         if not df:
             try:
@@ -3453,6 +3445,7 @@ class File(Base):
             except AttributeError:
                 pass
             return False
+
         return self.changed_content(target, prev_ni)
 
     def changed_timestamp_newer(self, target, prev_ni):

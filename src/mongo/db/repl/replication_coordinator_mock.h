@@ -29,13 +29,14 @@
 
 #pragma once
 
+#include <functional>
+
 #include "mongo/base/status.h"
 #include "mongo/db/repl/optime.h"
 #include "mongo/db/repl/repl_set_config.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/repl/storage_interface.h"
 #include "mongo/platform/atomic_word.h"
-#include "mongo/stdx/functional.h"
 
 namespace mongo {
 
@@ -179,7 +180,8 @@ public:
 
     virtual Status processReplSetGetStatus(BSONObjBuilder*, ReplSetGetStatusResponseStyle);
 
-    virtual void fillIsMasterForReplSet(IsMasterResponse* result);
+    void fillIsMasterForReplSet(IsMasterResponse* result,
+                                const SplitHorizon::Parameters& horizon) override;
 
     virtual void appendSlaveInfoData(BSONObjBuilder* result);
 
@@ -287,7 +289,7 @@ public:
      * Sets the function to generate the return value for calls to awaitReplication().
      * 'opTime' is the optime passed to awaitReplication().
      */
-    using AwaitReplicationReturnValueFunction = stdx::function<StatusAndDuration(const OpTime&)>;
+    using AwaitReplicationReturnValueFunction = std::function<StatusAndDuration(const OpTime&)>;
     void setAwaitReplicationReturnValueFunction(
         AwaitReplicationReturnValueFunction returnValueFunction);
 
@@ -310,6 +312,8 @@ public:
 
     virtual void attemptToAdvanceStableTimestamp() override;
 
+    virtual void setCanAcceptNonLocalWrites(bool canAcceptNonLocalWrites);
+
 private:
     AtomicWord<unsigned long long> _snapshotNameGenerator;
     ServiceContext* const _service;
@@ -327,6 +331,7 @@ private:
     bool _alwaysAllowWrites = false;
     bool _resetLastOpTimesCalled = false;
     long long _term = OpTime::kInitialTerm;
+    bool _canAcceptNonLocalWrites = false;
 };
 
 }  // namespace repl

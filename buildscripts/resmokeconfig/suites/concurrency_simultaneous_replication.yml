@@ -6,6 +6,7 @@ selector:
   exclude_files:
   # These workloads implicitly assume that their tid ranges are [0, $config.threadCount). This
   # isn't guaranteed to be true when they are run in parallel with other workloads.
+  - jstests/concurrency/fsm_workloads/findAndModify_inc_pipeline.js
   - jstests/concurrency/fsm_workloads/list_indexes.js
   - jstests/concurrency/fsm_workloads/update_inc_capped.js
   - jstests/concurrency/fsm_workloads/update_inc_pipeline.js
@@ -34,6 +35,9 @@ selector:
   # there is a concurrent dropDatabase waiting for the global X lock.
   # TODO: SERVER-37876
   - jstests/concurrency/fsm_workloads/multi_statement_transaction_all_commands_same_session.js
+
+  # This workload assumes no locks are taken outside of the workload.
+  - jstests/concurrency/fsm_workloads/access_collection_in_transaction_after_catalog_changes.js
   exclude_with_any_tags:
   - requires_sharding
 

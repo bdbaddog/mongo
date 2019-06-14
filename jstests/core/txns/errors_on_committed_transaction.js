@@ -22,7 +22,7 @@
 
     session.startTransaction();
     assert.commandWorked(sessionColl.insert(doc));
-    session.commitTransaction();
+    assert.commandWorked(session.commitTransaction_forTesting());
 
     const txnNumber = NumberLong(session.getTxnNumber_forTesting());
 
@@ -40,8 +40,7 @@
     jsTestLog("Test the error precedence when calling prepare on a committed transaction but not " +
               "providing autocommit to prepareTransaction.");
     assert.commandFailedWithCode(
-        sessionDB.adminCommand({prepareTransaction: 1, txnNumber: txnNumber}),
-        ErrorCodes.IncompleteTransactionHistory);
+        sessionDB.adminCommand({prepareTransaction: 1, txnNumber: txnNumber}), 50768);
 
     jsTestLog("Test the error precedence when calling prepare on a committed transaction and " +
               "providing startTransaction to prepareTransaction.");

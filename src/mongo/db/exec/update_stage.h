@@ -132,8 +132,6 @@ public:
      * Set 'isInternalRequest' to true if the upsert was issued by the replication or
      * sharding systems.
      *
-     * Fills out whether or not this is a fastmodinsert in 'stats'.
-     *
      * Returns the document to insert.
      */
     static BSONObj applyUpdateOpsForInsert(OperationContext* opCtx,
@@ -228,6 +226,9 @@ private:
 
     // True if updated documents should be validated with storage_validation::storageValid().
     bool _enforceOkForStorage;
+
+    // True if the request should be checked for an update to the shard key.
+    bool _shouldCheckForShardKeyUpdate;
 
     // If the update was in-place, we may see it again.  This only matters if we're doing
     // a multi-update; if we're not doing a multi-update we stop after one update and we

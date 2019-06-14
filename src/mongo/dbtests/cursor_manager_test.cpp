@@ -58,9 +58,9 @@ const NamespaceString kTestNss{"test.collection"};
 class CursorManagerTest : public unittest::Test {
 public:
     CursorManagerTest()
-        : _queryServiceContext(stdx::make_unique<QueryTestServiceContext>()),
+        : _queryServiceContext(std::make_unique<QueryTestServiceContext>()),
           _opCtx(_queryServiceContext->makeOperationContext()) {
-        _opCtx->getServiceContext()->setPreciseClockSource(stdx::make_unique<ClockSourceMock>());
+        _opCtx->getServiceContext()->setPreciseClockSource(std::make_unique<ClockSourceMock>());
         _clock =
             static_cast<ClockSourceMock*>(_opCtx->getServiceContext()->getPreciseClockSource());
     }
@@ -71,8 +71,8 @@ public:
 
     std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> makeFakePlanExecutor(
         OperationContext* opCtx) {
-        auto workingSet = stdx::make_unique<WorkingSet>();
-        auto queuedDataStage = stdx::make_unique<QueuedDataStage>(opCtx, workingSet.get());
+        auto workingSet = std::make_unique<WorkingSet>();
+        auto queuedDataStage = std::make_unique<QueuedDataStage>(opCtx, workingSet.get());
         return unittest::assertGet(PlanExecutor::make(opCtx,
                                                       std::move(workingSet),
                                                       std::move(queuedDataStage),
@@ -84,6 +84,7 @@ public:
         return {makeFakePlanExecutor(opCtx),
                 kTestNss,
                 {},
+                opCtx->getWriteConcern(),
                 repl::ReadConcernArgs(repl::ReadConcernLevel::kLocalReadConcern),
                 BSONObj(),
                 ClientCursorParams::LockPolicy::kLocksInternally,
@@ -134,6 +135,7 @@ TEST_F(CursorManagerTest, ShouldBeAbleToKillPinnedCursor) {
         {makeFakePlanExecutor(),
          kTestNss,
          {},
+         {},
          repl::ReadConcernArgs(repl::ReadConcernLevel::kLocalReadConcern),
          BSONObj(),
          ClientCursorParams::LockPolicy::kLocksInternally,
@@ -159,6 +161,7 @@ TEST_F(CursorManagerTest, ShouldBeAbleToKillPinnedCursorMultiClient) {
         pinningOpCtx,
         {makeFakePlanExecutor(),
          kTestNss,
+         {},
          {},
          repl::ReadConcernArgs(repl::ReadConcernLevel::kLocalReadConcern),
          BSONObj(),
@@ -196,6 +199,7 @@ TEST_F(CursorManagerTest, InactiveCursorShouldTimeout) {
                                   {makeFakePlanExecutor(),
                                    NamespaceString{"test.collection"},
                                    {},
+                                   {},
                                    repl::ReadConcernArgs(repl::ReadConcernLevel::kLocalReadConcern),
                                    BSONObj(),
                                    ClientCursorParams::LockPolicy::kLocksInternally,
@@ -210,6 +214,7 @@ TEST_F(CursorManagerTest, InactiveCursorShouldTimeout) {
     cursorManager->registerCursor(_opCtx.get(),
                                   {makeFakePlanExecutor(),
                                    NamespaceString{"test.collection"},
+                                   {},
                                    {},
                                    repl::ReadConcernArgs(repl::ReadConcernLevel::kLocalReadConcern),
                                    BSONObj(),
@@ -230,6 +235,7 @@ TEST_F(CursorManagerTest, InactivePinnedCursorShouldNotTimeout) {
         _opCtx.get(),
         {makeFakePlanExecutor(),
          NamespaceString{"test.collection"},
+         {},
          {},
          repl::ReadConcernArgs(repl::ReadConcernLevel::kLocalReadConcern),
          BSONObj(),
@@ -254,6 +260,7 @@ TEST_F(CursorManagerTest, MarkedAsKilledCursorsShouldBeDeletedOnCursorPin) {
         _opCtx.get(),
         {makeFakePlanExecutor(),
          NamespaceString{"test.collection"},
+         {},
          {},
          repl::ReadConcernArgs(repl::ReadConcernLevel::kLocalReadConcern),
          BSONObj(),
@@ -288,6 +295,7 @@ TEST_F(CursorManagerTest, InactiveKilledCursorsShouldTimeout) {
         {makeFakePlanExecutor(),
          NamespaceString{"test.collection"},
          {},
+         {},
          repl::ReadConcernArgs(repl::ReadConcernLevel::kLocalReadConcern),
          BSONObj(),
          ClientCursorParams::LockPolicy::kLocksInternally,
@@ -320,6 +328,7 @@ TEST_F(CursorManagerTest, UsingACursorShouldUpdateTimeOfLastUse) {
         {makeFakePlanExecutor(),
          kTestNss,
          {},
+         {},
          repl::ReadConcernArgs(repl::ReadConcernLevel::kLocalReadConcern),
          BSONObj(),
          ClientCursorParams::LockPolicy::kLocksInternally,
@@ -332,6 +341,7 @@ TEST_F(CursorManagerTest, UsingACursorShouldUpdateTimeOfLastUse) {
     cursorManager->registerCursor(_opCtx.get(),
                                   {makeFakePlanExecutor(),
                                    kTestNss,
+                                   {},
                                    {},
                                    repl::ReadConcernArgs(repl::ReadConcernLevel::kLocalReadConcern),
                                    BSONObj(),
@@ -369,6 +379,7 @@ TEST_F(CursorManagerTest, CursorShouldNotTimeOutUntilIdleForLongEnoughAfterBeing
         _opCtx.get(),
         {makeFakePlanExecutor(),
          kTestNss,
+         {},
          {},
          repl::ReadConcernArgs(repl::ReadConcernLevel::kLocalReadConcern),
          BSONObj(),

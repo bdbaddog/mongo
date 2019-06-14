@@ -33,7 +33,11 @@
 
 #include "mongo/platform/basic.h"
 
+#include <fmt/format.h>
+
 #include "mongo/db/storage/wiredtiger/wiredtiger_record_store.h"
+
+#include <memory>
 
 #include "mongo/base/checked_cast.h"
 #include "mongo/base/static_assert.h"
@@ -56,7 +60,6 @@
 #include "mongo/db/storage/wiredtiger/wiredtiger_recovery_unit.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_session_cache.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_util.h"
-#include "mongo/stdx/memory.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/concurrency/idle_thread_block.h"
 #include "mongo/util/fail_point.h"
@@ -68,6 +71,7 @@
 
 namespace mongo {
 
+using namespace fmt::literals;
 using std::unique_ptr;
 using std::string;
 
@@ -812,11 +816,10 @@ int64_t WiredTigerRecordStore::storageSize(OperationContext* opCtx,
         return dataSize(opCtx);
     }
     WiredTigerSession* session = WiredTigerRecoveryUnit::get(opCtx)->getSessionNoTxn();
-    StatusWith<int64_t> result =
-        WiredTigerUtil::getStatisticsValueAs<int64_t>(session->getSession(),
-                                                      "statistics:" + getURI(),
-                                                      "statistics=(size)",
-                                                      WT_STAT_DSRC_BLOCK_SIZE);
+    auto result = WiredTigerUtil::getStatisticsValue(session->getSession(),
+                                                     "statistics:" + getURI(),
+                                                     "statistics=(size)",
+                                                     WT_STAT_DSRC_BLOCK_SIZE);
     uassertStatusOK(result.getStatus());
 
     int64_t size = result.getValue();
@@ -1401,8 +1404,37 @@ Status WiredTigerRecordStore::updateRecord(OperationContext* opCtx,
     }
 
     WiredTigerItem value(data, len);
-    c->set_value(c, value.Get());
-    ret = WT_OP_CHECK(c->insert(c));
+
+    // Check if we should modify rather than doing a full update.  Look for deltas for documents
+    // larger than 1KB, up to 16 changes representing up to 10% of the data.
+    const int kMinLengthForDiff = 1024;
+    const int kMaxEntries = 16;
+    const int kMaxDiffBytes = len / 10;
+
+    bool skip_update = false;
+    if (len > kMinLengthForDiff && len <= old_length + kMaxDiffBytes) {
+        int nentries = kMaxEntries;
+        std::vector<WT_MODIFY> entries(nentries);
+
+        if ((ret = wiredtiger_calc_modify(
+                 c->session, &old_value, value.Get(), kMaxDiffBytes, entries.data(), &nentries)) ==
+            0) {
+            invariantWTOK(WT_OP_CHECK(nentries == 0 ? c->reserve(c)
+                                                    : c->modify(c, entries.data(), nentries)));
+            WT_ITEM new_value;
+            dassert(nentries == 0 ||
+                    (c->get_value(c, &new_value) == 0 && new_value.size == value.size &&
+                     memcmp(data, new_value.data, len) == 0));
+            skip_update = true;
+        } else if (ret != WT_NOTFOUND) {
+            invariantWTOK(ret);
+        }
+    }
+
+    if (!skip_update) {
+        c->set_value(c, value.Get());
+        ret = WT_OP_CHECK(c->insert(c));
+    }
     invariantWTOK(ret);
 
     _increaseDataSize(opCtx, len - old_length);
@@ -1778,22 +1810,9 @@ void WiredTigerRecordStore::cappedTruncateAfter(OperationContext* opCtx,
             const bool force = true;
             _kvEngine->setOldestTimestamp(truncTs, force);
         } else {
-            char commitTSConfigString["commit_timestamp="_sd.size() +
-                                      (8 * 2) /* 8 hexadecimal characters */ +
-                                      1 /* trailing null */];
-            auto size = std::snprintf(commitTSConfigString,
-                                      sizeof(commitTSConfigString),
-                                      "commit_timestamp=%llx",
-                                      truncTs.asULL());
-            if (size < 0) {
-                int e = errno;
-                error() << "error snprintf " << errnoWithDescription(e);
-                fassertFailedNoTrace(40662);
-            }
-
-            invariant(static_cast<std::size_t>(size) < sizeof(commitTSConfigString));
             auto conn = WiredTigerRecoveryUnit::get(opCtx)->getSessionCache()->conn();
-            invariantWTOK(conn->set_timestamp(conn, commitTSConfigString));
+            auto commitTSConfigString = "commit_timestamp={:x}"_format(truncTs.asULL());
+            invariantWTOK(conn->set_timestamp(conn, commitTSConfigString.c_str()));
         }
 
         _kvEngine->getOplogManager()->setOplogReadTimestamp(truncTs);
@@ -2033,12 +2052,12 @@ std::unique_ptr<SeekableRecordCursor> StandardWiredTigerRecordStore::getCursor(
         wru->setIsOplogReader();
     }
 
-    return stdx::make_unique<WiredTigerRecordStoreStandardCursor>(opCtx, *this, forward);
+    return std::make_unique<WiredTigerRecordStoreStandardCursor>(opCtx, *this, forward);
 }
 
 std::unique_ptr<RecordCursor> StandardWiredTigerRecordStore::getRandomCursorWithOptions(
     OperationContext* opCtx, StringData extraConfig) const {
-    return stdx::make_unique<RandomCursor>(opCtx, *this, extraConfig);
+    return std::make_unique<RandomCursor>(opCtx, *this, extraConfig);
 }
 
 WiredTigerRecordStoreStandardCursor::WiredTigerRecordStoreStandardCursor(
@@ -2084,7 +2103,7 @@ std::unique_ptr<SeekableRecordCursor> PrefixedWiredTigerRecordStore::getCursor(
         wru->setIsOplogReader();
     }
 
-    return stdx::make_unique<WiredTigerRecordStorePrefixedCursor>(opCtx, *this, _prefix, forward);
+    return std::make_unique<WiredTigerRecordStorePrefixedCursor>(opCtx, *this, _prefix, forward);
 }
 
 std::unique_ptr<RecordCursor> PrefixedWiredTigerRecordStore::getRandomCursorWithOptions(

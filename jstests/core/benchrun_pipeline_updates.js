@@ -18,7 +18,7 @@
               ns: coll.getFullName(),
               query: {_id: 0},
               writeCmd: true,
-              update: [{$addFields: {x: {$add: ["$x", 1]}}}]
+              update: [{$set: {x: {$add: ["$x", 1]}}}]
             },
         ],
         parallel: 2,
@@ -32,7 +32,7 @@
     }
     let res = benchRun(benchArgs);
     assert.eq(res.errCount, 0);
-    assert.gt(
+    assert.gte(
         coll.findOne({_id: 0}).x, 2, "Expected at least one update to succeed and increment 'x'");
 
     // Now test that the pipeline is still subject to benchRun's keyword replacement.

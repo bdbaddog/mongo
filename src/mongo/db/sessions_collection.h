@@ -29,13 +29,12 @@
 
 #pragma once
 
+#include <functional>
+
 #include "mongo/db/logical_session_id.h"
-#include "mongo/stdx/functional.h"
 
 namespace mongo {
 
-class BSONArrayBuilder;
-class BSONObjBuilder;
 class DBClientBase;
 class OperationContext;
 
@@ -46,7 +45,6 @@ class OperationContext;
  * implement their own classes that fulfill this interface.
  */
 class SessionsCollection {
-
 public:
     static constexpr StringData kSessionsTTLIndex = "lsidTTLIndex"_sd;
 
@@ -98,14 +96,16 @@ public:
     static BSONObj generateCollModCmd();
 
 protected:
+    SessionsCollection();
+
     /**
      * Makes a send function for the given client.
      */
-    using SendBatchFn = stdx::function<Status(BSONObj batch)>;
+    using SendBatchFn = std::function<Status(BSONObj batch)>;
     static SendBatchFn makeSendFnForCommand(const NamespaceString& ns, DBClientBase* client);
     static SendBatchFn makeSendFnForBatchWrite(const NamespaceString& ns, DBClientBase* client);
 
-    using FindBatchFn = stdx::function<StatusWith<BSONObj>(BSONObj batch)>;
+    using FindBatchFn = std::function<StatusWith<BSONObj>(BSONObj batch)>;
     static FindBatchFn makeFindFnForCommand(const NamespaceString& ns, DBClientBase* client);
 
     /**

@@ -58,7 +58,6 @@
 #include "mongo/db/stats/counters.h"
 #include "mongo/db/stats/top.h"
 #include "mongo/s/chunk_version.h"
-#include "mongo/stdx/memory.h"
 #include "mongo/util/fail_point_service.h"
 #include "mongo/util/log.h"
 #include "mongo/util/scopeguard.h"
@@ -166,6 +165,45 @@ void applyCursorReadConcern(OperationContext* opCtx, repl::ReadConcernArgs rcArg
         stdx::lock_guard<Client> lk(*opCtx->getClient());
         repl::ReadConcernArgs::get(opCtx) = rcArgs;
     }
+}
+
+/**
+ * Sets a deadline on the operation if the originating command had a maxTimeMS specified or if this
+ * is a tailable, awaitData cursor.
+ */
+void setUpOperationDeadline(OperationContext* opCtx,
+                            const ClientCursor& cursor,
+                            const GetMoreRequest& request,
+                            bool disableAwaitDataFailpointActive) {
+
+    // We assume that cursors created through a DBDirectClient are always used from their
+    // original OperationContext, so we do not need to move time to and from the cursor.
+    if (!opCtx->getClient()->isInDirectClient()) {
+        // There is no time limit set directly on this getMore command. If the cursor is
+        // awaitData, then we supply a default time of one second. Otherwise we roll over
+        // any leftover time from the maxTimeMS of the operation that spawned this cursor,
+        // applying it to this getMore.
+        if (cursor.isAwaitData() && !disableAwaitDataFailpointActive) {
+            awaitDataState(opCtx).waitForInsertsDeadline =
+                opCtx->getServiceContext()->getPreciseClockSource()->now() +
+                request.awaitDataTimeout.value_or(Seconds{1});
+        } else if (cursor.getLeftoverMaxTimeMicros() < Microseconds::max()) {
+            opCtx->setDeadlineAfterNowBy(cursor.getLeftoverMaxTimeMicros(),
+                                         ErrorCodes::MaxTimeMSExpired);
+        }
+    }
+}
+/**
+ * Sets up the OperationContext in order to correctly inherit options like the read concern from the
+ * cursor to this operation.
+ */
+void setUpOperationContextStateForGetMore(OperationContext* opCtx,
+                                          const ClientCursor& cursor,
+                                          const GetMoreRequest& request,
+                                          bool disableAwaitDataFailpointActive) {
+    applyCursorReadConcern(opCtx, cursor.getReadConcernArgs());
+    opCtx->setWriteConcern(cursor.getWriteConcernOptions());
+    setUpOperationDeadline(opCtx, cursor, request, disableAwaitDataFailpointActive);
 }
 
 /**
@@ -335,8 +373,10 @@ public:
                         RecoveryUnit::ReadSource::kProvided, clusterTime);
 
                     // The $_internalReadAtClusterTime option also causes any storage-layer cursors
-                    // created during plan execution to block on prepared transactions.
-                    opCtx->recoveryUnit()->setIgnorePrepared(false);
+                    // created during plan execution to block on prepared transactions. Since the
+                    // getMore command ignores prepare conflicts by default, change the behavior.
+                    opCtx->recoveryUnit()->setPrepareConflictBehavior(
+                        PrepareConflictBehavior::kEnforce);
                 }
             }
             if (cursorPin->lockPolicy() == ClientCursorParams::LockPolicy::kLocksInternally) {
@@ -383,15 +423,6 @@ public:
                 uassertStatusOK(repl::ReplicationCoordinator::get(opCtx)->checkCanServeReadsFor(
                     opCtx, _request.nss, true));
             }
-
-            // Only used by the failpoints.
-            stdx::function<void()> dropAndReacquireReadLock = [&readLock, opCtx, this]() {
-                // Make sure an interrupted operation does not prevent us from reacquiring the lock.
-                UninterruptibleLockGuard noInterrupt(opCtx->lockState());
-
-                readLock.reset();
-                readLock.emplace(opCtx, _request.nss);
-            };
 
             // A user can only call getMore on their own cursor. If there were multiple users
             // authenticated when the cursor was created, then at least one of them must be
@@ -445,6 +476,12 @@ public:
             // repeatedly release and re-acquire the collection readLock at regular intervals until
             // the failpoint is released. This is done in order to avoid deadlocks caused by the
             // pinned-cursor failpoints in this file (see SERVER-21997).
+            std::function<void()> dropAndReacquireReadLock = [&readLock, opCtx, this]() {
+                // Make sure an interrupted operation does not prevent us from reacquiring the lock.
+                UninterruptibleLockGuard noInterrupt(opCtx->lockState());
+                readLock.reset();
+                readLock.emplace(opCtx, _request.nss);
+            };
             if (MONGO_FAIL_POINT(waitAfterPinningCursorBeforeGetMoreBatch)) {
                 CurOpFailpointHelpers::waitWhileFailPointEnabled(
                     &waitAfterPinningCursorBeforeGetMoreBatch,
@@ -455,28 +492,13 @@ public:
                     _request.nss);
             }
 
-            // We must respect the read concern from the cursor.
-            applyCursorReadConcern(opCtx, cursorPin->getReadConcernArgs());
-
             const bool disableAwaitDataFailpointActive =
                 MONGO_FAIL_POINT(disableAwaitDataForGetMoreCmd);
 
-            // We assume that cursors created through a DBDirectClient are always used from their
-            // original OperationContext, so we do not need to move time to and from the cursor.
-            if (!opCtx->getClient()->isInDirectClient()) {
-                // There is no time limit set directly on this getMore command. If the cursor is
-                // awaitData, then we supply a default time of one second. Otherwise we roll over
-                // any leftover time from the maxTimeMS of the operation that spawned this cursor,
-                // applying it to this getMore.
-                if (cursorPin->isAwaitData() && !disableAwaitDataFailpointActive) {
-                    awaitDataState(opCtx).waitForInsertsDeadline =
-                        opCtx->getServiceContext()->getPreciseClockSource()->now() +
-                        _request.awaitDataTimeout.value_or(Seconds{1});
-                } else if (cursorPin->getLeftoverMaxTimeMicros() < Microseconds::max()) {
-                    opCtx->setDeadlineAfterNowBy(cursorPin->getLeftoverMaxTimeMicros(),
-                                                 ErrorCodes::MaxTimeMSExpired);
-                }
-            }
+            // Inherit properties like readConcern and maxTimeMS from our originating cursor.
+            setUpOperationContextStateForGetMore(
+                opCtx, *cursorPin.getCursor(), _request, disableAwaitDataFailpointActive);
+
             if (!cursorPin->isAwaitData()) {
                 opCtx->checkForInterrupt();  // May trigger maxTimeAlwaysTimeOut fail point.
             }
@@ -532,14 +554,21 @@ public:
             // the 'waitWithPinnedCursorDuringGetMoreBatch' failpoint is active, set the 'msg' field
             // of this operation's CurOp to signal that we've hit this point and then spin until the
             // failpoint is released.
+            std::function<void()> saveAndRestoreStateWithReadLockReacquisition =
+                [exec, dropAndReacquireReadLock]() {
+                    exec->saveState();
+                    dropAndReacquireReadLock();
+                    exec->restoreState();
+                };
             MONGO_FAIL_POINT_BLOCK(waitWithPinnedCursorDuringGetMoreBatch, options) {
                 const BSONObj& data = options.getData();
                 CurOpFailpointHelpers::waitWhileFailPointEnabled(
                     &waitWithPinnedCursorDuringGetMoreBatch,
                     opCtx,
                     "waitWithPinnedCursorDuringGetMoreBatch",
-                    data["shouldNotdropLock"].booleanSafe() ? []() {} /*empty function*/
-                                                            : dropAndReacquireReadLock,
+                    data["shouldNotdropLock"].booleanSafe()
+                        ? []() {} /*empty function*/
+                        : saveAndRestoreStateWithReadLockReacquisition,
                     false,
                     _request.nss);
             }

@@ -30,9 +30,11 @@ usage(void)
 	fprintf(stderr,
 	    "global options:\n"
 	    "\t" "-C\t" "wiredtiger_open configuration\n"
+	    "\t" "-E\t" "secret encryption key\n"
 	    "\t" "-h\t" "database directory\n"
 	    "\t" "-L\t" "turn logging off for debug-mode\n"
-	    "\t" "-R\t" "run recovery if configured\n"
+	    "\t" "-R\t" "run recovery (if recovery configured)\n"
+	    "\t" "-S\t" "run salvage recovery (if recovery configured)\n"
 	    "\t" "-V\t" "display library version and exit\n"
 	    "\t" "-v\t" "verbose\n");
 	fprintf(stderr,
@@ -45,6 +47,10 @@ usage(void)
 	    "\t" "downgrade downgrade a database\n"
 	    "\t" "drop\t  drop an object\n"
 	    "\t" "dump\t  dump an object\n"
+	    /*
+	     * Import is not documented.
+	     * "\t" "import\t  import an object\n"
+	     */
 	    "\t" "list\t  list database objects\n"
 	    "\t" "load\t  load an object\n"
 	    "\t" "loadtext  load an object from a text file\n"
@@ -190,6 +196,10 @@ main(int argc, char *argv[])
 			func = util_drop;
 		else if (strcmp(command, "dump") == 0)
 			func = util_dump;
+		break;
+	case 'i':
+		if (strcmp(command, "import") == 0)
+			func = util_import;
 		break;
 	case 'l':
 		if (strcmp(command, "list") == 0)

@@ -64,7 +64,7 @@
 namespace mongo {
 namespace {
 
-MONGO_FAIL_POINT_DEFINE(writeConfilctInRenameCollCopyToTmp);
+MONGO_FAIL_POINT_DEFINE(writeConflictInRenameCollCopyToTmp);
 
 boost::optional<NamespaceString> getNamespaceFromUUID(OperationContext* opCtx, const UUID& uuid) {
     return CollectionCatalog::get(opCtx).lookupNSSByUUID(uuid);
@@ -337,8 +337,12 @@ Status renameCollectionWithinDB(OperationContext* opCtx,
     Lock::DBLock dbWriteLock(opCtx, source.db(), MODE_IX);
     boost::optional<Lock::CollectionLock> sourceLock;
     boost::optional<Lock::CollectionLock> targetLock;
-    if (ResourceId(RESOURCE_COLLECTION, source.ns()) <
-        ResourceId(RESOURCE_COLLECTION, target.ns())) {
+    // To prevent deadlock, always lock system.views collection in the end because concurrent
+    // view-related operations always lock system.views in the end.
+    if (!source.isSystemDotViews() && (target.isSystemDotViews() ||
+                                       ResourceId(RESOURCE_COLLECTION, source.ns()) <
+                                           ResourceId(RESOURCE_COLLECTION, target.ns()))) {
+        // To prevent deadlock, always lock source and target in ascending resourceId order.
         sourceLock.emplace(opCtx, source, MODE_X);
         targetLock.emplace(opCtx, target, MODE_X);
     } else {
@@ -395,7 +399,26 @@ Status renameCollectionWithinDBForApplyOps(OperationContext* opCtx,
 
     if (targetColl) {
         if (sourceColl->uuid() == targetColl->uuid()) {
-            return Status::OK();
+            if (!uuidToDrop || uuidToDrop == targetColl->uuid()) {
+                return Status::OK();
+            }
+
+            // During initial sync, it is possible that the collection already
+            // got renamed to the target, so there is not much left to do other
+            // than drop the dropTarget. See SERVER-40861 for more details.
+            return writeConflictRetry(opCtx, "renameCollection", target.ns(), [&] {
+                WriteUnitOfWork wunit(opCtx);
+                auto collToDropBasedOnUUID = getNamespaceFromUUID(opCtx, *uuidToDrop);
+                if (!collToDropBasedOnUUID)
+                    return Status::OK();
+                repl::UnreplicatedWritesBlock uwb(opCtx);
+                Status status =
+                    db->dropCollection(opCtx, *collToDropBasedOnUUID, renameOpTimeFromApplyOps);
+                if (!status.isOK())
+                    return status;
+                wunit.commit();
+                return Status::OK();
+            });
         }
         if (uuidToDrop && uuidToDrop != targetColl->uuid()) {
             // We need to rename the targetColl to a temporary name.
@@ -646,9 +669,7 @@ Status renameBetweenDBs(OperationContext* opCtx,
 
         if (opCtx->getServiceContext()->getStorageEngine()->supportsDBLocking()) {
             if (globalWriteLock) {
-                const ResourceId globalLockResourceId(RESOURCE_GLOBAL,
-                                                      ResourceId::SINGLETON_GLOBAL);
-                opCtx->lockState()->downgrade(globalLockResourceId, MODE_IX);
+                opCtx->lockState()->downgrade(resourceIdGlobal, MODE_IX);
                 invariant(!opCtx->lockState()->isW());
             } else {
                 invariant(opCtx->lockState()->isW());
@@ -683,7 +704,7 @@ Status renameBetweenDBs(OperationContext* opCtx,
                         opCtx, "retryRestoreCursor", ns, [&cursor] { cursor->restore(); });
                 });
                 // Used to make sure that a WCE can be handled by this logic without data loss.
-                if (MONGO_FAIL_POINT(writeConfilctInRenameCollCopyToTmp)) {
+                if (MONGO_FAIL_POINT(writeConflictInRenameCollCopyToTmp)) {
                     throw WriteConflictException();
                 }
                 wunit.commit();
@@ -828,9 +849,12 @@ Status renameCollectionForApplyOps(OperationContext* opCtx,
     log() << "renameCollectionForApplyOps: rename " << sourceNss << " (" << uuidString << ") to "
           << targetNss << dropTargetMsg;
 
-    invariant(sourceNss.db() == targetNss.db());
-    return renameCollectionWithinDBForApplyOps(
-        opCtx, sourceNss, targetNss, uuidToDrop, renameOpTime, options);
+    if (sourceNss.db() == targetNss.db()) {
+        return renameCollectionWithinDBForApplyOps(
+            opCtx, sourceNss, targetNss, uuidToDrop, renameOpTime, options);
+    } else {
+        return renameBetweenDBs(opCtx, sourceNss, targetNss, options);
+    }
 }
 
 Status renameCollectionForRollback(OperationContext* opCtx,

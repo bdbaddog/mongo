@@ -30,6 +30,7 @@
 #pragma once
 
 #include <boost/optional.hpp>
+#include <functional>
 #include <string>
 
 #include "mongo/base/owned_pointer_vector.h"
@@ -39,7 +40,6 @@
 #include "mongo/db/record_id.h"
 #include "mongo/db/storage/kv/kv_prefix.h"
 #include "mongo/platform/atomic_word.h"
-#include "mongo/stdx/functional.h"
 #include "mongo/stdx/mutex.h"
 #include "mongo/util/debug_util.h"
 
@@ -47,7 +47,6 @@ namespace mongo {
 class CollatorInterface;
 class CollectionCatalogEntry;
 class CollectionInfoCache;
-class HeadManager;
 class IndexAccessMethod;
 class IndexBuildInterceptor;
 class IndexDescriptor;
@@ -90,13 +89,7 @@ public:
 
     /// ---------------------
 
-    virtual const RecordId& head(OperationContext* const opCtx) const = 0;
-
-    virtual void setHead(OperationContext* const opCtx, const RecordId newHead) = 0;
-
     virtual void setIsReady(const bool newIsReady) = 0;
-
-    virtual HeadManager* headManager() const = 0;
 
     // --
 

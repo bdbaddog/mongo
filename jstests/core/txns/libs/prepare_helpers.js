@@ -40,9 +40,10 @@ const PrepareHelpers = (function() {
 
         // End the transaction on the shell session.
         if (res.ok) {
-            session.commitTransaction_forTesting();
+            assert.commandWorked(session.commitTransaction_forTesting());
         } else {
-            session.abortTransaction_forTesting();
+            assert.commandWorkedOrFailedWithCode(session.abortTransaction_forTesting(),
+                                                 ErrorCodes.NoSuchTransaction);
         }
         return res;
     }
@@ -132,13 +133,31 @@ const PrepareHelpers = (function() {
         assert.soon(() => {
             const ts = assert.commandWorked(primary.adminCommand({replSetGetStatus: 1}))
                            .optimes.lastCommittedOpTime.ts;
-            if (ts >= timestamp) {
+            if (timestampCmp(ts, timestamp) >= 0) {
+                print(`Finished awaiting lastCommittedOpTime.ts, now at ${ts}`);
                 return true;
             } else {
                 print(`Awaiting lastCommittedOpTime.ts, now at ${ts}`);
                 return false;
             }
         }, "Timeout waiting for majority commit point", ReplSetTest.kDefaultTimeoutMS, 1000);
+    }
+
+    function findPrepareEntry(oplogColl) {
+        return oplogColl.findOne({op: "c", "o.prepare": true});
+    }
+
+    /**
+     * Retrieves the oldest required timestamp from the serverStatus output.
+     *
+     * @return {Timestamp} oldest required timestamp for crash recovery.
+     */
+    function getOldestRequiredTimestampForCrashRecovery(database) {
+        const res = database.serverStatus().storageEngine;
+        const ts = res.oldestRequiredTimestampForCrashRecovery;
+        assert(ts instanceof Timestamp,
+               'oldestRequiredTimestampForCrashRecovery was not a Timestamp: ' + tojson(res));
+        return ts;
     }
 
     return {
@@ -150,6 +169,8 @@ const PrepareHelpers = (function() {
         replSetStartSetOptions: {oplogSize: oplogSizeMB},
         growOplogPastMaxSize: growOplogPastMaxSize,
         awaitOplogTruncation: awaitOplogTruncation,
-        awaitMajorityCommitted: awaitMajorityCommitted
+        awaitMajorityCommitted: awaitMajorityCommitted,
+        findPrepareEntry: findPrepareEntry,
+        getOldestRequiredTimestampForCrashRecovery: getOldestRequiredTimestampForCrashRecovery,
     };
 })();

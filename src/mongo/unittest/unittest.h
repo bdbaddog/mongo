@@ -37,6 +37,7 @@
 
 #include <boost/preprocessor/cat.hpp>
 #include <cmath>
+#include <functional>
 #include <sstream>
 #include <string>
 #include <type_traits>
@@ -46,7 +47,6 @@
 #include "mongo/base/status_with.h"
 #include "mongo/logger/logstream_builder.h"
 #include "mongo/logger/message_log_domain.h"
-#include "mongo/stdx/functional.h"
 #include "mongo/unittest/bson_test_util.h"
 #include "mongo/unittest/unittest_helpers.h"
 #include "mongo/util/assert_util.h"
@@ -243,6 +243,18 @@
         }                                                                                       \
     } while (false)
 
+#define ASSERT_STRING_OMITS(BIG_STRING, OMITS)                                                  \
+    do {                                                                                        \
+        std::string myString(BIG_STRING);                                                       \
+        std::string myOmits(OMITS);                                                             \
+        if (myString.find(myOmits) != std::string::npos) {                                      \
+            ::mongo::str::stream err;                                                           \
+            err << "Did not expect to find " #OMITS " (" << myOmits << ") in " #BIG_STRING " (" \
+                << myString << ")";                                                             \
+            ::mongo::unittest::TestAssertionFailure(__FILE__, __LINE__, err).stream();          \
+        }                                                                                       \
+    } while (false)
+
 /**
  * Construct a single test, named "TEST_NAME" within the test case "CASE_NAME".
  *
@@ -252,16 +264,18 @@
  *     ASSERT_EQUALS(error_success, foo(invalidValue));
  * }
  */
-#define TEST(CASE_NAME, TEST_NAME)                                                          \
-    class _TEST_TYPE_NAME(CASE_NAME, TEST_NAME) : public ::mongo::unittest::Test {          \
-    private:                                                                                \
-        virtual void _doTest();                                                             \
-                                                                                            \
-        static const RegistrationAgent<_TEST_TYPE_NAME(CASE_NAME, TEST_NAME)> _agent;       \
-    };                                                                                      \
-    const ::mongo::unittest::Test::RegistrationAgent<_TEST_TYPE_NAME(CASE_NAME, TEST_NAME)> \
-        _TEST_TYPE_NAME(CASE_NAME, TEST_NAME)::_agent(#CASE_NAME, #TEST_NAME);              \
-    void _TEST_TYPE_NAME(CASE_NAME, TEST_NAME)::_doTest()
+#define TEST(CASE_NAME, TEST_NAME)                                                                 \
+    class UNIT_TEST_DETAIL_TEST_TYPE_NAME(CASE_NAME, TEST_NAME) : public ::mongo::unittest::Test { \
+    private:                                                                                       \
+        virtual void _doTest();                                                                    \
+                                                                                                   \
+        static const RegistrationAgent<UNIT_TEST_DETAIL_TEST_TYPE_NAME(CASE_NAME, TEST_NAME)>      \
+            _agent;                                                                                \
+    };                                                                                             \
+    const ::mongo::unittest::Test::RegistrationAgent<UNIT_TEST_DETAIL_TEST_TYPE_NAME(CASE_NAME,    \
+                                                                                     TEST_NAME)>   \
+        UNIT_TEST_DETAIL_TEST_TYPE_NAME(CASE_NAME, TEST_NAME)::_agent(#CASE_NAME, #TEST_NAME);     \
+    void UNIT_TEST_DETAIL_TEST_TYPE_NAME(CASE_NAME, TEST_NAME)::_doTest()
 
 /**
  * Construct a single test named TEST_NAME that has access to a common class (a "fixture")
@@ -279,22 +293,26 @@
  *     ASSERT_EQUALS(10, myVar);
  * }
  */
-#define TEST_F(FIXTURE_NAME, TEST_NAME)                                                        \
-    class _TEST_TYPE_NAME(FIXTURE_NAME, TEST_NAME) : public FIXTURE_NAME {                     \
-    private:                                                                                   \
-        virtual void _doTest();                                                                \
-                                                                                               \
-        static const RegistrationAgent<_TEST_TYPE_NAME(FIXTURE_NAME, TEST_NAME)> _agent;       \
-    };                                                                                         \
-    const ::mongo::unittest::Test::RegistrationAgent<_TEST_TYPE_NAME(FIXTURE_NAME, TEST_NAME)> \
-        _TEST_TYPE_NAME(FIXTURE_NAME, TEST_NAME)::_agent(#FIXTURE_NAME, #TEST_NAME);           \
-    void _TEST_TYPE_NAME(FIXTURE_NAME, TEST_NAME)::_doTest()
+#define TEST_F(FIXTURE_NAME, TEST_NAME)                                                            \
+    class UNIT_TEST_DETAIL_TEST_TYPE_NAME(FIXTURE_NAME, TEST_NAME) : public FIXTURE_NAME {         \
+    private:                                                                                       \
+        virtual void _doTest();                                                                    \
+                                                                                                   \
+        static const RegistrationAgent<UNIT_TEST_DETAIL_TEST_TYPE_NAME(FIXTURE_NAME, TEST_NAME)>   \
+            _agent;                                                                                \
+    };                                                                                             \
+    const ::mongo::unittest::Test::RegistrationAgent<UNIT_TEST_DETAIL_TEST_TYPE_NAME(FIXTURE_NAME, \
+                                                                                     TEST_NAME)>   \
+        UNIT_TEST_DETAIL_TEST_TYPE_NAME(FIXTURE_NAME, TEST_NAME)::_agent(#FIXTURE_NAME,            \
+                                                                         #TEST_NAME);              \
+    void UNIT_TEST_DETAIL_TEST_TYPE_NAME(FIXTURE_NAME, TEST_NAME)::_doTest()
 
 /**
  * Macro to construct a type name for a test, from its "CASE_NAME" and "TEST_NAME".
  * Do not use directly in test code.
  */
-#define _TEST_TYPE_NAME(CASE_NAME, TEST_NAME) UnitTest__##CASE_NAME##__##TEST_NAME
+#define UNIT_TEST_DETAIL_TEST_TYPE_NAME(CASE_NAME, TEST_NAME) \
+    UnitTest_CaseName##CASE_NAME##TestName##TEST_NAME
 
 namespace mongo {
 namespace unittest {
@@ -313,7 +331,7 @@ mongo::logger::LogstreamBuilder warning();
 /**
  * Type representing the function composing a test.
  */
-typedef stdx::function<void(void)> TestFunction;
+typedef std::function<void(void)> TestFunction;
 
 /**
  * Container holding a test function and its name.  Suites

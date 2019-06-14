@@ -63,8 +63,8 @@ LogicalSessionCacheImpl::LogicalSessionCacheImpl(std::unique_ptr<ServiceLiaison>
     : _service(std::move(service)),
       _sessionsColl(std::move(collection)),
       _reapSessionsOlderThanFn(std::move(reapSessionsOlderThanFn)) {
-    _stats.setLastSessionsCollectionJobTimestamp(now());
-    _stats.setLastTransactionReaperJobTimestamp(now());
+    _stats.setLastSessionsCollectionJobTimestamp(_service->now());
+    _stats.setLastTransactionReaperJobTimestamp(_service->now());
 
     if (!disableLogicalSessionCacheRefresh) {
         _service->scheduleJob({"LogicalSessionCacheRefresh",
@@ -85,61 +85,21 @@ void LogicalSessionCacheImpl::joinOnShutDown() {
     _service->join();
 }
 
-Status LogicalSessionCacheImpl::promote(LogicalSessionId lsid) {
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
-    auto it = _activeSessions.find(lsid);
-    if (it == _activeSessions.end()) {
-        return {ErrorCodes::NoSuchSession, "no matching session record found in the cache"};
-    }
-
-    return Status::OK();
-}
-
-Status LogicalSessionCacheImpl::startSession(OperationContext* opCtx, LogicalSessionRecord record) {
-    // Add the new record to our local cache. We will insert it into the sessions collection
-    // the next time _refresh is called. If there is already a record in the cache for this
-    // session, we'll just write over it with our newer, more recent one.
-    return _addToCache(record);
-}
-
-Status LogicalSessionCacheImpl::refreshSessions(OperationContext* opCtx,
-                                                const RefreshSessionsCmdFromClient& cmd) {
-    // Update the timestamps of all these records in our cache.
-    auto sessions = makeLogicalSessionIds(cmd.getRefreshSessions(), opCtx);
-    for (const auto& lsid : sessions) {
-        if (!promote(lsid).isOK()) {
-            // This is a new record, insert it.
-            auto addToCacheStatus = _addToCache(makeLogicalSessionRecord(opCtx, lsid, now()));
-            if (!addToCacheStatus.isOK()) {
-                return addToCacheStatus;
-            }
-        }
-    }
-
-    return Status::OK();
-}
-
-Status LogicalSessionCacheImpl::refreshSessions(OperationContext* opCtx,
-                                                const RefreshSessionsCmdFromClusterMember& cmd) {
-    // Update the timestamps of all these records in our cache.
-    auto records = cmd.getRefreshSessionsInternal();
-    for (const auto& record : records) {
-        if (!promote(record.getId()).isOK()) {
-            // This is a new record, insert it.
-            auto addToCacheStatus = _addToCache(record);
-            if (!addToCacheStatus.isOK()) {
-                return addToCacheStatus;
-            }
-        }
-    }
-
-    return Status::OK();
+Status LogicalSessionCacheImpl::startSession(OperationContext* opCtx,
+                                             const LogicalSessionRecord& record) {
+    stdx::lock_guard lg(_mutex);
+    return _addToCache(lg, record);
 }
 
 Status LogicalSessionCacheImpl::vivify(OperationContext* opCtx, const LogicalSessionId& lsid) {
-    if (!promote(lsid).isOK()) {
-        return startSession(opCtx, makeLogicalSessionRecord(opCtx, lsid, now()));
-    }
+    stdx::lock_guard lg(_mutex);
+    auto it = _activeSessions.find(lsid);
+    if (it == _activeSessions.end())
+        return _addToCache(lg, makeLogicalSessionRecord(opCtx, lsid, _service->now()));
+
+    auto& cacheEntry = it->second;
+    cacheEntry.setLastUse(_service->now());
+
     return Status::OK();
 }
 
@@ -154,10 +114,6 @@ Status LogicalSessionCacheImpl::refreshNow(Client* client) {
 
 Status LogicalSessionCacheImpl::reapNow(Client* client) {
     return _reap(client);
-}
-
-Date_t LogicalSessionCacheImpl::now() {
-    return _service->now();
 }
 
 size_t LogicalSessionCacheImpl::size() {
@@ -192,7 +148,7 @@ Status LogicalSessionCacheImpl::_reap(Client* client) {
         _stats.setLastTransactionReaperJobEntriesCleanedUp(0);
 
         // Start the new run.
-        _stats.setLastTransactionReaperJobTimestamp(now());
+        _stats.setLastTransactionReaperJobTimestamp(_service->now());
         _stats.setTransactionReaperJobCount(_stats.getTransactionReaperJobCount() + 1);
     }
 
@@ -226,15 +182,14 @@ Status LogicalSessionCacheImpl::_reap(Client* client) {
             return Status::OK();
         }
 
-        numReaped =
-            _reapSessionsOlderThanFn(opCtx,
-                                     *_sessionsColl,
-                                     opCtx->getServiceContext()->getFastClockSource()->now() -
-                                         Minutes(gTransactionRecordMinimumLifetimeMinutes));
+        numReaped = _reapSessionsOlderThanFn(opCtx,
+                                             *_sessionsColl,
+                                             _service->now() -
+                                                 Minutes(gTransactionRecordMinimumLifetimeMinutes));
     } catch (const DBException& ex) {
         {
             stdx::lock_guard<stdx::mutex> lk(_mutex);
-            auto millis = now() - _stats.getLastTransactionReaperJobTimestamp();
+            auto millis = _service->now() - _stats.getLastTransactionReaperJobTimestamp();
             _stats.setLastTransactionReaperJobDurationMillis(millis.count());
         }
 
@@ -243,7 +198,7 @@ Status LogicalSessionCacheImpl::_reap(Client* client) {
 
     {
         stdx::lock_guard<stdx::mutex> lk(_mutex);
-        auto millis = now() - _stats.getLastTransactionReaperJobTimestamp();
+        auto millis = _service->now() - _stats.getLastTransactionReaperJobTimestamp();
         _stats.setLastTransactionReaperJobDurationMillis(millis.count());
         _stats.setLastTransactionReaperJobEntriesCleanedUp(numReaped);
     }
@@ -263,14 +218,14 @@ void LogicalSessionCacheImpl::_refresh(Client* client) {
         _stats.setLastSessionsCollectionJobCursorsClosed(0);
 
         // Start the new run.
-        _stats.setLastSessionsCollectionJobTimestamp(now());
+        _stats.setLastSessionsCollectionJobTimestamp(_service->now());
         _stats.setSessionsCollectionJobCount(_stats.getSessionsCollectionJobCount() + 1);
     }
 
     // This will finish timing _refresh for our stats no matter when we return.
     const auto timeRefreshJob = makeGuard([this] {
         stdx::lock_guard<stdx::mutex> lk(_mutex);
-        auto millis = now() - _stats.getLastSessionsCollectionJobTimestamp();
+        auto millis = _service->now() - _stats.getLastSessionsCollectionJobTimestamp();
         _stats.setLastSessionsCollectionJobDurationMillis(millis.count());
     });
 
@@ -336,7 +291,7 @@ void LogicalSessionCacheImpl::_refresh(Client* client) {
         if (explicitlyEndingSessions.count(it) > 0) {
             continue;
         }
-        activeSessionRecords.insert(makeLogicalSessionRecord(it, now()));
+        activeSessionRecords.insert(makeLogicalSessionRecord(it, _service->now()));
     }
     for (const auto& it : activeSessions) {
         activeSessionRecords.insert(it.second);
@@ -413,13 +368,15 @@ LogicalSessionCacheStats LogicalSessionCacheImpl::getStats() {
     return _stats;
 }
 
-Status LogicalSessionCacheImpl::_addToCache(LogicalSessionRecord record) {
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
-    if (_activeSessions.size() >= static_cast<size_t>(maxSessions)) {
-        return {ErrorCodes::TooManyLogicalSessions, "cannot add session into the cache"};
+Status LogicalSessionCacheImpl::_addToCache(WithLock, LogicalSessionRecord record) {
+    if (_activeSessions.size() >= size_t(maxSessions)) {
+        return {ErrorCodes::TooManyLogicalSessions,
+                "Unable to add session into the cache because the number of active sessions is too "
+                "high"};
     }
 
-    _activeSessions.insert(std::make_pair(record.getId(), record));
+    _activeSessions.insert(std::make_pair(record.getId(), std::move(record)));
+
     return Status::OK();
 }
 

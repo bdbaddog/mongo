@@ -152,6 +152,28 @@ TEST_F(DocumentSourceFacetTest, ShouldRejectFacetsContainingAnOutStage) {
                   AssertionException);
 }
 
+TEST_F(DocumentSourceFacetTest, ShouldRejectFacetsContainingAMergeStage) {
+    auto ctx = getExpCtx();
+    auto spec =
+        BSON("$facet" << BSON("a" << BSON_ARRAY(BSON("$merge" << BSON("into"
+                                                                      << "merge_collection")))));
+    ASSERT_THROWS(DocumentSourceFacet::createFromBson(spec.firstElement(), ctx),
+                  AssertionException);
+
+    spec =
+        BSON("$facet" << BSON("a" << BSON_ARRAY(BSON("$skip" << 1)
+                                                << BSON("$merge" << BSON("into"
+                                                                         << "merge_collection")))));
+    ASSERT_THROWS(DocumentSourceFacet::createFromBson(spec.firstElement(), ctx),
+                  AssertionException);
+
+    spec = BSON("$facet" << BSON("a" << BSON_ARRAY(BSON("$merge" << BSON("into"
+                                                                         << "merge_collection"))
+                                                   << BSON("$skip" << 1))));
+    ASSERT_THROWS(DocumentSourceFacet::createFromBson(spec.firstElement(), ctx),
+                  AssertionException);
+}
+
 TEST_F(DocumentSourceFacetTest, ShouldRejectFacetsContainingAFacetStage) {
     auto ctx = getExpCtx();
     auto spec = fromjson("{$facet: {a: [{$facet: {a: [{$skip: 2}]}}]}}");
@@ -218,7 +240,8 @@ public:
                 HostTypeRequirement::kNone,
                 DiskUseRequirement::kNoDiskUse,
                 FacetRequirement::kAllowed,
-                TransactionRequirement::kAllowed};
+                TransactionRequirement::kAllowed,
+                LookupRequirement::kAllowed};
     }
 
     DocumentSource::GetNextResult getNext() final {
@@ -251,12 +274,15 @@ TEST_F(DocumentSourceFacetTest, PassthroughFacetDoesntRequireDiskAndIsOKInaTxn) 
 class DocumentSourceWritesPersistentData final : public DocumentSourcePassthrough {
 public:
     StageConstraints constraints(Pipeline::SplitState) const final {
-        return {StreamType::kStreaming,
-                PositionRequirement::kNone,
-                HostTypeRequirement::kNone,
-                DiskUseRequirement::kWritesPersistentData,
-                FacetRequirement::kAllowed,
-                TransactionRequirement::kNotAllowed};
+        return {
+            StreamType::kStreaming,
+            PositionRequirement::kNone,
+            HostTypeRequirement::kNone,
+            DiskUseRequirement::kWritesPersistentData,
+            FacetRequirement::kAllowed,
+            TransactionRequirement::kNotAllowed,
+            LookupRequirement::kNotAllowed,
+        };
     }
 
     static boost::intrusive_ptr<DocumentSourceWritesPersistentData> create() {
@@ -530,7 +556,7 @@ TEST_F(DocumentSourceFacetTest, ShouldPropagateDetachingAndReattachingOfOpCtx) {
     auto ctx = getExpCtx();
     // We're going to be changing the OperationContext, so we need to use a MongoProcessInterface
     // that won't throw when we do so.
-    ctx->mongoProcessInterface = stdx::make_unique<StubMongoProcessOkWithOpCtxChanges>();
+    ctx->mongoProcessInterface = std::make_unique<StubMongoProcessOkWithOpCtxChanges>();
 
     auto firstDummy = DocumentSourcePassthrough::create();
     auto firstPipeline = unittest::assertGet(Pipeline::createFacetPipeline({firstDummy}, ctx));
@@ -724,7 +750,8 @@ public:
                 HostTypeRequirement::kPrimaryShard,
                 DiskUseRequirement::kNoDiskUse,
                 FacetRequirement::kAllowed,
-                TransactionRequirement::kAllowed};
+                TransactionRequirement::kAllowed,
+                LookupRequirement::kAllowed};
     }
 
     static boost::intrusive_ptr<DocumentSourceNeedsPrimaryShard> create() {
@@ -791,11 +818,32 @@ public:
                 HostTypeRequirement::kPrimaryShard,
                 DiskUseRequirement::kWritesTmpData,
                 FacetRequirement::kAllowed,
-                TransactionRequirement::kNotAllowed};
+                TransactionRequirement::kNotAllowed,
+                LookupRequirement::kAllowed};
     }
 
     static boost::intrusive_ptr<DocumentSourcePrimaryShardTmpDataNoTxn> create() {
         return new DocumentSourcePrimaryShardTmpDataNoTxn();
+    }
+};
+
+/**
+ * A DocumentSource which cannot be used in a $lookup pipeline.
+ */
+class DocumentSourceBannedInLookup final : public DocumentSourcePassthrough {
+public:
+    StageConstraints constraints(Pipeline::SplitState pipeState) const final {
+        return {StreamType::kStreaming,
+                PositionRequirement::kNone,
+                HostTypeRequirement::kAnyShard,
+                DiskUseRequirement::kNoDiskUse,
+                FacetRequirement::kAllowed,
+                TransactionRequirement::kAllowed,
+                LookupRequirement::kNotAllowed};
+    }
+
+    static boost::intrusive_ptr<DocumentSourceBannedInLookup> create() {
+        return new DocumentSourceBannedInLookup();
     }
 };
 
@@ -810,9 +858,14 @@ TEST_F(DocumentSourceFacetTest, ShouldSurfaceStrictestRequirementsOfEachConstrai
     auto secondPipeline =
         unittest::assertGet(Pipeline::createFacetPipeline({secondPassthrough}, ctx));
 
+    auto thirdPassthrough = DocumentSourceBannedInLookup::create();
+    auto thirdPipeline =
+        unittest::assertGet(Pipeline::createFacetPipeline({thirdPassthrough}, ctx));
+
     std::vector<DocumentSourceFacet::FacetPipeline> facets;
     facets.emplace_back("first", std::move(firstPipeline));
     facets.emplace_back("second", std::move(secondPipeline));
+    facets.emplace_back("third", std::move(thirdPipeline));
     auto facetStage = DocumentSourceFacet::create(std::move(facets), ctx);
 
     ASSERT(facetStage->constraints(Pipeline::SplitState::kUnsplit).hostRequirement ==
@@ -821,6 +874,8 @@ TEST_F(DocumentSourceFacetTest, ShouldSurfaceStrictestRequirementsOfEachConstrai
            StageConstraints::DiskUseRequirement::kWritesTmpData);
     ASSERT(facetStage->constraints(Pipeline::SplitState::kUnsplit).transactionRequirement ==
            StageConstraints::TransactionRequirement::kNotAllowed);
+    ASSERT_FALSE(
+        facetStage->constraints(Pipeline::SplitState::kUnsplit).isAllowedInLookupPipeline());
 }
 }  // namespace
 }  // namespace mongo

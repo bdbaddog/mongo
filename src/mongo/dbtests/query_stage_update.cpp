@@ -33,6 +33,8 @@
 
 #include "mongo/platform/basic.h"
 
+#include <memory>
+
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/database.h"
 #include "mongo/db/client.h"
@@ -52,7 +54,6 @@
 #include "mongo/db/service_context.h"
 #include "mongo/db/update/update_driver.h"
 #include "mongo/dbtests/dbtests.h"
-#include "mongo/stdx/memory.h"
 
 #define ASSERT_DOES_NOT_THROW(EXPRESSION)                                          \
     try {                                                                          \
@@ -67,7 +68,7 @@ namespace QueryStageUpdate {
 
 using std::unique_ptr;
 using std::vector;
-using stdx::make_unique;
+using std::make_unique;
 
 static const NamespaceString nss("unittests.QueryStageUpdate");
 
@@ -97,7 +98,7 @@ public:
     }
 
     unique_ptr<CanonicalQuery> canonicalize(const BSONObj& query) {
-        auto qr = stdx::make_unique<QueryRequest>(nss);
+        auto qr = std::make_unique<QueryRequest>(nss);
         qr->setFilter(query);
         auto statusWithCQ = CanonicalQuery::canonicalize(&_opCtx, std::move(qr));
         ASSERT_OK(statusWithCQ.getStatus());
@@ -215,9 +216,10 @@ public:
             request.setUpdateModification(updates);
 
             const std::map<StringData, std::unique_ptr<ExpressionWithPlaceholder>> arrayFilters;
+            const auto constants = boost::none;
 
-            ASSERT_DOES_NOT_THROW(
-                driver.parse(request.getUpdateModification(), arrayFilters, request.isMulti()));
+            ASSERT_DOES_NOT_THROW(driver.parse(
+                request.getUpdateModification(), arrayFilters, constants, request.isMulti()));
 
             // Setup update params.
             UpdateStageParams params(&request, &driver, opDebug);
@@ -288,9 +290,10 @@ public:
             request.setUpdateModification(updates);
 
             const std::map<StringData, std::unique_ptr<ExpressionWithPlaceholder>> arrayFilters;
+            const auto constants = boost::none;
 
-            ASSERT_DOES_NOT_THROW(
-                driver.parse(request.getUpdateModification(), arrayFilters, request.isMulti()));
+            ASSERT_DOES_NOT_THROW(driver.parse(
+                request.getUpdateModification(), arrayFilters, constants, request.isMulti()));
 
             // Configure the scan.
             CollectionScanParams collScanParams;
@@ -399,9 +402,10 @@ public:
         request.setReturnDocs(UpdateRequest::RETURN_OLD);
 
         const std::map<StringData, std::unique_ptr<ExpressionWithPlaceholder>> arrayFilters;
+        const auto constants = boost::none;
 
-        ASSERT_DOES_NOT_THROW(
-            driver.parse(request.getUpdateModification(), arrayFilters, request.isMulti()));
+        ASSERT_DOES_NOT_THROW(driver.parse(
+            request.getUpdateModification(), arrayFilters, constants, request.isMulti()));
 
         // Configure a QueuedDataStage to pass the first object in the collection back in a
         // RID_AND_OBJ state.
@@ -490,9 +494,10 @@ public:
         request.setReturnDocs(UpdateRequest::RETURN_NEW);
 
         const std::map<StringData, std::unique_ptr<ExpressionWithPlaceholder>> arrayFilters;
+        const auto constants = boost::none;
 
-        ASSERT_DOES_NOT_THROW(
-            driver.parse(request.getUpdateModification(), arrayFilters, request.isMulti()));
+        ASSERT_DOES_NOT_THROW(driver.parse(
+            request.getUpdateModification(), arrayFilters, constants, request.isMulti()));
 
         // Configure a QueuedDataStage to pass the first object in the collection back in a
         // RID_AND_OBJ state.

@@ -31,9 +31,10 @@
 
 #include "mongo/client/replica_set_monitor_test_fixture.h"
 
+#include <memory>
+
 #include "mongo/client/mongo_uri.h"
 #include "mongo/client/read_preference.h"
-#include "mongo/stdx/memory.h"
 
 namespace mongo {
 namespace {
@@ -61,6 +62,35 @@ public:
             Node* node = set->findNode(out);
             ASSERT(node);
             *isPrimarySelected = node->isMaster;
+        }
+
+        return out;
+    }
+
+    std::vector<HostAndPort> selectNodes(const SetState::Nodes& nodes,
+                                         ReadPreference pref,
+                                         const TagSet& tagSet,
+                                         int latencyThresholdMillis,
+                                         bool* isPrimarySelected) {
+        invariant(!nodes.empty());
+
+        auto connStr = ConnectionString::forReplicaSet(kSetName, {nodes.front().host});
+        auto set = makeState(MongoURI(connStr));
+        set->nodes = nodes;
+        set->latencyThresholdMicros = latencyThresholdMillis * 1000;
+
+        ReadPreferenceSetting criteria(pref, tagSet);
+        auto out = set->getMatchingHosts(criteria);
+        if (isPrimarySelected && !out.empty()) {
+            for (auto& host : out) {
+                Node* node = set->findNode(host);
+                ASSERT(node);
+
+                if (node->isMaster) {
+                    *isPrimarySelected = node->isMaster;
+                    break;
+                }
+            }
         }
 
         return out;
@@ -137,6 +167,19 @@ TEST_F(ReadPrefTest, PrimaryOnly) {
     ASSERT_EQUALS("b", host.host());
 }
 
+TEST_F(ReadPrefTest, PrimaryOnlyMulti) {
+    auto nodes = getThreeMemberWithTags();
+    TagSet tags(getDefaultTagSet());
+
+    bool isPrimarySelected = false;
+    std::vector<HostAndPort> hosts =
+        selectNodes(nodes, mongo::ReadPreference::PrimaryOnly, tags, 3, &isPrimarySelected);
+
+    ASSERT(isPrimarySelected);
+    ASSERT_EQUALS(hosts.size(), 1ull);
+    ASSERT_EQUALS("b", hosts[0].host());
+}
+
 TEST_F(ReadPrefTest, PrimaryOnlyPriNotOk) {
     auto nodes = getThreeMemberWithTags();
     TagSet tags(getDefaultTagSet());
@@ -161,6 +204,19 @@ TEST_F(ReadPrefTest, PrimaryMissing) {
         selectNode(nodes, mongo::ReadPreference::PrimaryOnly, tags, 3, &isPrimarySelected);
 
     ASSERT(host.empty());
+}
+
+TEST_F(ReadPrefTest, PrimaryMissingMulti) {
+    auto nodes = getThreeMemberWithTags();
+    TagSet tags(getDefaultTagSet());
+
+    nodes[1].isMaster = false;
+
+    bool isPrimarySelected = false;
+    std::vector<HostAndPort> hosts =
+        selectNodes(nodes, mongo::ReadPreference::PrimaryOnly, tags, 3, &isPrimarySelected);
+
+    ASSERT(hosts.empty());
 }
 
 TEST_F(ReadPrefTest, PriPrefWithPriOk) {
@@ -201,6 +257,22 @@ TEST_F(ReadPrefTest, SecOnly) {
 
     ASSERT(!isPrimarySelected);
     ASSERT_EQUALS("a", host.host());
+}
+
+TEST_F(ReadPrefTest, SecOnlyMulti) {
+    auto nodes = getThreeMemberWithTags();
+    TagSet tags(getDefaultTagSet());
+
+    bool isPrimarySelected = false;
+    std::vector<HostAndPort> hosts =
+        selectNodes(nodes, mongo::ReadPreference::SecondaryOnly, tags, 1, &isPrimarySelected);
+
+    ASSERT(!isPrimarySelected);
+    std::sort(hosts.begin(), hosts.end());
+
+    ASSERT_EQUALS(hosts.size(), 2ull);
+    ASSERT_EQUALS("a", hosts[0].host());
+    ASSERT_EQUALS("c", hosts[1].host());
 }
 
 TEST_F(ReadPrefTest, SecOnlyOnlyPriOk) {

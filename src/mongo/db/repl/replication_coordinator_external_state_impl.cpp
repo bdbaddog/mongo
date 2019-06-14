@@ -33,6 +33,8 @@
 
 #include "mongo/db/repl/replication_coordinator_external_state_impl.h"
 
+#include <functional>
+#include <memory>
 #include <string>
 
 #include "mongo/base/status_with.h"
@@ -93,8 +95,6 @@
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/cluster_identity_loader.h"
 #include "mongo/s/grid.h"
-#include "mongo/stdx/functional.h"
-#include "mongo/stdx/memory.h"
 #include "mongo/stdx/thread.h"
 #include "mongo/transport/service_entry_point.h"
 #include "mongo/util/assert_util.h"
@@ -152,16 +152,16 @@ auto makeThreadPool(const std::string& poolName) {
         Client::initThread(threadName.c_str());
         AuthorizationSession::get(cc())->grantInternalAuthorization(&cc());
     };
-    return stdx::make_unique<ThreadPool>(threadPoolOptions);
+    return std::make_unique<ThreadPool>(threadPoolOptions);
 }
 
 /**
  * Returns a new thread pool task executor.
  */
 auto makeTaskExecutor(ServiceContext* service, const std::string& poolName) {
-    auto hookList = stdx::make_unique<rpc::EgressMetadataHookList>();
-    hookList->addHook(stdx::make_unique<rpc::LogicalTimeMetadataHook>(service));
-    return stdx::make_unique<executor::ThreadPoolTaskExecutor>(
+    auto hookList = std::make_unique<rpc::EgressMetadataHookList>();
+    hookList->addHook(std::make_unique<rpc::LogicalTimeMetadataHook>(service));
+    return std::make_unique<executor::ThreadPoolTaskExecutor>(
         makeThreadPool(poolName),
         executor::makeNetworkInterface("RS", nullptr, std::move(hookList)));
 }
@@ -207,9 +207,6 @@ bool ReplicationCoordinatorExternalStateImpl::isInitialSyncFlagSet(OperationCont
 void ReplicationCoordinatorExternalStateImpl::startSteadyStateReplication(
     OperationContext* opCtx, ReplicationCoordinator* replCoord) {
 
-    // Initialize the cached pointer to the oplog collection, for writing to the oplog.
-    acquireOplogCollectionForLogging(opCtx);
-
     LockGuard lk(_threadMutex);
 
     // We've shut down the external state, don't start again.
@@ -229,15 +226,14 @@ void ReplicationCoordinatorExternalStateImpl::startSteadyStateReplication(
     // interface. During steady state replication, there is no need to log details on every batch
     // we apply (recovery); or track missing documents that are fetched from the sync source
     // (initial sync).
-    _oplogApplier =
-        stdx::make_unique<OplogApplierImpl>(_oplogApplierTaskExecutor.get(),
-                                            _oplogBuffer.get(),
-                                            &noopOplogApplierObserver,
-                                            replCoord,
-                                            _replicationProcess->getConsistencyMarkers(),
-                                            _storageInterface,
-                                            OplogApplier::Options(),
-                                            _writerPool.get());
+    _oplogApplier = std::make_unique<OplogApplierImpl>(_oplogApplierTaskExecutor.get(),
+                                                       _oplogBuffer.get(),
+                                                       &noopOplogApplierObserver,
+                                                       replCoord,
+                                                       _replicationProcess->getConsistencyMarkers(),
+                                                       _storageInterface,
+                                                       OplogApplier::Options(),
+                                                       _writerPool.get());
 
     invariant(!_bgSync);
     _bgSync =
@@ -255,27 +251,27 @@ void ReplicationCoordinatorExternalStateImpl::startSteadyStateReplication(
     // leave the unique pointer empty if the _syncSourceFeedbackThread's function starts
     // after _stopDataReplication_inlock's move.
     auto bgSyncPtr = _bgSync.get();
-    _syncSourceFeedbackThread = stdx::make_unique<stdx::thread>([this, bgSyncPtr, replCoord] {
+    _syncSourceFeedbackThread = std::make_unique<stdx::thread>([this, bgSyncPtr, replCoord] {
         _syncSourceFeedback.run(_taskExecutor.get(), bgSyncPtr, replCoord);
     });
 }
 
 void ReplicationCoordinatorExternalStateImpl::stopDataReplication(OperationContext* opCtx) {
     UniqueLock lk(_threadMutex);
-    _stopDataReplication_inlock(opCtx, &lk);
+    _stopDataReplication_inlock(opCtx, lk);
 }
 
 void ReplicationCoordinatorExternalStateImpl::_stopDataReplication_inlock(OperationContext* opCtx,
-                                                                          UniqueLock* lock) {
+                                                                          UniqueLock& lock) {
     // Make sue no other _stopDataReplication calls are in progress.
-    _dataReplicationStopped.wait(*lock, [this]() { return !_stoppingDataReplication; });
+    _dataReplicationStopped.wait(lock, [this]() { return !_stoppingDataReplication; });
     _stoppingDataReplication = true;
 
     auto oldSSF = std::move(_syncSourceFeedbackThread);
     auto oldOplogBuffer = std::move(_oplogBuffer);
     auto oldBgSync = std::move(_bgSync);
     auto oldApplier = std::move(_oplogApplier);
-    lock->unlock();
+    lock.unlock();
 
     // _syncSourceFeedbackThread should be joined before _bgSync's shutdown because it has
     // a pointer of _bgSync.
@@ -314,7 +310,7 @@ void ReplicationCoordinatorExternalStateImpl::_stopDataReplication_inlock(Operat
         oldOplogBuffer->shutdown(opCtx);
     }
 
-    lock->lock();
+    lock.lock();
     _stoppingDataReplication = false;
     _dataReplicationStopped.notify_all();
 }
@@ -347,7 +343,7 @@ void ReplicationCoordinatorExternalStateImpl::shutdown(OperationContext* opCtx) 
     }
 
     _inShutdown = true;
-    _stopDataReplication_inlock(opCtx, &lk);
+    _stopDataReplication_inlock(opCtx, lk);
 
     if (_noopWriter) {
         LOG(1) << "Stopping noop writer";
@@ -463,6 +459,8 @@ OpTime ReplicationCoordinatorExternalStateImpl::onTransitionToPrimary(OperationC
     invariant(opCtx->lockState()->isRSTLExclusive());
     invariant(!opCtx->shouldParticipateInFlowControl());
 
+    MongoDSessionCatalog::onStepUp(opCtx);
+
     // Clear the appliedThrough marker so on startup we'll use the top of the oplog. This must be
     // done before we add anything to our oplog.
     // We record this update at the 'lastAppliedOpTime'. If there are any outstanding
@@ -489,14 +487,9 @@ OpTime ReplicationCoordinatorExternalStateImpl::onTransitionToPrimary(OperationC
     fassert(28665, loadLastOpTimeAndWallTimeResult);
     auto opTimeToReturn = loadLastOpTimeAndWallTimeResult.getValue().opTime;
 
-
     _shardingOnTransitionToPrimaryHook(opCtx);
 
-    // This has to go before reaquiring locks for prepared transactions, otherwise this can be
-    // blocked by prepared transactions.
     _dropAllTempCollections(opCtx);
-
-    MongoDSessionCatalog::onStepUp(opCtx);
 
     notifyFreeMonitoringOnTransitionToPrimary();
 
@@ -834,7 +827,7 @@ void ReplicationCoordinatorExternalStateImpl::_dropAllTempCollections(OperationC
         if (*it == "local")
             continue;
         LOG(2) << "Removing temporary collections from " << *it;
-        AutoGetDb autoDb(opCtx, *it, MODE_X);
+        AutoGetDb autoDb(opCtx, *it, MODE_IX);
         invariant(autoDb.getDb(), str::stream() << "Unable to get reference to database " << *it);
         autoDb.getDb()->clearTmpCollections(opCtx);
     }
@@ -949,7 +942,7 @@ void ReplicationCoordinatorExternalStateImpl::stopNoopWriter() {
 void ReplicationCoordinatorExternalStateImpl::setupNoopWriter(Seconds waitTime) {
     invariant(!_noopWriter);
 
-    _noopWriter = stdx::make_unique<NoopWriter>(waitTime);
+    _noopWriter = std::make_unique<NoopWriter>(waitTime);
 }
 }  // namespace repl
 }  // namespace mongo

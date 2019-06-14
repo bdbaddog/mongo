@@ -74,23 +74,23 @@ boost::optional<BSONObj> findSplitPoint(Pipeline::SourceContainer* shardPipe, Pi
         boost::intrusive_ptr<DocumentSource> current = mergePipe->popFront();
 
         // Check if this source is splittable.
-        auto mergeLogic = current->mergingLogic();
-        if (!mergeLogic) {
+        auto distributedPlanLogic = current->distributedPlanLogic();
+        if (!distributedPlanLogic) {
             // Move the source from the merger _sources to the shard _sources.
             shardPipe->push_back(current);
             continue;
         }
 
         // A source may not simultaneously be present on both sides of the split.
-        invariant(mergeLogic->shardsStage != mergeLogic->mergingStage);
+        invariant(distributedPlanLogic->shardsStage != distributedPlanLogic->mergingStage);
 
-        if (mergeLogic->shardsStage)
-            shardPipe->push_back(std::move(mergeLogic->shardsStage));
+        if (distributedPlanLogic->shardsStage)
+            shardPipe->push_back(std::move(distributedPlanLogic->shardsStage));
 
-        if (mergeLogic->mergingStage)
-            mergePipe->addInitialSource(std::move(mergeLogic->mergingStage));
+        if (distributedPlanLogic->mergingStage)
+            mergePipe->addInitialSource(std::move(distributedPlanLogic->mergingStage));
 
-        return mergeLogic->inputSortPattern;
+        return distributedPlanLogic->inputSortPattern;
     }
     return boost::none;
 }
@@ -289,8 +289,8 @@ ClusterClientCursorGuard convertPipelineToRouterStages(
 
 bool stageCanRunInParallel(const boost::intrusive_ptr<DocumentSource>& stage,
                            const std::set<std::string>& nameOfShardKeyFieldsUponEntryToStage) {
-    if (stage->mergingLogic()) {
-        return stage->canRunInParallelBeforeOut(nameOfShardKeyFieldsUponEntryToStage);
+    if (stage->distributedPlanLogic()) {
+        return stage->canRunInParallelBeforeWriteStage(nameOfShardKeyFieldsUponEntryToStage);
     } else {
         // This stage is fine to execute in parallel on each stream. For example, a $match can be
         // applied to each stream in parallel.

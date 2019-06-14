@@ -28,6 +28,8 @@
  */
 #define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
 
+#include "mongo/platform/basic.h"
+
 #include "mongo/unittest/unittest.h"
 
 #include "mongo/client/remote_command_targeter_mock.h"
@@ -178,7 +180,7 @@ protected:
             const std::vector<ShardId> _shardIds;
         };
 
-        return stdx::make_unique<StaticCatalogClient>(kShardIdList);
+        return std::make_unique<StaticCatalogClient>(kShardIdList);
     }
 
     const ShardId kShard1{"s1"};

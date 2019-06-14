@@ -81,8 +81,7 @@ OplogEntry makeOplogEntry(int ts) {
                       boost::none,                  // statement id
                       boost::none,   // optime of previous write within same transaction
                       boost::none,   // pre-image optime
-                      boost::none,   // post-image optime
-                      boost::none);  // prepare
+                      boost::none);  // post-image optime
 }
 
 TEST_F(MultiApplierTest, InvalidConstruction) {
@@ -259,7 +258,7 @@ TEST_F(
 
     ASSERT_TRUE(multiApplyTxn);
     ASSERT_EQUALS(1U, operationsToApply.size());
-    ASSERT_BSONOBJ_EQ(operations[0].raw, operationsToApply[0].raw);
+    ASSERT_BSONOBJ_EQ(operations[0].getRaw(), operationsToApply[0].getRaw());
 
     ASSERT_OK(callbackResult);
     ASSERT_FALSE(callbackTxn);

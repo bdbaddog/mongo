@@ -145,12 +145,13 @@ DocumentSource::GetNextResult DocumentSourceSort::getNext() {
 void DocumentSourceSort::serializeToArray(
     std::vector<Value>& array, boost::optional<ExplainOptions::Verbosity> explain) const {
     if (explain) {  // always one Value for combined $sort + $limit
-        array.push_back(
-            Value(DOC(kStageName << DOC(
-                          "sortKey" << sortKeyPattern(SortKeySerialization::kForExplain) << "limit"
-                                    << (_limitSrc ? Value(_limitSrc->getLimit()) : Value())))));
+        array.push_back(Value(DOC(
+            kStageName << DOC(
+                "sortKey" << serializeSortKeyPattern(SortKeySerialization::kForExplain) << "limit"
+                          << (_limitSrc ? Value(_limitSrc->getLimit()) : Value())))));
     } else {  // one Value for $sort and maybe a Value for $limit
-        MutableDocument inner(sortKeyPattern(SortKeySerialization::kForPipelineSerialization));
+        MutableDocument inner(
+            serializeSortKeyPattern(SortKeySerialization::kForPipelineSerialization));
         array.push_back(Value(DOC(kStageName << inner.freeze())));
 
         if (_limitSrc) {
@@ -167,7 +168,7 @@ long long DocumentSourceSort::getLimit() const {
     return _limitSrc ? _limitSrc->getLimit() : -1;
 }
 
-Document DocumentSourceSort::sortKeyPattern(SortKeySerialization serializationMode) const {
+Document DocumentSourceSort::serializeSortKeyPattern(SortKeySerialization serializationMode) const {
     MutableDocument keyObj;
     const size_t n = _sortPattern.size();
     for (size_t i = 0; i < n; ++i) {
@@ -313,7 +314,7 @@ intrusive_ptr<DocumentSourceSort> DocumentSourceSort::create(
     pSort->_sortKeyGen = SortKeyGenerator{
         // The SortKeyGenerator expects the expressions to be serialized in order to detect a sort
         // by a metadata field.
-        pSort->sortKeyPattern(SortKeySerialization::kForPipelineSerialization).toBson(),
+        pSort->serializeSortKeyPattern(SortKeySerialization::kForPipelineSerialization).toBson(),
         pExpCtx->getCollator()};
 
     if (limit > 0) {
@@ -422,7 +423,7 @@ StatusWith<Value> DocumentSourceSort::extractKeyPart(const Document& doc,
         plainKey = key.getValue();
     } else {
         invariant(patternPart.expression);
-        plainKey = patternPart.expression->evaluate(doc);
+        plainKey = patternPart.expression->evaluate(doc, &pExpCtx->variables);
     }
 
     return getCollationComparisonKey(plainKey);
@@ -530,21 +531,22 @@ int DocumentSourceSort::compare(const Value& lhs, const Value& rhs) const {
     return 0;
 }
 
-boost::optional<DocumentSource::MergingLogic> DocumentSourceSort::mergingLogic() {
-    MergingLogic split;
+boost::optional<DocumentSource::DistributedPlanLogic> DocumentSourceSort::distributedPlanLogic() {
+    DistributedPlanLogic split;
     split.shardsStage = this;
-    split.inputSortPattern = sortKeyPattern(SortKeySerialization::kForSortKeyMerging).toBson();
+    split.inputSortPattern =
+        serializeSortKeyPattern(SortKeySerialization::kForSortKeyMerging).toBson();
     if (_limitSrc) {
         split.mergingStage = DocumentSourceLimit::create(pExpCtx, _limitSrc->getLimit());
     }
     return split;
 }
 
-bool DocumentSourceSort::canRunInParallelBeforeOut(
+bool DocumentSourceSort::canRunInParallelBeforeWriteStage(
     const std::set<std::string>& nameOfShardKeyFieldsUponEntryToStage) const {
     // This is an interesting special case. If there are no further stages which require merging the
     // streams into one, a $sort should not require it. This is only the case because the sort order
-    // doesn't matter for a pipeline ending with a $out stage. We may encounter it here as an
+    // doesn't matter for a pipeline ending with a write stage. We may encounter it here as an
     // intermediate stage before a final $group with a $sort, which would make sense. Should we
     // extend our analysis to detect if an exchange is appropriate in a general pipeline, a $sort
     // would generally require merging the streams before producing output.

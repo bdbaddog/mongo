@@ -75,7 +75,6 @@
 #include "mongo/db/stats/timer_stats.h"
 #include "mongo/db/transaction_participant.h"
 #include "mongo/db/transaction_participant_gen.h"
-#include "mongo/stdx/memory.h"
 #include "mongo/util/exit.h"
 #include "mongo/util/fail_point_service.h"
 #include "mongo/util/log.h"
@@ -190,7 +189,7 @@ void ApplyBatchFinalizerForJournal::_run() {
     Client::initThread("ApplyBatchFinalizerForJournal");
 
     while (true) {
-        OpTimeAndWallTime latestOpTimeAndWallTime = {OpTime(), Date_t::min()};
+        OpTimeAndWallTime latestOpTimeAndWallTime = {OpTime(), Date_t()};
 
         {
             stdx::unique_lock<stdx::mutex> lock(_mutex);
@@ -203,7 +202,7 @@ void ApplyBatchFinalizerForJournal::_run() {
             }
 
             latestOpTimeAndWallTime = _latestOpTimeAndWallTime;
-            _latestOpTimeAndWallTime = {OpTime(), Date_t::min()};
+            _latestOpTimeAndWallTime = {OpTime(), Date_t()};
         }
 
         auto opCtx = cc().makeOperationContext();
@@ -326,13 +325,8 @@ Status SyncTail::syncApply(OperationContext* opCtx,
     };
 
     if (opType == OpTypeEnum::kNoop) {
-        if (nss.db() == "") {
-            incrementOpsAppliedStats();
-            return Status::OK();
-        }
-        Lock::DBLock dbLock(opCtx, nss.db(), MODE_X);
-        OldClientContext ctx(opCtx, nss.ns());
-        return finishApply(applyOp(ctx.db()));
+        incrementOpsAppliedStats();
+        return Status::OK();
     } else if (OplogEntry::isCrudOpType(opType)) {
         return finishApply(writeConflictRetry(opCtx, "syncApply_CRUD", nss.ns(), [&] {
             // Need to throw instead of returning a status for it to be properly ignored.
@@ -437,8 +431,9 @@ void scheduleWritesToOplog(OperationContext* opCtx,
             for (size_t i = begin; i < end; i++) {
                 // Add as unowned BSON to avoid unnecessary ref-count bumps.
                 // 'ops' will outlive 'docs' so the BSON lifetime will be guaranteed.
-                docs.emplace_back(InsertStatement{
-                    ops[i].raw, ops[i].getOpTime().getTimestamp(), ops[i].getOpTime().getTerm()});
+                docs.emplace_back(InsertStatement{ops[i].getRaw(),
+                                                  ops[i].getOpTime().getTimestamp(),
+                                                  ops[i].getOpTime().getTerm()});
             }
 
             fassert(40141,
@@ -659,7 +654,7 @@ private:
                 auto oplogEntries =
                     fassertNoTrace(31004, _getNextApplierBatchFn(opCtx.get(), batchLimits));
                 for (const auto& oplogEntry : oplogEntries) {
-                    ops.emplace_back(oplogEntry.raw);
+                    ops.emplace_back(oplogEntry.getRaw());
                 }
 
                 // If we don't have anything in the queue, wait a bit for something to appear.
@@ -849,7 +844,7 @@ void SyncTail::_oplogApplication(ReplicationCoordinator* replCoord,
 // or a non-final applyOps in an transaction.
 inline bool isCommitApplyOps(const OplogEntry& entry) {
     return entry.getCommandType() == OplogEntry::CommandType::kApplyOps && !entry.shouldPrepare() &&
-        !entry.isPartialTransaction();
+        !entry.isPartialTransaction() && !entry.getObject().getBoolField("prepare");
 }
 
 void SyncTail::shutdown() {
@@ -1027,10 +1022,6 @@ Status multiSyncApply(OperationContext* opCtx,
     // Explicitly start future read transactions without a timestamp.
     opCtx->recoveryUnit()->setTimestampReadSource(RecoveryUnit::ReadSource::kNoTimestamp);
 
-    // TODO: SERVER-40177 This should be removed once it is guaranteed operations applied on
-    // secondaries cannot encounter unnecessary prepare conflicts.
-    opCtx->recoveryUnit()->setIgnorePrepared(true);
-
     ApplierHelpers::stableSortByNamespace(ops);
 
     // Assume we are recovering if oplog writes are disabled in the options.
@@ -1062,7 +1053,7 @@ Status multiSyncApply(OperationContext* opCtx,
             try {
                 auto stableTimestampForRecovery = st->getOptions().stableTimestampForRecovery;
                 const Status status = SyncTail::syncApply(
-                    opCtx, entry.raw, oplogApplicationMode, stableTimestampForRecovery);
+                    opCtx, entry.getRaw(), oplogApplicationMode, stableTimestampForRecovery);
 
                 if (!status.isOK()) {
                     // In initial sync, update operations can cause documents to be missed during
@@ -1155,14 +1146,17 @@ void SyncTail::_fillWriterVectors(OperationContext* opCtx,
         // yet.
         if (op.isPartialTransaction()) {
             auto& partialTxnList = partialTxnOps[*op.getSessionId()];
-            if (!partialTxnList.empty() &&
-                partialTxnList.front()->getTxnNumber() != op.getTxnNumber()) {
-                // TODO: When abortTransaction is implemented, this should invariant and
-                // the list should be cleared on abort.
-                partialTxnList.clear();
-            }
+            // If this operation belongs to an existing partial transaction, partialTxnList
+            // must contain the previous operations of the transaction.
+            invariant(partialTxnList.empty() ||
+                      partialTxnList.front()->getTxnNumber() == op.getTxnNumber());
             partialTxnList.push_back(&op);
             continue;
+        }
+
+        if (op.getCommandType() == OplogEntry::CommandType::kAbortTransaction) {
+            auto& partialTxnList = partialTxnOps[*op.getSessionId()];
+            partialTxnList.clear();
         }
 
         if (op.isCrudOpType()) {
@@ -1192,10 +1186,13 @@ void SyncTail::_fillWriterVectors(OperationContext* opCtx,
         // function.
         if (isCommitApplyOps(op)) {
             try {
-                // On commit of unprepared transactions, get transactional operations from the oplog
-                // and fill writers with those operations.
-                // Flush partialTxnList operations for current transaction.
-                if (auto logicalSessionId = op.getSessionId()) {
+                auto logicalSessionId = op.getSessionId();
+                // applyOps entries generated by a transaction must have a sessionId and a
+                // transaction number.
+                if (logicalSessionId && op.getTxnNumber()) {
+                    // On commit of unprepared transactions, get transactional operations from the
+                    // oplog and fill writers with those operations.
+                    // Flush partialTxnList operations for current transaction.
                     auto& partialTxnList = partialTxnOps[*logicalSessionId];
                     {
                         // We need to use a ReadSourceScope avoid the reads of the transaction
@@ -1209,13 +1206,15 @@ void SyncTail::_fillWriterVectors(OperationContext* opCtx,
                     // Transaction entries cannot have different session updates.
                     _fillWriterVectors(
                         opCtx, &derivedOps->back(), writerVectors, derivedOps, nullptr);
+                } else {
+                    // The applyOps entry was not generated as part of a transaction.
+                    invariant(!op.getPrevWriteOpTimeInTransaction());
+                    derivedOps->emplace_back(ApplyOps::extractOperations(op));
+
+                    // Nested entries cannot have different session updates.
+                    _fillWriterVectors(
+                        opCtx, &derivedOps->back(), writerVectors, derivedOps, nullptr);
                 }
-
-                // After flushing partialTxnList ops, extract remaining ops from current operation.
-                derivedOps->emplace_back(ApplyOps::extractOperations(op));
-
-                // Nested entries cannot have different session updates.
-                _fillWriterVectors(opCtx, &derivedOps->back(), writerVectors, derivedOps, nullptr);
             } catch (...) {
                 fassertFailedWithStatusNoTrace(
                     50711,

@@ -81,6 +81,10 @@ auto getThreadPool(OperationContext* opCtx) {
     return &sessionTasksExecutor(opCtx->getServiceContext()).threadPool;
 }
 
+/**
+ * Non-blocking call, which schedules asynchronously the work to finish cleaning up the specified
+ * set of kill tokens.
+ */
 void killSessionTokens(OperationContext* opCtx,
                        std::vector<SessionCatalog::KillToken> sessionKillTokens) {
     if (sessionKillTokens.empty())
@@ -104,6 +108,18 @@ void killSessionTokens(OperationContext* opCtx,
         });
 }
 
+void disallowDirectWritesUnderSession(OperationContext* opCtx) {
+    const auto replCoord = repl::ReplicationCoordinator::get(opCtx);
+    bool isReplSet = replCoord->getReplicationMode() == repl::ReplicationCoordinator::modeReplSet;
+    if (isReplSet) {
+        uassert(40528,
+                str::stream() << "Direct writes against "
+                              << NamespaceString::kSessionTransactionsTableNamespace
+                              << " cannot be performed using a transaction or on a session.",
+                !opCtx->getLogicalSessionId());
+    }
+}
+
 const auto kIdProjection = BSON(SessionTxnRecord::kSessionIdFieldName << 1);
 const auto kSortById = BSON(SessionTxnRecord::kSessionIdFieldName << 1);
 const auto kLastWriteDateFieldName = SessionTxnRecord::kLastWriteDateFieldName;
@@ -125,6 +141,7 @@ int removeSessionsTransactionRecords(OperationContext* opCtx,
     if (expiredSessionIds.empty())
         return 0;
 
+    // Remove the session ids from the on-disk catalog
     write_ops::Delete deleteOp(NamespaceString::kSessionTransactionsTableNamespace);
     deleteOp.setWriteCommandBase([] {
         write_ops::WriteCommandBase base;
@@ -157,6 +174,55 @@ int removeSessionsTransactionRecords(OperationContext* opCtx,
     return response.getN();
 }
 
+void createTransactionTable(OperationContext* opCtx) {
+    const size_t initialExtentSize = 0;
+    const bool capped = false;
+    const bool maxSize = 0;
+    BSONObj result;
+
+    DBDirectClient client(opCtx);
+
+    if (client.createCollection(NamespaceString::kSessionTransactionsTableNamespace.ns(),
+                                initialExtentSize,
+                                capped,
+                                maxSize,
+                                &result)) {
+        return;
+    }
+
+    const auto status = getStatusFromCommandResult(result);
+
+    if (status == ErrorCodes::NamespaceExists) {
+        return;
+    }
+
+    uassertStatusOKWithContext(status,
+                               str::stream()
+                                   << "Failed to create the "
+                                   << NamespaceString::kSessionTransactionsTableNamespace.ns()
+                                   << " collection");
+}
+
+void abortInProgressTransactions(OperationContext* opCtx) {
+    DBDirectClient client(opCtx);
+    Query query(BSON(SessionTxnRecord::kStateFieldName
+                     << DurableTxnState_serializer(DurableTxnStateEnum::kInProgress)));
+    auto cursor = client.query(NamespaceString::kSessionTransactionsTableNamespace, query);
+    if (cursor->more()) {
+        LOG(3) << "Aborting in-progress transactions on stepup.";
+    }
+    while (cursor->more()) {
+        auto txnRecord = SessionTxnRecord::parse(
+            IDLParserErrorContext("abort-in-progress-transactions"), cursor->next());
+        opCtx->setLogicalSessionId(txnRecord.getSessionId());
+        opCtx->setTxnNumber(txnRecord.getTxnNum());
+        MongoDOperationContextSessionWithoutRefresh ocs(opCtx);
+        auto txnParticipant = TransactionParticipant::get(opCtx);
+        LOG(3) << "Aborting transaction sessionId: " << txnRecord.getSessionId().toBSON()
+               << " txnNumber " << txnRecord.getTxnNum();
+        txnParticipant.abortTransactionForStepUp(opCtx);
+    }
+}
 }  // namespace
 
 void MongoDSessionCatalog::onStepUp(OperationContext* opCtx) {
@@ -201,33 +267,9 @@ void MongoDSessionCatalog::onStepUp(OperationContext* opCtx) {
         }
     }
 
-    const size_t initialExtentSize = 0;
-    const bool capped = false;
-    const bool maxSize = 0;
+    abortInProgressTransactions(opCtx);
 
-    BSONObj result;
-
-    DBDirectClient client(opCtx);
-
-    if (client.createCollection(NamespaceString::kSessionTransactionsTableNamespace.ns(),
-                                initialExtentSize,
-                                capped,
-                                maxSize,
-                                &result)) {
-        return;
-    }
-
-    const auto status = getStatusFromCommandResult(result);
-
-    if (status == ErrorCodes::NamespaceExists) {
-        return;
-    }
-
-    uassertStatusOKWithContext(status,
-                               str::stream()
-                                   << "Failed to create the "
-                                   << NamespaceString::kSessionTransactionsTableNamespace.ns()
-                                   << " collection");
+    createTransactionTable(opCtx);
 }
 
 boost::optional<UUID> MongoDSessionCatalog::getTransactionTableUUID(OperationContext* opCtx) {
@@ -241,47 +283,102 @@ boost::optional<UUID> MongoDSessionCatalog::getTransactionTableUUID(OperationCon
     return coll->uuid();
 }
 
-void MongoDSessionCatalog::invalidateSessions(OperationContext* opCtx,
-                                              boost::optional<BSONObj> singleSessionDoc) {
-    const auto replCoord = repl::ReplicationCoordinator::get(opCtx);
-    bool isReplSet = replCoord->getReplicationMode() == repl::ReplicationCoordinator::modeReplSet;
-    if (isReplSet) {
-        uassert(40528,
-                str::stream() << "Direct writes against "
-                              << NamespaceString::kSessionTransactionsTableNamespace.ns()
-                              << " cannot be performed using a transaction or on a session.",
-                !opCtx->getLogicalSessionId());
-    }
+void MongoDSessionCatalog::observeDirectWriteToConfigTransactions(OperationContext* opCtx,
+                                                                  BSONObj singleSessionDoc) {
+    disallowDirectWritesUnderSession(opCtx);
+
+    class KillSessionTokenOnCommit : public RecoveryUnit::Change {
+    public:
+        KillSessionTokenOnCommit(OperationContext* opCtx,
+                                 SessionCatalog::KillToken sessionKillToken)
+            : _opCtx(opCtx), _sessionKillToken(std::move(sessionKillToken)) {}
+
+        void commit(boost::optional<Timestamp>) override {
+            rollback();
+        }
+
+        void rollback() override {
+            std::vector<SessionCatalog::KillToken> sessionKillTokenVec;
+            sessionKillTokenVec.emplace_back(std::move(_sessionKillToken));
+            killSessionTokens(_opCtx, std::move(sessionKillTokenVec));
+        }
+
+    private:
+        OperationContext* _opCtx;
+        SessionCatalog::KillToken _sessionKillToken;
+    };
+
+    const auto catalog = SessionCatalog::get(opCtx);
+
+    const auto lsid =
+        LogicalSessionId::parse(IDLParserErrorContext("lsid"), singleSessionDoc["_id"].Obj());
+    catalog->scanSession(lsid, [&](const ObservableSession& session) {
+        const auto participant = TransactionParticipant::get(session);
+        uassert(ErrorCodes::PreparedTransactionInProgress,
+                str::stream() << "Cannot modify the entry for session "
+                              << session.getSessionId().getId()
+                              << " because it is in the prepared state",
+                !participant.transactionIsPrepared());
+
+        opCtx->recoveryUnit()->registerChange(new KillSessionTokenOnCommit(opCtx, session.kill()));
+    });
+}
+
+void MongoDSessionCatalog::invalidateAllSessions(OperationContext* opCtx) {
+    disallowDirectWritesUnderSession(opCtx);
 
     const auto catalog = SessionCatalog::get(opCtx);
 
     std::vector<SessionCatalog::KillToken> sessionKillTokens;
 
-    if (singleSessionDoc) {
-        const auto lsid = LogicalSessionId::parse(IDLParserErrorContext("lsid"),
-                                                  singleSessionDoc->getField("_id").Obj());
-        catalog->scanSession(lsid, [&sessionKillTokens](const ObservableSession& session) {
-            const auto participant = TransactionParticipant::get(session);
-            uassert(ErrorCodes::PreparedTransactionInProgress,
-                    str::stream() << "Cannot modify the entry for session "
-                                  << session.getSessionId().getId()
-                                  << " because it is in the prepared state",
-                    !participant.transactionIsPrepared());
-            sessionKillTokens.emplace_back(session.kill());
-        });
-    } else {
-        SessionKiller::Matcher matcher(
-            KillAllSessionsByPatternSet{makeKillAllSessionsByPattern(opCtx)});
-        catalog->scanSessions(matcher, [&sessionKillTokens](const ObservableSession& session) {
-            sessionKillTokens.emplace_back(session.kill());
-        });
-    }
+    SessionKiller::Matcher matcher(
+        KillAllSessionsByPatternSet{makeKillAllSessionsByPattern(opCtx)});
+    catalog->scanSessions(matcher, [&sessionKillTokens](const ObservableSession& session) {
+        sessionKillTokens.emplace_back(session.kill());
+    });
+
     killSessionTokens(opCtx, std::move(sessionKillTokens));
 }
 
 int MongoDSessionCatalog::reapSessionsOlderThan(OperationContext* opCtx,
                                                 SessionsCollection& sessionsCollection,
                                                 Date_t possiblyExpired) {
+    {
+        const auto catalog = SessionCatalog::get(opCtx);
+
+        // Capture the possbily expired in-memory session ids
+        LogicalSessionIdSet lsids;
+        catalog->scanSessions(SessionKiller::Matcher(
+                                  KillAllSessionsByPatternSet{makeKillAllSessionsByPattern(opCtx)}),
+                              [&](const ObservableSession& session) {
+                                  if (session.getLastCheckout() < possiblyExpired) {
+                                      lsids.insert(session.getSessionId());
+                                  }
+                              });
+
+        // From the passed-in sessions, find the ones which are actually expired/removed
+        auto expiredSessionIds =
+            uassertStatusOK(sessionsCollection.findRemovedSessions(opCtx, lsids));
+
+        // Remove the session ids from the in-memory catalog
+        for (const auto& lsid : expiredSessionIds) {
+            catalog->scanSession(lsid, [](ObservableSession& session) {
+                const auto participant = TransactionParticipant::get(session);
+                if (!participant.inMultiDocumentTransaction()) {
+                    session.markForReap();
+                }
+            });
+        }
+    }
+
+    // The "unsafe" check for primary below is a best-effort attempt to ensure that the on-disk
+    // state reaping code doesn't run if the node is secondary and cause log spam. It is a work
+    // around the fact that the logical sessions cache is not registered to listen for replication
+    // state changes.
+    const auto replCoord = repl::ReplicationCoordinator::get(opCtx);
+    if (!replCoord->canAcceptWritesForDatabase_UNSAFE(opCtx, NamespaceString::kConfigDb))
+        return 0;
+
     // Scan for records older than the minimum lifetime and uses a sort to walk the '_id' index
     DBDirectClient client(opCtx);
     auto cursor =
@@ -291,11 +388,11 @@ int MongoDSessionCatalog::reapSessionsOlderThan(OperationContext* opCtx,
                      0,
                      &kIdProjection);
 
-    // The max batch size is chosen so that a single batch won't exceed the 16MB BSON object
-    // size limit
-    LogicalSessionIdSet lsids;
+    // The max batch size is chosen so that a single batch won't exceed the 16MB BSON object size
+    // limit
     const int kMaxBatchSize = 10'000;
 
+    LogicalSessionIdSet lsids;
     int numReaped = 0;
     while (cursor->more()) {
         auto transactionSession = SessionsCollectionFetchResultIndividualResult::parse(

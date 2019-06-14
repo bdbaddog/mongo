@@ -31,11 +31,14 @@
 #include "mongo/platform/basic.h"
 
 #include <boost/optional.hpp>
+#include <vector>
 
 #include "mongo/db/catalog/collection_catalog.h"
 #include "mongo/db/catalog/collection_mock.h"
 #include "mongo/db/catalog/drop_collection.h"
 #include "mongo/db/index/index_descriptor.h"
+#include "mongo/db/logical_session_id_gen.h"
+#include "mongo/db/logical_session_id_helpers.h"
 #include "mongo/db/repl/drop_pending_collection_reaper.h"
 #include "mongo/db/repl/oplog_entry.h"
 #include "mongo/db/repl/oplog_interface_local.h"
@@ -46,6 +49,9 @@
 #include "mongo/db/s/type_shard_identity.h"
 #include "mongo/db/service_context.h"
 #include "mongo/s/catalog/type_config_version.h"
+#include "mongo/stdx/thread.h"
+#include "mongo/transport/session.h"
+#include "mongo/transport/transport_layer_mock.h"
 #include "mongo/unittest/death_test.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/log.h"
@@ -240,45 +246,52 @@ protected:
         ASSERT_OK(_storageInterface->deleteById(_opCtx.get(), nss, id));
     }
 
+    /**
+     * Sets up a test for an unprepared transaction that is comprised of multiple
+     * applyOps oplog entries.
+     * Returns entries appended to the oplog.
+     */
+    std::vector<OplogInterfaceMock::Operation> _setUpUnpreparedTransactionForCountTest(UUID collId);
+
     std::unique_ptr<OplogInterfaceLocal> _localOplog;
     std::unique_ptr<OplogInterfaceMock> _remoteOplog;
     std::unique_ptr<RollbackImplForTest> _rollback;
 
     bool _transitionedToRollback = false;
-    stdx::function<void()> _onTransitionToRollbackFn = [this]() { _transitionedToRollback = true; };
+    std::function<void()> _onTransitionToRollbackFn = [this]() { _transitionedToRollback = true; };
 
     bool _recoveredToStableTimestamp = false;
     Timestamp _stableTimestamp;
-    stdx::function<void(Timestamp)> _onRecoverToStableTimestampFn =
+    std::function<void(Timestamp)> _onRecoverToStableTimestampFn =
         [this](Timestamp stableTimestamp) {
             _recoveredToStableTimestamp = true;
             _stableTimestamp = stableTimestamp;
         };
 
     bool _recoveredFromOplog = false;
-    stdx::function<void()> _onRecoverFromOplogFn = [this]() { _recoveredFromOplog = true; };
+    std::function<void()> _onRecoverFromOplogFn = [this]() { _recoveredFromOplog = true; };
 
     bool _incrementedRollbackID = false;
-    stdx::function<void()> _onRollbackIDIncrementedFn = [this]() { _incrementedRollbackID = true; };
+    std::function<void()> _onRollbackIDIncrementedFn = [this]() { _incrementedRollbackID = true; };
 
     bool _reconstructedPreparedTransactions = false;
-    stdx::function<void()> _onPreparedTransactionsReconstructedFn = [this]() {
+    std::function<void()> _onPreparedTransactionsReconstructedFn = [this]() {
         _reconstructedPreparedTransactions = true;
     };
 
     Timestamp _commonPointFound;
-    stdx::function<void(Timestamp commonPoint)> _onCommonPointFoundFn =
+    std::function<void(Timestamp commonPoint)> _onCommonPointFoundFn =
         [this](Timestamp commonPoint) { _commonPointFound = commonPoint; };
 
     Timestamp _truncatePoint;
-    stdx::function<void(Timestamp truncatePoint)> _onSetOplogTruncateAfterPointFn =
+    std::function<void(Timestamp truncatePoint)> _onSetOplogTruncateAfterPointFn =
         [this](Timestamp truncatePoint) { _truncatePoint = truncatePoint; };
 
     bool _triggeredOpObserver = false;
-    stdx::function<void(const OpObserver::RollbackObserverInfo& rbInfo)> _onRollbackOpObserverFn =
+    std::function<void(const OpObserver::RollbackObserverInfo& rbInfo)> _onRollbackOpObserverFn =
         [this](const OpObserver::RollbackObserverInfo& rbInfo) { _triggeredOpObserver = true; };
 
-    stdx::function<void(UUID, NamespaceString)> _onRollbackFileWrittenForNamespaceFn =
+    std::function<void(UUID, NamespaceString)> _onRollbackFileWrittenForNamespaceFn =
         [this](UUID, NamespaceString) {};
 
     std::unique_ptr<Listener> _listener;
@@ -292,15 +305,15 @@ private:
 void RollbackImplTest::setUp() {
     RollbackTest::setUp();
 
-    _localOplog = stdx::make_unique<OplogInterfaceLocal>(_opCtx.get());
-    _remoteOplog = stdx::make_unique<OplogInterfaceMock>();
-    _listener = stdx::make_unique<Listener>(this);
-    _rollback = stdx::make_unique<RollbackImplForTest>(_localOplog.get(),
-                                                       _remoteOplog.get(),
-                                                       _storageInterface,
-                                                       _replicationProcess.get(),
-                                                       _coordinator,
-                                                       _listener.get());
+    _localOplog = std::make_unique<OplogInterfaceLocal>(_opCtx.get());
+    _remoteOplog = std::make_unique<OplogInterfaceMock>();
+    _listener = std::make_unique<Listener>(this);
+    _rollback = std::make_unique<RollbackImplForTest>(_localOplog.get(),
+                                                      _remoteOplog.get(),
+                                                      _storageInterface,
+                                                      _replicationProcess.get(),
+                                                      _coordinator,
+                                                      _listener.get());
 
     createOplog(_opCtx.get());
     serverGlobalParams.clusterRole = ClusterRole::None;
@@ -486,6 +499,49 @@ TEST_F(RollbackImplTest, RollbackSucceedsIfRollbackPeriodIsWithinTimeLimit) {
 
     // Run rollback.
     ASSERT_OK(_rollback->runRollback(_opCtx.get()));
+}
+
+TEST_F(RollbackImplTest, RollbackKillsNecessaryOperations) {
+    auto op = makeOpAndRecordId(1);
+    _remoteOplog->setOperations({op});
+    ASSERT_OK(_insertOplogEntry(op.first));
+    ASSERT_OK(_insertOplogEntry(makeOp(2)));
+    _storageInterface->setStableTimestamp(nullptr, Timestamp(1, 1));
+
+    transport::TransportLayerMock transportLayer;
+    transport::SessionHandle session = transportLayer.createSession();
+
+    auto writeClient = getGlobalServiceContext()->makeClient("writeClient", session);
+    auto writeOpCtx = writeClient->makeOperationContext();
+    boost::optional<Lock::GlobalLock> globalWrite;
+    globalWrite.emplace(writeOpCtx.get(), MODE_IX);
+    ASSERT(globalWrite->isLocked());
+
+    auto readClient = getGlobalServiceContext()->makeClient("readClient", session);
+    auto readOpCtx = readClient->makeOperationContext();
+    boost::optional<Lock::GlobalLock> globalRead;
+    globalRead.emplace(readOpCtx.get(), MODE_IS);
+    ASSERT(globalRead->isLocked());
+
+    // Run rollback in a separate thread so the locking threads can check for interrupt.
+    Status status(ErrorCodes::InternalError, "Not set");
+    stdx::thread rollbackThread([&] { status = _rollback->runRollback(_opCtx.get()); });
+
+    while (!(writeOpCtx->isKillPending() && readOpCtx->isKillPending())) {
+        // Do nothing.
+        sleepmillis(10);
+    }
+
+    // We assume that an interrupted opCtx would release its locks.
+    unittest::log() << "Both opCtx's marked for kill";
+    ASSERT_EQ(ErrorCodes::InterruptedDueToReplStateChange, writeOpCtx->checkForInterruptNoAssert());
+    globalWrite = boost::none;
+    ASSERT_EQ(ErrorCodes::InterruptedDueToReplStateChange, readOpCtx->checkForInterruptNoAssert());
+    globalRead = boost::none;
+    unittest::log() << "Both opCtx's were interrupted";
+
+    rollbackThread.join();
+    ASSERT_OK(status);
 }
 
 TEST_F(RollbackImplTest, RollbackFailsIfRollbackPeriodIsTooLong) {
@@ -1347,6 +1403,110 @@ TEST_F(RollbackImplTest, ResetToZeroIfCountGoesNegative) {
 
     ASSERT_OK(_rollback->runRollback(_opCtx.get()));
     ASSERT_EQ(_storageInterface->getFinalCollectionCount(kGenericUUID), 0);
+}
+
+std::vector<OplogInterfaceMock::Operation>
+RollbackImplTest::_setUpUnpreparedTransactionForCountTest(UUID collId) {
+    std::vector<OplogInterfaceMock::Operation> ops;
+
+    // Initialize the collection with one document inserted outside a transaction.
+    // The final collection count after rolling back the transaction, which has one entry before the
+    // stable timestamp, should be 1.
+    auto nss = NamespaceString("test.coll1");
+    _initializeCollection(_opCtx.get(), collId, nss);
+    auto insertOp1 = _insertDocAndReturnOplogEntry(BSON("_id" << 1), collId, nss, 1);
+    ops.push_back(insertOp1);
+    ASSERT_OK(_insertOplogEntry(insertOp1.first));
+
+    // Common field values for applyOps oplog entries.
+    auto adminCmdNss = NamespaceString(NamespaceString::kAdminDb).getCommandNS();
+    OperationSessionInfo sessionInfo;
+    sessionInfo.setSessionId(makeLogicalSessionId(_opCtx.get()));
+    sessionInfo.setTxnNumber(1);
+
+    // Start an unprepared transaction with an applyOps oplog entry with the "partialTxn" field
+    // set to true.
+    auto insertOp2 = _insertDocAndReturnOplogEntry(BSON("_id" << 2), collId, nss, 2);
+    auto partialApplyOpsOpTime = unittest::assertGet(OpTime::parseFromOplogEntry(insertOp2.first));
+    auto partialApplyOpsObj =
+        BSON("applyOps" << BSON_ARRAY(insertOp2.first) << "partialTxn" << true);
+    OplogEntry partialApplyOpsOplogEntry(partialApplyOpsOpTime,      // opTime
+                                         1LL,                        // hash
+                                         OpTypeEnum::kCommand,       // opType
+                                         adminCmdNss,                // nss
+                                         boost::none,                // uuid
+                                         boost::none,                // fromMigrate
+                                         OplogEntry::kOplogVersion,  // version
+                                         partialApplyOpsObj,         // oField
+                                         boost::none,                // o2Field
+                                         sessionInfo,                // sessionInfo
+                                         boost::none,                // isUpsert
+                                         boost::none,                // wallClockTime
+                                         boost::none,                // statementId
+                                         OpTime(),                   // prevWriteOpTimeInTransaction
+                                         boost::none,                // preImageOpTime
+                                         boost::none);               // postImageOpTime
+    ASSERT_OK(_insertOplogEntry(partialApplyOpsOplogEntry.toBSON()));
+    ops.push_back(std::make_pair(partialApplyOpsOplogEntry.toBSON(), insertOp2.second));
+
+    // Complete the unprepared transaction with an implicit commit oplog entry.
+    // When rolling back the implicit commit operation, we should be traversing, in reverse, the
+    // chain of applyOps oplog entries for this transaction.
+    auto insertOp3 = _insertDocAndReturnOplogEntry(BSON("_id" << 3), collId, nss, 3);
+    auto commitApplyOpsOpTime = unittest::assertGet(OpTime::parseFromOplogEntry(insertOp3.first));
+    auto commitApplyOpsObj = BSON("applyOps" << BSON_ARRAY(insertOp3.first) << "count" << 1);
+    OplogEntry commitApplyOpsOplogEntry(commitApplyOpsOpTime,       // opTime
+                                        1LL,                        // hash
+                                        OpTypeEnum::kCommand,       // opType
+                                        adminCmdNss,                // nss
+                                        boost::none,                // uuid
+                                        boost::none,                // fromMigrate
+                                        OplogEntry::kOplogVersion,  // version
+                                        commitApplyOpsObj,          // oField
+                                        boost::none,                // o2Field
+                                        sessionInfo,                // sessionInfo
+                                        boost::none,                // isUpsert
+                                        boost::none,                // wallClockTime
+                                        boost::none,                // statementId
+                                        partialApplyOpsOpTime,      // prevWriteOpTimeInTransaction
+                                        boost::none,                // preImageOpTime
+                                        boost::none);               // postImageOpTime
+    ASSERT_OK(_insertOplogEntry(commitApplyOpsOplogEntry.toBSON()));
+    ops.push_back(std::make_pair(commitApplyOpsOplogEntry.toBSON(), insertOp3.second));
+
+    ASSERT_OK(_storageInterface->setCollectionCount(nullptr, {nss.db().toString(), collId}, 3));
+    _assertDocsInOplog(_opCtx.get(), {1, 2, 3});
+
+    return ops;
+}
+
+TEST_F(RollbackImplTest, RollbackFixesCountForUnpreparedTransactionApplyOpsChain1) {
+    auto collId = UUID::gen();
+    auto ops = _setUpUnpreparedTransactionForCountTest(collId);
+
+    // Make the non-transaction CRUD oplog entry the common point and use its timestamp for the
+    // stable timestamp.
+    const auto& commonOp = ops[0];
+    _storageInterface->setStableTimestamp(nullptr, commonOp.first["ts"].timestamp());
+    _remoteOplog->setOperations({commonOp});
+    ASSERT_OK(_rollback->runRollback(_opCtx.get()));
+
+    // The entire applyOps chain occurs after the common point.
+    ASSERT_EQ(_storageInterface->getFinalCollectionCount(collId), 1);
+}
+
+TEST_F(RollbackImplTest, RollbackFixesCountForUnpreparedTransactionApplyOpsChain2) {
+    auto collId = UUID::gen();
+    auto ops = _setUpUnpreparedTransactionForCountTest(collId);
+
+    // Make the starting applyOps oplog entry the common point and use its timestamp for the stable
+    // timestamp.
+    const auto& commonOp = ops[1];
+    _storageInterface->setStableTimestamp(nullptr, commonOp.first["ts"].timestamp());
+    _remoteOplog->setOperations({commonOp});
+    ASSERT_OK(_rollback->runRollback(_opCtx.get()));
+
+    ASSERT_EQ(_storageInterface->getFinalCollectionCount(collId), 1);
 }
 
 /**

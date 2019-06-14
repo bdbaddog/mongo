@@ -37,6 +37,7 @@
 #include <boost/date_time/posix_time/posix_time.hpp>
 #include <fstream>
 #include <iostream>
+#include <memory>
 #include <sstream>
 #include <stack>
 #include <string>
@@ -48,7 +49,6 @@
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/config.h"
 #include "mongo/platform/atomic_word.h"
-#include "mongo/stdx/memory.h"
 #include "mongo/transport/session.h"
 #include "mongo/util/concurrency/mutex.h"
 #include "mongo/util/debug_util.h"
@@ -318,7 +318,7 @@ public:
         CRYPTO_set_locking_callback(&SSLThreadInfo::lockingCallback);
 
         while ((int)_mutex.size() < CRYPTO_num_locks()) {
-            _mutex.emplace_back(stdx::make_unique<stdx::recursive_mutex>());
+            _mutex.emplace_back(std::make_unique<stdx::recursive_mutex>());
         }
     }
 
@@ -359,6 +359,14 @@ private:
 std::vector<std::unique_ptr<stdx::recursive_mutex>> SSLThreadInfo::_mutex;
 SSLThreadInfo::ThreadIDManager SSLThreadInfo::_idManager;
 
+boost::optional<std::string> getRawSNIServerName(const SSL* const ssl) {
+    const char* name = SSL_get_servername(ssl, TLSEXT_NAMETYPE_host_name);
+    if (!name) {
+        return boost::none;
+    }
+    return std::string(name);
+}
+
 class SSLConnectionOpenSSL : public SSLConnectionInterface {
 public:
     SSL* ssl;
@@ -371,11 +379,7 @@ public:
     ~SSLConnectionOpenSSL();
 
     std::string getSNIServerName() const final {
-        const char* name = SSL_get_servername(ssl, TLSEXT_NAMETYPE_host_name);
-        if (!name)
-            return "";
-
-        return name;
+        return getRawSNIServerName(ssl).value_or("");
     }
 };
 
@@ -408,7 +412,7 @@ public:
                                                           const std::string& remoteHost,
                                                           const HostAndPort& hostForLogging) final;
 
-    StatusWith<boost::optional<SSLPeerInfo>> parseAndValidatePeerCertificate(
+    StatusWith<SSLPeerInfo> parseAndValidatePeerCertificate(
         SSL* conn, const std::string& remoteHost, const HostAndPort& hostForLogging) final;
 
     const SSLConfiguration& getSSLConfiguration() const final {
@@ -631,7 +635,7 @@ MONGO_INITIALIZER_WITH_PREREQUISITES(SSLManager, ("SetupOpenSSL", "EndStartupOpt
 
 std::unique_ptr<SSLManagerInterface> SSLManagerInterface::create(const SSLParams& params,
                                                                  bool isServer) {
-    return stdx::make_unique<SSLManagerOpenSSL>(params, isServer);
+    return std::make_unique<SSLManagerOpenSSL>(params, isServer);
 }
 
 SSLX509Name getCertificateSubjectX509Name(X509* cert) {
@@ -881,22 +885,27 @@ Status SSLManagerOpenSSL::initSSLContext(SSL_CTX* context,
     // SSL_OP_ALL - Activate all bug workaround options, to support buggy client SSL's.
     // SSL_OP_NO_SSLv2 - Disable SSL v2 support
     // SSL_OP_NO_SSLv3 - Disable SSL v3 support
-    long supportedProtocols = SSL_OP_ALL | SSL_OP_NO_SSLv2 | SSL_OP_NO_SSLv3;
+    long options = SSL_OP_ALL | SSL_OP_NO_SSLv2 | SSL_OP_NO_SSLv3;
 
     // Set the supported TLS protocols. Allow --sslDisabledProtocols to disable selected
     // ciphers.
     for (const SSLParams::Protocols& protocol : params.sslDisabledProtocols) {
         if (protocol == SSLParams::Protocols::TLS1_0) {
-            supportedProtocols |= SSL_OP_NO_TLSv1;
+            options |= SSL_OP_NO_TLSv1;
         } else if (protocol == SSLParams::Protocols::TLS1_1) {
-            supportedProtocols |= SSL_OP_NO_TLSv1_1;
+            options |= SSL_OP_NO_TLSv1_1;
         } else if (protocol == SSLParams::Protocols::TLS1_2) {
-            supportedProtocols |= SSL_OP_NO_TLSv1_2;
+            options |= SSL_OP_NO_TLSv1_2;
         } else if (protocol == SSLParams::Protocols::TLS1_3) {
-            supportedProtocols |= SSL_OP_NO_TLSv1_3;
+            options |= SSL_OP_NO_TLSv1_3;
         }
     }
-    ::SSL_CTX_set_options(context, supportedProtocols);
+
+#ifdef SSL_OP_NO_RENEGOTIATION
+    options |= SSL_OP_NO_RENEGOTIATION;
+#endif
+
+    ::SSL_CTX_set_options(context, options);
 
     // HIGH - Enable strong ciphers
     // !EXPORT - Disable export ciphers (40/56 bit)
@@ -1418,7 +1427,7 @@ bool SSLManagerOpenSSL::_doneWithSSLOp(SSLConnectionOpenSSL* conn, int status) {
 
 SSLConnectionInterface* SSLManagerOpenSSL::connect(Socket* socket) {
     std::unique_ptr<SSLConnectionOpenSSL> sslConn =
-        stdx::make_unique<SSLConnectionOpenSSL>(_clientContext.get(), socket, (const char*)NULL, 0);
+        std::make_unique<SSLConnectionOpenSSL>(_clientContext.get(), socket, (const char*)NULL, 0);
 
     const auto undotted = removeFQDNRoot(socket->remoteAddr().hostOrIp());
     int ret = ::SSL_set_tlsext_host_name(sslConn->ssl, undotted.c_str());
@@ -1439,7 +1448,7 @@ SSLConnectionInterface* SSLManagerOpenSSL::accept(Socket* socket,
                                                   const char* initialBytes,
                                                   int len) {
     std::unique_ptr<SSLConnectionOpenSSL> sslConn =
-        stdx::make_unique<SSLConnectionOpenSSL>(_serverContext.get(), socket, initialBytes, len);
+        std::make_unique<SSLConnectionOpenSSL>(_serverContext.get(), socket, initialBytes, len);
 
     int ret;
     do {
@@ -1472,8 +1481,9 @@ StatusWith<TLSVersion> mapTLSVersion(SSL* conn) {
     }
 }
 
-StatusWith<boost::optional<SSLPeerInfo>> SSLManagerOpenSSL::parseAndValidatePeerCertificate(
+StatusWith<SSLPeerInfo> SSLManagerOpenSSL::parseAndValidatePeerCertificate(
     SSL* conn, const std::string& remoteHost, const HostAndPort& hostForLogging) {
+    auto sniName = getRawSNIServerName(conn);
 
     auto tlsVersionStatus = mapTLSVersion(conn);
     if (!tlsVersionStatus.isOK()) {
@@ -1483,7 +1493,7 @@ StatusWith<boost::optional<SSLPeerInfo>> SSLManagerOpenSSL::parseAndValidatePeer
     recordTLSVersion(tlsVersionStatus.getValue(), hostForLogging);
 
     if (!_sslConfiguration.hasCA && isSSLServer)
-        return {boost::none};
+        return SSLPeerInfo(std::move(sniName));
 
     X509* peerCert = SSL_get_peer_certificate(conn);
 
@@ -1493,7 +1503,7 @@ StatusWith<boost::optional<SSLPeerInfo>> SSLManagerOpenSSL::parseAndValidatePeer
             if (!_suppressNoCertificateWarning) {
                 warning() << "no SSL certificate provided by peer";
             }
-            return {boost::none};
+            return SSLPeerInfo(std::move(sniName));
         } else {
             auto msg = "no SSL certificate provided by peer; connection rejected";
             error() << msg;
@@ -1508,7 +1518,7 @@ StatusWith<boost::optional<SSLPeerInfo>> SSLManagerOpenSSL::parseAndValidatePeer
         if (_allowInvalidCertificates) {
             warning() << "SSL peer certificate validation failed: "
                       << X509_verify_cert_error_string(result);
-            return {boost::none};
+            return SSLPeerInfo(std::move(sniName));
         } else {
             str::stream msg;
             msg << "SSL peer certificate validation failed: "
@@ -1535,8 +1545,7 @@ StatusWith<boost::optional<SSLPeerInfo>> SSLManagerOpenSSL::parseAndValidatePeer
     // If this is an SSL client context (on a MongoDB server or client)
     // perform hostname validation of the remote server
     if (remoteHost.empty()) {
-        return boost::make_optional(
-            SSLPeerInfo(peerSubject, std::move(swPeerCertificateRoles.getValue())));
+        return SSLPeerInfo(peerSubject, sniName, std::move(swPeerCertificateRoles.getValue()));
     }
 
     // This is to standardize the IPAddress format for comparison.
@@ -1636,7 +1645,7 @@ StatusWith<boost::optional<SSLPeerInfo>> SSLManagerOpenSSL::parseAndValidatePeer
         }
     }
 
-    return boost::make_optional(SSLPeerInfo(peerSubject, stdx::unordered_set<RoleName>()));
+    return SSLPeerInfo(peerSubject);
 }
 
 
@@ -1651,7 +1660,7 @@ SSLPeerInfo SSLManagerOpenSSL::parseAndValidatePeerCertificateDeprecated(
     if (!swPeerSubjectName.isOK()) {
         throwSocketError(SocketErrorKind::CONNECT_ERROR, swPeerSubjectName.getStatus().reason());
     }
-    return swPeerSubjectName.getValue().get_value_or(SSLPeerInfo());
+    return swPeerSubjectName.getValue();
 }
 
 StatusWith<stdx::unordered_set<RoleName>> SSLManagerOpenSSL::_parsePeerRoles(X509* peerCert) const {
@@ -1696,6 +1705,7 @@ std::string SSLManagerInterface::getSSLErrorMessage(int code) {
 void SSLManagerOpenSSL::_handleSSLError(SSLConnectionOpenSSL* conn, int ret) {
     int code = SSL_get_error(conn->ssl, ret);
     int err = ERR_get_error();
+    SocketErrorKind errToThrow = SocketErrorKind::CONNECT_ERROR;
 
     switch (code) {
         case SSL_ERROR_WANT_READ:
@@ -1704,12 +1714,15 @@ void SSLManagerOpenSSL::_handleSSLError(SSLConnectionOpenSSL* conn, int ret) {
             // However, it turns out this CAN happen during a connect, if the other side
             // accepts the socket connection but fails to do the SSL handshake in a timely
             // manner.
+            errToThrow = (code == SSL_ERROR_WANT_READ) ? SocketErrorKind::RECV_ERROR
+                                                       : SocketErrorKind::SEND_ERROR;
             error() << "SSL: " << code << ", possibly timed out during connect";
             break;
 
         case SSL_ERROR_ZERO_RETURN:
             // TODO: Check if we can avoid throwing an exception for this condition
-            LOG(3) << "SSL network connection closed";
+            // If so, change error() back to LOG(3)
+            error() << "SSL network connection closed";
             break;
         case SSL_ERROR_SYSCALL:
             // If ERR_get_error returned 0, the error queue is empty
@@ -1732,6 +1745,6 @@ void SSLManagerOpenSSL::_handleSSLError(SSLConnectionOpenSSL* conn, int ret) {
             break;
     }
     _flushNetworkBIO(conn);
-    throwSocketError(SocketErrorKind::CONNECT_ERROR, "");
+    throwSocketError(errToThrow, conn->socket->remoteString());
 }
 }  // namespace mongo

@@ -74,7 +74,7 @@ __wt_page_release_evict(WT_SESSION_IMPL *session, WT_REF *ref, uint32_t flags)
 	 */
 	previous_state = ref->state;
 	if ((previous_state == WT_REF_MEM || previous_state == WT_REF_LIMBO) &&
-	    __wt_atomic_casv32(&ref->state, previous_state, WT_REF_LOCKED))
+	    WT_REF_CAS_STATE(session, ref, previous_state, WT_REF_LOCKED))
 		locked = true;
 	if ((ret = __wt_hazard_clear(session, ref)) != 0 || !locked) {
 		if (locked)
@@ -656,7 +656,13 @@ __evict_review(
 		else if (!WT_IS_METADATA(session->dhandle)) {
 			LF_SET(WT_REC_UPDATE_RESTORE);
 
-			if (F_ISSET(cache, WT_CACHE_EVICT_SCRUB))
+			/*
+			 * Scrub if we're supposed to or toss it in sometimes
+			 * if we are in debugging mode.
+			 */
+			if (F_ISSET(cache, WT_CACHE_EVICT_SCRUB) ||
+			    (F_ISSET(cache, WT_CACHE_EVICT_DEBUG_MODE) &&
+			    __wt_random(&session->rnd) % 3 == 0))
 				LF_SET(WT_REC_SCRUB);
 
 			/*
@@ -665,8 +671,16 @@ __evict_review(
 			 * suggests trying the lookaside table.
 			 */
 			if (F_ISSET(cache, WT_CACHE_EVICT_LOOKASIDE) &&
-			    !F_ISSET(conn, WT_CONN_EVICTION_NO_LOOKASIDE))
+			    !F_ISSET(conn, WT_CONN_EVICTION_NO_LOOKASIDE)) {
+				if (F_ISSET(cache,
+				    WT_CACHE_EVICT_DEBUG_MODE) &&
+				    __wt_random(&session->rnd) % 10 == 0) {
+					LF_CLR(WT_REC_SCRUB |
+					    WT_REC_UPDATE_RESTORE);
+					LF_SET(WT_REC_LOOKASIDE);
+				}
 				lookaside_retryp = &lookaside_retry;
+			}
 		}
 	}
 

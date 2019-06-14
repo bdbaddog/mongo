@@ -616,6 +616,10 @@ private:
         return _command->allowsAfterClusterTime(cmdObj());
     }
 
+    bool canIgnorePrepareConflicts() const override {
+        return _command->canIgnorePrepareConflicts();
+    }
+
     void doCheckAuthorization(OperationContext* opCtx) const override {
         uassertStatusOK(_command->checkAuthForOperation(
             opCtx, _request->getDatabase().toString(), _request->body));
@@ -650,7 +654,7 @@ void Command::snipForLogging(mutablebson::Document* cmdObj) const {
 std::unique_ptr<CommandInvocation> BasicCommand::parse(OperationContext* opCtx,
                                                        const OpMsgRequest& request) {
     CommandHelpers::uassertNoDocumentSequences(getName(), request);
-    return stdx::make_unique<Invocation>(opCtx, request, this);
+    return std::make_unique<Invocation>(opCtx, request, this);
 }
 
 Command::Command(StringData name, StringData oldName)

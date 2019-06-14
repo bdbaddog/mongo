@@ -140,20 +140,26 @@ public:
 
     /**
      * Reads contents of table using URI and exports all keys to BSON as string elements.
-     * Additional, adds 'uri' field to output document.
+     * Additional, adds 'uri' field to output document. A filter can be specified to skip desired
+     * fields.
      */
     static Status exportTableToBSON(WT_SESSION* s,
                                     const std::string& uri,
                                     const std::string& config,
                                     BSONObjBuilder* bob);
+    static Status exportTableToBSON(WT_SESSION* s,
+                                    const std::string& uri,
+                                    const std::string& config,
+                                    BSONObjBuilder* bob,
+                                    const std::vector<std::string>& filter);
 
     /**
      * Appends information about the storage engine's currently available snapshots and the settings
      * that affect that window of maintained history.
      *
      * "snapshot-window-settings" : {
-     *      "cache pressure percentage threshold" : <num>,
-     *      "current cache pressure percentage" : <num>,
+     *      "total number of cache overflow disk writes",
+     *      "total number of SnapshotTooOld errors",
      *      "max target available snapshots window size in seconds" : <num>,
      *      "target available snapshots window size in seconds" : <num>,
      *      "current available snapshots window size in seconds" : <num>,
@@ -203,31 +209,10 @@ public:
      * Reads individual statistics using URI.
      * List of statistics keys WT_STAT_* can be found in wiredtiger.h.
      */
-    static StatusWith<uint64_t> getStatisticsValue(WT_SESSION* session,
-                                                   const std::string& uri,
-                                                   const std::string& config,
-                                                   int statisticsKey);
-
-    /**
-     * Reads individual statistics using URI and casts to type ResultType.
-     * Caps statistics value at max(ResultType) in case of overflow.
-     */
-    template <typename ResultType>
-    static StatusWith<ResultType> getStatisticsValueAs(WT_SESSION* session,
-                                                       const std::string& uri,
-                                                       const std::string& config,
-                                                       int statisticsKey);
-
-    /**
-     * Reads individual statistics using URI and casts to type ResultType.
-     * Caps statistics value at 'maximumResultType'.
-     */
-    template <typename ResultType>
-    static StatusWith<ResultType> getStatisticsValueAs(WT_SESSION* session,
-                                                       const std::string& uri,
-                                                       const std::string& config,
-                                                       int statisticsKey,
-                                                       ResultType maximumResultType);
+    static StatusWith<int64_t> getStatisticsValue(WT_SESSION* session,
+                                                  const std::string& uri,
+                                                  const std::string& config,
+                                                  int statisticsKey);
 
     static int64_t getIdentSize(WT_SESSION* s, const std::string& uri);
 
@@ -316,31 +301,6 @@ public:
 private:
     WT_CONFIG_PARSER* _parser;
 };
-
-// static
-template <typename ResultType>
-StatusWith<ResultType> WiredTigerUtil::getStatisticsValueAs(WT_SESSION* session,
-                                                            const std::string& uri,
-                                                            const std::string& config,
-                                                            int statisticsKey) {
-    return getStatisticsValueAs<ResultType>(
-        session, uri, config, statisticsKey, std::numeric_limits<ResultType>::max());
-}
-
-// static
-template <typename ResultType>
-StatusWith<ResultType> WiredTigerUtil::getStatisticsValueAs(WT_SESSION* session,
-                                                            const std::string& uri,
-                                                            const std::string& config,
-                                                            int statisticsKey,
-                                                            ResultType maximumResultType) {
-    StatusWith<uint64_t> result = getStatisticsValue(session, uri, config, statisticsKey);
-    if (!result.isOK()) {
-        return StatusWith<ResultType>(result.getStatus());
-    }
-    return StatusWith<ResultType>(
-        _castStatisticsValue<ResultType>(result.getValue(), maximumResultType));
-}
 
 // static
 template <typename ResultType>

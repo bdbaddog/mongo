@@ -275,6 +275,7 @@ connection_stats = [
     CacheStat('cache_lookaside_entries', 'cache overflow table entries', 'no_clear,no_scale'),
     CacheStat('cache_lookaside_insert', 'cache overflow table insert calls'),
     CacheStat('cache_lookaside_ondisk', 'cache overflow table on-disk size', 'no_clear,no_scale,size'),
+    CacheStat('cache_lookaside_ondisk_max', 'cache overflow table max on-disk size', 'no_clear,no_scale,size'),
     CacheStat('cache_lookaside_remove', 'cache overflow table remove calls'),
     CacheStat('cache_lookaside_score', 'cache overflow score', 'no_clear,no_scale'),
     CacheStat('cache_overhead', 'percentage overhead', 'no_clear,no_scale'),
@@ -513,6 +514,8 @@ connection_stats = [
     SessionOpStat('session_table_create_success', 'table create successful calls', 'no_clear,no_scale'),
     SessionOpStat('session_table_drop_fail', 'table drop failed calls', 'no_clear,no_scale'),
     SessionOpStat('session_table_drop_success', 'table drop successful calls', 'no_clear,no_scale'),
+    SessionOpStat('session_table_import_fail', 'table import failed calls', 'no_clear,no_scale'),
+    SessionOpStat('session_table_import_success', 'table import successful calls', 'no_clear,no_scale'),
     SessionOpStat('session_table_rebalance_fail', 'table rebalance failed calls', 'no_clear,no_scale'),
     SessionOpStat('session_table_rebalance_success', 'table rebalance successful calls', 'no_clear,no_scale'),
     SessionOpStat('session_table_rename_fail', 'table rename failed calls', 'no_clear,no_scale'),
@@ -726,6 +729,8 @@ dsrc_stats = [
     # Compression statistics
     ##########################################
     CompressStat('compress_read', 'compressed pages read'),
+    CompressStat('compress_precomp_intl_max_page_size', 'compressed page maximum internal page size prior to compression', 'no_clear,no_scale,size'),
+    CompressStat('compress_precomp_leaf_max_page_size', 'compressed page maximum leaf page size prior to compression ', 'no_clear,no_scale,size'),
     CompressStat('compress_write', 'compressed pages written'),
     CompressStat('compress_write_fail', 'page written failed to compress'),
     CompressStat('compress_write_too_small', 'page written was too small to compress'),

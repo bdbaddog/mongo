@@ -57,14 +57,6 @@ server_parameters:
         on_update: std::ref(TransactionParticipant::observeTransactionLifetimeLimitSeconds)
         default: 60
 
-    useMultipleOplogEntryFormatForTransactions:
-        description: >-
-            Use multi oplog format for transactions to allow transactions > 16MB.
-        set_at: startup
-        cpp_vartype: bool
-        cpp_varname: gUseMultipleOplogEntryFormatForTransactions
-        default: false
-
     maxNumberOfTransactionOperationsInSingleOplogEntry:
         description: >-
             Maximum number of operations to pack into a single oplog entry, when multi-oplog
@@ -74,3 +66,12 @@ server_parameters:
         cpp_varname: gMaxNumberOfTransactionOperationsInSingleOplogEntry
         default: 2147483647  # INT_MAX
         validator: { gte: 1 }
+
+    transactionSizeLimitBytes:
+        description: >-
+            Maximum total size of operations in a multi-document transaction.
+        set_at: [ startup, runtime ]
+        cpp_vartype: AtomicWord<long long>
+        cpp_varname: gTransactionSizeLimitBytes
+        default:
+          expr: std::numeric_limits<long long>::max()

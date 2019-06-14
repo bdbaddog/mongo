@@ -33,6 +33,8 @@
 
 #include "mongo/client/replica_set_monitor_manager.h"
 
+#include <memory>
+
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/client/connection_string.h"
 #include "mongo/client/mongo_uri.h"
@@ -44,7 +46,6 @@
 #include "mongo/executor/task_executor_pool.h"
 #include "mongo/executor/thread_pool_task_executor.h"
 #include "mongo/rpc/metadata/egress_metadata_hook_list.h"
-#include "mongo/stdx/memory.h"
 #include "mongo/stdx/mutex.h"
 #include "mongo/util/log.h"
 #include "mongo/util/map_util.h"
@@ -79,7 +80,7 @@ shared_ptr<ReplicaSetMonitor> ReplicaSetMonitorManager::getMonitor(StringData se
 }
 
 void ReplicaSetMonitorManager::_setupTaskExecutorInLock(const std::string& name) {
-    auto hookList = stdx::make_unique<rpc::EgressMetadataHookList>();
+    auto hookList = std::make_unique<rpc::EgressMetadataHookList>();
 
     // do not restart taskExecutor if is in shutdown
     if (!_taskExecutor && !_isShutdown) {
@@ -87,8 +88,8 @@ void ReplicaSetMonitorManager::_setupTaskExecutorInLock(const std::string& name)
         auto net = executor::makeNetworkInterface(
             "ReplicaSetMonitor-TaskExecutor", nullptr, std::move(hookList));
         auto netPtr = net.get();
-        _taskExecutor = stdx::make_unique<ThreadPoolTaskExecutor>(
-            stdx::make_unique<NetworkInterfaceThreadPool>(netPtr), std::move(net));
+        _taskExecutor = std::make_unique<ThreadPoolTaskExecutor>(
+            std::make_unique<NetworkInterfaceThreadPool>(netPtr), std::move(net));
         LOG(1) << "Starting up task executor for monitoring replica sets in response to request to "
                   "monitor set: "
                << redact(name);
@@ -203,19 +204,22 @@ void ReplicaSetMonitorManager::removeAllMonitors() {
     }
 }
 
-void ReplicaSetMonitorManager::report(BSONObjBuilder* builder) {
+void ReplicaSetMonitorManager::report(BSONObjBuilder* builder, bool forFTDC) {
     // Don't hold _mutex the whole time to avoid ever taking a monitor's mutex while holding the
     // manager's mutex.  Otherwise we could get a deadlock between the manager's, monitor's, and
     // ShardRegistry's mutex due to the ReplicaSetMonitor's AsynchronousConfigChangeHook potentially
     // calling ShardRegistry::updateConfigServerConnectionString.
     auto setNames = getAllSetNames();
+
+    BSONObjBuilder setStats(
+        builder->subobjStart(forFTDC ? "replicaSetPingTimesMillis" : "replicaSets"));
+
     for (const auto& setName : setNames) {
         auto monitor = getMonitor(setName);
         if (!monitor) {
             continue;
         }
-        BSONObjBuilder monitorInfo(builder->subobjStart(setName));
-        monitor->appendInfo(monitorInfo);
+        monitor->appendInfo(setStats, forFTDC);
     }
 }
 

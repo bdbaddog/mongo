@@ -274,7 +274,6 @@ Status rollback_internal::updateFixUpInfoFromLocalOplogEntry(OperationContext* o
     if (txnNumber) {
         auto sessionId = operationSessionInfo.getSessionId();
         invariant(sessionId);
-        invariant(oplogEntry.getStatementId());
 
         auto transactionTableUUID = fixUpInfo.transactionTableUUID;
         if (transactionTableUUID) {
@@ -1570,7 +1569,7 @@ void rollback_internal::syncFixUp(OperationContext* opCtx,
 
     // If necessary, clear the memory of existing sessions.
     if (fixUpInfo.refetchTransactionDocs) {
-        MongoDSessionCatalog::invalidateSessions(opCtx, boost::none);
+        MongoDSessionCatalog::invalidateAllSessions(opCtx);
     }
 
     if (auto validator = LogicalTimeValidator::get(opCtx)) {
@@ -1621,7 +1620,7 @@ void rollback(OperationContext* opCtx,
               int requiredRBID,
               ReplicationCoordinator* replCoord,
               ReplicationProcess* replicationProcess,
-              stdx::function<void(int)> sleepSecsFn) {
+              std::function<void(int)> sleepSecsFn) {
     // Set state to ROLLBACK while we are in this function. This prevents serving reads, even from
     // the oplog. This can fail if we are elected PRIMARY, in which case we better not do any
     // rolling back. If we successfully enter ROLLBACK we will only exit this function fatally or

@@ -64,7 +64,7 @@ Status IndexCatalogImpl::IndexBuildBlock::init(OperationContext* opCtx, Collecti
 
     // need this first for names, etc...
     BSONObj keyPattern = _spec.getObjectField("key");
-    auto descriptor = stdx::make_unique<IndexDescriptor>(
+    auto descriptor = std::make_unique<IndexDescriptor>(
         collection, IndexNames::findPluginName(keyPattern), _spec);
 
     _indexName = descriptor->indexName();
@@ -80,7 +80,7 @@ Status IndexCatalogImpl::IndexBuildBlock::init(OperationContext* opCtx, Collecti
     }
 
     // Setup on-disk structures.
-    const auto protocol = IndexBuildProtocol::kTwoPhase;
+    const auto protocol = IndexBuildProtocol::kSinglePhase;
     Status status = collection->getCatalogEntry()->prepareForIndexBuild(
         opCtx, descriptor.get(), protocol, isBackgroundSecondaryBuild);
     if (!status.isOK())
@@ -92,17 +92,17 @@ Status IndexCatalogImpl::IndexBuildBlock::init(OperationContext* opCtx, Collecti
         opCtx, std::move(descriptor), initFromDisk, isReadyIndex);
 
     if (_method == IndexBuildMethod::kHybrid) {
-        _indexBuildInterceptor = stdx::make_unique<IndexBuildInterceptor>(opCtx, _entry);
+        _indexBuildInterceptor = std::make_unique<IndexBuildInterceptor>(opCtx, _entry);
         _entry->setIndexBuildInterceptor(_indexBuildInterceptor.get());
 
-        const auto sideWritesIdent = _indexBuildInterceptor->getSideWritesTableIdent();
-        // Only unique indexes have a constraint violations table.
-        const auto constraintsIdent = (_entry->descriptor()->unique())
-            ? boost::optional<std::string>(
-                  _indexBuildInterceptor->getConstraintViolationsTableIdent())
-            : boost::none;
-
         if (IndexBuildProtocol::kTwoPhase == protocol) {
+            const auto sideWritesIdent = _indexBuildInterceptor->getSideWritesTableIdent();
+            // Only unique indexes have a constraint violations table.
+            const auto constraintsIdent = (_entry->descriptor()->unique())
+                ? boost::optional<std::string>(
+                      _indexBuildInterceptor->getConstraintViolationsTableIdent())
+                : boost::none;
+
             collection->getCatalogEntry()->setIndexBuildScanning(
                 opCtx, _entry->descriptor()->indexName(), sideWritesIdent, constraintsIdent);
         }

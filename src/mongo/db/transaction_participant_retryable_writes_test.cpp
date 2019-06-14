@@ -29,6 +29,8 @@
 
 #include "mongo/platform/basic.h"
 
+#include <memory>
+
 #include "mongo/db/client.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/dbdirectclient.h"
@@ -45,7 +47,6 @@
 #include "mongo/db/session_catalog_mongod.h"
 #include "mongo/db/transaction_participant.h"
 #include "mongo/stdx/future.h"
-#include "mongo/stdx/memory.h"
 #include "mongo/unittest/death_test.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/net/socket_utils.h"
@@ -81,8 +82,7 @@ repl::OplogEntry makeOplogEntry(repl::OpTime opTime,
         stmtId,                        // statement id
         prevWriteOpTimeInTransaction,  // optime of previous write within same transaction
         boost::none,                   // pre-image optime
-        boost::none,                   // post-image optime
-        boost::none);                  // prepare
+        boost::none);                  // post-image optime
 }
 
 class OpObserverMock : public OpObserverNoop {
@@ -102,7 +102,7 @@ public:
 
     bool onTransactionPrepareThrowsException = false;
     bool transactionPrepared = false;
-    stdx::function<void()> onTransactionPrepareFn = [this]() { transactionPrepared = true; };
+    std::function<void()> onTransactionPrepareFn = [this]() { transactionPrepared = true; };
 
     void onUnpreparedTransactionCommit(
         OperationContext* opCtx, const std::vector<repl::ReplOperation>& statements) override {
@@ -119,7 +119,7 @@ public:
     bool onUnpreparedTransactionCommitThrowsException = false;
     bool unpreparedTransactionCommitted = false;
 
-    stdx::function<void()> onUnpreparedTransactionCommitFn = [this]() {
+    std::function<void()> onUnpreparedTransactionCommitFn = [this]() {
         unpreparedTransactionCommitted = true;
     };
 
@@ -142,7 +142,7 @@ public:
 
     bool onPreparedTransactionCommitThrowsException = false;
     bool preparedTransactionCommitted = false;
-    stdx::function<void(OplogSlot, Timestamp)> onPreparedTransactionCommitFn =
+    std::function<void(OplogSlot, Timestamp)> onPreparedTransactionCommitFn =
         [this](OplogSlot commitOplogEntryOpTime, Timestamp commitTimestamp) {
             preparedTransactionCommitted = true;
         };
@@ -173,7 +173,7 @@ protected:
         const auto service = opCtx()->getServiceContext();
 
         const auto opObserverRegistry = dynamic_cast<OpObserverRegistry*>(service->getOpObserver());
-        opObserverRegistry->addObserver(stdx::make_unique<OpObserverMock>());
+        opObserverRegistry->addObserver(std::make_unique<OpObserverMock>());
 
         opCtx()->setLogicalSessionId(makeLogicalSessionIdForTest());
         _opContextSession.emplace(opCtx());
@@ -219,8 +219,6 @@ protected:
                            osi,
                            stmtId,
                            link,
-                           false /* prepare */,
-                           false /* inTxn */,
                            OplogSlot());
     }
 
@@ -588,8 +586,6 @@ TEST_F(TransactionParticipantRetryableWritesTest, ErrorOnlyWhenStmtIdBeingChecke
                                   osi,
                                   1,
                                   {},
-                                  false /* prepare */,
-                                  false /* inTxn */,
                                   OplogSlot());
         txnParticipant.onWriteOpCompletedOnPrimary(
             opCtx(), txnNum, {1}, opTime, wallClockTime, boost::none, boost::none);
@@ -618,8 +614,6 @@ TEST_F(TransactionParticipantRetryableWritesTest, ErrorOnlyWhenStmtIdBeingChecke
                                   osi,
                                   kIncompleteHistoryStmtId,
                                   link,
-                                  false /* prepare */,
-                                  false /* inTxn */,
                                   OplogSlot());
 
         txnParticipant.onWriteOpCompletedOnPrimary(opCtx(),

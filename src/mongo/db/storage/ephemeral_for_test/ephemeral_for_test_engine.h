@@ -61,9 +61,8 @@ public:
                                              StringData ident,
                                              const IndexDescriptor* desc);
 
-    virtual SortedDataInterface* getSortedDataInterface(OperationContext* opCtx,
-                                                        StringData ident,
-                                                        const IndexDescriptor* desc);
+    virtual std::unique_ptr<SortedDataInterface> getSortedDataInterface(
+        OperationContext* opCtx, StringData ident, const IndexDescriptor* desc);
 
     virtual Status beginBackup(OperationContext* opCtx) {
         return Status::OK();
@@ -118,6 +117,10 @@ public:
 
     virtual Timestamp getOldestOpenReadTimestamp() const override {
         return Timestamp();
+    }
+
+    boost::optional<Timestamp> getOplogNeededForCrashRecovery() const final {
+        return boost::none;
     }
 
 private:

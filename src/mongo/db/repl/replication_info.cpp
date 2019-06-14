@@ -58,9 +58,13 @@
 #include "mongo/executor/network_interface.h"
 #include "mongo/rpc/metadata/client_metadata.h"
 #include "mongo/rpc/metadata/client_metadata_ismaster.h"
+#include "mongo/util/fail_point_service.h"
+#include "mongo/util/log.h"
 #include "mongo/util/map_util.h"
 
 namespace mongo {
+
+MONGO_FAIL_POINT_DEFINE(waitInIsMaster);
 
 using std::unique_ptr;
 using std::list;
@@ -68,12 +72,13 @@ using std::string;
 using std::stringstream;
 
 namespace repl {
-
+namespace {
 void appendReplicationInfo(OperationContext* opCtx, BSONObjBuilder& result, int level) {
     ReplicationCoordinator* replCoord = ReplicationCoordinator::get(opCtx);
     if (replCoord->getSettings().usingReplSets()) {
+        const auto& horizonParams = SplitHorizon::getParameters(opCtx->getClient());
         IsMasterResponse isMasterResponse;
-        replCoord->fillIsMasterForReplSet(&isMasterResponse);
+        replCoord->fillIsMasterForReplSet(&isMasterResponse, horizonParams);
         result.appendElements(isMasterResponse.toBSON());
         if (level) {
             replCoord->appendSlaveInfoData(&result);
@@ -147,8 +152,6 @@ void appendReplicationInfo(OperationContext* opCtx, BSONObjBuilder& result, int 
         replCoord->appendSlaveInfoData(&result);
     }
 }
-
-namespace {
 
 class ReplicationInfoServerStatus : public ServerStatusSection {
 public:
@@ -237,6 +240,10 @@ public:
              const BSONObj& cmdObj,
              BSONObjBuilder& result) final {
         CommandHelpers::handleMarkKillOnClientDisconnect(opCtx);
+
+        // TODO Unwind after SERVER-41070
+        MONGO_FAIL_POINT_PAUSE_WHILE_SET_OR_INTERRUPTED(opCtx, waitInIsMaster);
+
         /* currently request to arbiter is (somewhat arbitrarily) an ismaster request that is not
            authenticated.
         */
@@ -255,6 +262,7 @@ public:
 
         auto& clientMetadataIsMasterState = ClientMetadataIsMasterState::get(opCtx->getClient());
         bool seenIsMaster = clientMetadataIsMasterState.hasSeenIsMaster();
+
         if (!seenIsMaster) {
             clientMetadataIsMasterState.setSeenIsMaster();
         }
@@ -266,16 +274,19 @@ public:
                           "The client metadata document may only be sent in the first isMaster");
             }
 
-            auto swParseClientMetadata = ClientMetadata::parse(element);
+            auto parsedClientMetadata = uassertStatusOK(ClientMetadata::parse(element));
 
-            uassertStatusOK(swParseClientMetadata.getStatus());
+            invariant(parsedClientMetadata);
 
-            invariant(swParseClientMetadata.getValue());
+            parsedClientMetadata->logClientMetadata(opCtx->getClient());
 
-            swParseClientMetadata.getValue().get().logClientMetadata(opCtx->getClient());
+            clientMetadataIsMasterState.setClientMetadata(opCtx->getClient(),
+                                                          std::move(parsedClientMetadata));
+        }
 
-            clientMetadataIsMasterState.setClientMetadata(
-                opCtx->getClient(), std::move(swParseClientMetadata.getValue()));
+        if (!seenIsMaster) {
+            auto sniName = opCtx->getClient()->getSniNameForSession();
+            SplitHorizon::setParameters(opCtx->getClient(), std::move(sniName));
         }
 
         // Parse the optional 'internalClient' field. This is provided by incoming connections from

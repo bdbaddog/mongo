@@ -30,6 +30,7 @@
 #pragma once
 
 #include <boost/optional.hpp>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -48,7 +49,6 @@
 #include "mongo/db/write_concern.h"
 #include "mongo/rpc/op_msg.h"
 #include "mongo/rpc/reply_builder_interface.h"
-#include "mongo/stdx/functional.h"
 #include "mongo/util/fail_point_service.h"
 #include "mongo/util/string_map.h"
 
@@ -605,8 +605,7 @@ public:
      * field and wait for that write concern to be satisfied after the command runs.
      *
      * @param cmd is a BSONObj representation of the command that is used to determine if the
-     *            the command supports a write concern. Ex. aggregate only supports write concern
-     *            when $out is provided.
+     *            the command supports a write concern.
      */
     virtual bool supportsWriteConcern(const BSONObj& cmdObj) const = 0;
 

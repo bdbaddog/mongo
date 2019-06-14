@@ -36,6 +36,7 @@
 #include "mongo/base/initializer.h"
 #include "mongo/config.h"
 #include "mongo/db/catalog/collection_catalog.h"
+#include "mongo/db/catalog/collection_impl.h"
 #include "mongo/db/catalog/database_holder_impl.h"
 #include "mongo/db/catalog/health_log.h"
 #include "mongo/db/catalog/index_key_validate.h"
@@ -45,18 +46,21 @@
 #include "mongo/db/concurrency/lock_state.h"
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/global_settings.h"
+#include "mongo/db/index/index_access_method_factory_impl.h"
 #include "mongo/db/kill_sessions_local.h"
 #include "mongo/db/logical_clock.h"
+#include "mongo/db/logical_session_cache_impl.h"
 #include "mongo/db/op_observer_impl.h"
 #include "mongo/db/op_observer_registry.h"
 #include "mongo/db/repair_database_and_check_version.h"
 #include "mongo/db/repl/storage_interface_impl.h"
+#include "mongo/db/service_liaison_mongod.h"
 #include "mongo/db/session_killer.h"
+#include "mongo/db/sessions_collection_standalone.h"
 #include "mongo/db/storage/encryption_hooks.h"
 #include "mongo/db/storage/storage_engine_init.h"
 #include "mongo/db/ttl.h"
 #include "mongo/embedded/index_builds_coordinator_embedded.h"
-#include "mongo/embedded/logical_session_cache_factory_embedded.h"
 #include "mongo/embedded/periodic_runner_embedded.h"
 #include "mongo/embedded/replication_coordinator_embedded.h"
 #include "mongo/embedded/service_entry_point_embedded.h"
@@ -91,7 +95,7 @@ void initWireSpec() {
 }
 
 
-// Noop, to fulfull dependencies for other initializers
+// Noop, to fulfill dependencies for other initializers.
 MONGO_INITIALIZER_GENERAL(ForkServer, ("EndStartupOptionHandling"), ("default"))
 (InitializerContext* context) {
     return Status::OK();
@@ -99,6 +103,8 @@ MONGO_INITIALIZER_GENERAL(ForkServer, ("EndStartupOptionHandling"), ("default"))
 
 void setUpCatalog(ServiceContext* serviceContext) {
     DatabaseHolder::set(serviceContext, std::make_unique<DatabaseHolderImpl>());
+    IndexAccessMethodFactory::set(serviceContext, std::make_unique<IndexAccessMethodFactoryImpl>());
+    Collection::Factory::set(serviceContext, std::make_unique<CollectionImpl::FactoryImpl>());
 }
 
 // Create a minimalistic replication coordinator to provide a limited interface for users. Not
@@ -109,7 +115,7 @@ ServiceContext::ConstructorActionRegisterer replicationManagerInitializer(
     [](ServiceContext* serviceContext) {
         repl::StorageInterface::set(serviceContext, std::make_unique<repl::StorageInterfaceImpl>());
 
-        auto logicalClock = stdx::make_unique<LogicalClock>(serviceContext);
+        auto logicalClock = std::make_unique<LogicalClock>(serviceContext);
         LogicalClock::set(serviceContext, std::move(logicalClock));
 
         auto replCoord = std::make_unique<ReplicationCoordinatorEmbedded>(serviceContext);
@@ -127,8 +133,6 @@ MONGO_INITIALIZER(fsyncLockedForWriting)(InitializerContext* context) {
 
 GlobalInitializerRegisterer filterAllowedIndexFieldNamesEmbeddedInitializer(
     "FilterAllowedIndexFieldNamesEmbedded",
-    {},
-    {"FilterAllowedIndexFieldNames"},
     [](InitializerContext* service) {
         index_key_validate::filterAllowedIndexFieldNames =
             [](std::set<StringData>& allowedIndexFieldNames) {
@@ -136,7 +140,10 @@ GlobalInitializerRegisterer filterAllowedIndexFieldNamesEmbeddedInitializer(
                 allowedIndexFieldNames.erase(IndexDescriptor::kExpireAfterSecondsFieldName);
             };
         return Status::OK();
-    });
+    },
+    DeinitializerFunction(nullptr),
+    {},
+    {"FilterAllowedIndexFieldNames"});
 }  // namespace
 
 using logger::LogComponent;
@@ -232,8 +239,8 @@ ServiceContext* initialize(const char* yaml_config) {
     periodicRunner->startup();
     serviceContext->setPeriodicRunner(std::move(periodicRunner));
 
-    initializeStorageEngine(serviceContext, StorageEngineInitFlags::kAllowNoLockFile);
     setUpCatalog(serviceContext);
+    initializeStorageEngine(serviceContext, StorageEngineInitFlags::kAllowNoLockFile);
 
     // Warn if we detect configurations for multiple registered storage engines in the same
     // configuration file/environment.
@@ -305,8 +312,13 @@ ServiceContext* initialize(const char* yaml_config) {
     srand((unsigned)(curTimeMicros64()) ^ (unsigned(uintptr_t(&startupOpCtx))));
 
     // Set up the logical session cache
-    auto sessionCache = makeLogicalSessionCacheEmbedded();
-    LogicalSessionCache::set(serviceContext, std::move(sessionCache));
+    LogicalSessionCache::set(serviceContext,
+                             std::make_unique<LogicalSessionCacheImpl>(
+                                 std::make_unique<ServiceLiaisonMongod>(),
+                                 std::make_shared<SessionsCollectionStandalone>(),
+                                 [](OperationContext*, SessionsCollection&, Date_t) {
+                                     return 0; /* No op */
+                                 }));
 
     // MessageServer::run will return when exit code closes its socket and we don't need the
     // operation context anymore

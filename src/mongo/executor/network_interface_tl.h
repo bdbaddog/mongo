@@ -65,7 +65,7 @@ public:
     void signalWorkAvailable() override;
     Date_t now() override;
     Status startCommand(const TaskExecutor::CallbackHandle& cbHandle,
-                        RemoteCommandRequest& request,
+                        RemoteCommandRequestOnAny& request,
                         RemoteCommandCompletionFn&& onFinish,
                         const BatonHandle& baton) override;
 
@@ -85,14 +85,23 @@ public:
 
 private:
     struct CommandState {
-        CommandState(RemoteCommandRequest request_,
-                     TaskExecutor::CallbackHandle cbHandle_,
-                     Promise<RemoteCommandResponse> promise_)
-            : request(std::move(request_)),
-              cbHandle(std::move(cbHandle_)),
-              promise(std::move(promise_)) {}
+        CommandState(NetworkInterfaceTL* interface_,
+                     RemoteCommandRequestOnAny request_,
+                     const TaskExecutor::CallbackHandle& cbHandle_,
+                     Promise<RemoteCommandOnAnyResponse> promise_);
+        ~CommandState();
 
-        RemoteCommandRequest request;
+        // Create a new CommandState in a shared_ptr
+        // Prefer this over raw construction
+        static auto make(NetworkInterfaceTL* interface,
+                         RemoteCommandRequestOnAny request,
+                         const TaskExecutor::CallbackHandle& cbHandle,
+                         Promise<RemoteCommandOnAnyResponse> promise);
+
+        NetworkInterfaceTL* interface;
+
+        RemoteCommandRequestOnAny requestOnAny;
+        boost::optional<RemoteCommandRequest> request;
         TaskExecutor::CallbackHandle cbHandle;
         Date_t deadline = RemoteCommandRequest::kNoExpirationDate;
         Date_t start;
@@ -101,7 +110,7 @@ private:
         std::unique_ptr<transport::ReactorTimer> timer;
 
         AtomicWord<bool> done;
-        Promise<RemoteCommandResponse> promise;
+        Promise<RemoteCommandOnAnyResponse> promise;
     };
 
     struct AlarmState {
@@ -125,11 +134,9 @@ private:
     void _answerAlarm(Status status, std::shared_ptr<AlarmState> state);
 
     void _run();
-    void _eraseInUseConn(const TaskExecutor::CallbackHandle& handle);
-    Future<RemoteCommandResponse> _onAcquireConn(std::shared_ptr<CommandState> state,
-                                                 Future<RemoteCommandResponse> future,
-                                                 ConnectionPool::ConnectionHandle conn,
-                                                 const BatonHandle& baton);
+    void _onAcquireConn(std::shared_ptr<CommandState> state,
+                        ConnectionPool::ConnectionHandle conn,
+                        const BatonHandle& baton);
 
     std::string _instanceName;
     ServiceContext* _svcCtx;
@@ -157,7 +164,7 @@ private:
     stdx::thread _ioThread;
 
     stdx::mutex _inProgressMutex;
-    stdx::unordered_map<TaskExecutor::CallbackHandle, std::shared_ptr<CommandState>> _inProgress;
+    stdx::unordered_map<TaskExecutor::CallbackHandle, std::weak_ptr<CommandState>> _inProgress;
     stdx::unordered_map<TaskExecutor::CallbackHandle, std::shared_ptr<AlarmState>>
         _inProgressAlarms;
 

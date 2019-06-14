@@ -6,8 +6,10 @@
 (function() {
     "use strict";
 
-    // For arrayEq, assertErrorCode, and orderedArrayEq.
-    load("jstests/aggregation/extras/utils.js");
+    // For assertMergeFailsForAllModesWithCode.
+    load("jstests/aggregation/extras/merge_helpers.js");
+    load("jstests/aggregation/extras/utils.js");  // For arrayEq, assertErrorCode, and
+                                                  // orderedArrayEq.
 
     let viewsDB = db.getSiblingDB("views_aggregation");
     assert.commandWorked(viewsDB.dropDatabase());
@@ -75,30 +77,24 @@
 
     // Test that the $out stage errors when writing to a view namespace.
     assertErrorCode(coll, [{$out: "emptyPipelineView"}], ErrorCodes.CommandNotSupportedOnView);
-    assertErrorCode(coll,
-                    [{$out: {to: "emptyPipelineView", mode: "replaceCollection"}}],
-                    ErrorCodes.CommandNotSupportedOnView);
-    assertErrorCode(coll,
-                    [{$out: {to: "emptyPipelineView", mode: "insertDocuments"}}],
-                    ErrorCodes.CommandNotSupportedOnView);
-    assertErrorCode(coll,
-                    [{$out: {to: "emptyPipelineView", mode: "replaceDocuments"}}],
-                    ErrorCodes.CommandNotSupportedOnView);
 
-    // Test that the $out stage errors when writing to a view namespace in a foreign database.
+    // Test that the $merge stage errors when writing to a view namespace.
+    assertMergeFailsForAllModesWithCode({
+        source: viewsDB.coll,
+        target: viewsDB.emptyPipelineView,
+        errorCodes: [ErrorCodes.CommandNotSupportedOnView]
+    });
+
+    // Test that the $merge stage errors when writing to a view namespace in a foreign database.
     let foreignDB = db.getSiblingDB("views_aggregation_foreign");
     foreignDB.view.drop();
     assert.commandWorked(foreignDB.createView("view", "coll", []));
-    assertErrorCode(coll,
-                    [{$out: {db: foreignDB.getName(), to: "view", mode: "insertDocuments"}}],
-                    ErrorCodes.CommandNotSupportedOnView);
-    assertErrorCode(coll,
-                    [{$out: {db: foreignDB.getName(), to: "view", mode: "replaceDocuments"}}],
-                    ErrorCodes.CommandNotSupportedOnView);
-    // TODO (SERVER-36832): When $out to foreign database is allowed with "replaceCollection", this
-    // should fail with ErrorCodes.CommandNotSupportedOnView.
-    assertErrorCode(
-        coll, [{$out: {db: foreignDB.getName(), to: "view", mode: "replaceCollection"}}], 50939);
+
+    assertMergeFailsForAllModesWithCode({
+        source: viewsDB.coll,
+        target: foreignDB.view,
+        errorCodes: [ErrorCodes.CommandNotSupportedOnView]
+    });
 
     // Test that an aggregate on a view propagates the 'bypassDocumentValidation' option.
     const validatedCollName = "collectionWithValidator";

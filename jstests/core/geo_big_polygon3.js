@@ -1,4 +1,8 @@
-// @tags: [does_not_support_stepdowns, requires_non_retryable_writes, requires_fastcount]
+// @tags: [
+//   does_not_support_stepdowns,
+//   requires_fastcount,
+//   requires_non_retryable_writes,
+// ]
 
 //
 //  Big Polygon edge cases

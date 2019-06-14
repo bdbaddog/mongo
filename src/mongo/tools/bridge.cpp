@@ -33,6 +33,7 @@
 
 #include <boost/optional.hpp>
 #include <cstdint>
+#include <memory>
 
 #include "mongo/base/init.h"
 #include "mongo/base/initializer.h"
@@ -44,7 +45,6 @@
 #include "mongo/rpc/factory.h"
 #include "mongo/rpc/message.h"
 #include "mongo/rpc/reply_builder_interface.h"
-#include "mongo/stdx/memory.h"
 #include "mongo/stdx/mutex.h"
 #include "mongo/stdx/thread.h"
 #include "mongo/tools/bridge_commands.h"
@@ -383,6 +383,10 @@ DbResponse ServiceEntryPointBridge::handleRequest(OperationContext* opCtx, const
         } else {
             dest.setExhaust(false);
         }
+
+        // The original checksum won't be valid once the network layer replaces requestId. Remove it
+        // because the network layer re-checksums the response.
+        OpMsg::removeChecksum(&response);
         return {std::move(response), exhaustNS};
     } else {
         return {Message()};

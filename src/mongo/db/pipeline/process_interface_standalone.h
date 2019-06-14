@@ -30,6 +30,7 @@
 #pragma once
 
 #include "mongo/db/dbdirectclient.h"
+#include "mongo/db/exec/shard_filterer.h"
 #include "mongo/db/ops/write_ops_exec.h"
 #include "mongo/db/ops/write_ops_gen.h"
 #include "mongo/db/pipeline/mongo_process_common.h"
@@ -54,22 +55,21 @@ public:
 
     void setOperationContext(OperationContext* opCtx) final;
     DBClientBase* directClient() final;
-    virtual repl::OplogEntry lookUpOplogEntryByOpTime(OperationContext* opCtx,
-                                                      repl::OpTime lookupTime) final;
+    std::unique_ptr<TransactionHistoryIteratorBase> createTransactionHistoryIterator(
+        repl::OpTime time) const final;
     bool isSharded(OperationContext* opCtx, const NamespaceString& nss) final;
-    void insert(const boost::intrusive_ptr<ExpressionContext>& expCtx,
-                const NamespaceString& ns,
-                std::vector<BSONObj>&& objs,
-                const WriteConcernOptions& wc,
-                boost::optional<OID> targetEpoch) override;
-    void update(const boost::intrusive_ptr<ExpressionContext>& expCtx,
-                const NamespaceString& ns,
-                std::vector<BSONObj>&& queries,
-                std::vector<BSONObj>&& updates,
-                const WriteConcernOptions& wc,
-                bool upsert,
-                bool multi,
-                boost::optional<OID> targetEpoch) override;
+    Status insert(const boost::intrusive_ptr<ExpressionContext>& expCtx,
+                  const NamespaceString& ns,
+                  std::vector<BSONObj>&& objs,
+                  const WriteConcernOptions& wc,
+                  boost::optional<OID> targetEpoch) override;
+    StatusWith<UpdateResult> update(const boost::intrusive_ptr<ExpressionContext>& expCtx,
+                                    const NamespaceString& ns,
+                                    BatchedObjects&& batch,
+                                    const WriteConcernOptions& wc,
+                                    bool upsert,
+                                    bool multi,
+                                    boost::optional<OID> targetEpoch) override;
 
     CollectionIndexUsageMap getIndexStats(OperationContext* opCtx, const NamespaceString& ns) final;
     void appendLatencyStats(OperationContext* opCtx,
@@ -95,7 +95,15 @@ public:
         const MakePipelineOptions opts = MakePipelineOptions{}) final;
     std::unique_ptr<Pipeline, PipelineDeleter> attachCursorSourceToPipeline(
         const boost::intrusive_ptr<ExpressionContext>& expCtx, Pipeline* pipeline) override;
+    std::unique_ptr<Pipeline, PipelineDeleter> attachCursorSourceToPipelineForLocalRead(
+        const boost::intrusive_ptr<ExpressionContext>& expCtx, Pipeline* pipeline) override;
     std::string getShardName(OperationContext* opCtx) const final;
+
+    std::unique_ptr<ShardFilterer> getShardFilterer(
+        const boost::intrusive_ptr<ExpressionContext>& expCtx) const override {
+        // We'll never do shard filtering on a standalone.
+        return nullptr;
+    }
     std::pair<std::vector<FieldPath>, bool> collectDocumentKeyFieldsForHostedCollection(
         OperationContext* opCtx, const NamespaceString&, UUID) const override;
     std::vector<FieldPath> collectDocumentKeyFieldsActingAsRouter(
@@ -119,9 +127,9 @@ public:
                                                         const NamespaceString&,
                                                         const MatchExpression*) const final;
 
-    bool uniqueKeyIsSupportedByIndex(const boost::intrusive_ptr<ExpressionContext>& expCtx,
-                                     const NamespaceString& nss,
-                                     const std::set<FieldPath>& uniqueKeyPaths) const final;
+    bool fieldsHaveSupportingUniqueIndex(const boost::intrusive_ptr<ExpressionContext>& expCtx,
+                                         const NamespaceString& nss,
+                                         const std::set<FieldPath>& fieldPaths) const;
 
     virtual void checkRoutingInfoEpochOrThrow(const boost::intrusive_ptr<ExpressionContext>& expCtx,
                                               const NamespaceString& nss,
@@ -130,6 +138,12 @@ public:
     }
 
     std::unique_ptr<ResourceYielder> getResourceYielder() const override;
+
+    std::pair<std::set<FieldPath>, boost::optional<ChunkVersion>>
+    ensureFieldsUniqueOrResolveDocumentKey(const boost::intrusive_ptr<ExpressionContext>& expCtx,
+                                           boost::optional<std::vector<std::string>> fields,
+                                           boost::optional<ChunkVersion> targetCollectionVersion,
+                                           const NamespaceString& outputNs) const override;
 
 protected:
     BSONObj _reportCurrentOpForClient(OperationContext* opCtx,
@@ -148,17 +162,13 @@ protected:
                          bool bypassDocValidation);
 
     /**
-     * Builds an ordered update op on namespace 'nss' with update entries {q: <queries>, u:
-     * <updates>}.
-     *
-     * Note that 'queries' and 'updates' must be the same length.
+     * Builds an ordered update op on namespace 'nss' with update entries contained in 'batch'.
      */
-    Update buildUpdateOp(const NamespaceString& nss,
-                         std::vector<BSONObj>&& queries,
-                         std::vector<BSONObj>&& updates,
+    Update buildUpdateOp(const boost::intrusive_ptr<ExpressionContext>& expCtx,
+                         const NamespaceString& nss,
+                         BatchedObjects&& batch,
                          bool upsert,
-                         bool multi,
-                         bool bypassDocValidation);
+                         bool multi);
 
 private:
     /**

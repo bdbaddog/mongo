@@ -29,13 +29,14 @@
 
 #pragma once
 
+#include <functional>
+
 #include "mongo/base/status_with.h"
 #include "mongo/db/op_observer.h"
 #include "mongo/db/repl/oplog_entry.h"
 #include "mongo/db/repl/roll_back_local_operations.h"
 #include "mongo/db/repl/rollback.h"
 #include "mongo/db/repl/storage_interface.h"
-#include "mongo/stdx/functional.h"
 
 namespace mongo {
 
@@ -378,6 +379,12 @@ private:
      * timestamp order (that is, starting from the newest oplog entry, going backwards).
      */
     Status _processRollbackOp(OperationContext* opCtx, const OplogEntry& oplogEntry);
+
+    /**
+     * Process a single applyOps oplog entry that is getting rolled back.
+     * This function processes each sub-operation using _processRollbackOp().
+     */
+    Status _processRollbackOpForApplyOps(OperationContext* opCtx, const OplogEntry& oplogEntry);
 
     /**
      * Iterates through the _countDiff map and retrieves the count of the record store pointed to

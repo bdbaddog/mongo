@@ -30,6 +30,7 @@
 #pragma once
 
 #include <list>
+#include <memory>
 
 #include "mongo/bson/simple_bsonobj_comparator.h"
 #include "mongo/db/logical_time.h"
@@ -40,7 +41,6 @@
 #include "mongo/db/service_context.h"
 #include "mongo/executor/task_executor.h"
 #include "mongo/s/catalog/type_chunk.h"
-#include "mongo/stdx/memory.h"
 #include "mongo/util/concurrency/notification.h"
 #include "mongo/util/concurrency/with_lock.h"
 
@@ -80,6 +80,13 @@ public:
      * tests.
      */
     size_t numberOfMetadataSnapshots() const;
+
+    /**
+     * Returns the number of metadata objects that have been set to boost::none in
+     * _retireExpiredMetadata(). The actual number may vary after it returns, so this is really only
+     * useful for unit tests.
+     */
+    int numberOfEmptyMetadataSnapshots() const;
 
     void setFilteringMetadata(CollectionMetadata newMetadata);
 
@@ -162,7 +169,7 @@ private:
             invariant(!usageCounter);
         }
 
-        CollectionMetadata metadata;
+        boost::optional<CollectionMetadata> metadata;
 
         std::list<Deletion> orphans;
 
@@ -176,7 +183,7 @@ private:
 
     /**
      * Cancels all scheduled deletions of orphan ranges, notifying listeners with status
-     * InterruptedDueToStepDown.
+     * InterruptedDueToReplStateChange.
      */
     void _clearAllCleanups(WithLock);
 

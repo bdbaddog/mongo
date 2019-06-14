@@ -61,7 +61,9 @@ env.Library(
         'cluster_commands_helpers.cpp',
         'multi_statement_transaction_requests_sender.cpp',
         'transaction_router.cpp',
+        'router_transactions_metrics.cpp',
         'session_catalog_router.cpp',
+        env.Idlc('router_transactions_stats.idl')[0],
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/db/commands/txn_cmd_request',
@@ -74,6 +76,7 @@ env.Library(
     ],
     LIBDEPS_PRIVATE=[
         '$BUILD_DIR/mongo/db/session_catalog',
+        '$BUILD_DIR/mongo/db/sessions_collection',
     ],
 )
 
@@ -101,6 +104,7 @@ env.Library(
     target='sharding_initialization',
     source=[
         'sharding_initialization.cpp',
+        'sharding_task_executor_pool_controller.cpp',
         env.Idlc('sharding_task_executor_pool.idl')[0],
         'client/sharding_connection_hook.cpp',
         'client/sharding_network_connection_hook.cpp',
@@ -115,6 +119,7 @@ env.Library(
     LIBDEPS_PRIVATE=[
         "$BUILD_DIR/mongo/idl/server_parameter",
         '$BUILD_DIR/mongo/executor/thread_pool_task_executor',
+        '$BUILD_DIR/mongo/executor/connection_pool_executor',
         'coreshard',
         'sharding_task_executor',
     ],

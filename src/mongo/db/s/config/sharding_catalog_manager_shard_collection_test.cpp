@@ -173,7 +173,7 @@ TEST_F(ConfigServerShardCollectionTest, RangeSharding_ForMapReduce_NoInitialSpli
     shard.setHost(shardHost.toString());
 
     std::unique_ptr<RemoteCommandTargeterMock> targeter(
-        stdx::make_unique<RemoteCommandTargeterMock>());
+        std::make_unique<RemoteCommandTargeterMock>());
     targeter->setConnectionStringReturnValue(ConnectionString(shardHost));
     targeter->setFindHostReturnValue(shardHost);
     targeterFactory()->addTargeterToReturn(ConnectionString(shardHost), std::move(targeter));
@@ -231,11 +231,11 @@ TEST_F(ConfigServerShardCollectionTest, RangeSharding_ForMapReduce_WithInitialSp
     shard2.setHost(shard2Host.toString());
 
     std::unique_ptr<RemoteCommandTargeterMock> targeter0(
-        stdx::make_unique<RemoteCommandTargeterMock>());
+        std::make_unique<RemoteCommandTargeterMock>());
     std::unique_ptr<RemoteCommandTargeterMock> targeter1(
-        stdx::make_unique<RemoteCommandTargeterMock>());
+        std::make_unique<RemoteCommandTargeterMock>());
     std::unique_ptr<RemoteCommandTargeterMock> targeter2(
-        stdx::make_unique<RemoteCommandTargeterMock>());
+        std::make_unique<RemoteCommandTargeterMock>());
     targeter0->setConnectionStringReturnValue(ConnectionString(shard0Host));
     targeter0->setFindHostReturnValue(shard0Host);
     targeterFactory()->addTargeterToReturn(ConnectionString(shard0Host), std::move(targeter0));
@@ -308,7 +308,7 @@ TEST_F(ConfigServerShardCollectionTest, RangeSharding_NoInitialSplitPoints_NoSpl
     shard.setHost(shardHost.toString());
 
     std::unique_ptr<RemoteCommandTargeterMock> targeter(
-        stdx::make_unique<RemoteCommandTargeterMock>());
+        std::make_unique<RemoteCommandTargeterMock>());
     targeter->setConnectionStringReturnValue(ConnectionString(shardHost));
     targeter->setFindHostReturnValue(shardHost);
     targeterFactory()->addTargeterToReturn(ConnectionString(shardHost), std::move(targeter));
@@ -358,7 +358,7 @@ TEST_F(ConfigServerShardCollectionTest, RangeSharding_NoInitialSplitPoints_WithS
     shard.setHost(shardHost.toString());
 
     std::unique_ptr<RemoteCommandTargeterMock> targeter(
-        stdx::make_unique<RemoteCommandTargeterMock>());
+        std::make_unique<RemoteCommandTargeterMock>());
     targeter->setConnectionStringReturnValue(ConnectionString(shardHost));
     targeter->setFindHostReturnValue(shardHost);
     targeterFactory()->addTargeterToReturn(ConnectionString(shardHost), std::move(targeter));
@@ -430,7 +430,7 @@ TEST_F(ConfigServerShardCollectionTest, RangeSharding_WithInitialSplitPoints_NoS
     shard.setHost(shardHost.toString());
 
     std::unique_ptr<RemoteCommandTargeterMock> targeter(
-        stdx::make_unique<RemoteCommandTargeterMock>());
+        std::make_unique<RemoteCommandTargeterMock>());
     targeter->setConnectionStringReturnValue(ConnectionString(shardHost));
     targeter->setFindHostReturnValue(shardHost);
     targeterFactory()->addTargeterToReturn(ConnectionString(shardHost), std::move(targeter));
@@ -500,7 +500,7 @@ protected:
 
 TEST_F(CreateFirstChunksTest, Split_Disallowed_With_Both_SplitPoints_And_Zones) {
     ASSERT_THROWS_CODE(
-        InitialSplitPolicy::createFirstChunks(
+        InitialSplitPolicy::createFirstChunksOptimized(
             operationContext(),
             kNamespace,
             kShardKeyPattern,
@@ -509,12 +509,13 @@ TEST_F(CreateFirstChunksTest, Split_Disallowed_With_Both_SplitPoints_And_Zones) 
             {TagsType(kNamespace,
                       "TestZone",
                       ChunkRange(kShardKeyPattern.getKeyPattern().globalMin(), BSON("x" << 0)))},
+            InitialSplitPolicy::ShardingOptimizationType::SplitPointsProvided,
             true /* isEmpty */),
         AssertionException,
         ErrorCodes::InvalidOptions);
 
     ASSERT_THROWS_CODE(
-        InitialSplitPolicy::createFirstChunks(
+        InitialSplitPolicy::createFirstChunksOptimized(
             operationContext(),
             kNamespace,
             kShardKeyPattern,
@@ -523,6 +524,7 @@ TEST_F(CreateFirstChunksTest, Split_Disallowed_With_Both_SplitPoints_And_Zones) 
             {TagsType(kNamespace,
                       "TestZone",
                       ChunkRange(kShardKeyPattern.getKeyPattern().globalMin(), BSON("x" << 0)))},
+            InitialSplitPolicy::ShardingOptimizationType::TagsProvidedWithEmptyCollection,
             false /* isEmpty */),
         AssertionException,
         ErrorCodes::InvalidOptions);
@@ -536,7 +538,7 @@ TEST_F(CreateFirstChunksTest, NonEmptyCollection_SplitPoints_FromSplitVector_Man
     const auto connStr = assertGet(ConnectionString::parse(kShards[1].getHost()));
 
     std::unique_ptr<RemoteCommandTargeterMock> targeter(
-        stdx::make_unique<RemoteCommandTargeterMock>());
+        std::make_unique<RemoteCommandTargeterMock>());
     targeter->setConnectionStringReturnValue(connStr);
     targeter->setFindHostReturnValue(connStr.getServers()[0]);
     targeterFactory()->addTargeterToReturn(connStr, std::move(targeter));
@@ -547,13 +549,15 @@ TEST_F(CreateFirstChunksTest, NonEmptyCollection_SplitPoints_FromSplitVector_Man
     auto future = launchAsync([&] {
         ThreadClient tc("Test", getServiceContext());
         auto opCtx = cc().makeOperationContext();
-        return InitialSplitPolicy::createFirstChunks(opCtx.get(),
-                                                     kNamespace,
-                                                     kShardKeyPattern,
-                                                     ShardId("shard1"),
-                                                     {}, /* No split points */
-                                                     {}, /* No zones */
-                                                     false /* isEmpty */);
+
+        auto optimization =
+            InitialSplitPolicy::calculateOptimizationType({}, /* splitPoints */
+                                                          {}, /* tags */
+                                                          false /* collectionIsEmpty */);
+
+        ASSERT_EQ(optimization, InitialSplitPolicy::ShardingOptimizationType::None);
+        return InitialSplitPolicy::createFirstChunksUnoptimized(
+            opCtx.get(), kNamespace, kShardKeyPattern, ShardId("shard1"));
     });
 
     expectSplitVector(connStr.getServers()[0], kShardKeyPattern, BSON_ARRAY(BSON("x" << 0)));
@@ -572,7 +576,7 @@ TEST_F(CreateFirstChunksTest, NonEmptyCollection_SplitPoints_FromClient_ManyChun
     const auto connStr = assertGet(ConnectionString::parse(kShards[1].getHost()));
 
     std::unique_ptr<RemoteCommandTargeterMock> targeter(
-        stdx::make_unique<RemoteCommandTargeterMock>());
+        std::make_unique<RemoteCommandTargeterMock>());
     targeter->setConnectionStringReturnValue(connStr);
     targeter->setFindHostReturnValue(connStr.getServers()[0]);
     targeterFactory()->addTargeterToReturn(connStr, std::move(targeter));
@@ -583,13 +587,23 @@ TEST_F(CreateFirstChunksTest, NonEmptyCollection_SplitPoints_FromClient_ManyChun
     auto future = launchAsync([&] {
         ThreadClient tc("Test", getServiceContext());
         auto opCtx = cc().makeOperationContext();
-        return InitialSplitPolicy::createFirstChunks(opCtx.get(),
-                                                     kNamespace,
-                                                     kShardKeyPattern,
-                                                     ShardId("shard1"),
-                                                     {BSON("x" << 0)},
-                                                     {}, /* No zones */
-                                                     false /* isEmpty */);
+
+        std::vector<BSONObj> splitPoints{BSON("x" << 0)};
+        std::vector<TagsType> zones{};
+        bool collectionIsEmpty = false;
+
+        auto optimization =
+            InitialSplitPolicy::calculateOptimizationType(splitPoints, zones, collectionIsEmpty);
+        ASSERT_EQ(optimization, InitialSplitPolicy::ShardingOptimizationType::SplitPointsProvided);
+
+        return InitialSplitPolicy::createFirstChunksOptimized(opCtx.get(),
+                                                              kNamespace,
+                                                              kShardKeyPattern,
+                                                              ShardId("shard1"),
+                                                              splitPoints,
+                                                              zones,
+                                                              optimization,
+                                                              collectionIsEmpty);
     });
 
     const auto& firstChunks = future.default_timed_get();
@@ -605,16 +619,26 @@ TEST_F(CreateFirstChunksTest, NonEmptyCollection_WithZones_OneChunkToPrimary) {
     ASSERT_OK(setupShards(kShards));
     shardRegistry()->reload(operationContext());
 
-    const auto firstChunks = InitialSplitPolicy::createFirstChunks(
-        operationContext(),
-        kNamespace,
-        kShardKeyPattern,
-        ShardId("shard1"),
-        {}, /* No split points */
-        {TagsType(kNamespace,
-                  "TestZone",
-                  ChunkRange(kShardKeyPattern.getKeyPattern().globalMin(), BSON("x" << 0)))},
-        false /* isEmpty */);
+    std::vector<BSONObj> splitPoints{};
+    std::vector<TagsType> zones{
+        TagsType(kNamespace,
+                 "TestZone",
+                 ChunkRange(kShardKeyPattern.getKeyPattern().globalMin(), BSON("x" << 0)))};
+    bool collectionIsEmpty = false;
+
+    auto optimization =
+        InitialSplitPolicy::calculateOptimizationType(splitPoints, zones, collectionIsEmpty);
+    ASSERT_EQ(optimization,
+              InitialSplitPolicy::ShardingOptimizationType::TagsProvidedWithNonEmptyCollection);
+
+    const auto firstChunks = InitialSplitPolicy::createFirstChunksOptimized(operationContext(),
+                                                                            kNamespace,
+                                                                            kShardKeyPattern,
+                                                                            ShardId("shard1"),
+                                                                            splitPoints,
+                                                                            zones,
+                                                                            optimization,
+                                                                            collectionIsEmpty);
 
     ASSERT_EQ(1U, firstChunks.chunks.size());
     ASSERT_EQ(kShards[1].getName(), firstChunks.chunks[0].getShard());
@@ -628,7 +652,7 @@ TEST_F(CreateFirstChunksTest, EmptyCollection_SplitPoints_FromClient_ManyChunksD
     const auto connStr = assertGet(ConnectionString::parse(kShards[1].getHost()));
 
     std::unique_ptr<RemoteCommandTargeterMock> targeter(
-        stdx::make_unique<RemoteCommandTargeterMock>());
+        std::make_unique<RemoteCommandTargeterMock>());
     targeter->setConnectionStringReturnValue(connStr);
     targeter->setFindHostReturnValue(connStr.getServers()[0]);
     targeterFactory()->addTargeterToReturn(connStr, std::move(targeter));
@@ -639,13 +663,23 @@ TEST_F(CreateFirstChunksTest, EmptyCollection_SplitPoints_FromClient_ManyChunksD
     auto future = launchAsync([&] {
         ThreadClient tc("Test", getServiceContext());
         auto opCtx = cc().makeOperationContext();
-        return InitialSplitPolicy::createFirstChunks(opCtx.get(),
-                                                     kNamespace,
-                                                     kShardKeyPattern,
-                                                     ShardId("shard1"),
-                                                     {BSON("x" << 0), BSON("x" << 100)},
-                                                     {}, /* No zones */
-                                                     true /* isEmpty */);
+
+        std::vector<BSONObj> splitPoints{BSON("x" << 0), BSON("x" << 100)};
+        std::vector<TagsType> zones{};
+        bool collectionIsEmpty = true;
+
+        auto optimization =
+            InitialSplitPolicy::calculateOptimizationType(splitPoints, zones, collectionIsEmpty);
+        ASSERT_EQ(optimization, InitialSplitPolicy::ShardingOptimizationType::SplitPointsProvided);
+
+        return InitialSplitPolicy::createFirstChunksOptimized(opCtx.get(),
+                                                              kNamespace,
+                                                              kShardKeyPattern,
+                                                              ShardId("shard1"),
+                                                              splitPoints,
+                                                              zones,
+                                                              optimization,
+                                                              collectionIsEmpty);
     });
 
     const auto& firstChunks = future.default_timed_get();
@@ -663,7 +697,7 @@ TEST_F(CreateFirstChunksTest, EmptyCollection_NoSplitPoints_OneChunkToPrimary) {
     const auto connStr = assertGet(ConnectionString::parse(kShards[1].getHost()));
 
     std::unique_ptr<RemoteCommandTargeterMock> targeter(
-        stdx::make_unique<RemoteCommandTargeterMock>());
+        std::make_unique<RemoteCommandTargeterMock>());
     targeter->setConnectionStringReturnValue(connStr);
     targeter->setFindHostReturnValue(connStr.getServers()[0]);
     targeterFactory()->addTargeterToReturn(connStr, std::move(targeter));
@@ -674,13 +708,23 @@ TEST_F(CreateFirstChunksTest, EmptyCollection_NoSplitPoints_OneChunkToPrimary) {
     auto future = launchAsync([&] {
         ThreadClient tc("Test", getServiceContext());
         auto opCtx = cc().makeOperationContext();
-        return InitialSplitPolicy::createFirstChunks(opCtx.get(),
-                                                     kNamespace,
-                                                     kShardKeyPattern,
-                                                     ShardId("shard1"),
-                                                     {}, /* No split points */
-                                                     {}, /* No zones */
-                                                     true /* isEmpty */);
+
+        std::vector<BSONObj> splitPoints{};
+        std::vector<TagsType> zones{};
+        bool collectionIsEmpty = true;
+
+        auto optimization =
+            InitialSplitPolicy::calculateOptimizationType(splitPoints, zones, collectionIsEmpty);
+        ASSERT_EQ(optimization, InitialSplitPolicy::ShardingOptimizationType::EmptyCollection);
+
+        return InitialSplitPolicy::createFirstChunksOptimized(opCtx.get(),
+                                                              kNamespace,
+                                                              kShardKeyPattern,
+                                                              ShardId("shard1"),
+                                                              splitPoints,
+                                                              zones,
+                                                              optimization,
+                                                              collectionIsEmpty);
     });
 
     const auto& firstChunks = future.default_timed_get();
@@ -695,16 +739,26 @@ TEST_F(CreateFirstChunksTest, EmptyCollection_WithZones_ManyChunksOnFirstZoneSha
     ASSERT_OK(setupShards(kShards));
     shardRegistry()->reload(operationContext());
 
-    const auto firstChunks = InitialSplitPolicy::createFirstChunks(
-        operationContext(),
-        kNamespace,
-        kShardKeyPattern,
-        ShardId("shard1"),
-        {}, /* No split points */
-        {TagsType(kNamespace,
-                  "TestZone",
-                  ChunkRange(kShardKeyPattern.getKeyPattern().globalMin(), BSON("x" << 0)))},
-        true /* isEmpty */);
+    std::vector<BSONObj> splitPoints{};
+    std::vector<TagsType> zones{
+        TagsType(kNamespace,
+                 "TestZone",
+                 ChunkRange(kShardKeyPattern.getKeyPattern().globalMin(), BSON("x" << 0)))};
+    bool collectionIsEmpty = true;
+
+    auto optimization =
+        InitialSplitPolicy::calculateOptimizationType(splitPoints, zones, collectionIsEmpty);
+    ASSERT_EQ(optimization,
+              InitialSplitPolicy::ShardingOptimizationType::TagsProvidedWithEmptyCollection);
+
+    const auto firstChunks = InitialSplitPolicy::createFirstChunksOptimized(operationContext(),
+                                                                            kNamespace,
+                                                                            kShardKeyPattern,
+                                                                            ShardId("shard1"),
+                                                                            splitPoints,
+                                                                            zones,
+                                                                            optimization,
+                                                                            collectionIsEmpty);
 
     ASSERT_EQ(2U, firstChunks.chunks.size());
     ASSERT_EQ(kShards[0].getName(), firstChunks.chunks[0].getShard());

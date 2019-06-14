@@ -61,10 +61,12 @@
 
 namespace mongo {
 
+MONGO_FAIL_POINT_DEFINE(hangAfterSettingUpIndexBuild);
 MONGO_FAIL_POINT_DEFINE(hangAfterStartingIndexBuild);
 MONGO_FAIL_POINT_DEFINE(hangAfterStartingIndexBuildUnlocked);
 MONGO_FAIL_POINT_DEFINE(hangBeforeIndexBuildOf);
 MONGO_FAIL_POINT_DEFINE(hangAfterIndexBuildOf);
+MONGO_FAIL_POINT_DEFINE(hangAndThenFailIndexBuild);
 MONGO_FAIL_POINT_DEFINE(leaveIndexBuildUnfinishedForShutdown);
 
 MultiIndexBlock::~MultiIndexBlock() {
@@ -151,19 +153,6 @@ bool MultiIndexBlock::areHybridIndexBuildsEnabled() {
         return false;
     }
 
-    // Hybrid index builds must only be used when in FCV 4.2. This restriction is due to the case
-    // where an index build starts in FCV 4.0, then continues during an upgrade to FCV 4.2. Because
-    // prepared transactions yield locks on secondaries, hybrid index builds may miss prepared, but
-    // uncommitted writes, leading to data corruption. With two-phase index builds, an FCV 4.2-only
-    // feature, the hybrid build will not complete until the primary writes an oplog entry
-    // indicating the index build can finish, implying that there are no uncommitted prepared
-    // transactions.
-    if (!serverGlobalParams.featureCompatibility.isVersionInitialized() ||
-        serverGlobalParams.featureCompatibility.getVersion() !=
-            ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo42) {
-        return false;
-    }
-
     return enableHybridIndexBuilds.load();
 }
 
@@ -243,9 +232,6 @@ StatusWith<std::vector<BSONObj>> MultiIndexBlock::init(OperationContext* opCtx,
     const auto idxCat = collection->getIndexCatalog();
     invariant(idxCat);
     invariant(idxCat->ok());
-    Status status = idxCat->checkUnfinished();
-    if (!status.isOK())
-        return status;
 
     const bool enableHybrid = areHybridIndexBuildsEnabled();
 
@@ -282,8 +268,18 @@ StatusWith<std::vector<BSONObj>> MultiIndexBlock::init(OperationContext* opCtx,
         StatusWith<BSONObj> statusWithInfo =
             collection->getIndexCatalog()->prepareSpecForCreate(opCtx, info);
         Status status = statusWithInfo.getStatus();
-        if (!status.isOK())
+        if (!status.isOK()) {
+            // If we were given two identical indexes to build, we will run into an error trying to
+            // set up the same index a second time in this for-loop. This is the only way to
+            // encounter this error because callers filter out ready/in-progress indexes and start
+            // the build while holding a lock throughout.
+            if (status == ErrorCodes::IndexBuildAlreadyInProgress) {
+                invariant(indexSpecs.size() > 1);
+                return {ErrorCodes::OperationFailed,
+                        "Cannot build two identical indexes. Try again without duplicate indexes."};
+            }
             return status;
+        }
         info = statusWithInfo.getValue();
         indexInfoObjs.push_back(info);
 
@@ -338,7 +334,7 @@ StatusWith<std::vector<BSONObj>> MultiIndexBlock::init(OperationContext* opCtx,
     if (isBackgroundBuilding())
         _backgroundOperation.reset(new BackgroundOperation(ns));
 
-    status = onInit(indexInfoObjs);
+    Status status = onInit(indexInfoObjs);
     if (!status.isOK()) {
         return status;
     }
@@ -385,6 +381,20 @@ Status MultiIndexBlock::insertAllDocumentsInCollection(OperationContext* opCtx,
     {
         stdx::unique_lock<Client> lk(*opCtx->getClient());
         progress.set(CurOp::get(opCtx)->setProgress_inlock(curopMessage, numRecords));
+    }
+
+    if (MONGO_FAIL_POINT(hangAfterSettingUpIndexBuild)) {
+        // Hang the build after the BackgroundOperation and curOP info is set up.
+        log() << "Hanging index build due to failpoint 'hangAfterSettingUpIndexBuild'";
+        MONGO_FAIL_POINT_PAUSE_WHILE_SET(hangAfterSettingUpIndexBuild);
+    }
+
+    if (MONGO_FAIL_POINT(hangAndThenFailIndexBuild)) {
+        // Hang the build after the BackgroundOperation and curOP info is set up.
+        log() << "Hanging index build due to failpoint 'hangAndThenFailIndexBuild'";
+        MONGO_FAIL_POINT_PAUSE_WHILE_SET(hangAndThenFailIndexBuild);
+        return {ErrorCodes::InternalError,
+                "Failed index build because of failpoint 'hangAndThenFailIndexBuild'"};
     }
 
     Timer t;

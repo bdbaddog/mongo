@@ -58,13 +58,6 @@
           ]
         },
         {
-          name: "distinct",
-          commandFuncs: [
-              (coll) => coll.distinct("_id", {_id: -5}).length,
-              (coll) => coll.distinct("_id", {_id: 5}).length,
-          ]
-        },
-        {
           name: "find",
           commandFuncs: [
               (coll) => coll.find({_id: -5}).itcount(),
@@ -104,7 +97,7 @@
                   1,
                   "expected to find document in second chunk, cmd: " + cmdName);
 
-        session.commitTransaction();
+        assert.commandWorked(session.commitTransaction_forTesting());
 
         // Move the chunk back to Shard1 for the next iteration.
         assert.commandWorked(

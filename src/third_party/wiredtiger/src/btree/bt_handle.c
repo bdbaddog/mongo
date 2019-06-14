@@ -93,6 +93,7 @@ __wt_btree_open(WT_SESSION_IMPL *session, const char *op_cfg[])
 	WT_CKPT ckpt;
 	WT_CONFIG_ITEM cval;
 	WT_DATA_HANDLE *dhandle;
+	WT_DECL_ITEM(tmp);
 	WT_DECL_RET;
 	size_t root_addr_size;
 	uint8_t root_addr[WT_BTREE_MAX_ADDR_COOKIE];
@@ -142,6 +143,12 @@ __wt_btree_open(WT_SESSION_IMPL *session, const char *op_cfg[])
 
 	/* Initialize and configure the WT_BTREE structure. */
 	WT_ERR(__btree_conf(session, &ckpt));
+
+	/*
+	 * We could be a re-open of a table that was put in the lookaside
+	 * dropped list. Remove our id from that list.
+	 */
+	__wt_las_remove_dropped(session);
 
 	/* Connect to the underlying block manager. */
 	filename = dhandle->name;
@@ -233,6 +240,7 @@ err:		WT_TRET(__wt_btree_close(session));
 	}
 	__wt_meta_checkpoint_free(session, &ckpt);
 
+	__wt_scr_free(session, &tmp);
 	return (ret);
 }
 
@@ -262,6 +270,16 @@ __wt_btree_close(WT_SESSION_IMPL *session)
 	if (F_ISSET(btree, WT_BTREE_CLOSED))
 		return (0);
 	F_SET(btree, WT_BTREE_CLOSED);
+
+	/*
+	 * If closing a tree let sweep drop lookaside entries for it.
+	 */
+	if (F_ISSET(S2C(session), WT_CONN_LOOKASIDE_OPEN) &&
+	    btree->lookaside_entries) {
+		WT_ASSERT(session, !WT_IS_METADATA(btree->dhandle) &&
+		    !F_ISSET(btree, WT_BTREE_LOOKASIDE));
+		WT_TRET(__wt_las_save_dropped(session));
+	}
 
 	/*
 	 * If we turned eviction off and never turned it back on, do that now,
@@ -308,6 +326,44 @@ __wt_btree_discard(WT_SESSION_IMPL *session)
 }
 
 /*
+ * __wt_btree_config_encryptor --
+ *	Return an encryptor handle based on the configuration.
+ */
+int
+__wt_btree_config_encryptor(WT_SESSION_IMPL *session,
+    const char **cfg, WT_KEYED_ENCRYPTOR **kencryptorp)
+{
+	WT_CONFIG_ITEM cval, enc, keyid;
+	WT_DECL_RET;
+	const char *enc_cfg[] = { NULL, NULL };
+
+	/*
+	 * We do not use __wt_config_gets_none here because "none" and the empty
+	 * string have different meanings. The empty string means inherit the
+	 * system encryption setting and "none" means this table is in the clear
+	 * even if the database is encrypted.
+	 */
+	WT_RET(__wt_config_gets(session, cfg, "encryption.name", &cval));
+	if (cval.len == 0)
+		*kencryptorp = S2C(session)->kencryptor;
+	else if (WT_STRING_MATCH("none", cval.str, cval.len))
+		*kencryptorp = NULL;
+	else {
+		WT_RET(__wt_config_gets_none(
+		    session, cfg, "encryption.keyid", &keyid));
+		WT_RET(__wt_config_gets(session, cfg, "encryption", &enc));
+		if (enc.len != 0)
+			WT_RET(__wt_strndup(session, enc.str, enc.len,
+			    &enc_cfg[0]));
+		ret = __wt_encryptor_config(session, &cval, &keyid,
+		    (WT_CONFIG_ARG *)enc_cfg, kencryptorp);
+		__wt_free(session, enc_cfg[0]);
+		WT_RET(ret);
+	}
+	return (0);
+}
+
+/*
  * __btree_conf --
  *	Configure a WT_BTREE structure.
  */
@@ -315,12 +371,11 @@ static int
 __btree_conf(WT_SESSION_IMPL *session, WT_CKPT *ckpt)
 {
 	WT_BTREE *btree;
-	WT_CONFIG_ITEM cval, enc, keyid, metadata;
+	WT_CONFIG_ITEM cval, metadata;
 	WT_CONNECTION_IMPL *conn;
-	WT_DECL_RET;
 	int64_t maj_version, min_version;
 	uint32_t bitcnt;
-	const char **cfg, *enc_cfg[] = { NULL, NULL };
+	const char **cfg;
 	bool fixed;
 
 	btree = S2BT(session);
@@ -532,29 +587,8 @@ __btree_conf(WT_SESSION_IMPL *session, WT_CKPT *ckpt)
 		}
 	}
 
-	/*
-	 * We do not use __wt_config_gets_none here because "none" and the empty
-	 * string have different meanings. The empty string means inherit the
-	 * system encryption setting and "none" means this table is in the clear
-	 * even if the database is encrypted.
-	 */
-	WT_RET(__wt_config_gets(session, cfg, "encryption.name", &cval));
-	if (cval.len == 0)
-		btree->kencryptor = conn->kencryptor;
-	else if (WT_STRING_MATCH("none", cval.str, cval.len))
-		btree->kencryptor = NULL;
-	else {
-		WT_RET(__wt_config_gets_none(
-		    session, cfg, "encryption.keyid", &keyid));
-		WT_RET(__wt_config_gets(session, cfg, "encryption", &enc));
-		if (enc.len != 0)
-			WT_RET(__wt_strndup(session, enc.str, enc.len,
-			    &enc_cfg[0]));
-		ret = __wt_encryptor_config(session, &cval, &keyid,
-		    (WT_CONFIG_ARG *)enc_cfg, &btree->kencryptor);
-		__wt_free(session, enc_cfg[0]);
-		WT_RET(ret);
-	}
+	/* Configure encryption. */
+	WT_RET(__wt_btree_config_encryptor(session, cfg, &btree->kencryptor));
 
 	/* Initialize locks. */
 	WT_RET(__wt_rwlock_init(session, &btree->ovfl_lock));
@@ -576,12 +610,14 @@ __btree_conf(WT_SESSION_IMPL *session, WT_CKPT *ckpt)
  *	Initialize a tree root reference, and link in the root page.
  */
 void
-__wt_root_ref_init(WT_REF *root_ref, WT_PAGE *root, bool is_recno)
+__wt_root_ref_init(WT_SESSION_IMPL *session,
+    WT_REF *root_ref, WT_PAGE *root, bool is_recno)
 {
+	WT_UNUSED(session);	/* Used in a macro for diagnostic builds */
 	memset(root_ref, 0, sizeof(*root_ref));
 
 	root_ref->page = root;
-	root_ref->state = WT_REF_MEM;
+	WT_REF_SET_STATE(root_ref, WT_REF_MEM);
 
 	root_ref->ref_recno = is_recno ? 1 : WT_RECNO_OOB;
 
@@ -662,7 +698,8 @@ __wt_btree_tree_open(
 	dsk.mem = NULL;
 
 	/* Finish initializing the root, root reference links. */
-	__wt_root_ref_init(&btree->root, page, btree->type != BTREE_ROW);
+	__wt_root_ref_init(session,
+	    &btree->root, page, btree->type != BTREE_ROW);
 
 err:	__wt_buf_free(session, &dsk);
 	__wt_scr_free(session, &tmp);
@@ -746,7 +783,8 @@ __btree_tree_open_empty(WT_SESSION_IMPL *session, bool creation)
 	}
 
 	/* Finish initializing the root, root reference links. */
-	__wt_root_ref_init(&btree->root, root, btree->type != BTREE_ROW);
+	__wt_root_ref_init(session,
+	    &btree->root, root, btree->type != BTREE_ROW);
 
 	return (0);
 

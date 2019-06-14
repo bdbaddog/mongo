@@ -16,6 +16,8 @@
 #define	WT_BTREE_MAJOR_VERSION_MAX	1	/* Newest version supported */
 #define	WT_BTREE_MINOR_VERSION_MAX	1
 
+#define	WT_BTREE_MIN_ALLOC_SIZE		512
+
 /*
  * The maximum btree leaf and internal page size is 512MB (2^29).  The limit
  * is enforced in software, it could be larger, specifically, the underlying
@@ -195,6 +197,12 @@ struct __wt_btree {
 	uint64_t    bytes_dirty_intl;	/* Bytes in dirty internal pages. */
 	uint64_t    bytes_dirty_leaf;	/* Bytes in dirty leaf pages. */
 	uint64_t    bytes_dirty_total;	/* Bytes ever dirtied in cache. */
+
+	/*
+	 * The maximum bytes allowed to be used for the table on disk.  This is
+	 * currently only used for the lookaside table.
+	 */
+	uint64_t    file_max;
 
 	/*
 	 * We flush pages from the tree (in order to make checkpoint faster),

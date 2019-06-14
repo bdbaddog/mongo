@@ -71,8 +71,8 @@ public:
 
         settings.setReplSetString("lookupTestSet/node1:12345");
 
-        repl::StorageInterface::set(service, stdx::make_unique<repl::StorageInterfaceMock>());
-        auto replCoord = stdx::make_unique<repl::ReplicationCoordinatorMock>(service, settings);
+        repl::StorageInterface::set(service, std::make_unique<repl::StorageInterfaceMock>());
+        auto replCoord = std::make_unique<repl::ReplicationCoordinatorMock>(service, settings);
 
         // Ensure that we are primary.
         ASSERT_OK(replCoord->setFollowerMode(repl::MemberState::RS_PRIMARY));
@@ -255,7 +255,7 @@ TEST_F(ReplDocumentSourceLookUpTest, RejectsPipelineWithChangeStreamStage) {
                 .firstElement(),
             expCtx),
         AssertionException,
-        ErrorCodes::IllegalOperation);
+        51047);
 }
 
 TEST_F(ReplDocumentSourceLookUpTest, RejectsSubPipelineWithChangeStreamStage) {
@@ -273,7 +273,7 @@ TEST_F(ReplDocumentSourceLookUpTest, RejectsSubPipelineWithChangeStreamStage) {
                 .firstElement(),
             expCtx),
         AssertionException,
-        ErrorCodes::IllegalOperation);
+        51047);
 }
 
 TEST_F(DocumentSourceLookUpTest, RejectsLocalFieldForeignFieldWhenPipelineIsSpecified) {

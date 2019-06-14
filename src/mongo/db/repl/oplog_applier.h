@@ -92,6 +92,10 @@ public:
         // This is intended for implementing slaveDelay, so it should be some number of seconds
         // before now.
         boost::optional<Date_t> slaveDelayLatestTimestamp = {};
+
+        // If non-null, the batch will include operations with timestamps either
+        // before-and-including this point or after it, not both.
+        Timestamp forceBatchBoundaryAfter;
     };
 
     // Used to report oplog application progress.
@@ -100,7 +104,7 @@ public:
     using Operations = std::vector<OplogEntry>;
 
     // Used by SyncTail to access batching logic.
-    using GetNextApplierBatchFn = stdx::function<StatusWith<OplogApplier::Operations>(
+    using GetNextApplierBatchFn = std::function<StatusWith<OplogApplier::Operations>(
         OperationContext* opCtx, const BatchLimits& batchLimits)>;
 
     /**

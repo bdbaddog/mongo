@@ -33,6 +33,8 @@
 
 #include "repair_database_and_check_version.h"
 
+#include <functional>
+
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/collection_catalog_entry.h"
 #include "mongo/db/catalog/create_collection.h"
@@ -52,7 +54,6 @@
 #include "mongo/db/repl_set_member_in_standalone_mode.h"
 #include "mongo/db/server_options.h"
 #include "mongo/db/storage/storage_repair_observer.h"
-#include "mongo/stdx/functional.h"
 #include "mongo/util/exit.h"
 #include "mongo/util/fail_point.h"
 #include "mongo/util/log.h"
@@ -166,6 +167,11 @@ Status buildMissingIdIndex(OperationContext* opCtx, Collection* collection) {
         return status;
     }
 
+    status = indexer.checkConstraints(opCtx);
+    if (!status.isOK()) {
+        return status;
+    }
+
     WriteUnitOfWork wuow(opCtx);
     status = indexer.commit(
         opCtx, collection, MultiIndexBlock::kNoopOnCreateEachFn, MultiIndexBlock::kNoopOnCommitFn);
@@ -260,6 +266,16 @@ void rebuildIndexes(OperationContext* opCtx, StorageEngine* storageEngine) {
     std::vector<StorageEngine::CollectionIndexNamePair> indexesToRebuild =
         fassert(40593, storageEngine->reconcileCatalogAndIdents(opCtx));
 
+    if (!indexesToRebuild.empty() && serverGlobalParams.indexBuildRetry) {
+        log() << "note: restart the server with --noIndexBuildRetry "
+              << "to skip index rebuilds";
+    }
+
+    if (!serverGlobalParams.indexBuildRetry) {
+        log() << "  not rebuilding interrupted indexes";
+        return;
+    }
+
     // Determine which indexes need to be rebuilt. rebuildIndexesOnCollection() requires that all
     // indexes on that collection are done at once, so we use a map to group them together.
     StringMap<IndexNameObjs> nsToIndexNameObjMap;
@@ -321,12 +337,9 @@ void setReplSetMemberInStandaloneMode(OperationContext* opCtx) {
         return;
     }
 
-    Lock::DBLock dbLock(opCtx, NamespaceString::kSystemReplSetNamespace.db(), MODE_X);
-    auto databaseHolder = DatabaseHolder::get(opCtx);
-    databaseHolder->openDb(opCtx, NamespaceString::kSystemReplSetNamespace.db());
-
-    AutoGetCollectionForRead autoCollection(opCtx, NamespaceString::kSystemReplSetNamespace);
-    Collection* collection = autoCollection.getCollection();
+    invariant(opCtx->lockState()->isW());
+    Collection* collection = CollectionCatalog::get(opCtx).lookupCollectionByNamespace(
+        NamespaceString::kSystemReplSetNamespace);
     if (collection && collection->numRecords(opCtx) > 0) {
         setReplSetMemberInStandaloneMode(opCtx->getServiceContext(), true);
         return;
@@ -379,18 +392,12 @@ bool repairDatabasesAndCheckVersion(OperationContext* opCtx) {
             invariant(dbNames.front() == NamespaceString::kLocalDb);
         }
 
-        stdx::function<void(const std::string& dbName)> onRecordStoreRepair =
-            [opCtx](const std::string& dbName) {
-                if (dbName == NamespaceString::kLocalDb) {
-                    setReplSetMemberInStandaloneMode(opCtx);
-                }
-            };
-
         for (const auto& dbName : dbNames) {
             LOG(1) << "    Repairing database: " << dbName;
-            fassertNoTrace(18506,
-                           repairDatabase(opCtx, storageEngine, dbName, onRecordStoreRepair));
+            fassertNoTrace(18506, repairDatabase(opCtx, storageEngine, dbName));
         }
+
+        setReplSetMemberInStandaloneMode(opCtx);
 
         // All collections must have UUIDs before restoring the FCV document to a version that
         // requires UUIDs.

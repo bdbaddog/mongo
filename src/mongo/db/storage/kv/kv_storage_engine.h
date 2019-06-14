@@ -29,7 +29,9 @@
 
 #pragma once
 
+#include <functional>
 #include <map>
+#include <memory>
 #include <string>
 
 #include "mongo/base/status_with.h"
@@ -44,8 +46,6 @@
 #include "mongo/db/storage/record_store.h"
 #include "mongo/db/storage/storage_engine.h"
 #include "mongo/db/storage/temporary_record_store.h"
-#include "mongo/stdx/functional.h"
-#include "mongo/stdx/memory.h"
 #include "mongo/stdx/mutex.h"
 #include "mongo/util/periodic_runner.h"
 
@@ -125,9 +125,9 @@ public:
     virtual void setOldestActiveTransactionTimestampCallback(
         StorageEngine::OldestActiveTransactionTimestampCallback) override;
 
-    virtual bool isCacheUnderPressure(OperationContext* opCtx) const override;
+    virtual int64_t getCacheOverflowTableInsertCount(OperationContext* opCtx) const override;
 
-    virtual void setCachePressureForTest(int pressure) override;
+    virtual void setCacheOverflowTableInsertCountForTest(int insertCount) override;
 
     virtual bool supportsRecoverToStableTimestamp() const override;
 
@@ -142,6 +142,8 @@ public:
     virtual Timestamp getAllCommittedTimestamp() const override;
 
     virtual Timestamp getOldestOpenReadTimestamp() const override;
+
+    boost::optional<Timestamp> getOplogNeededForCrashRecovery() const final;
 
     bool supportsReadConcernSnapshot() const final;
 
@@ -186,7 +188,7 @@ public:
         class TimestampListener {
         public:
             // Caller must ensure that the lifetime of the variables used in the callback are valid.
-            using Callback = stdx::function<void(Timestamp timestamp)>;
+            using Callback = std::function<void(Timestamp timestamp)>;
 
             /**
              * A TimestampListener saves a 'callback' that will be executed whenever the specified
@@ -345,6 +347,8 @@ public:
 
 private:
     using CollIter = std::list<std::string>::iterator;
+
+    void _initCollection(OperationContext* opCtx, const NamespaceString& nss, bool forRepair);
 
     Status _dropCollectionsNoTimestamp(OperationContext* opCtx,
                                        std::vector<NamespaceString>& toDrop);

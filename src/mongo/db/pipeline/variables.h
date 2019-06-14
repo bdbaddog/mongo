@@ -29,10 +29,11 @@
 
 #pragma once
 
+#include <memory>
+
 #include "mongo/db/operation_context.h"
 #include "mongo/db/pipeline/document.h"
 #include "mongo/db/pipeline/runtime_constants_gen.h"
-#include "mongo/stdx/memory.h"
 #include "mongo/stdx/unordered_map.h"
 #include "mongo/util/string_map.h"
 
@@ -46,6 +47,11 @@ public:
     // Each unique variable is assigned a unique id of this type. Negative ids are reserved for
     // system variables and non-negative ids are allocated for user variables.
     using Id = int64_t;
+
+    /**
+     * Generate runtime constants using the current local and cluster times.
+     */
+    static RuntimeConstants generateRuntimeConstants(OperationContext* opCtx);
 
     /**
      * Generates Variables::Id and keeps track of the number of Ids handed out. Each successive Id
@@ -134,9 +140,9 @@ public:
     void setRuntimeConstants(const RuntimeConstants& constants);
 
     /**
-     * Generate values that must be constant during the execution.
+     * Set the runtime constants using the current local and cluster times.
      */
-    void generateRuntimeConstants(OperationContext* opCtx);
+    void setDefaultRuntimeConstants(OperationContext* opCtx);
 
 private:
     struct ValueAndState {

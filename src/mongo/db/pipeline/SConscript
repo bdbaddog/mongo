@@ -223,6 +223,7 @@ env.CppUnitTest(
         'document_source_geo_near_test.cpp',
         'document_source_graph_lookup_test.cpp',
         'document_source_group_test.cpp',
+        'document_source_internal_split_pipeline_test.cpp',
         'document_source_limit_test.cpp',
         'document_source_lookup_change_post_image_test.cpp',
         'document_source_lookup_test.cpp',
@@ -236,6 +237,7 @@ env.CppUnitTest(
         'document_source_redact_test.cpp',
         'document_source_replace_root_test.cpp',
         'document_source_sample_test.cpp',
+        'document_source_internal_shard_filter_test.cpp',
         'document_source_skip_test.cpp',
         'document_source_sort_by_count_test.cpp',
         'document_source_sort_test.cpp',
@@ -332,6 +334,7 @@ env.Library(
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/db/transaction',
+        '$BUILD_DIR/mongo/db/write_ops',
         '$BUILD_DIR/mongo/s/sharding_api',
         'process_interface_standalone',
         'sharded_agg_helpers',
@@ -387,6 +390,7 @@ pipelineeEnv.Library(
         'document_source_group.cpp',
         'document_source_index_stats.cpp',
         'document_source_internal_inhibit_optimization.cpp',
+        'document_source_internal_shard_filter.cpp',
         'document_source_internal_split_pipeline.cpp',
         'document_source_limit.cpp',
         'document_source_list_cached_and_active_users.cpp',
@@ -397,9 +401,9 @@ pipelineeEnv.Library(
         'document_source_match.cpp',
         'document_source_merge.cpp',
         'document_source_out.cpp',
-        'document_source_out_replace_coll.cpp',
         'document_source_plan_cache_stats.cpp',
         'document_source_project.cpp',
+        'document_source_queue.cpp',
         'document_source_redact.cpp',
         'document_source_replace_root.cpp',
         'document_source_sample.cpp',
@@ -594,14 +598,25 @@ env.CppUnitTest(
 )
 
 env.Library(
+    target='runtime_constants_idl',
+    source=[
+        env.Idlc('runtime_constants.idl')[0]
+    ],
+    LIBDEPS=[
+        '$BUILD_DIR/mongo/idl/idl_parser',
+    ],
+)
+
+env.Library(
     target='document_sources_idl',
     source=[
         env.Idlc('document_source_change_stream.idl')[0],
         env.Idlc('document_source_list_sessions.idl')[0],
         env.Idlc('document_source_merge.idl')[0],
-        env.Idlc('document_source_out.idl')[0],
+        env.Idlc('document_source_merge_modes.idl')[0],
+        env.Idlc('document_source_replace_root.idl')[0],
         env.Idlc('exchange_spec.idl')[0],
-        env.Idlc('runtime_constants.idl')[0],
+        env.Idlc('value.idl')[0],
         'document_source_merge_spec.cpp',
         'resume_token.cpp'
     ],
@@ -611,6 +626,7 @@ env.Library(
         '$BUILD_DIR/mongo/idl/idl_parser',
         '$BUILD_DIR/mongo/s/common_s',
         'document_value',
+        'runtime_constants_idl',
     ],
 )
 
@@ -631,3 +647,28 @@ env.CppUnitTest(
         'pipeline',
     ],
 )
+
+env.CppUnitTest(
+    target='expression_walker_test',
+    source='expression_walker_test.cpp',
+    LIBDEPS=[
+        '$BUILD_DIR/mongo/db/service_context_test_fixture',
+        'expression',
+    ],
+)
+
+env.CppUnitTest(
+    target='process_interface_test',
+    source=[
+        'mongos_process_interface_test.cpp',
+        'process_interface_standalone_test.cpp'
+    ],
+    LIBDEPS=[
+        '$BUILD_DIR/mongo/db/service_context_test_fixture',
+        'mongo_process_common',
+        'mongo_process_interface',
+        'mongos_process_interface',
+        'process_interface_shardsvr',
+        'process_interface_standalone'
+        ],
+    )

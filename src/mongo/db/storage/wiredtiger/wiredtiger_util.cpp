@@ -309,19 +309,19 @@ Status WiredTigerUtil::checkTableCreationOptions(const BSONElement& configElem) 
 }
 
 // static
-StatusWith<uint64_t> WiredTigerUtil::getStatisticsValue(WT_SESSION* session,
-                                                        const std::string& uri,
-                                                        const std::string& config,
-                                                        int statisticsKey) {
+StatusWith<int64_t> WiredTigerUtil::getStatisticsValue(WT_SESSION* session,
+                                                       const std::string& uri,
+                                                       const std::string& config,
+                                                       int statisticsKey) {
     invariant(session);
     WT_CURSOR* cursor = NULL;
     const char* cursorConfig = config.empty() ? NULL : config.c_str();
     int ret = session->open_cursor(session, uri.c_str(), NULL, cursorConfig, &cursor);
     if (ret != 0) {
-        return StatusWith<uint64_t>(ErrorCodes::CursorNotFound,
-                                    str::stream() << "unable to open cursor at URI " << uri
-                                                  << ". reason: "
-                                                  << wiredtiger_strerror(ret));
+        return StatusWith<int64_t>(ErrorCodes::CursorNotFound,
+                                   str::stream() << "unable to open cursor at URI " << uri
+                                                 << ". reason: "
+                                                 << wiredtiger_strerror(ret));
     }
     invariant(cursor);
     ON_BLOCK_EXIT([&] { cursor->close(cursor); });
@@ -329,28 +329,28 @@ StatusWith<uint64_t> WiredTigerUtil::getStatisticsValue(WT_SESSION* session,
     cursor->set_key(cursor, statisticsKey);
     ret = cursor->search(cursor);
     if (ret != 0) {
-        return StatusWith<uint64_t>(
+        return StatusWith<int64_t>(
             ErrorCodes::NoSuchKey,
             str::stream() << "unable to find key " << statisticsKey << " at URI " << uri
                           << ". reason: "
                           << wiredtiger_strerror(ret));
     }
 
-    uint64_t value;
+    int64_t value;
     ret = cursor->get_value(cursor, NULL, NULL, &value);
     if (ret != 0) {
-        return StatusWith<uint64_t>(
+        return StatusWith<int64_t>(
             ErrorCodes::BadValue,
             str::stream() << "unable to get value for key " << statisticsKey << " at URI " << uri
                           << ". reason: "
                           << wiredtiger_strerror(ret));
     }
 
-    return StatusWith<uint64_t>(value);
+    return StatusWith<int64_t>(value);
 }
 
 int64_t WiredTigerUtil::getIdentSize(WT_SESSION* s, const std::string& uri) {
-    StatusWith<int64_t> result = WiredTigerUtil::getStatisticsValueAs<int64_t>(
+    StatusWith<int64_t> result = WiredTigerUtil::getStatisticsValue(
         s, "statistics:" + uri, "statistics=(size)", WT_STAT_DSRC_BLOCK_SIZE);
     const Status& status = result.getStatus();
     if (!status.isOK()) {
@@ -602,6 +602,14 @@ Status WiredTigerUtil::exportTableToBSON(WT_SESSION* session,
                                          const std::string& uri,
                                          const std::string& config,
                                          BSONObjBuilder* bob) {
+    return exportTableToBSON(session, uri, config, bob, {});
+}
+
+Status WiredTigerUtil::exportTableToBSON(WT_SESSION* session,
+                                         const std::string& uri,
+                                         const std::string& config,
+                                         BSONObjBuilder* bob,
+                                         const std::vector<std::string>& filter) {
     invariant(session);
     invariant(bob);
     WT_CURSOR* c = NULL;
@@ -646,6 +654,11 @@ Status WiredTigerUtil::exportTableToBSON(WT_SESSION* session,
         if (prefix.size() == 0) {
             bob->appendNumber(desc, v);
         } else {
+            bool shouldSkipField = std::find(filter.begin(), filter.end(), prefix) != filter.end();
+            if (shouldSkipField) {
+                continue;
+            }
+
             BSONObjBuilder*& sub = subs[prefix.toString()];
             if (!sub)
                 sub = new BSONObjBuilder();
@@ -675,13 +688,14 @@ void WiredTigerUtil::appendSnapshotWindowSettings(WiredTigerKVEngine* engine,
     const unsigned currentAvailableSnapshotWindow =
         stableTimestamp.getSecs() - oldestTimestamp.getSecs();
 
-    int64_t score = uassertStatusOK(WiredTigerUtil::getStatisticsValueAs<int64_t>(
-        session->getSession(), "statistics:", "", WT_STAT_CONN_CACHE_LOOKASIDE_SCORE));
+    int64_t overflowTableInsertCount = uassertStatusOK(WiredTigerUtil::getStatisticsValue(
+        session->getSession(), "statistics:", "", WT_STAT_CONN_CACHE_LOOKASIDE_INSERT));
+    long long totalNumberOfSnapshotTooOldErrors =
+        snapshotWindowParams.snapshotTooOldErrorCount.load();
 
     BSONObjBuilder settings(bob->subobjStart("snapshot-window-settings"));
-    settings.append("cache pressure percentage threshold",
-                    snapshotWindowParams.cachePressureThreshold.load());
-    settings.append("current cache pressure percentage", score);
+    settings.append("total number of cache overflow disk writes", overflowTableInsertCount);
+    settings.append("total number of SnapshotTooOld errors", totalNumberOfSnapshotTooOldErrors);
     settings.append("max target available snapshots window size in seconds",
                     snapshotWindowParams.maxTargetSnapshotHistoryWindowInSeconds.load());
     settings.append("target available snapshots window size in seconds",

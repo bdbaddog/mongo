@@ -183,13 +183,17 @@ public:
                                                     int maxToDelete = 0,
                                                     CollectionRangeDeleter* forTestOnly = nullptr);
 
+    // TODO SERVER-41606: Remove this function when we refactor CollectionRangeDeleter.
+    void setDoDeletionShouldThrowWriteConflictForTest(bool on) {
+        _throwWriteConflictForTest = on;
+    }
+
 private:
     /**
      * Verifies that the metadata for the collection to be cleaned up is still valid. Makes sure
      * the collection has not been dropped (or dropped then recreated).
      */
     static bool _checkCollectionMetadataStillValid(
-        OperationContext* opCtx,
         const NamespaceString& nss,
         OID const& epoch,
         CollectionRangeDeleter* forTestOnly,
@@ -214,6 +218,9 @@ private:
      * interested callers of this->overlaps(range) with specified status.
      */
     void _pop(Status status);
+
+    // TODO SERVER-41606: Remove this function when we refactor CollectionRangeDeleter.
+    bool _throwWriteConflictForTest{false};
 
     /**
      * Ranges scheduled for deletion.  The front of the list will be in active process of deletion.

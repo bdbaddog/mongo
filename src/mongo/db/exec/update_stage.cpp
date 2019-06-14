@@ -34,6 +34,7 @@
 #include "mongo/db/exec/update_stage.h"
 
 #include <algorithm>
+#include <memory>
 
 #include "mongo/base/status_with.h"
 #include "mongo/bson/bson_comparator_interface_base.h"
@@ -46,12 +47,13 @@
 #include "mongo/db/op_observer.h"
 #include "mongo/db/query/explain.h"
 #include "mongo/db/repl/replication_coordinator.h"
+#include "mongo/db/s/operation_sharding_state.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/storage/duplicate_key_error_info.h"
 #include "mongo/db/update/path_support.h"
 #include "mongo/db/update/storage_validation.h"
+#include "mongo/s/shard_key_pattern.h"
 #include "mongo/s/would_change_owning_shard_exception.h"
-#include "mongo/stdx/memory.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/log.h"
 #include "mongo/util/scopeguard.h"
@@ -65,7 +67,6 @@ MONGO_FAIL_POINT_DEFINE(hangBeforeThrowWouldChangeOwningShard);
 using std::string;
 using std::unique_ptr;
 using std::vector;
-using stdx::make_unique;
 
 namespace mb = mutablebson;
 
@@ -179,6 +180,13 @@ UpdateStage::UpdateStage(OperationContext* opCtx,
         !(request->isFromOplogApplication() || request->getNamespaceString().isConfigDB() ||
           request->isFromMigration());
 
+    // We should only check for an update to the shard key if the update is coming from a user and
+    // the request is versioned.
+    _shouldCheckForShardKeyUpdate =
+        !(request->isFromOplogApplication() || request->getNamespaceString().isConfigDB() ||
+          request->isFromMigration()) &&
+        OperationShardingState::isOperationVersioned(opCtx);
+
     _specificStats.isModUpdate = params.driver->type() == UpdateDriver::UpdateType::kOperator;
 }
 
@@ -216,7 +224,8 @@ BSONObj UpdateStage::transformAndUpdate(const Snapshotted<BSONObj>& oldObj, Reco
     const bool isInsert = false;
     FieldRefSet immutablePaths;
     if (getOpCtx()->writesAreReplicated() && !request->isFromMigration()) {
-        if (!isFCV42 && metadata->isSharded()) {
+        if (metadata->isSharded() &&
+            (!OperationShardingState::isOperationVersioned(getOpCtx()) || !isFCV42)) {
             auto& immutablePathsVector = metadata->getKeyPatternFields();
             immutablePaths.fillFrom(
                 transitional_tools_do_not_use::unspool_vector(immutablePathsVector));
@@ -314,7 +323,7 @@ BSONObj UpdateStage::transformAndUpdate(const Snapshotted<BSONObj>& oldObj, Reco
 
                 Snapshotted<RecordData> snap(oldObj.snapshotId(), oldRec);
 
-                if (isFCV42 && metadata->isSharded()) {
+                if (isFCV42 && metadata->isSharded() && _shouldCheckForShardKeyUpdate) {
                     bool changesShardKeyOnSameNode =
                         checkUpdateChangesShardKeyFields(metadata, oldObj);
                     if (changesShardKeyOnSameNode && !args.preImageDoc) {
@@ -342,7 +351,7 @@ BSONObj UpdateStage::transformAndUpdate(const Snapshotted<BSONObj>& oldObj, Reco
                     newObj.objsize() <= BSONObjMaxUserSize);
 
             if (!request->isExplain()) {
-                if (isFCV42 && metadata->isSharded()) {
+                if (isFCV42 && metadata->isSharded() && _shouldCheckForShardKeyUpdate) {
                     bool changesShardKeyOnSameNode =
                         checkUpdateChangesShardKeyFields(metadata, oldObj);
                     if (changesShardKeyOnSameNode && !args.preImageDoc) {
@@ -408,7 +417,8 @@ BSONObj UpdateStage::applyUpdateOpsForInsert(OperationContext* opCtx,
             ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo42;
 
     FieldRefSet immutablePaths;
-    if (!isFCV42 && metadata->isSharded()) {
+    if (metadata->isSharded() &&
+        (!OperationShardingState::isOperationVersioned(opCtx) || !isFCV42)) {
         auto& immutablePathsVector = metadata->getKeyPatternFields();
         immutablePaths.fillFrom(
             transitional_tools_do_not_use::unspool_vector(immutablePathsVector));
@@ -424,8 +434,6 @@ BSONObj UpdateStage::applyUpdateOpsForInsert(OperationContext* opCtx,
         }
         requiredPaths.keepShortest(&idFieldRef);
         uassertStatusOK(driver->populateDocumentWithQueryFields(*cq, requiredPaths, *doc));
-        if (driver->type() == UpdateDriver::UpdateType::kReplacement)
-            stats->fastmodinsert = true;
     } else {
         fassert(17354, CanonicalQuery::isSimpleIdQuery(query));
         BSONElement idElt = query[idFieldName];
@@ -579,6 +587,37 @@ void UpdateStage::doInsert() {
     // If this is an explain, bail out now without doing the insert.
     if (request->isExplain()) {
         return;
+    }
+
+    // If in FCV 4.2 and this collection is sharded, check if the doc we plan to insert belongs to
+    // this shard. MongoS uses the query field to target a shard, and it is possible the shard key
+    // fields in the 'q' field belong to this shard, but those in the 'u' field do not. In this case
+    // we need to throw so that MongoS can target the insert to the correct shard.
+    if (_shouldCheckForShardKeyUpdate) {
+        const auto isFCV42 = serverGlobalParams.featureCompatibility.isVersionInitialized() &&
+            serverGlobalParams.featureCompatibility.getVersion() ==
+                ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo42;
+        auto* const css = CollectionShardingState::get(getOpCtx(), collection()->ns());
+        const auto& metadata = css->getCurrentMetadata();
+
+        if (isFCV42 && metadata->isSharded()) {
+            const ShardKeyPattern shardKeyPattern(metadata->getKeyPattern());
+            auto newShardKey = shardKeyPattern.extractShardKeyFromDoc(newObj);
+
+            if (!metadata->keyBelongsToMe(newShardKey)) {
+                // An attempt to upsert a document with a shard key value that belongs on another
+                // shard must either be a retryable write or inside a transaction.
+                uassert(ErrorCodes::IllegalOperation,
+                        "The upsert document could not be inserted onto the shard targeted by the "
+                        "query, since its shard key belongs on a different shard. Cross-shard "
+                        "upserts are only allowed when running in a transaction or with "
+                        "retryWrites: true.",
+                        getOpCtx()->getTxnNumber());
+                uasserted(
+                    WouldChangeOwningShardInfo(request->getQuery(), newObj, true /* upsert */),
+                    "The document we are inserting belongs on a different shard");
+            }
+        }
     }
 
     if (MONGO_FAIL_POINT(hangBeforeUpsertPerformsInsert)) {
@@ -838,8 +877,8 @@ void UpdateStage::doRestoreStateRequiresCollection() {
 
 unique_ptr<PlanStageStats> UpdateStage::getStats() {
     _commonStats.isEOF = isEOF();
-    unique_ptr<PlanStageStats> ret = make_unique<PlanStageStats>(_commonStats, STAGE_UPDATE);
-    ret->specific = make_unique<UpdateStats>(_specificStats);
+    unique_ptr<PlanStageStats> ret = std::make_unique<PlanStageStats>(_commonStats, STAGE_UPDATE);
+    ret->specific = std::make_unique<UpdateStats>(_specificStats);
     ret->children.emplace_back(child()->getStats());
     return ret;
 }
@@ -879,7 +918,6 @@ void UpdateStage::recordUpdateStatsInOpDebug(const UpdateStats* updateStats, OpD
     opDebug->additiveMetrics.nMatched = updateStats->nMatched;
     opDebug->additiveMetrics.nModified = updateStats->nModified;
     opDebug->upsert = updateStats->inserted;
-    opDebug->fastmodinsert = updateStats->fastmodinsert;
 }
 
 UpdateResult UpdateStage::makeUpdateResult(const UpdateStats* updateStats) {
@@ -899,8 +937,9 @@ PlanStage::StageState UpdateStage::prepareToRetryWSM(WorkingSetID idToRetry, Wor
 bool UpdateStage::checkUpdateChangesShardKeyFields(ScopedCollectionMetadata metadata,
                                                    const Snapshotted<BSONObj>& oldObj) {
     auto newObj = _doc.getObject();
-    auto oldShardKey = metadata->extractDocumentKey(oldObj.value());
-    auto newShardKey = metadata->extractDocumentKey(newObj);
+    const ShardKeyPattern shardKeyPattern(metadata->getKeyPattern());
+    auto oldShardKey = shardKeyPattern.extractShardKeyFromDoc(oldObj.value());
+    auto newShardKey = shardKeyPattern.extractShardKeyFromDoc(newObj);
 
     // If the shard key fields remain unchanged by this update or if this document is an orphan and
     // so does not belong to this shard, we can skip the rest of the checks.
@@ -908,27 +947,40 @@ bool UpdateStage::checkUpdateChangesShardKeyFields(ScopedCollectionMetadata meta
         return false;
     }
 
-    // Assert that the updated doc has all shard key fields and none are arrays or array
-    // descendants.
     FieldRefSet shardKeyPaths;
     const auto& shardKeyPathsVector = metadata->getKeyPatternFields();
     shardKeyPaths.fillFrom(transitional_tools_do_not_use::unspool_vector(shardKeyPathsVector));
+
+    // Assert that the updated doc has all shard key fields and none are arrays or array
+    // descendants.
     assertRequiredPathsPresent(_doc, shardKeyPaths);
+
+    // We do not allow modifying shard key value without specifying the full shard key in the query.
+    // If the query is a simple equality match on _id, then '_params.canonicalQuery' will be null.
+    // But if we are here, we already know that the shard key is not _id, since we have an assertion
+    // earlier for requests that try to modify the immutable _id field. So it is safe to uassert if
+    // '_params.canonicalQuery' is null OR if the query does not include equality matches on all
+    // shard key fields.
+    pathsupport::EqualityMatches equalities;
+    uassert(31025,
+            "Shard key update is not allowed without specifying the full shard key in the query",
+            _params.canonicalQuery &&
+                pathsupport::extractFullEqualityMatches(
+                    *(_params.canonicalQuery->root()), shardKeyPaths, &equalities)
+                    .isOK() &&
+                equalities.size() == shardKeyPathsVector.size());
 
     // We do not allow updates to the shard key when 'multi' is true.
     uassert(ErrorCodes::InvalidOptions,
-            str::stream() << "Multi-update operations are not allowed when updating the"
-                          << " shard key field.",
+            "Multi-update operations are not allowed when updating the shard key field.",
             !_params.request->isMulti());
 
     // If this node is a replica set primary node, an attempted update to the shard key value must
     // either be a retryable write or inside a transaction.
-    //
     // If this node is a replica set secondary node, we can skip validation.
     uassert(ErrorCodes::IllegalOperation,
-            str::stream() << "Must run update to shard key field "
-                          << " in a multi-statement transaction or"
-                             " with retryWrites: true.",
+            "Must run update to shard key field in a multi-statement transaction or with "
+            "retryWrites: true.",
             getOpCtx()->getTxnNumber() || !getOpCtx()->writesAreReplicated());
 
     if (!metadata->keyBelongsToMe(newShardKey)) {
@@ -938,8 +990,8 @@ bool UpdateStage::checkUpdateChangesShardKeyFields(ScopedCollectionMetadata meta
                                                             hangBeforeThrowWouldChangeOwningShard);
         }
 
-        uasserted(WouldChangeOwningShardInfo(oldObj.value(), newObj),
-                  str::stream() << "This update would cause the doc to change owning shards");
+        uasserted(WouldChangeOwningShardInfo(oldObj.value(), newObj, false /* upsert */),
+                  "This update would cause the doc to change owning shards");
     }
 
     // We passed all checks, so we will return that this update changes the shard key field, and

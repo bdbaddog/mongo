@@ -160,7 +160,7 @@
 
         // Commit first transaction and confirm that the change stream sees the changes expected
         // from each shard.
-        session1.commitTransaction();
+        assert.commandWorked(session1.commitTransaction_forTesting());
         assertWritesVisibleWithCapture(changeStreamCursor,
                                        [
                                          {operationType: "insert", _id: "no-txn-doc-3"},
@@ -182,7 +182,7 @@
 
         // Abort second transaction and confirm that the change stream sees only the previous
         // non-transaction write.
-        session2.abortTransaction();
+        assert.commandWorked(session2.abortTransaction_forTesting());
         assertWritesVisibleWithCapture(changeStreamCursor,
                                        [],
                                        [{operationType: "insert", _id: "no-txn-doc-4"}],

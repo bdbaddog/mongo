@@ -84,8 +84,7 @@ repl::OplogEntry makeOplogEntry(repl::OpTime opTime,
                             boost::none,                // statement id
                             boost::none,   // optime of previous write within same transaction
                             boost::none,   // pre-image optime
-                            boost::none,   // post-image optime
-                            boost::none);  // prepare
+                            boost::none);  // post-image optime
 }
 
 BSONObj f(const char* s) {
@@ -131,7 +130,7 @@ public:
         // to avoid the invariant in ReplClientInfo::setLastOp that the optime only goes forward.
         repl::ReplClientInfo::forClient(_opCtx.getClient()).clearLastOp_forTest();
 
-        getGlobalServiceContext()->setOpObserver(stdx::make_unique<OpObserverShardingImpl>());
+        getGlobalServiceContext()->setOpObserver(std::make_unique<OpObserverShardingImpl>());
 
         setOplogCollectionName(getGlobalServiceContext());
         createOplog(&_opCtx);

@@ -36,7 +36,6 @@ static void	   config_compression(const char *);
 static void	   config_encryption(void);
 static const char *config_file_type(u_int);
 static bool	   config_fix(void);
-static void	   config_helium_reset(void);
 static void	   config_in_memory(void);
 static void	   config_in_memory_reset(void);
 static int	   config_is_perm(const char *);
@@ -93,8 +92,8 @@ config_setup(void)
 	}
 	config_map_file_type(g.c_file_type, &g.type);
 
-	config_single("data_source=table", 0);
-	if (!config_is_perm("data_source"))
+	if (!config_is_perm("data_source")) {
+		config_single("data_source=table", 0);
 		switch (mmrand(NULL, 1, 5)) {
 		case 1:						/* 20% */
 			config_single("data_source=file", 0);
@@ -107,7 +106,7 @@ config_setup(void)
 			 * cache problems, don't configure LSM if those set.
 			 *
 			 * XXX
-			 * Remove the timestamp test when WT-4067 resolved.
+			 * Remove the timestamp test when WT-4162 resolved.
 			 */
 			if (g.type != ROW || g.c_in_memory)
 				break;
@@ -121,6 +120,7 @@ config_setup(void)
 		case 3: case 4: case 5:				/* 60% */
 			break;
 		}
+	}
 
 	/*
 	 * If data_source and file_type were both "permanent", we may still
@@ -140,8 +140,6 @@ config_setup(void)
 	 */
 	g.uri = dmalloc(256);
 	strcpy(g.uri, DATASOURCE("file") ? "file:" : "table:");
-	if (DATASOURCE("helium"))
-		strcat(g.uri, "dev1/");
 	strcat(g.uri, WT_NAME);
 
 	/* Fill in random values for the rest of the run. */
@@ -167,8 +165,6 @@ config_setup(void)
 	}
 
 	/* Required shared libraries. */
-	if (DATASOURCE("helium") && access(HELIUM_PATH, R_OK) != 0)
-		testutil_die(errno, "Helium shared library: %s", HELIUM_PATH);
 	if (DATASOURCE("kvsbdb") && access(KVS_BDB_PATH, R_OK) != 0)
 		testutil_die(errno, "kvsbdb shared library: %s", KVS_BDB_PATH);
 
@@ -196,9 +192,7 @@ config_setup(void)
 	config_pct();
 	config_cache();
 
-	/* Give Helium, in-memory and LSM configurations a final review. */
-	if (DATASOURCE("helium"))
-		config_helium_reset();
+	/* Give in-memory and LSM configurations a final review. */
 	if (g.c_in_memory != 0)
 		config_in_memory_reset();
 	if (DATASOURCE("lsm"))
@@ -466,36 +460,6 @@ config_fix(void)
 }
 
 /*
- * config_helium_reset --
- *	Helium configuration review.
- */
-static void
-config_helium_reset(void)
-{
-	/* Turn off a lot of stuff. */
-	if (!config_is_perm("alter"))
-		config_single("alter=off", 0);
-	if (!config_is_perm("backups"))
-		config_single("backups=off", 0);
-	if (!config_is_perm("checkpoints"))
-		config_single("checkpoints=off", 0);
-	if (!config_is_perm("compression"))
-		config_single("compression=none", 0);
-	if (!config_is_perm("in_memory"))
-		config_single("in_memory=off", 0);
-	if (!config_is_perm("logging"))
-		config_single("logging=off", 0);
-	if (!config_is_perm("rebalance"))
-		config_single("rebalance=off", 0);
-	if (!config_is_perm("reverse"))
-		config_single("reverse=off", 0);
-	if (!config_is_perm("salvage"))
-		config_single("salvage=off", 0);
-	if (!config_is_perm("transaction_timestamps"))
-		config_single("transaction_timestamps=off", 0);
-}
-
-/*
  * config_in_memory --
  *	Periodically set up an in-memory configuration.
  */
@@ -599,8 +563,7 @@ config_lsm_reset(void)
 	 * LSM doesn't currently play nicely with timestamps, don't choose the
 	 * pair unless forced to. If we turn off timestamps, make sure we turn
 	 * off prepare as well, it requires timestamps. Remove this code with
-	 * WT-4067.
-	 *
+	 * WT-4162.
 	 */
 	if (!config_is_perm("prepare") &&
 	    !config_is_perm("transaction_timestamps")) {
@@ -1005,7 +968,6 @@ config_single(const char *s, int perm)
 		} else if (strncmp(s,
 		    "data_source", strlen("data_source")) == 0 &&
 		    strncmp("file", ep, strlen("file")) != 0 &&
-		    strncmp("helium", ep, strlen("helium")) != 0 &&
 		    strncmp("kvsbdb", ep, strlen("kvsbdb")) != 0 &&
 		    strncmp("lsm", ep, strlen("lsm")) != 0 &&
 		    strncmp("table", ep, strlen("table")) != 0) {

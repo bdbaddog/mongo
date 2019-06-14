@@ -24,8 +24,7 @@
     const dbName = "test";
     const collName = "recover_prepared_transaction_state_after_rollback";
 
-    const rollbackTest =
-        new RollbackTest(dbName, undefined, true /* expect prepared transaction after rollback */);
+    const rollbackTest = new RollbackTest(dbName);
     let primary = rollbackTest.getPrimary();
 
     // Create collection we're using beforehand.
@@ -84,7 +83,7 @@
     // The following commit and abort will be rolled back.
     rollbackTest.transitionToRollbackOperations();
     PrepareHelpers.commitTransaction(session1, prepareTimestamp);
-    session2.abortTransaction_forTesting();
+    assert.commandWorked(session2.abortTransaction_forTesting());
 
     // The fastcount should be accurate because there are no open transactions.
     assert.eq(testColl.count(), 3);
@@ -92,7 +91,7 @@
     rollbackTest.transitionToSyncSourceOperationsBeforeRollback();
     rollbackTest.transitionToSyncSourceOperationsDuringRollback();
     try {
-        rollbackTest.transitionToSteadyStateOperations();
+        rollbackTest.transitionToSteadyStateOperations({skipDataConsistencyChecks: true});
     } finally {
         assert.commandWorked(
             primary.adminCommand({configureFailPoint: 'disableSnapshotting', mode: 'off'}));

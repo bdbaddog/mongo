@@ -29,6 +29,7 @@
 
 #pragma once
 
+#include <functional>
 #include <list>
 #include <vector>
 
@@ -42,7 +43,6 @@
 #include "mongo/db/query/query_knobs_gen.h"
 #include "mongo/executor/task_executor.h"
 #include "mongo/s/query/async_results_merger_params_gen.h"
-#include "mongo/stdx/functional.h"
 #include "mongo/util/intrusive_counter.h"
 #include "mongo/util/timer.h"
 
@@ -129,9 +129,9 @@ public:
         SourceContainer sources, const boost::intrusive_ptr<ExpressionContext>& expCtx);
 
     /**
-     * Returns true if the provided aggregation command has a $out stage.
+     * Returns true if the provided aggregation command has an $out or $merge stage.
      */
-    static bool aggSupportsWriteConcern(const BSONObj& cmd);
+    static bool aggHasWriteStage(const BSONObj& cmd);
 
     /**
      * Given 'pathsOfInterest' which describes a set of paths which the caller is interested in,
@@ -315,7 +315,7 @@ public:
      * stage. Returns nullptr if there is no first stage which meets these criteria.
      */
     boost::intrusive_ptr<DocumentSource> popFrontWithNameAndCriteria(
-        StringData targetStageName, stdx::function<bool(const DocumentSource* const)> predicate);
+        StringData targetStageName, std::function<bool(const DocumentSource* const)> predicate);
 
     /**
      * PipelineD is a "sister" class that has additional functionality for the Pipeline. It exists

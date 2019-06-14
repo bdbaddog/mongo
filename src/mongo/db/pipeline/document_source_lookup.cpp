@@ -31,6 +31,8 @@
 
 #include "mongo/db/pipeline/document_source_lookup.h"
 
+#include <memory>
+
 #include "mongo/base/init.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/matcher/expression_algo.h"
@@ -40,7 +42,6 @@
 #include "mongo/db/pipeline/expression_context.h"
 #include "mongo/db/pipeline/value.h"
 #include "mongo/db/query/query_knobs_gen.h"
-#include "mongo/stdx/memory.h"
 
 namespace mongo {
 
@@ -151,7 +152,7 @@ std::unique_ptr<DocumentSourceLookUp::LiteParsed> DocumentSourceLookUp::LitePars
 
     foreignNssSet.insert(fromNss);
 
-    return stdx::make_unique<DocumentSourceLookUp::LiteParsed>(
+    return std::make_unique<DocumentSourceLookUp::LiteParsed>(
         std::move(fromNss), std::move(foreignNssSet), std::move(liteParsedPipeline));
 }
 
@@ -196,7 +197,8 @@ StageConstraints DocumentSourceLookUp::constraints(Pipeline::SplitState) const {
                                  hostRequirement,
                                  diskRequirement,
                                  FacetRequirement::kAllowed,
-                                 txnRequirement);
+                                 txnRequirement,
+                                 LookupRequirement::kAllowed);
 
     constraints.canSwapWithMatch = true;
     return constraints;
@@ -336,6 +338,10 @@ DocumentSource::GetModPathsReturn DocumentSourceLookUp::getModifiedPaths() const
 Pipeline::SourceContainer::iterator DocumentSourceLookUp::doOptimizeAt(
     Pipeline::SourceContainer::iterator itr, Pipeline::SourceContainer* container) {
     invariant(*itr == this);
+
+    if (std::next(itr) == container->end()) {
+        return container->end();
+    }
 
     auto nextUnwind = dynamic_cast<DocumentSourceUnwind*>((*std::next(itr)).get());
 
@@ -623,7 +629,7 @@ void DocumentSourceLookUp::resolveLetVariables(const Document& localDoc, Variabl
     invariant(variables);
 
     for (auto& letVar : _letVariables) {
-        auto value = letVar.expression->evaluate(localDoc);
+        auto value = letVar.expression->evaluate(localDoc, &pExpCtx->variables);
         variables->setConstantValue(letVar.id, value);
     }
 }
@@ -635,17 +641,16 @@ void DocumentSourceLookUp::initializeResolvedIntrospectionPipeline() {
 
     auto& sources = _resolvedIntrospectionPipeline->getSources();
 
-    // Ensure that the pipeline does not contain a $changeStream stage. This check will be
-    // performed recursively on all sub-pipelines.
-    uassert(ErrorCodes::IllegalOperation,
-            "$changeStream is not allowed within a $lookup's pipeline",
-            sources.empty() || !sources.front()->constraints().isChangeStreamStage());
+    auto it = std::find_if(
+        sources.begin(), sources.end(), [](const boost::intrusive_ptr<DocumentSource>& src) {
+            return !src->constraints().isAllowedInLookupPipeline();
+        });
 
-    // Ensure that the pipeline does not contain a $out stage. Since $out must be the last stage
-    // of a pipeline, we only need to check the last DocumentSource.
+    // For other stages, use a generic error.
     uassert(51047,
-            "$out is not allowed within a $lookup's pipeline",
-            sources.empty() || !sources.back()->constraints().writesPersistentData());
+            str::stream() << (*it)->getSourceName()
+                          << " is not allowed within a $lookup's sub-pipeline",
+            it == sources.end());
 }
 
 void DocumentSourceLookUp::serializeToArray(

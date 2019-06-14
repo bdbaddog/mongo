@@ -142,7 +142,7 @@ public:
     struct Waiter {
         Date_t deadline;
         ReadPreferenceSetting criteria;
-        Promise<HostAndPort> promise;
+        Promise<std::vector<HostAndPort>> promise;
     };
 
     SetState(const MongoURI& uri, ReplicaSetChangeNotifier*, executor::TaskExecutor*);
@@ -154,6 +154,8 @@ public:
      *
      * Note: Uses only local data and does not go over the network.
      */
+    std::vector<HostAndPort> getMatchingHosts(const ReadPreferenceSetting& criteria) const;
+
     HostAndPort getMatchingHost(const ReadPreferenceSetting& criteria) const;
 
     /**
@@ -239,10 +241,10 @@ public:
     mutable PseudoRandom rand;   // only used for host selection to balance load
 
     // For scheduling scans
-    Seconds refreshPeriod;       // Normal refresh period when not expedited
-    bool isExpedited = false;    // True when we are doing more frequent refreshes due to waiters
-    stdx::list<Waiter> waiters;  // Everyone waiting for some ReadPreference to be satisfied
-    ScanStatePtr currentScan;    // NULL if no scan in progress
+    Seconds refreshPeriod;      // Normal refresh period when not expedited
+    bool isExpedited = false;   // True when we are doing more frequent refreshes due to waiters
+    std::list<Waiter> waiters;  // Everyone waiting for some ReadPreference to be satisfied
+    ScanStatePtr currentScan;   // NULL if no scan in progress
 };
 
 struct ReplicaSetMonitor::ScanState {

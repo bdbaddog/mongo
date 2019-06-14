@@ -55,6 +55,7 @@ typedef struct {
 	char *home;				/* Home directory */
 	const char *checkpoint_name;		/* Checkpoint name */
 	WT_CONNECTION *conn;			/* WiredTiger connection */
+	bool debug_mode;			/* Lookaside stress test */
 	u_int nkeys;				/* Keys to load */
 	u_int nops;				/* Operations per thread */
 	FILE *logfp;				/* Message log file. */
@@ -63,8 +64,13 @@ typedef struct {
 	int ntables_created;			/* Number tables opened */
 	int running;				/* Whether to stop */
 	int status;				/* Exit status */
+	bool sweep_stress;			/* Sweep stress test */
+	u_int ts;				/* Current timestamp */
+	bool use_timestamps;			/* Use txn timestamps */
 	COOKIE *cookies;			/* Per-thread info */
+	WT_RWLOCK clock_lock;			/* Clock synchronization */
 	wt_thread_t checkpoint_thread;		/* Checkpoint thread */
+	wt_thread_t clock_thread;		/* Clock thread */
 } GLOBAL;
 extern GLOBAL g;
 

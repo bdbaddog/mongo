@@ -31,6 +31,8 @@
 
 #include "mongo/db/pipeline/document_source_match.h"
 
+#include <memory>
+
 #include "mongo/db/jsobj.h"
 #include "mongo/db/matcher/expression_algo.h"
 #include "mongo/db/matcher/expression_array.h"
@@ -41,7 +43,6 @@
 #include "mongo/db/pipeline/document_path_support.h"
 #include "mongo/db/pipeline/expression.h"
 #include "mongo/db/pipeline/lite_parsed_document_source.h"
-#include "mongo/stdx/memory.h"
 #include "mongo/util/str.h"
 
 namespace mongo {
@@ -112,6 +113,10 @@ DocumentSource::GetNextResult DocumentSourceMatch::getNext() {
 Pipeline::SourceContainer::iterator DocumentSourceMatch::doOptimizeAt(
     Pipeline::SourceContainer::iterator itr, Pipeline::SourceContainer* container) {
     invariant(*itr == this);
+
+    if (std::next(itr) == container->end()) {
+        return container->end();
+    }
 
     auto nextMatch = dynamic_cast<DocumentSourceMatch*>((*std::next(itr)).get());
 
@@ -376,13 +381,7 @@ bool DocumentSourceMatch::isTextQuery(const BSONObj& query) {
 }
 
 void DocumentSourceMatch::joinMatchWith(intrusive_ptr<DocumentSourceMatch> other) {
-    _predicate = BSON("$and" << BSON_ARRAY(_predicate << other->getQuery()));
-
-    StatusWithMatchExpression status = uassertStatusOK(MatchExpressionParser::parse(
-        _predicate, pExpCtx, ExtensionsCallbackNoop(), Pipeline::kAllowedMatcherFeatures));
-    _expression = std::move(status.getValue());
-    _dependencies = DepsTracker(_dependencies.getMetadataAvailable());
-    getDependencies(&_dependencies);
+    rebuild(BSON("$and" << BSON_ARRAY(_predicate << other->getQuery())));
 }
 
 pair<intrusive_ptr<DocumentSourceMatch>, intrusive_ptr<DocumentSourceMatch>>
@@ -498,14 +497,17 @@ DepsTracker::State DocumentSourceMatch::getDependencies(DepsTracker* deps) const
 
 DocumentSourceMatch::DocumentSourceMatch(const BSONObj& query,
                                          const intrusive_ptr<ExpressionContext>& expCtx)
-    : DocumentSource(expCtx),
-      _predicate(query.getOwned()),
-      _isTextQuery(isTextQuery(query)),
-      _dependencies(_isTextQuery ? DepsTracker::MetadataAvailable::kTextScore
-                                 : DepsTracker::MetadataAvailable::kNoMetadata) {
-    StatusWithMatchExpression status = uassertStatusOK(MatchExpressionParser::parse(
-        _predicate, expCtx, ExtensionsCallbackNoop(), Pipeline::kAllowedMatcherFeatures));
-    _expression = std::move(status.getValue());
+    : DocumentSource(expCtx) {
+    rebuild(query);
+}
+
+void DocumentSourceMatch::rebuild(BSONObj filter) {
+    _predicate = filter.getOwned();
+    _expression = uassertStatusOK(MatchExpressionParser::parse(
+        _predicate, pExpCtx, ExtensionsCallbackNoop(), Pipeline::kAllowedMatcherFeatures));
+    _isTextQuery = isTextQuery(_predicate);
+    _dependencies = DepsTracker(_isTextQuery ? DepsTracker::MetadataAvailable::kTextScore
+                                             : DepsTracker::MetadataAvailable::kNoMetadata);
     getDependencies(&_dependencies);
 }
 

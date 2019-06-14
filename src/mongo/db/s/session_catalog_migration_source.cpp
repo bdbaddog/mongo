@@ -31,6 +31,8 @@
 
 #include "mongo/db/s/session_catalog_migration_source.h"
 
+#include <memory>
+
 #include "mongo/db/catalog_raii.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/dbdirectclient.h"
@@ -44,7 +46,6 @@
 #include "mongo/db/transaction_participant.h"
 #include "mongo/db/write_concern.h"
 #include "mongo/platform/random.h"
-#include "mongo/stdx/memory.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/str.h"
 
@@ -101,8 +102,7 @@ repl::OplogEntry makeOplogEntry(repl::OpTime opTime,
                             statementId,                      // statement id
                             boost::none,   // optime of previous write within same transaction
                             boost::none,   // pre-image optime
-                            boost::none,   // post-image optime
-                            boost::none);  // prepare
+                            boost::none);  // post-image optime
 }
 
 /**
@@ -128,8 +128,13 @@ repl::OplogEntry makeSentinelOplogEntry(const LogicalSessionId& lsid,
 }  // namespace
 
 SessionCatalogMigrationSource::SessionCatalogMigrationSource(OperationContext* opCtx,
-                                                             NamespaceString ns)
-    : _ns(std::move(ns)), _rollbackIdAtInit(repl::ReplicationProcess::get(opCtx)->getRollbackID()) {
+                                                             NamespaceString ns,
+                                                             ChunkRange chunk,
+                                                             KeyPattern shardKey)
+    : _ns(std::move(ns)),
+      _rollbackIdAtInit(repl::ReplicationProcess::get(opCtx)->getRollbackID()),
+      _chunkRange(std::move(chunk)),
+      _keyPattern(shardKey) {
     // Exclude entries for transaction.
     Query query;
     // Sort is not needed for correctness. This is just for making it easier to write deterministic
@@ -144,7 +149,7 @@ SessionCatalogMigrationSource::SessionCatalogMigrationSource(OperationContext* o
             IDLParserErrorContext("Session migration cloning"), cursor->next());
         if (!nextSession.getLastWriteOpTime().isNull()) {
             _sessionOplogIterators.push_back(
-                stdx::make_unique<SessionOplogIterator>(std::move(nextSession), _rollbackIdAtInit));
+                std::make_unique<SessionOplogIterator>(std::move(nextSession), _rollbackIdAtInit));
         }
     }
 
@@ -248,16 +253,25 @@ std::shared_ptr<Notification<bool>> SessionCatalogMigrationSource::getNotificati
 }
 
 bool SessionCatalogMigrationSource::_handleWriteHistory(WithLock, OperationContext* opCtx) {
-    if (_currentOplogIterator) {
+    while (_currentOplogIterator) {
         if (auto nextOplog = _currentOplogIterator->getNext(opCtx)) {
             auto nextStmtId = nextOplog->getStatementId();
 
-            // Note: This is an optimization based on the assumption that it is not possible to be
-            // touching different namespaces in the same transaction.
+            // Skip the rest of the chain for this session since the ns is unrelated with the
+            // current one being migrated. It is ok to not check the rest of the chain because
+            // retryable writes doesn't allow touching different namespaces.
             if (!nextStmtId || (nextStmtId && *nextStmtId != kIncompleteHistoryStmtId &&
                                 nextOplog->getNss() != _ns)) {
                 _currentOplogIterator.reset();
                 return false;
+            }
+
+            if (nextOplog->isCrudOpType()) {
+                auto shardKey =
+                    _keyPattern.extractShardKeyFromDoc(nextOplog->getObjectContainingDocumentKey());
+                if (!_chunkRange.containsKey(shardKey)) {
+                    continue;
+                }
             }
 
             auto doc = fetchPrePostImageOplog(opCtx, *nextOplog);
@@ -267,6 +281,7 @@ bool SessionCatalogMigrationSource::_handleWriteHistory(WithLock, OperationConte
             } else {
                 _lastFetchedOplog = *nextOplog;
             }
+
             return true;
         } else {
             _currentOplogIterator.reset();
@@ -376,7 +391,7 @@ SessionCatalogMigrationSource::SessionOplogIterator::SessionOplogIterator(
     SessionTxnRecord txnRecord, int expectedRollbackId)
     : _record(std::move(txnRecord)), _initialRollbackId(expectedRollbackId) {
     _writeHistoryIterator =
-        stdx::make_unique<TransactionHistoryIterator>(_record.getLastWriteOpTime());
+        std::make_unique<TransactionHistoryIterator>(_record.getLastWriteOpTime());
 }
 
 boost::optional<repl::OplogEntry> SessionCatalogMigrationSource::SessionOplogIterator::getNext(

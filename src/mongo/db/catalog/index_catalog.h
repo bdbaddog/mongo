@@ -330,12 +330,6 @@ public:
         const = 0;
 
     /**
-     * Returns a not-ok Status if there are any unfinished index builds. No new indexes should
-     * be built when in this state.
-     */
-    virtual Status checkUnfinished() const = 0;
-
-    /**
      * Returns an iterator for the index descriptors in this IndexCatalog.
      */
     virtual std::unique_ptr<IndexIterator> getIndexIterator(
@@ -356,7 +350,8 @@ public:
      * fields. Lastly, checks whether the spec conflicts with ready and in-progress indexes.
      *
      * Returns an error Status or the cleaned up version of the non-conflicting spec. Returns
-     * IndexAlreadyExists if the index either already exists or is already being built.
+     * IndexAlreadyExists if the index already exists; IndexBuildAlreadyInProgress if the index is
+     * already being built.
      */
     virtual StatusWith<BSONObj> prepareSpecForCreate(OperationContext* const opCtx,
                                                      const BSONObj& original) const = 0;
@@ -364,15 +359,21 @@ public:
     /**
      * Returns a copy of 'indexSpecsToBuild' that does not contain index specifications that already
      * exist or are already being built. If this is not done, an index build using
-     * 'indexSpecsToBuild' may fail with error code IndexAlreadyExists. If {buildIndexes:false} is
-     * set in the replica set config, also filters non-_id index specs out of the results.
+     * 'indexSpecsToBuild' may fail with an IndexAlreadyExists or IndexBuildAlreadyInProgress error.
+     * If {buildIndexes:false} is set in the replica set config, also filters non-_id index specs
+     * out of the results.
      *
-     * Additionally verifies the specs are valid and corrects any legacy fields. Throws on any spec
-     * validation errors or conflicts other than IndexAlreadyExists, which indicates that the index
-     * spec either already exists or is already being built and is what this function filters out.
+     * Additionally verifies the specs are valid. Throws on any spec validation errors or conflicts
+     * other than IndexAlreadyExists, which indicates that the index spec already exists is what
+     * this function filters out.
+     *
+     * 'removeIndexBuildsToo' controls whether in-progress index builds are also filtered out. If
+     * they are not, then IndexBuildAlreadyInProgress errors can be thrown.
      */
     virtual std::vector<BSONObj> removeExistingIndexes(
-        OperationContext* const opCtx, const std::vector<BSONObj>& indexSpecsToBuild) const = 0;
+        OperationContext* const opCtx,
+        const std::vector<BSONObj>& indexSpecsToBuild,
+        const bool removeIndexBuildsToo) const = 0;
 
     /**
      * Filters out ready and in-progress indexes that already exist and returns the remaining
@@ -394,7 +395,7 @@ public:
      */
     virtual void dropAllIndexes(OperationContext* opCtx,
                                 bool includingIdIndex,
-                                stdx::function<void(const IndexDescriptor*)> onDropFn) = 0;
+                                std::function<void(const IndexDescriptor*)> onDropFn) = 0;
     virtual void dropAllIndexes(OperationContext* opCtx, bool includingIdIndex) = 0;
 
     /**
@@ -404,11 +405,6 @@ public:
      * collection.
      */
     virtual Status dropIndex(OperationContext* const opCtx, const IndexDescriptor* const desc) = 0;
-
-    /**
-     * Drops all incomplete indexes and returns specs. After this, the indexes can be rebuilt.
-     */
-    virtual std::vector<BSONObj> getAndClearUnfinishedIndexes(OperationContext* const opCtx) = 0;
 
     // ---- modify single index
 

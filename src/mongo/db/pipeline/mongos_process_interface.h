@@ -29,6 +29,7 @@
 
 #pragma once
 
+#include "mongo/db/exec/shard_filterer.h"
 #include "mongo/db/pipeline/mongo_process_common.h"
 #include "mongo/db/pipeline/pipeline.h"
 #include "mongo/s/async_requests_sender.h"
@@ -42,7 +43,7 @@ namespace mongo {
  * Class to provide access to mongos-specific implementations of methods required by some
  * document sources.
  */
-class MongoSInterface final : public MongoProcessCommon {
+class MongoSInterface : public MongoProcessCommon {
 public:
     static BSONObj createPassthroughCommandForShard(OperationContext* opCtx,
                                                     const AggregationRequest& request,
@@ -89,8 +90,8 @@ public:
     std::vector<GenericCursor> getIdleCursors(const boost::intrusive_ptr<ExpressionContext>& expCtx,
                                               CurrentOpUserMode userMode) const final;
 
-    repl::OplogEntry lookUpOplogEntryByOpTime(OperationContext* opCtx,
-                                              repl::OpTime lookupTime) final {
+    std::unique_ptr<TransactionHistoryIteratorBase> createTransactionHistoryIterator(
+        repl::OpTime time) const override {
         MONGO_UNREACHABLE;
     }
 
@@ -100,22 +101,21 @@ public:
 
     bool isSharded(OperationContext* opCtx, const NamespaceString& nss) final;
 
-    void insert(const boost::intrusive_ptr<ExpressionContext>& expCtx,
-                const NamespaceString& ns,
-                std::vector<BSONObj>&& objs,
-                const WriteConcernOptions& wc,
-                boost::optional<OID>) final {
+    Status insert(const boost::intrusive_ptr<ExpressionContext>& expCtx,
+                  const NamespaceString& ns,
+                  std::vector<BSONObj>&& objs,
+                  const WriteConcernOptions& wc,
+                  boost::optional<OID>) final {
         MONGO_UNREACHABLE;
     }
 
-    void update(const boost::intrusive_ptr<ExpressionContext>& expCtx,
-                const NamespaceString& ns,
-                std::vector<BSONObj>&& queries,
-                std::vector<BSONObj>&& updates,
-                const WriteConcernOptions& wc,
-                bool upsert,
-                bool multi,
-                boost::optional<OID>) final {
+    StatusWith<UpdateResult> update(const boost::intrusive_ptr<ExpressionContext>& expCtx,
+                                    const NamespaceString& ns,
+                                    BatchedObjects&& batch,
+                                    const WriteConcernOptions& wc,
+                                    bool upsert,
+                                    bool multi,
+                                    boost::optional<OID>) final {
         MONGO_UNREACHABLE;
     }
 
@@ -158,6 +158,17 @@ public:
 
     std::unique_ptr<Pipeline, PipelineDeleter> attachCursorSourceToPipeline(
         const boost::intrusive_ptr<ExpressionContext>& expCtx, Pipeline* pipeline) final;
+
+    std::unique_ptr<Pipeline, PipelineDeleter> attachCursorSourceToPipelineForLocalRead(
+        const boost::intrusive_ptr<ExpressionContext>& expCtx, Pipeline* pipeline) final {
+        // It is not meaningful to perform a "local read" on mongos.
+        MONGO_UNREACHABLE;
+    }
+
+    std::unique_ptr<ShardFilterer> getShardFilterer(
+        const boost::intrusive_ptr<ExpressionContext>& expCtx) const override {
+        return nullptr;
+    }
 
     std::string getShardName(OperationContext* opCtx) const final {
         MONGO_UNREACHABLE;
@@ -202,9 +213,9 @@ public:
         MONGO_UNREACHABLE;
     }
 
-    bool uniqueKeyIsSupportedByIndex(const boost::intrusive_ptr<ExpressionContext>&,
-                                     const NamespaceString&,
-                                     const std::set<FieldPath>& uniqueKeyPaths) const final;
+    bool fieldsHaveSupportingUniqueIndex(const boost::intrusive_ptr<ExpressionContext>&,
+                                         const NamespaceString&,
+                                         const std::set<FieldPath>& fieldPaths) const;
 
     void checkRoutingInfoEpochOrThrow(const boost::intrusive_ptr<ExpressionContext>&,
                                       const NamespaceString&,
@@ -215,6 +226,12 @@ public:
     std::unique_ptr<ResourceYielder> getResourceYielder() const override {
         return nullptr;
     }
+
+    std::pair<std::set<FieldPath>, boost::optional<ChunkVersion>>
+    ensureFieldsUniqueOrResolveDocumentKey(const boost::intrusive_ptr<ExpressionContext>& expCtx,
+                                           boost::optional<std::vector<std::string>> fields,
+                                           boost::optional<ChunkVersion> targetCollectionVersion,
+                                           const NamespaceString& outputNs) const override;
 
 protected:
     BSONObj _reportCurrentOpForClient(OperationContext* opCtx,

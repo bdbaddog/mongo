@@ -34,6 +34,7 @@
 #include "mongo/db/commands/run_aggregate.h"
 
 #include <boost/optional.hpp>
+#include <memory>
 #include <vector>
 
 #include "mongo/db/auth/authorization_session.h"
@@ -71,7 +72,6 @@
 #include "mongo/db/transaction_participant.h"
 #include "mongo/db/views/view.h"
 #include "mongo/db/views/view_catalog.h"
-#include "mongo/stdx/memory.h"
 #include "mongo/util/log.h"
 #include "mongo/util/scopeguard.h"
 #include "mongo/util/string_map.h"
@@ -84,7 +84,6 @@ using std::shared_ptr;
 using std::string;
 using std::stringstream;
 using std::unique_ptr;
-using stdx::make_unique;
 
 namespace {
 /**
@@ -284,8 +283,8 @@ StatusWith<StringMap<ExpressionContext::ResolvedNamespace>> resolveInvolvedNames
 
         if (involvedNs.db() != request.getNamespaceString().db()) {
             // If the involved namespace is not in the same database as the aggregation, it must be
-            // from a $out to a collection in a different database. Since we cannot write to views,
-            // simply assume that the namespace is a collection.
+            // from a $merge to a collection in a different database. Since we cannot write to
+            // views, simply assume that the namespace is a collection.
             resolvedNamespaces[involvedNs.coll()] = {involvedNs, std::vector<BSONObj>{}};
         } else if (!db || db->getCollection(opCtx, involvedNs)) {
             // If the aggregation database exists and 'involvedNs' refers to a collection namespace,
@@ -421,8 +420,8 @@ void _adjustChangeStreamReadConcern(OperationContext* opCtx) {
     }
 
     // Wait for read concern again since we changed the original read concern.
-    uassertStatusOK(
-        waitForReadConcern(opCtx, readConcernArgs, true, PrepareConflictBehavior::kIgnore));
+    uassertStatusOK(waitForReadConcern(
+        opCtx, readConcernArgs, true, PrepareConflictBehavior::kIgnoreConflicts));
 }
 
 /**
@@ -475,10 +474,10 @@ std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> createOuterPipelineProxyExe
     std::unique_ptr<Pipeline, PipelineDeleter> pipeline,
     bool hasChangeStream) {
     // Transfer ownership of the Pipeline to the PipelineProxyStage.
-    auto ws = make_unique<WorkingSet>();
+    auto ws = std::make_unique<WorkingSet>();
     auto proxy = hasChangeStream
-        ? make_unique<ChangeStreamProxyStage>(opCtx, std::move(pipeline), ws.get())
-        : make_unique<PipelineProxyStage>(opCtx, std::move(pipeline), ws.get());
+        ? std::make_unique<ChangeStreamProxyStage>(opCtx, std::move(pipeline), ws.get())
+        : std::make_unique<PipelineProxyStage>(opCtx, std::move(pipeline), ws.get());
 
     // This PlanExecutor will simply forward requests to the Pipeline, so does not need
     // to yield or to be registered with any collection's CursorManager to receive
@@ -732,6 +731,7 @@ Status runAggregate(OperationContext* opCtx,
             std::move(exec),
             origNss,
             AuthorizationSession::get(opCtx->getClient())->getAuthenticatedUserNames(),
+            opCtx->getWriteConcern(),
             repl::ReadConcernArgs::get(opCtx),
             cmdObj,
             lockPolicy,

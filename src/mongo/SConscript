@@ -42,6 +42,7 @@ env.SConscript(
         'transport',
         'unittest',
         'util',
+        'watchdog',
     ],
     exports=[
         'env',
@@ -114,6 +115,7 @@ env.Library(
         'util/allocator.cpp',
         'util/assert_util.cpp',
         'util/base64.cpp',
+        'util/boost_assert_impl.cpp',
         'util/concurrency/idle_thread_block.cpp',
         'util/concurrency/thread_name.cpp',
         'util/duration.cpp',
@@ -129,7 +131,6 @@ env.Library(
         'util/signal_handlers_synchronous.cpp',
         'util/stacktrace.cpp',
         'util/stacktrace_${TARGET_OS_FAMILY}.cpp',
-        'util/startup_test.cpp',
         'util/str.cpp',
         'util/system_clock_source.cpp',
         'util/system_tick_source.cpp',
@@ -149,11 +150,22 @@ env.Library(
         '$BUILD_DIR/third_party/shim_fmt',
         '$BUILD_DIR/third_party/shim_intel_decimal128',
         '$BUILD_DIR/third_party/shim_pcrecpp',
+        'boost_assert_shim',
         'util/quick_exit',
     ],
     LIBDEPS_PRIVATE=[
         'util/debugger',
     ],
+)
+
+# Shim library for boost to depend on
+env.Library(
+    target='boost_assert_shim',
+    source=[
+        'util/boost_assert_shim.cpp'
+    ],
+    # NOTE: This library *must not* depend on any mongodb code
+    LIBDEPS=[],
 )
 
 js_engine_ver = get_option("js-engine") if get_option("server-js") == "on" else "none"
@@ -258,7 +270,6 @@ config_header_substs = (
     ('@mongo_config_have_posix_monotonic_clock@', 'MONGO_CONFIG_HAVE_POSIX_MONOTONIC_CLOCK'),
     ('@mongo_config_have_pthread_setname_np@', 'MONGO_CONFIG_HAVE_PTHREAD_SETNAME_NP'),
     ('@mongo_config_have_std_enable_if_t@', 'MONGO_CONFIG_HAVE_STD_ENABLE_IF_T'),
-    ('@mongo_config_have_std_make_unique@', 'MONGO_CONFIG_HAVE_STD_MAKE_UNIQUE'),
     ('@mongo_config_have_strnlen@', 'MONGO_CONFIG_HAVE_STRNLEN'),
     ('@mongo_config_max_extended_alignment@', 'MONGO_CONFIG_MAX_EXTENDED_ALIGNMENT'),
     ('@mongo_config_optimized_build@', 'MONGO_CONFIG_OPTIMIZED_BUILD'),
@@ -328,14 +339,15 @@ mongod = env.Program(
         'db/catalog/index_key_validate',
         'db/cloner',
         'db/collection_index_usage_tracker',
-        'db/commands/mongod_fcv',
         'db/commands/mongod',
+        'db/commands/mongod_fcv',
         'db/commands/server_status_servers',
         'db/common',
+        'db/concurrency/flow_control_ticketholder',
         'db/concurrency/lock_manager',
         'db/concurrency/write_conflict_exception',
-        'db/curop_metrics',
         'db/curop',
+        'db/curop_metrics',
         'db/db_raii',
         'db/dbdirectclient',
         'db/dbhelpers',
@@ -343,9 +355,10 @@ mongod = env.Program(
         'db/free_mon/free_mon_mongod',
         'db/ftdc/ftdc_mongod',
         'db/fts/ftsmongod',
-        'db/index_builds_coordinator_mongod',
         'db/index/index_access_method',
         'db/index/index_descriptor',
+        'db/index_builds_coordinator_mongod',
+        'db/initialize_server_security_state',
         'db/initialize_snmp',
         'db/introspect',
         'db/keys_collection_client_direct',
@@ -354,7 +367,6 @@ mongod = env.Program(
         'db/logical_time_metadata_hook',
         'db/matcher/expressions_mongod_only',
         'db/mongod_options',
-        'db/mongodandmongos',
         'db/ops/write_ops_parsers',
         'db/periodic_runner_job_abort_expired_transactions',
         'db/periodic_runner_job_decrease_snapshot_cache_pressure',
@@ -375,8 +387,8 @@ mongod = env.Program(
         'db/repl/rs_rollback',
         'db/repl/rslog',
         'db/repl/serveronly_repl',
-        'db/repl/storage_interface_impl',
         'db/repl/storage_interface',
+        'db/repl/storage_interface_impl',
         'db/repl/topology_coordinator',
         'db/rw_concern_d',
         'db/s/balancer',
@@ -392,8 +404,8 @@ mongod = env.Program(
         'db/storage/biggie/storage_biggie',
         'db/storage/devnull/storage_devnull',
         'db/storage/ephemeral_for_test/storage_ephemeral_for_test',
-        'db/storage/flow_control_parameters',
         'db/storage/flow_control',
+        'db/storage/flow_control_parameters',
         'db/storage/storage_engine_lock_file',
         'db/storage/storage_engine_metadata',
         'db/storage/storage_init_d',
@@ -403,8 +415,8 @@ mongod = env.Program(
         'db/traffic_recorder',
         'db/ttl_collection_cache',
         'db/ttl_d',
-        'db/update_index_data',
         'db/update/update_driver',
+        'db/update_index_data',
         'db/views/views_mongod',
         'db/windows_options' if env.TargetOSIs('windows') else [],
         'executor/network_interface_factory',
@@ -424,6 +436,7 @@ mongod = env.Program(
         'util/options_parser/options_parser_init',
         'util/periodic_runner_factory',
         'util/version_impl',
+        'watchdog/watchdog_mongod',
     ],
     INSTALL_ALIAS=[
         'core',
@@ -481,6 +494,7 @@ mongos = env.Program(
         's/mongos_options.cpp',
         's/mongos_options_init.cpp',
         env.Idlc('s/mongos_options.idl')[0],
+        's/router_transactions_server_status.cpp',
         's/s_sharding_server_status.cpp',
         's/server.cpp',
         's/service_entry_point_mongos.cpp',
@@ -490,17 +504,17 @@ mongos = env.Program(
     LIBDEPS=[
         'db/audit',
         'db/auth/authmongos',
+        'db/commands/server_status',
         'db/commands/server_status_core',
         'db/commands/server_status_servers',
-        'db/commands/server_status',
         'db/curop',
         'db/ftdc/ftdc_mongos',
-        'db/logical_session_cache_impl',
+        'db/initialize_server_security_state',
         'db/logical_session_cache',
+        'db/logical_session_cache_impl',
         'db/logical_time_metadata_hook',
-        'db/mongodandmongos',
-        'db/server_options_base',
         'db/server_options',
+        'db/server_options_base',
         'db/service_liaison_mongos',
         'db/sessions_collection_sharded',
         'db/startup_warnings_common',
@@ -550,12 +564,7 @@ if not has_option('noshell') and usemozjs:
     shell_core_env.Library("shell_core",
                 source=[
                     "shell/linenoise.cpp",
-                    "shell/mk_wcwidth.cpp",
-                    "shell/mongo-server.cpp",
-                    "shell/shell_options.cpp",
-                    "shell/shell_utils.cpp",
-                    "shell/shell_utils_extended.cpp",
-                    "shell/shell_utils_launcher.cpp",
+                    "shell/mk_wcwidth.cpp"
                 ],
                 LIBDEPS=[
                     'client/clientdriver_network',
@@ -571,7 +580,7 @@ if not has_option('noshell') and usemozjs:
                     'scripting/scripting',
                     'shell/benchrun',
                     'shell/mongojs',
-                    'shell/shell_options_storage',
+                    'shell/shell_utils',
                     'transport/message_compressor',
                     'transport/transport_layer_manager',
                     'util/net/network',
@@ -583,11 +592,6 @@ if not has_option('noshell') and usemozjs:
                     'executor/thread_pool_task_executor',
                     'executor/network_interface_thread_pool',
                     'executor/network_interface_factory'
-                ],
-                # Because `::environ` is resolved in `/usr/lib/crt1.o` on FreeBSD, this library
-                # needs to be marked `incomplete` on FreeBSD.
-                LIBDEPS_TAGS=[] if not env.TargetOSIs('freebsd') else [
-                    'illegal_cyclic_or_unresolved_dependencies_whitelisted',
                 ],
     )
 
@@ -670,7 +674,7 @@ def installBinary( e, name ):
         debug_sym_name += '.debug'
     elif e.TargetOSIs('darwin'):
         debug_sym_name += '.dSYM'
-        debug_sym_cmd = 'dsymutil -o ${TARGET} ${SOURCE}'
+        debug_sym_cmd = 'dsymutil -num-threads=1 -o ${TARGET} ${SOURCE}'
     elif e.ToolchainIs('msvc'):
         debug_sym_name += '.pdb'
         distBinaries.append(debug_sym_name)

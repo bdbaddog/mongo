@@ -74,6 +74,8 @@ const WriteConcernOptions kMajorityWriteConcern(WriteConcernOptions::kMajority,
                                                 WriteConcernOptions::SyncMode::UNSET,
                                                 WriteConcernOptions::kWriteConcernTimeoutSharding);
 
+MONGO_FAIL_POINT_DEFINE(hangBeforeDoingDeletion);
+
 boost::optional<DeleteNotification> checkOverlap(std::list<Deletion> const& deletions,
                                                  ChunkRange const& range) {
     // Start search with newest entries by using reverse iterators
@@ -93,7 +95,7 @@ CollectionRangeDeleter::CollectionRangeDeleter() = default;
 
 CollectionRangeDeleter::~CollectionRangeDeleter() {
     // Notify anybody still sleeping on orphan ranges
-    clear({ErrorCodes::InterruptedDueToStepDown, "Collection sharding metadata discarded"});
+    clear({ErrorCodes::InterruptedDueToReplStateChange, "Collection sharding metadata discarded"});
 }
 
 boost::optional<Date_t> CollectionRangeDeleter::cleanUpNextRange(
@@ -110,7 +112,7 @@ boost::optional<Date_t> CollectionRangeDeleter::cleanUpNextRange(
         }
     }
 
-    StatusWith<int> wrote = 0;
+    StatusWith<int> swNumDeleted = 0;
 
     auto range = boost::optional<ChunkRange>(boost::none);
     auto notification = DeleteNotification();
@@ -123,7 +125,7 @@ boost::optional<Date_t> CollectionRangeDeleter::cleanUpNextRange(
         auto& metadataManager = csr->_metadataManager;
 
         if (!_checkCollectionMetadataStillValid(
-                opCtx, nss, epoch, forTestOnly, collection, metadataManager)) {
+                nss, epoch, forTestOnly, collection, metadataManager)) {
             return boost::none;
         }
 
@@ -199,22 +201,31 @@ boost::optional<Date_t> CollectionRangeDeleter::cleanUpNextRange(
         const auto& metadata = *scopedCollectionMetadata;
 
         try {
-            wrote = self->_doDeletion(
+            swNumDeleted = self->_doDeletion(
                 opCtx, collection, metadata->getKeyPattern(), *range, maxToDelete);
         } catch (const DBException& e) {
-            wrote = e.toStatus();
+            swNumDeleted = e.toStatus();
             warning() << e.what();
         }
     }  // drop autoColl
 
-    if (!wrote.isOK() || wrote.getValue() == 0) {
-        if (wrote.isOK()) {
+    bool continueDeleting = swNumDeleted.isOK() && swNumDeleted.getValue() > 0;
+
+    if (swNumDeleted == ErrorCodes::WriteConflict) {
+        CurOp::get(opCtx)->debug().additiveMetrics.incrementWriteConflicts(1);
+        continueDeleting = true;
+    }
+
+    // If there's an error or if there are no more documents to delete, take this branch.
+    // This branch means that we will NOT continue deleting documents from this range.
+    if (!continueDeleting) {
+        if (swNumDeleted.isOK()) {
             LOG(0) << "No documents remain to delete in " << nss << " range "
                    << redact(range->toString());
         }
 
-        // Wait for majority replication even when wrote isn't OK or == 0, because it might have
-        // been OK and/or > 0 previously, and the deletions must be persistent before notifying
+        // Wait for majority replication even when swNumDeleted isn't OK or == 0, because it might
+        // have been OK and/or > 0 previously, and the deletions must be persistent before notifying
         // clients in _pop().
 
         LOG(0) << "Waiting for majority replication of local deletions in " << nss.ns() << " range "
@@ -243,7 +254,7 @@ boost::optional<Date_t> CollectionRangeDeleter::cleanUpNextRange(
         auto& metadataManager = csr->_metadataManager;
 
         if (!_checkCollectionMetadataStillValid(
-                opCtx, nss, epoch, forTestOnly, collection, metadataManager)) {
+                nss, epoch, forTestOnly, collection, metadataManager)) {
             return boost::none;
         }
 
@@ -268,7 +279,7 @@ boost::optional<Date_t> CollectionRangeDeleter::cleanUpNextRange(
             LOG(0) << "Finished deleting documents in " << nss.ns() << " range "
                    << redact(range->toString());
 
-            self->_pop(wrote.getStatus());
+            self->_pop(swNumDeleted.getStatus());
         }
 
         if (!self->_orphans.empty()) {
@@ -280,15 +291,13 @@ boost::optional<Date_t> CollectionRangeDeleter::cleanUpNextRange(
     }
 
     invariant(range);
-    invariant(wrote.getStatus());
-    invariant(wrote.getValue() > 0);
+    invariant(continueDeleting);
 
     notification.abandon();
     return Date_t::now() + Milliseconds(rangeDeleterBatchDelayMS.load());
 }
 
 bool CollectionRangeDeleter::_checkCollectionMetadataStillValid(
-    OperationContext* opCtx,
     const NamespaceString& nss,
     OID const& epoch,
     CollectionRangeDeleter* forTestOnly,
@@ -392,11 +401,21 @@ StatusWith<int> CollectionRangeDeleter::_doDeletion(OperationContext* opCtx,
                                                      PlanExecutor::YIELD_MANUAL,
                                                      InternalPlanner::FORWARD);
 
+    if (MONGO_FAIL_POINT(hangBeforeDoingDeletion)) {
+        LOG(0) << "Hit hangBeforeDoingDeletion failpoint";
+        MONGO_FAIL_POINT_PAUSE_WHILE_SET_OR_INTERRUPTED(opCtx, hangBeforeDoingDeletion);
+    }
+
     PlanYieldPolicy planYieldPolicy(exec.get(), PlanExecutor::YIELD_MANUAL);
 
     int numDeleted = 0;
     do {
         BSONObj deletedObj;
+
+        // TODO SERVER-41606: Remove this function when we refactor CollectionRangeDeleter.
+        if (_throwWriteConflictForTest)
+            throw WriteConflictException();
+
         PlanExecutor::ExecState state = exec->getNext(&deletedObj, nullptr);
 
         if (state == PlanExecutor::IS_EOF) {
