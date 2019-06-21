@@ -3291,7 +3291,7 @@ class File(Base):
             self._memo['changed'] = has_changed
         return has_changed
 
-    def changed_content(self, target, prev_ni):
+    def changed_content(self, target, prev_ni, repo_node=None):
         cur_csig = self.get_csig()
         try:
             return cur_csig != prev_ni.csig
@@ -3433,6 +3433,9 @@ class File(Base):
         if node is None:
             # We need required node argument to get BuildInfo to function
             raise DeciderNeedsNode(self.changed_timestamp_then_content)
+
+        if target != node:
+            print("target (%s) != node (%s)"%(str(target), str(node)))
 
         # Now get sconsign name -> csig map and then get proper prev_ni if possible
         bi = node.get_stored_info().binfo

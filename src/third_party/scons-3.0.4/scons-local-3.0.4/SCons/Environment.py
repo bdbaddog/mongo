@@ -858,13 +858,13 @@ class SubstitutionEnvironment(object):
         return self
 
 
-def default_decide_source(dependency, target, prev_ni):
+def default_decide_source(dependency, target, prev_ni, repo_node=None):
     f = SCons.Defaults.DefaultEnvironment().decide_source
-    return f(dependency, target, prev_ni)
+    return f(dependency, target, prev_ni, repo_node)
 
-def default_decide_target(dependency, target, prev_ni):
+def default_decide_target(dependency, target, prev_ni, repo_node=None):
     f = SCons.Defaults.DefaultEnvironment().decide_target
-    return f(dependency, target, prev_ni)
+    return f(dependency, target, prev_ni, repo_node)
 
 def default_copy_from_cache(src, dst):
     f = SCons.Defaults.DefaultEnvironment().copy_from_cache
@@ -1433,8 +1433,8 @@ class Base(SubstitutionEnvironment):
             return 1
         return self.decide_source(dependency, target, prev_ni)
 
-    def _changed_content(self, dependency, target, prev_ni):
-        return dependency.changed_content(target, prev_ni)
+    def _changed_content(self, dependency, target, prev_ni, repo_node=None):
+        return dependency.changed_content(target, prev_ni, repo_node)
 
     def _changed_source(self, dependency, target, prev_ni):
         target_env = dependency.get_build_env()
@@ -1444,8 +1444,8 @@ class Base(SubstitutionEnvironment):
         else:
             return target_env.decide_target(dependency, target, prev_ni)
 
-    def _changed_timestamp_then_content(self, dependency, target, prev_ni, node=None):
-        return dependency.changed_timestamp_then_content(target, prev_ni, node)
+    def _changed_timestamp_then_content(self, dependency, target, prev_ni, repo_node=None):
+        return dependency.changed_timestamp_then_content(target, prev_ni, repo_node)
 
     def _changed_timestamp_newer(self, dependency, target, prev_ni):
         return dependency.changed_timestamp_newer(target, prev_ni)
