@@ -69,6 +69,7 @@ else:
     _copy2 = shutil.copy2
 
 print_duplicate = 0
+MD5_TIMESTAMP_DEBUG = False
 
 
 def sconsign_none(node):
@@ -3351,7 +3352,7 @@ class File(Base):
         """
         first_string = str(next(iter(dmap)))
 
-        print("DMAP:%s"%id(dmap))
+        # print("DMAP:%s"%id(dmap))
         if first_string not in dmap:
             string_dict = { str(child):signature for child, signature in dmap.items()}
             dmap.update(string_dict)
@@ -3371,6 +3372,13 @@ class File(Base):
         Returns:
             List of csigs for provided list of children
         """
+
+        # Shortcut the logic if this is the first build. We have no info create the map or get previous
+        # signatures
+        if len(dmap) == 0:
+            if MD5_TIMESTAMP_DEBUG: print("Nothing dmap shortcutting")
+            return None
+
         # First try retrieving via Node
         df = dmap.get(self, False)
         if df:
@@ -3379,11 +3387,7 @@ class File(Base):
         rf= self.rfile()
         rfm = dmap.get(rf, False)
         if rfm:
-            # print("rfile yielded results (%s)"%str(rf))
             return rfm
-        # else:
-        #     print("rfile NO RESULTS :(%s)"%str(self))
-        #     pass
 
 
         # get default string for node and then also string swapping os.altsep for os.sep (/ for \)
@@ -3411,7 +3415,6 @@ class File(Base):
             df = dmap.get(s, False)
             if df:
                 return df
-
 
         # Lastly use nodes get_path() to generate string and see if that's in dmap
         if not df:
@@ -3449,12 +3452,12 @@ class File(Base):
         Returns: 
             Boolean - Indicates if node(File) has changed.
         """
-        if node is None:
-            # We need required node argument to get BuildInfo to function
-            raise DeciderNeedsNode(self.changed_timestamp_then_content)
+        # if node is None:
+        #     # We need required node argument to get BuildInfo to function
+        #     raise DeciderNeedsNode(self.changed_timestamp_then_content)
 
-        if target != node:
-            print("target (%s) != node (%s)"%(str(target), str(node)))
+        # if target != node:
+        #     print("target (%s) != node (%s)"%(str(target), str(node)))
 
         # Now get sconsign name -> csig map and then get proper prev_ni if possible
         bi = node.get_stored_info().binfo
@@ -3464,6 +3467,18 @@ class File(Base):
         except AttributeError as e:
             dependency_map = self._build_dependency_map(bi)
             rebuilt = True
+
+        if len(dependency_map) == 0:
+            # If there's no dependency map, there's no need to find the
+            # prev_ni as there aren't any
+            # shortcut the rest of the logic
+            if MD5_TIMESTAMP_DEBUG: print("Skipping checks len(dmap)=0")
+
+            # We still need to get the current file's csig
+            # This should be slightly faster than calling self.changed_content(target, new_prev_ni)
+            self.get_csig()
+            return True
+
 
         prev_ni = self._get_previous_signatures(dependency_map)
 
