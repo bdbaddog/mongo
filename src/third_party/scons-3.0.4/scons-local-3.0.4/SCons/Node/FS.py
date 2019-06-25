@@ -3341,7 +3341,6 @@ class File(Base):
         #     binfo.dependency_map[str(child)] = signature
         #     binfo.dependency_map[child] = signature
 
-
         return binfo.dependency_map
 
     # @profile
@@ -3352,6 +3351,7 @@ class File(Base):
         """
         first_string = str(next(iter(dmap)))
 
+        print("DMAP:%s"%id(dmap))
         if first_string not in dmap:
             string_dict = { str(child):signature for child, signature in dmap.items()}
             dmap.update(string_dict)
@@ -3376,11 +3376,15 @@ class File(Base):
         if df:
             return df
 
-        # If there are no strings in this dmap, then add them.
-        # This may not be necessary, we could walk the nodes in the dmap and check each string
-        # rather than adding ALL the strings to dmap. In theory that would be n/2 vs 2n str() calls on node
-        # if not dmap.has_strings:
-        dmap = self._add_strings_to_dependency_map(dmap)
+        rf= self.rfile()
+        rfm = dmap.get(rf, False)
+        if rfm:
+            # print("rfile yielded results (%s)"%str(rf))
+            return rfm
+        # else:
+        #     print("rfile NO RESULTS :(%s)"%str(self))
+        #     pass
+
 
         # get default string for node and then also string swapping os.altsep for os.sep (/ for \)
         c_strs = [str(self)]
@@ -3388,11 +3392,26 @@ class File(Base):
         if os.altsep:
             c_strs.append(c_strs[0].replace(os.sep, os.altsep))
 
+        # In some cases the dependency_maps' keys are already strings check.
         # Check if either string is now in dmap.
         for s in c_strs:
             df = dmap.get(s, False)
             if df:
                 return df
+
+        # Strings didn't existing in map, add them and try again
+        # If there are no strings in this dmap, then add them.
+        # This may not be necessary, we could walk the nodes in the dmap and check each string
+        # rather than adding ALL the strings to dmap. In theory that would be n/2 vs 2n str() calls on node
+        # if not dmap.has_strings:
+        dmap = self._add_strings_to_dependency_map(dmap)
+
+        # Check if either string is now in dmap.
+        for s in c_strs:
+            df = dmap.get(s, False)
+            if df:
+                return df
+
 
         # Lastly use nodes get_path() to generate string and see if that's in dmap
         if not df:
