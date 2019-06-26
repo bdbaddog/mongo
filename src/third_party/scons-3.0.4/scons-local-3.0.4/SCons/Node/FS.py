@@ -3299,7 +3299,7 @@ class File(Base):
         except AttributeError:
             return 1
 
-    def changed_state(self, target, prev_ni):
+    def changed_state(self, target, prev_ni, repo_node=None):
         return self.state != SCons.Node.up_to_date
 
 
@@ -3492,13 +3492,13 @@ class File(Base):
 
         return self.changed_content(target, prev_ni)
 
-    def changed_timestamp_newer(self, target, prev_ni):
+    def changed_timestamp_newer(self, target, prev_ni, repo_node=None):
         try:
             return self.get_timestamp() > target.get_timestamp()
         except AttributeError:
             return 1
 
-    def changed_timestamp_match(self, target, prev_ni):
+    def changed_timestamp_match(self, target, prev_ni, repo_node=None):
         """
         Return True if the timestamps don't match or if there is no previous timestamp
         :param target:

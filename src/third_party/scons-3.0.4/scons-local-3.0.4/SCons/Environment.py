@@ -1428,10 +1428,10 @@ class Base(SubstitutionEnvironment):
             _warn_copy_deprecated = False
         return self.Clone(*args, **kw)
 
-    def _changed_build(self, dependency, target, prev_ni):
-        if dependency.changed_state(target, prev_ni):
+    def _changed_build(self, dependency, target, prev_ni, repo_node=None):
+        if dependency.changed_state(target, prev_ni, repo_node):
             return 1
-        return self.decide_source(dependency, target, prev_ni)
+        return self.decide_source(dependency, target, prev_ni, repo_node)
 
     def _changed_content(self, dependency, target, prev_ni, repo_node=None):
         return dependency.changed_content(target, prev_ni, repo_node)
@@ -1447,11 +1447,11 @@ class Base(SubstitutionEnvironment):
     def _changed_timestamp_then_content(self, dependency, target, prev_ni, repo_node=None):
         return dependency.changed_timestamp_then_content(target, prev_ni, repo_node)
 
-    def _changed_timestamp_newer(self, dependency, target, prev_ni):
-        return dependency.changed_timestamp_newer(target, prev_ni)
+    def _changed_timestamp_newer(self, dependency, target, prev_ni, repo_node=None):
+        return dependency.changed_timestamp_newer(target, prev_ni, repo_node)
 
-    def _changed_timestamp_match(self, dependency, target, prev_ni):
-        return dependency.changed_timestamp_match(target, prev_ni)
+    def _changed_timestamp_match(self, dependency, target, prev_ni, repo_node=None):
+        return dependency.changed_timestamp_match(target, prev_ni, repo_node)
 
     def _copy_from_cache(self, src, dst):
         return self.fs.copy(src, dst)
